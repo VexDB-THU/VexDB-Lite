@@ -1,0 +1,289 @@
+# name: test/sql/vex/index/hybrid_index_stress.test
+# description: Stress test for hybrid index - 5 categories, 1000 rows, delete/re-insert partitions
+# group: [vex]
+
+require vex
+
+# =============================================================================
+# Phase 1: Create table with 5 categories, 200 rows each (1000 total)
+# =============================================================================
+
+statement ok
+CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOATVECTOR(4));
+
+# Category A: ids 0-199, vectors along axis 1
+statement ok
+INSERT INTO products
+SELECT i AS id, 'cat_a' AS category,
+  [(i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Category B: ids 200-399, vectors along axis 2
+statement ok
+INSERT INTO products
+SELECT 200 + i AS id, 'cat_b' AS category,
+  [0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Category C: ids 400-599, vectors along axis 3
+statement ok
+INSERT INTO products
+SELECT 400 + i AS id, 'cat_c' AS category,
+  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Category D: ids 600-799, vectors along axis 4
+statement ok
+INSERT INTO products
+SELECT 600 + i AS id, 'cat_d' AS category,
+  [(0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Category E: ids 800-999, mixed vectors
+statement ok
+INSERT INTO products
+SELECT 800 + i AS id, 'cat_e' AS category,
+  [(i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Verify total count
+query I
+SELECT COUNT(*) FROM products;
+----
+1000
+
+# Verify per-category counts
+query II
+SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY category;
+----
+cat_a	200
+cat_b	200
+cat_c	200
+cat_d	200
+cat_e	200
+
+# =============================================================================
+# Phase 2: Create hybrid index
+# =============================================================================
+
+statement ok
+CREATE INDEX idx_hybrid ON products USING HYBRID_INDEX (vec, category);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_hybrid';
+----
+1
+
+# =============================================================================
+# Phase 3: Filtered search on each category
+# =============================================================================
+
+# cat_a: id=0 has [0, 0.5, 0, 0], closest to origin in cat_a
+query I
+SELECT id FROM products
+WHERE category = 'cat_a'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+0
+
+# cat_b: id=200 has [0, 0, 0.5, 0], closest to origin in cat_b
+query I
+SELECT id FROM products
+WHERE category = 'cat_b'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+200
+
+# cat_c: id=400 has [0, 0, 0, 0.5], closest to origin in cat_c
+query I
+SELECT id FROM products
+WHERE category = 'cat_c'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+400
+
+# cat_d: id=600 has [0.5, 0, 0, 0], closest to origin in cat_d
+query I
+SELECT id FROM products
+WHERE category = 'cat_d'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+600
+
+# cat_e: id=800 has [0, 0, 0, 0], closest to origin in cat_e
+query I
+SELECT id FROM products
+WHERE category = 'cat_e'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+800
+
+# Top-5 filtered search returns correct count
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM products
+  WHERE category = 'cat_a'
+  ORDER BY l2_distance(vec, [1.0, 0.5, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 5
+) t;
+----
+5
+
+# =============================================================================
+# Phase 4: Global search (no filter)
+# =============================================================================
+
+# cat_e id=800 has [0,0,0,0], should be globally closest to origin
+query II
+SELECT id, category FROM products
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+800	cat_e
+
+# Global top-10 should return 10 results
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM products
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 10
+) t;
+----
+10
+
+# =============================================================================
+# Phase 5: Delete one entire category (cat_c, 200 rows)
+# =============================================================================
+
+statement ok
+DELETE FROM products WHERE category = 'cat_c';
+
+query I
+SELECT COUNT(*) FROM products;
+----
+800
+
+query I
+SELECT COUNT(*) FROM products WHERE category = 'cat_c';
+----
+0
+
+# =============================================================================
+# Phase 6: Verify filtered search on deleted category returns empty
+# =============================================================================
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM products
+  WHERE category = 'cat_c'
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 5
+) t;
+----
+0
+
+# =============================================================================
+# Phase 7: Verify other categories are unaffected
+# =============================================================================
+
+query I
+SELECT id FROM products
+WHERE category = 'cat_a'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+0
+
+query I
+SELECT id FROM products
+WHERE category = 'cat_b'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+200
+
+query I
+SELECT id FROM products
+WHERE category = 'cat_d'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+600
+
+query I
+SELECT id FROM products
+WHERE category = 'cat_e'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+800
+
+# Per-category counts for remaining categories
+query II
+SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY category;
+----
+cat_a	200
+cat_b	200
+cat_d	200
+cat_e	200
+
+# =============================================================================
+# Phase 8: Re-insert into deleted category, verify filtered search works again
+# =============================================================================
+
+statement ok
+INSERT INTO products
+SELECT 1000 + i AS id, 'cat_c' AS category,
+  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOATVECTOR(4)
+FROM range(200) t(i);
+
+# Verify total count restored to 1000
+query I
+SELECT COUNT(*) FROM products;
+----
+1000
+
+query I
+SELECT COUNT(*) FROM products WHERE category = 'cat_c';
+----
+200
+
+# Filtered search on re-inserted cat_c should work
+# id=1000 has [0, 0, 0, 0.5], closest to origin in new cat_c
+query I
+SELECT id FROM products
+WHERE category = 'cat_c'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 1;
+----
+1000
+
+# Top-5 filtered on re-inserted category
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM products
+  WHERE category = 'cat_c'
+  ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.5]::FLOATVECTOR(4))
+  LIMIT 5
+) t;
+----
+5
+
+# Global search should include new cat_c rows
+query I
+SELECT COUNT(*) FROM (
+  SELECT id, category FROM products
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 10
+) t;
+----
+10
+
+# Cleanup
+statement ok
+DROP TABLE products;

@@ -1,0 +1,163 @@
+# name: test/sql/vex/index/edge_cases.test
+# description: Test edge cases and boundary conditions for vex indexes
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Empty table with index
+# ============================================================
+statement ok
+CREATE TABLE empty_vecs (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_empty ON empty_vecs USING GRAPH_INDEX (vec);
+
+# Search on empty index should return empty result
+query I
+SELECT count(*) FROM (SELECT id FROM empty_vecs ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 5);
+----
+0
+
+# Insert into empty indexed table
+statement ok
+INSERT INTO empty_vecs VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM empty_vecs ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE empty_vecs;
+
+# ============================================================
+# Test 2: Single row
+# ============================================================
+statement ok
+CREATE TABLE single (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO single VALUES (1, [1.0, 2.0, 3.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_single ON single USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM single ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE single;
+
+# ============================================================
+# Test 3: Zero vectors
+# ============================================================
+statement ok
+CREATE TABLE zeros (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO zeros VALUES
+  (1, [0.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (3, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_zeros ON zeros USING GRAPH_INDEX (vec);
+
+# Both zero vectors have distance 0
+query I
+SELECT count(*) FROM zeros WHERE l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) = 0;
+----
+2
+
+statement ok
+DROP TABLE zeros;
+
+# ============================================================
+# Test 4: NULL vectors should be skipped by index
+# ============================================================
+statement ok
+CREATE TABLE with_nulls (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO with_nulls VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, NULL),
+  (3, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_nulls ON with_nulls USING GRAPH_INDEX (vec);
+
+# NULL rows should not appear in distance queries
+query I
+SELECT id FROM with_nulls WHERE vec IS NOT NULL ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+----
+1
+3
+
+statement ok
+DROP TABLE with_nulls;
+
+# ============================================================
+# Test 5: LIMIT and OFFSET
+# ============================================================
+statement ok
+CREATE TABLE limit_test (id INTEGER, vec FLOATVECTOR(2));
+
+statement ok
+INSERT INTO limit_test SELECT i, [(i * 0.1)::FLOAT, 0.0]::FLOATVECTOR(2) FROM range(20) t(i);
+
+statement ok
+CREATE INDEX idx_limit ON limit_test USING GRAPH_INDEX (vec);
+
+# LIMIT 3
+query I
+SELECT id FROM limit_test ORDER BY l2_distance(vec, [0.0, 0.0]::FLOATVECTOR(2)) LIMIT 3;
+----
+0
+1
+2
+
+# LIMIT 3 OFFSET 2
+query I
+SELECT id FROM limit_test ORDER BY l2_distance(vec, [0.0, 0.0]::FLOATVECTOR(2)) LIMIT 3 OFFSET 2;
+----
+2
+3
+4
+
+statement ok
+DROP TABLE limit_test;
+
+# ============================================================
+# Test 6: Drop and recreate index
+# ============================================================
+statement ok
+CREATE TABLE recreate (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO recreate VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)), (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_rc ON recreate USING GRAPH_INDEX (vec);
+
+statement ok
+DROP INDEX idx_rc;
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_rc';
+----
+0
+
+statement ok
+CREATE INDEX idx_rc2 ON recreate USING GRAPH_INDEX (vec);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_rc2';
+----
+1
+
+statement ok
+DROP TABLE recreate;

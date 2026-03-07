@@ -1,0 +1,187 @@
+# name: test/sql/vex/index/graph_index_scale.test
+# description: Test graph index at larger scale with 1000 rows, 16 dimensions, INSERT and DELETE
+# group: [vex]
+
+require vex
+
+# Generate 1000 rows with 16-dimensional vectors
+statement ok
+CREATE TABLE scale_data AS
+SELECT
+  i AS id,
+  [
+    sin(i * 0.1)::FLOAT,
+    cos(i * 0.2)::FLOAT,
+    sin(i * 0.3 + 1.0)::FLOAT,
+    cos(i * 0.4 + 2.0)::FLOAT,
+    sin(i * 0.5 + 3.0)::FLOAT,
+    cos(i * 0.6 + 4.0)::FLOAT,
+    sin(i * 0.7 + 5.0)::FLOAT,
+    cos(i * 0.8 + 6.0)::FLOAT,
+    sin(i * 0.9 + 7.0)::FLOAT,
+    cos(i * 1.0 + 8.0)::FLOAT,
+    sin(i * 1.1 + 9.0)::FLOAT,
+    cos(i * 1.2 + 10.0)::FLOAT,
+    sin(i * 1.3 + 11.0)::FLOAT,
+    cos(i * 1.4 + 12.0)::FLOAT,
+    sin(i * 1.5 + 13.0)::FLOAT,
+    cos(i * 1.6 + 14.0)::FLOAT
+  ]::FLOATVECTOR(16) AS vec
+FROM range(1, 1001) t(i);
+
+# Verify dataset size
+query I
+SELECT COUNT(*) FROM scale_data;
+----
+1000
+
+# Create graph index on 1000 rows with 16 dimensions
+statement ok
+CREATE INDEX idx_scale ON scale_data USING GRAPH_INDEX (vec);
+
+# Verify index was created
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_scale';
+----
+1
+
+# --- Basic search: verify results are reasonable ---
+# Search for a vector that exists in the dataset (id=500) - should return itself as nearest
+query I
+SELECT id FROM scale_data
+ORDER BY l2_distance(vec, (SELECT vec FROM scale_data WHERE id = 500))
+LIMIT 1;
+----
+500
+
+# Search near origin - should return some results with positive distances
+query I
+SELECT COUNT(*) FROM (
+  SELECT id, l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16)) AS dist
+  FROM scale_data
+  ORDER BY dist
+  LIMIT 10
+) t
+WHERE dist >= 0;
+----
+10
+
+# Top-5 search with a specific query
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM scale_data
+  ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOATVECTOR(16))
+  LIMIT 5
+) t;
+----
+5
+
+# --- Test INSERT after index creation ---
+# Insert 100 additional rows
+statement ok
+INSERT INTO scale_data
+SELECT
+  1000 + i AS id,
+  [
+    sin((1000 + i) * 0.1)::FLOAT,
+    cos((1000 + i) * 0.2)::FLOAT,
+    sin((1000 + i) * 0.3 + 1.0)::FLOAT,
+    cos((1000 + i) * 0.4 + 2.0)::FLOAT,
+    sin((1000 + i) * 0.5 + 3.0)::FLOAT,
+    cos((1000 + i) * 0.6 + 4.0)::FLOAT,
+    sin((1000 + i) * 0.7 + 5.0)::FLOAT,
+    cos((1000 + i) * 0.8 + 6.0)::FLOAT,
+    sin((1000 + i) * 0.9 + 7.0)::FLOAT,
+    cos((1000 + i) * 1.0 + 8.0)::FLOAT,
+    sin((1000 + i) * 1.1 + 9.0)::FLOAT,
+    cos((1000 + i) * 1.2 + 10.0)::FLOAT,
+    sin((1000 + i) * 1.3 + 11.0)::FLOAT,
+    cos((1000 + i) * 1.4 + 12.0)::FLOAT,
+    sin((1000 + i) * 1.5 + 13.0)::FLOAT,
+    cos((1000 + i) * 1.6 + 14.0)::FLOAT
+  ]::FLOATVECTOR(16) AS vec
+FROM range(1, 101) t(i);
+
+# Verify new total count
+query I
+SELECT COUNT(*) FROM scale_data;
+----
+1100
+
+# Search should find newly inserted rows
+# Searching for the exact vector of a new row (id=1050) should return it
+query I
+SELECT id FROM scale_data
+ORDER BY l2_distance(vec, (SELECT vec FROM scale_data WHERE id = 1050))
+LIMIT 1;
+----
+1050
+
+# Insert a single row very close to origin
+statement ok
+INSERT INTO scale_data VALUES (
+  9999,
+  [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]::FLOATVECTOR(16)
+);
+
+# The newly inserted near-origin vector should be closest to the origin
+query I
+SELECT id FROM scale_data
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+LIMIT 1;
+----
+9999
+
+# --- Test DELETE and re-search ---
+# Delete the near-origin vector we just inserted
+statement ok
+DELETE FROM scale_data WHERE id = 9999;
+
+# After deletion, the near-origin vector should no longer appear
+query I
+SELECT COUNT(*) FROM scale_data WHERE id = 9999;
+----
+0
+
+# Search near origin should still work and return a valid result
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM scale_data
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+  LIMIT 5
+) t;
+----
+5
+
+# Delete a batch of rows (ids 1-100)
+statement ok
+DELETE FROM scale_data WHERE id BETWEEN 1 AND 100;
+
+# Verify count after batch delete
+query I
+SELECT COUNT(*) FROM scale_data;
+----
+1000
+
+# Search should still work after batch delete
+query I
+SELECT id FROM scale_data
+ORDER BY l2_distance(vec, (SELECT vec FROM scale_data WHERE id = 500))
+LIMIT 1;
+----
+500
+
+# Verify deleted rows are not returned in search results
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM scale_data
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+  LIMIT 20
+) t
+WHERE t.id BETWEEN 1 AND 100;
+----
+0
+
+# Cleanup
+statement ok
+DROP TABLE scale_data;

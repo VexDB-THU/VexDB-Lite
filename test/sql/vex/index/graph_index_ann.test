@@ -1,0 +1,61 @@
+# name: test/sql/vex/index/graph_index_ann.test
+# description: Test ANN (Approximate Nearest Neighbor) search with graph index
+# group: [vex]
+
+require vex
+
+# Create a dataset for ANN search
+statement ok
+CREATE TABLE products (id INTEGER, name VARCHAR, vec FLOATVECTOR(3));
+
+# Insert sample products with 3D vectors
+statement ok
+INSERT INTO products VALUES (1, 'Zero', [0.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO products VALUES (2, 'Ones', [1.0, 1.0, 1.0]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO products VALUES (3, 'Mixed', [0.5, 0.5, 0.5]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO products VALUES (4, 'Small', [0.1, 0.1, 0.1]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO products VALUES (5, 'Large', [0.9, 0.9, 0.9]::FLOATVECTOR(3));
+
+# Create graph index
+statement ok
+CREATE INDEX idx_products_vec ON products USING GRAPH_INDEX (vec);
+
+# Verify index was created
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_products_vec';
+----
+1
+
+# ANN query: find products closest to origin [0,0,0]
+query III
+SELECT id, name, l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) as dist
+FROM products
+ORDER BY dist
+LIMIT 3;
+----
+1	Zero	0
+4	Small	0.17320508419816347
+3	Mixed	0.8660254037844386
+
+# Find products closest to [1,1,1]
+query III
+SELECT id, name, l2_distance(vec, [1.0, 1.0, 1.0]::FLOATVECTOR(3)) as dist
+FROM products
+ORDER BY dist
+LIMIT 3;
+----
+2	Ones	0
+5	Large	0.17320511646012016
+3	Mixed	0.8660254037844386
+
+# Cleanup
+statement ok
+DROP TABLE products;

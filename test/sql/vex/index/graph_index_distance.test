@@ -1,0 +1,26 @@
+# name: test/sql/vex/index/graph_index_distance.test
+# description: Test distance query with graph index
+# group: [vex]
+
+require vex
+
+# Create a table with vectors
+statement ok
+CREATE TABLE items (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO items VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO items VALUES (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO items VALUES (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+# Query without index first
+query III
+SELECT id, vec, l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) as dist FROM items ORDER BY dist;
+----
+1	[1.0, 0.0, 0.0]	0
+2	[0.0, 1.0, 0.0]	1.4142135623730951
+3	[0.0, 0.0, 1.0]	1.4142135623730951

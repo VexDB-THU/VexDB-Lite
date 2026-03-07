@@ -1,0 +1,99 @@
+# name: test/sql/vex/index/graph_index_restart_nocheckpoint.test
+# description: Test restart WITHOUT explicit checkpoint (WAL replay path)
+# group: [vex]
+
+require vex
+
+load __TEST_DIR__/restart_nocp.db
+
+statement ok
+CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx ON vectors USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(1, 201) t(i);
+
+# NO CHECKPOINT - restart with WAL replay
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# Delete without checkpoint, then restart
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 1 AND 50;
+
+# NO CHECKPOINT
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+150
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# Insert without checkpoint
+statement ok
+INSERT INTO vectors SELECT i, list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOATVECTOR(4)
+FROM range(201, 301) t(i);
+
+# NO CHECKPOINT
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+250
+
+# Delete + insert without checkpoint
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 51 AND 80;
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(301, 351) t(i);
+
+# NO CHECKPOINT
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+270
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 20);
+----
+20
+
+# Heavy delete without checkpoint
+statement ok
+DELETE FROM vectors WHERE id % 2 = 0;
+
+# NO CHECKPOINT
+restart
+
+statement ok
+SELECT count(*) FROM vectors;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE vectors;

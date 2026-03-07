@@ -1,0 +1,400 @@
+# name: test/sql/vex/index/graph_index_ddl.test
+# description: Test graph index DDL interactions (DROP TABLE, TRUNCATE, ALTER TABLE, index lifecycle)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: DROP TABLE that has an index (no dangling index)
+# ============================================================
+statement ok
+CREATE TABLE drop_test (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO drop_test VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_drop ON drop_test USING GRAPH_INDEX (vec);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_drop';
+----
+1
+
+# Drop the table - index should be cleaned up automatically
+statement ok
+DROP TABLE drop_test;
+
+# No dangling index should remain
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_drop';
+----
+0
+
+# ============================================================
+# Test 2: CREATE INDEX, DROP INDEX, CREATE INDEX with same name (lifecycle)
+# ============================================================
+statement ok
+CREATE TABLE lifecycle (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO lifecycle VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
+  (4, [0.5, 0.5, 0.0]::FLOATVECTOR(3));
+
+# First creation
+statement ok
+CREATE INDEX idx_life ON lifecycle USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM lifecycle ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Drop the index
+statement ok
+DROP INDEX idx_life;
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_life';
+----
+0
+
+# Recreate with the same name
+statement ok
+CREATE INDEX idx_life ON lifecycle USING GRAPH_INDEX (vec);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_life';
+----
+1
+
+# Search should work with the recreated index
+query I
+SELECT id FROM lifecycle ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+2
+
+# Drop and recreate a third time to confirm no residual state
+statement ok
+DROP INDEX idx_life;
+
+statement ok
+CREATE INDEX idx_life ON lifecycle USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM lifecycle ORDER BY l2_distance(vec, [0.0, 0.0, 1.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+3
+
+statement ok
+DROP TABLE lifecycle;
+
+# ============================================================
+# Test 3: TRUNCATE TABLE with index
+# ============================================================
+statement ok
+CREATE TABLE trunc_test (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO trunc_test VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_trunc ON trunc_test USING GRAPH_INDEX (vec);
+
+# Verify data and index
+query I
+SELECT count(*) FROM trunc_test;
+----
+3
+
+# Truncate the table
+statement ok
+TRUNCATE TABLE trunc_test;
+
+# Table should be empty
+query I
+SELECT count(*) FROM trunc_test;
+----
+0
+
+# Index should still exist
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_trunc';
+----
+1
+
+# Search on empty table after truncate should return no results
+query I
+SELECT count(*) FROM (SELECT id FROM trunc_test ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 5);
+----
+0
+
+# Re-insert data after truncate
+statement ok
+INSERT INTO trunc_test VALUES
+  (10, [0.5, 0.5, 0.0]::FLOATVECTOR(3)),
+  (11, [0.0, 0.5, 0.5]::FLOATVECTOR(3));
+
+# Search should work on newly inserted data
+query I
+SELECT id FROM trunc_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+10
+
+query I
+SELECT count(*) FROM trunc_test;
+----
+2
+
+statement ok
+DROP TABLE trunc_test;
+
+# ============================================================
+# Test 4: CREATE TABLE AS SELECT from indexed table (index should NOT carry over)
+# ============================================================
+statement ok
+CREATE TABLE source (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO source VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_source ON source USING GRAPH_INDEX (vec);
+
+# CTAS
+statement ok
+CREATE TABLE copied AS SELECT * FROM source;
+
+# The new table should have data
+query I
+SELECT count(*) FROM copied;
+----
+3
+
+# But no index should exist on the copied table
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'copied';
+----
+0
+
+# Original index should still exist
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_source';
+----
+1
+
+# Searches on both tables should work
+query I
+SELECT id FROM source ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+query I
+SELECT id FROM copied ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE copied;
+
+statement ok
+DROP TABLE source;
+
+# ============================================================
+# Test 5: ALTER TABLE ADD COLUMN - index should still work
+# ============================================================
+statement ok
+CREATE TABLE alter_add (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO alter_add VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_alter_add ON alter_add USING GRAPH_INDEX (vec);
+
+# Verify search works before alter
+query I
+SELECT id FROM alter_add ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Add a new column
+statement ok
+ALTER TABLE alter_add ADD COLUMN label VARCHAR;
+
+# Index should still exist
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_alter_add';
+----
+1
+
+# Search should still work after adding a column
+query I
+SELECT id FROM alter_add ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+2
+
+# Insert with the new column
+statement ok
+INSERT INTO alter_add VALUES (4, [0.9, 0.1, 0.0]::FLOATVECTOR(3), 'test');
+
+query I
+SELECT id FROM alter_add ORDER BY l2_distance(vec, [0.91, 0.09, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+4
+
+statement ok
+DROP TABLE alter_add;
+
+# ============================================================
+# Test 6: ALTER TABLE DROP COLUMN blocked by index dependency
+# ============================================================
+statement ok
+CREATE TABLE alter_drop (id INTEGER, vec FLOATVECTOR(3), extra INTEGER);
+
+statement ok
+INSERT INTO alter_drop VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 100),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 200),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 300);
+
+statement ok
+CREATE INDEX idx_alter_drop ON alter_drop USING GRAPH_INDEX (vec);
+
+# DuckDB does not allow DROP COLUMN when table has an index
+statement error
+ALTER TABLE alter_drop DROP COLUMN extra;
+----
+Cannot alter entry
+
+# Drop index first, then drop column
+statement ok
+DROP INDEX idx_alter_drop;
+
+statement ok
+ALTER TABLE alter_drop DROP COLUMN extra;
+
+# Verify table still works
+query I
+SELECT count(*) FROM alter_drop;
+----
+3
+
+# Recreate index after column drop
+statement ok
+CREATE INDEX idx_alter_drop ON alter_drop USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM alter_drop ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE alter_drop;
+
+# ============================================================
+# Test 7: Multiple indexes on same column (should work or error gracefully)
+# ============================================================
+statement ok
+CREATE TABLE multi_idx (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO multi_idx VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+# First index on vec
+statement ok
+CREATE INDEX idx_multi_a ON multi_idx USING GRAPH_INDEX (vec);
+
+# Second index on same column - this may succeed or fail depending on implementation
+# We test that the system handles it gracefully either way
+statement ok
+CREATE INDEX idx_multi_b ON multi_idx USING GRAPH_INDEX (vec);
+
+# If both indexes were created, verify they both exist
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name IN ('idx_multi_a', 'idx_multi_b');
+----
+2
+
+# Search should still work
+query I
+SELECT id FROM multi_idx ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Drop one index, search should still work
+statement ok
+DROP INDEX idx_multi_a;
+
+query I
+SELECT id FROM multi_idx ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+2
+
+# Drop the second index
+statement ok
+DROP INDEX idx_multi_b;
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE table_name = 'multi_idx';
+----
+0
+
+# Search should still work without any index (sequential scan)
+query I
+SELECT id FROM multi_idx ORDER BY l2_distance(vec, [0.0, 0.0, 1.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+3
+
+statement ok
+DROP TABLE multi_idx;
+
+# ============================================================
+# Test 8: DROP INDEX IF EXISTS on non-existent index (should not error)
+# ============================================================
+statement ok
+DROP INDEX IF EXISTS idx_nonexistent;
+
+# ============================================================
+# Test 9: CREATE INDEX IF NOT EXISTS (idempotent creation)
+# ============================================================
+statement ok
+CREATE TABLE idempotent (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO idempotent VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_idem ON idempotent USING GRAPH_INDEX (vec);
+
+# Second creation with IF NOT EXISTS should not error
+statement ok
+CREATE INDEX IF NOT EXISTS idx_idem ON idempotent USING GRAPH_INDEX (vec);
+
+# Only one index should exist
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_idem';
+----
+1
+
+statement ok
+DROP TABLE idempotent;

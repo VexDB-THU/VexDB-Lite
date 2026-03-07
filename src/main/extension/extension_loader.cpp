@@ -16,6 +16,7 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/secret/secret_manager.hpp"
 #include "duckdb/main/database.hpp"
+#include "duckdb/execution/index/index_type_set.hpp"
 
 namespace duckdb {
 
@@ -40,6 +41,22 @@ void ExtensionLoader::FinalizeLoad() {
 		auto info = make_uniq<ExtensionLoadedInfo>();
 		info->description = extension_description;
 		extension_info->load_info = std::move(info);
+	}
+
+	// Reload index types from global registry
+	// Extensions may have registered new index types that need to be available
+	auto &config = DBConfig::GetConfig(db);
+	auto extension_types = GlobalIndexTypeRegistry::GetInstance().GetExtensionIndexTypes();
+	auto &index_types = config.GetIndexTypes();
+	for (const auto &ext_type : extension_types) {
+		// Try to register each extension type
+		// If already registered, this will be ignored due to duplicate check
+		try {
+			index_types.RegisterIndexType(ext_type);
+		} catch (CatalogException &ex) {
+			// Type already registered - this is fine
+			(void)ex;
+		}
 	}
 }
 

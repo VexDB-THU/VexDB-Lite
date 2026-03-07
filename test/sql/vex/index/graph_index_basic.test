@@ -1,0 +1,82 @@
+# name: test/sql/vex/index/graph_index_basic.test
+# description: Test graph index (HNSW) creation and basic operations
+# group: [vex]
+
+require vex
+
+# Test basic index creation
+statement ok
+CREATE TABLE vectors (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO vectors VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx ON vectors USING GRAPH_INDEX (vec);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx';
+----
+1
+
+# Test index creation with data
+statement ok
+CREATE TABLE vectors2 (id INTEGER, vec FLOATVECTOR(128));
+
+statement ok
+INSERT INTO vectors2 SELECT i, list_transform(range(128), x -> (x + i)::FLOAT / 256.0)::FLOATVECTOR(128) FROM range(100) t(i);
+
+statement ok
+CREATE INDEX idx2 ON vectors2 USING GRAPH_INDEX (vec);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx2';
+----
+1
+
+# Test multiple dimensions
+statement ok
+CREATE TABLE vec256 (id INTEGER, vec FLOATVECTOR(256));
+
+statement ok
+CREATE INDEX idx256 ON vec256 USING GRAPH_INDEX (vec);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx256';
+----
+1
+
+# Test index on different sized vectors
+statement ok
+CREATE TABLE vec64 (id INTEGER, vec FLOATVECTOR(64));
+
+statement ok
+CREATE INDEX idx64 ON vec64 USING GRAPH_INDEX (vec);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx64';
+----
+1
+
+# Cleanup
+statement ok
+DROP TABLE vectors;
+
+statement ok
+DROP TABLE vectors2;
+
+statement ok
+DROP TABLE vec256;
+
+statement ok
+DROP TABLE vec64;
+
+# Verify indexes are dropped
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name LIKE 'idx%';
+----
+0

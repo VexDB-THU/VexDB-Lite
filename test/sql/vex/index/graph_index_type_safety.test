@@ -1,0 +1,86 @@
+# name: test/sql/vex/index/graph_index_type_safety.test
+# description: Test type safety - dimension mismatch, wrong types
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Dimension mismatch on INSERT
+# ============================================================
+statement ok
+CREATE TABLE t_dim (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_dim ON t_dim USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_dim VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+# Insert with wrong dimension should fail
+statement error
+INSERT INTO t_dim VALUES (2, [1.0, 0.0]::FLOATVECTOR(2));
+----
+
+statement error
+INSERT INTO t_dim VALUES (3, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4));
+----
+
+# Original data should be intact
+query I
+SELECT count(*) FROM t_dim;
+----
+1
+
+statement ok
+DROP TABLE t_dim;
+
+# ============================================================
+# Test 2: Distance function with mismatched dimensions
+# ============================================================
+statement ok
+CREATE TABLE t_dist (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_dist VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+# Query with wrong dimension vector
+statement error
+SELECT l2_distance(vec, [1.0, 0.0]::FLOATVECTOR(2)) FROM t_dist;
+----
+
+statement ok
+DROP TABLE t_dist;
+
+# ============================================================
+# Test 3: Create index on non-vector column should fail
+# ============================================================
+statement ok
+CREATE TABLE t_nonvec (id INTEGER, name VARCHAR);
+
+statement error
+CREATE INDEX idx_nonvec ON t_nonvec USING GRAPH_INDEX (name);
+----
+
+statement ok
+DROP TABLE t_nonvec;
+
+# ============================================================
+# Test 4: Integer values auto-cast to float in vector
+# ============================================================
+statement ok
+CREATE TABLE t_cast (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_cast ON t_cast USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_cast VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+# Query with integer-like values should work (auto-cast)
+query I
+SELECT id FROM t_cast ORDER BY l2_distance(vec, [1, 0, 0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_cast;
