@@ -1,0 +1,133 @@
+# name: test/sql/vex/index/graph_index_recall.test
+# description: Test ANN recall by comparing graph index results against exact brute-force search
+# group: [vex]
+
+require vex
+
+# Generate 500 rows with 8-dimensional vectors using deterministic math expressions
+statement ok
+CREATE TABLE recall_data AS
+SELECT
+  i AS id,
+  [
+    sin(i * 0.1)::FLOAT,
+    cos(i * 0.2)::FLOAT,
+    sin(i * 0.3 + 1.0)::FLOAT,
+    cos(i * 0.4 + 2.0)::FLOAT,
+    sin(i * 0.5 + 3.0)::FLOAT,
+    cos(i * 0.6 + 4.0)::FLOAT,
+    sin(i * 0.7 + 5.0)::FLOAT,
+    cos(i * 0.8 + 6.0)::FLOAT
+  ]::FLOATVECTOR(8) AS vec
+FROM range(1, 501) t(i);
+
+# Verify dataset size
+query I
+SELECT COUNT(*) FROM recall_data;
+----
+500
+
+# Create graph index
+statement ok
+CREATE INDEX idx_recall ON recall_data USING GRAPH_INDEX (vec);
+
+# Verify index was created
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_recall';
+----
+1
+
+# --- Recall test with k=1 ---
+# Compute the exact nearest neighbor (brute-force) for query [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# Then verify ANN returns the same top-1 result
+
+# Store exact top-1 result
+statement ok
+CREATE TABLE exact_top1 AS
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8))
+LIMIT 1;
+
+# ANN top-1 should match exact top-1 (for well-separated top-1, ANN should find it)
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM recall_data
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8))
+  LIMIT 1
+) ann
+WHERE ann.id IN (SELECT id FROM exact_top1);
+----
+1
+
+# --- Recall test with k=5 ---
+# Store exact top-5 results for a different query point
+statement ok
+CREATE TABLE exact_top5 AS
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8))
+LIMIT 5;
+
+# ANN top-5 recall: count how many of ANN's top-5 match exact top-5
+# For a good index, recall should be at least 4 out of 5
+query I
+SELECT COUNT(*) >= 4 FROM (
+  SELECT id FROM recall_data
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8))
+  LIMIT 5
+) ann
+WHERE ann.id IN (SELECT id FROM exact_top5);
+----
+true
+
+# --- Recall test with k=10 ---
+# Store exact top-10 results for another query point
+statement ok
+CREATE TABLE exact_top10 AS
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, [1.0, -0.5, 0.3, -0.8, 0.6, -0.2, 0.9, -0.4]::FLOATVECTOR(8))
+LIMIT 10;
+
+# ANN top-10 recall: at least 8 out of 10 should match
+query I
+SELECT COUNT(*) >= 8 FROM (
+  SELECT id FROM recall_data
+  ORDER BY l2_distance(vec, [1.0, -0.5, 0.3, -0.8, 0.6, -0.2, 0.9, -0.4]::FLOATVECTOR(8))
+  LIMIT 10
+) ann
+WHERE ann.id IN (SELECT id FROM exact_top10);
+----
+true
+
+# --- Recall test with query point that is an existing vector ---
+# Searching for a vector that exists in the dataset should return that vector as top-1
+query I
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, (SELECT vec FROM recall_data WHERE id = 250))
+LIMIT 1;
+----
+250
+
+# --- Verify distances are non-negative and ordered ---
+query I
+SELECT COUNT(*) FROM (
+  SELECT l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) AS dist
+  FROM recall_data
+  ORDER BY dist
+  LIMIT 10
+) t
+WHERE dist >= 0;
+----
+10
+
+# Cleanup
+statement ok
+DROP TABLE exact_top1;
+
+statement ok
+DROP TABLE exact_top5;
+
+statement ok
+DROP TABLE exact_top10;
+
+statement ok
+DROP TABLE recall_data;

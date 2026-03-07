@@ -1,0 +1,184 @@
+# name: test/sql/vex/index/graph_index_persistence.test_slow
+# description: Persistence test - checkpoint, restart, verify index survives
+# group: [vex]
+
+require vex
+
+# Use a persistent database file
+load __TEST_DIR__/graph_index_persist_slow.db
+
+# ============================================================
+# Phase 1: Create and populate index
+# ============================================================
+statement ok
+CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_persist ON vectors USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(1, 201) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Restart 1: Basic persistence - data and index survive
+# ============================================================
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+# ============================================================
+# Phase 2: Delete + Insert, checkpoint, restart
+# ============================================================
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 1 AND 50;
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOATVECTOR(4)
+FROM range(201, 301) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+250
+
+statement ok
+CHECKPOINT;
+
+# ============================================================
+# Restart 2: Verify modified data persists
+# ============================================================
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+250
+
+query I
+SELECT count(*) FROM vectors WHERE id BETWEEN 1 AND 50;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 15);
+----
+15
+
+# ============================================================
+# Phase 3: Heavy delete (50%), checkpoint, restart
+# ============================================================
+statement ok
+DELETE FROM vectors WHERE id % 2 = 0;
+
+statement ok
+CHECKPOINT;
+
+# ============================================================
+# Restart 3: Verify sparse index works after restart
+# ============================================================
+restart
+
+statement ok
+SELECT count(*) FROM vectors;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 4: Delete all, restart, rebuild from empty
+# ============================================================
+statement ok
+DELETE FROM vectors;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM vectors;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+0
+
+# Insert into empty index after restart
+statement ok
+INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(1, 101) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+100
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 5: Drop index, recreate, restart
+# ============================================================
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+DROP INDEX idx_persist;
+
+statement ok
+CREATE INDEX idx_persist2 ON vectors USING GRAPH_INDEX (vec);
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+restart
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+query I
+SELECT count(*) FROM vectors;
+----
+100
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE vectors;

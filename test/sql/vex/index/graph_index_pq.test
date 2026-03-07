@@ -1,0 +1,42 @@
+# name: test/sql/vex/index/graph_index_pq.test
+# description: Test graph index with Product Quantization (PQ) support
+# group: [vex]
+
+require vex
+
+# Create table with enough dimensions for PQ (dimension must be divisible by pq_m)
+statement ok
+CREATE TABLE pq_vecs (id INTEGER, vec FLOATVECTOR(8));
+
+# Insert enough data for PQ training (need at least 256 for good codebook)
+statement ok
+INSERT INTO pq_vecs SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT,
+                                (i * 0.05)::FLOAT, (i * 0.06)::FLOAT, (i * 0.07)::FLOAT, (i * 0.08)::FLOAT]::FLOATVECTOR(8)
+FROM range(500) t(i);
+
+# Create index with PQ enabled
+statement ok
+CREATE INDEX idx_pq ON pq_vecs USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# Verify index exists
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_pq';
+----
+1
+
+# PQ-accelerated search should return reasonable results
+# The closest vector to [0,0,...,0] should be id=0
+query I
+SELECT id FROM pq_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 1;
+----
+0
+
+# Search for a vector near the middle of the dataset
+query I
+SELECT id FROM pq_vecs ORDER BY l2_distance(vec, [2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 17.5, 20.0]::FLOATVECTOR(8)) LIMIT 1;
+----
+250
+
+# Cleanup
+statement ok
+DROP TABLE pq_vecs;

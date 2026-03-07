@@ -1,0 +1,100 @@
+# name: test/sql/vex/index/graph_index_null_vectors.test
+# description: Test NULL vector handling with graph index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: INSERT with NULL vector value
+# ============================================================
+statement ok
+CREATE TABLE t_null (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_null ON t_null USING GRAPH_INDEX (vec);
+
+# Insert rows with valid vectors
+statement ok
+INSERT INTO t_null VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_null VALUES (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+
+# Insert a row with NULL vector
+statement ok
+INSERT INTO t_null VALUES (3, NULL);
+
+# Insert more valid vectors after NULL
+statement ok
+INSERT INTO t_null VALUES (4, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+# Search should still work, returning non-NULL rows
+query I
+SELECT id FROM t_null ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+----
+1
+2
+
+# Verify all rows are in the table
+query I
+SELECT count(*) FROM t_null;
+----
+4
+
+# Verify NULL row exists
+query I
+SELECT id FROM t_null WHERE vec IS NULL;
+----
+3
+
+statement ok
+DROP TABLE t_null;
+
+# ============================================================
+# Test 2: All NULL vectors
+# ============================================================
+statement ok
+CREATE TABLE t_allnull (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_allnull ON t_allnull USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_allnull VALUES (1, NULL), (2, NULL), (3, NULL);
+
+# Table should have 3 rows
+query I
+SELECT count(*) FROM t_allnull;
+----
+3
+
+statement ok
+DROP TABLE t_allnull;
+
+# ============================================================
+# Test 3: Mix of NULLs and valid vectors in batch insert
+# ============================================================
+statement ok
+CREATE TABLE t_mixnull (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_mixnull ON t_mixnull USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_mixnull VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, NULL),
+  (3, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (4, NULL),
+  (5, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+# Search should return valid vectors only
+query I
+SELECT id FROM t_mixnull ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+----
+1
+3
+5
+
+statement ok
+DROP TABLE t_mixnull;

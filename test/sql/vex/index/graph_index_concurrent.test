@@ -1,0 +1,223 @@
+# name: test/sql/vex/index/graph_index_concurrent.test
+# description: Test concurrent-like operations (sequential simulation)
+# group: [vex]
+
+require vex
+
+# Note: sqllogictest is single-threaded, but we can test scenarios
+# that stress the index under rapid insert/delete/search cycles
+
+# ============================================================
+# Test 1: Rapid insert-search interleaving
+# ============================================================
+statement ok
+CREATE TABLE t_rapid (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_rapid ON t_rapid USING GRAPH_INDEX (vec);
+
+# Insert and search in quick succession
+statement ok
+INSERT INTO t_rapid VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM t_rapid ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+INSERT INTO t_rapid VALUES (2, [0.9, 0.1, 0.0]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM t_rapid ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+statement ok
+INSERT INTO t_rapid VALUES (3, [0.99, 0.01, 0.0]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM t_rapid ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Now delete and search
+statement ok
+DELETE FROM t_rapid WHERE id = 1;
+
+query I
+SELECT id FROM t_rapid ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+3
+
+statement ok
+DELETE FROM t_rapid WHERE id = 3;
+
+query I
+SELECT id FROM t_rapid ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+2
+
+statement ok
+DROP TABLE t_rapid;
+
+# ============================================================
+# Test 2: Insert-delete-insert same pattern (reuse scenario)
+# ============================================================
+statement ok
+CREATE TABLE t_reuse (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_reuse ON t_reuse USING GRAPH_INDEX (vec);
+
+# Round 1: insert
+statement ok
+INSERT INTO t_reuse VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+query I
+SELECT count(*) FROM t_reuse;
+----
+3
+
+# Round 1: delete all
+statement ok
+DELETE FROM t_reuse;
+
+query I
+SELECT count(*) FROM t_reuse;
+----
+0
+
+# Round 2: insert different data
+statement ok
+INSERT INTO t_reuse VALUES
+  (4, [0.5, 0.5, 0.0]::FLOATVECTOR(3)),
+  (5, [0.0, 0.5, 0.5]::FLOATVECTOR(3)),
+  (6, [0.5, 0.0, 0.5]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM t_reuse ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+4
+
+# Round 2: delete all again
+statement ok
+DELETE FROM t_reuse;
+
+# Round 3: insert again
+statement ok
+INSERT INTO t_reuse VALUES
+  (7, [0.1, 0.1, 0.8]::FLOATVECTOR(3)),
+  (8, [0.8, 0.1, 0.1]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM t_reuse ORDER BY l2_distance(vec, [0.0, 0.0, 1.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+7
+
+statement ok
+DROP TABLE t_reuse;
+
+# ============================================================
+# Test 3: Large batch insert followed by partial delete
+# ============================================================
+statement ok
+CREATE TABLE t_batch (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_batch ON t_batch USING GRAPH_INDEX (vec);
+
+# Insert 100 rows
+statement ok
+INSERT INTO t_batch SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, (i % 3)::FLOAT / 3.0]::FLOATVECTOR(3) FROM range(1, 101) t(i);
+
+query I
+SELECT count(*) FROM t_batch;
+----
+100
+
+# Delete even ids
+statement ok
+DELETE FROM t_batch WHERE id % 2 = 0;
+
+query I
+SELECT count(*) FROM t_batch;
+----
+50
+
+# Search should still work
+query I
+SELECT count(*) FROM (SELECT id FROM t_batch ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 10);
+----
+10
+
+# Delete more
+statement ok
+DELETE FROM t_batch WHERE id % 3 = 0;
+
+# Insert new data
+statement ok
+INSERT INTO t_batch SELECT i + 200, [0.5, 0.5, 0.5]::FLOATVECTOR(3) FROM range(1, 21) t(i);
+
+# Search should find newly inserted data as closest
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_batch
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3))
+  LIMIT 5
+) sub WHERE id > 200;
+----
+5
+
+statement ok
+DROP TABLE t_batch;
+
+# ============================================================
+# Test 4: Multiple indexes on same table
+# ============================================================
+statement ok
+CREATE TABLE t_multi_idx (id INTEGER, v1 FLOATVECTOR(3), v2 FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_v1 ON t_multi_idx USING GRAPH_INDEX (v1);
+
+statement ok
+CREATE INDEX idx_v2 ON t_multi_idx USING GRAPH_INDEX (v2);
+
+statement ok
+INSERT INTO t_multi_idx VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+
+# Search on v1
+query I
+SELECT id FROM t_multi_idx ORDER BY l2_distance(v1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Search on v2
+query I
+SELECT id FROM t_multi_idx ORDER BY l2_distance(v2, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+3
+
+# Delete and verify both indexes work
+statement ok
+DELETE FROM t_multi_idx WHERE id = 1;
+
+query I
+SELECT id FROM t_multi_idx ORDER BY l2_distance(v1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+2
+
+query I
+SELECT id FROM t_multi_idx ORDER BY l2_distance(v2, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+3
+
+statement ok
+DROP TABLE t_multi_idx;

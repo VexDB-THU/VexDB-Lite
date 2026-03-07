@@ -1,0 +1,29 @@
+# name: test/sql/vex/types/floatvector_dims.test
+# description: Test FLOATVECTOR dimension constraints
+# group: [vex]
+
+require vex
+
+# Zero dimension should fail
+statement error
+CREATE TABLE t_bad (v FLOATVECTOR(0));
+----
+
+# No dimension argument should fail
+statement error
+CREATE TABLE t_bad (v FLOATVECTOR);
+----
+
+# Negative dimension should fail
+statement error
+CREATE TABLE t_bad (v FLOATVECTOR(-1));
+----
+
+# Large valid dimension
+statement ok
+CREATE TABLE t_large (v FLOATVECTOR(4096));
+
+# Exceeding max dimension should fail
+statement error
+CREATE TABLE t_bad (v FLOATVECTOR(16385));
+----

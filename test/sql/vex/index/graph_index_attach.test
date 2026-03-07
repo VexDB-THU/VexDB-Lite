@@ -1,0 +1,58 @@
+# name: test/sql/vex/index/graph_index_attach.test
+# description: Test ATTACH database with graph index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Create index in attached database
+# ============================================================
+statement ok
+ATTACH '__TEST_DIR__/attached.db' AS db2;
+
+statement ok
+CREATE TABLE db2.vectors (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_attached ON db2.vectors USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO db2.vectors VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+
+query I
+SELECT id FROM db2.vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# ============================================================
+# Test 2: Cross-database query
+# ============================================================
+statement ok
+CREATE TABLE main_items (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO main_items VALUES (1, 'red'), (2, 'green'), (3, 'blue');
+
+query IT
+SELECT v.id, m.label FROM (
+  SELECT id FROM db2.vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 2
+) v JOIN main_items m ON v.id = m.id
+ORDER BY v.id;
+----
+1	red
+2	green
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE main_items;
+
+statement ok
+DROP TABLE db2.vectors;
+
+statement ok
+DETACH db2;
