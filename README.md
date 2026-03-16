@@ -320,4 +320,4 @@ Contributions are welcome! Please open an issue to discuss your idea before subm
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+This project is licensed under the [Apache License 2.0](LICENSE). The underlying DuckDB engine is licensed under the [MIT License](LICENSE-DUCKDB).
