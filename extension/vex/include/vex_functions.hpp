@@ -21,6 +21,7 @@ struct VexFunctions {
 	static ScalarFunction GetVectorSubFunction();
 
 	static void RegisterANNSearchFunction(ExtensionLoader &loader);
+	static void RegisterIndexInfoFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

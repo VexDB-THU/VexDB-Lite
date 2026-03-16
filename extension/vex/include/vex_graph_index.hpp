@@ -7,6 +7,7 @@
 #include "vex_graph_index_core.hpp"
 
 #include <random>
+#include <mutex>
 
 namespace duckdb {
 
@@ -26,7 +27,7 @@ struct GraphIndexScanState : public IndexScanState {
 };
 
 // ============================================================
-// Graph Index (HNSW implementation)
+// Graph Index (HNSW implementation using FixedSizeAllocator)
 // ============================================================
 class GraphIndex : public BoundIndex {
 public:
@@ -40,9 +41,16 @@ public:
 	           const vector<column_t> &column_ids, TableIOManager &table_io_manager,
 	           const vector<unique_ptr<Expression>> &unbound_expressions,
 	           AttachedDatabase &db, int m, int ef_construction,
+	           vex::VexMetric metric = vex::VexMetric::L2,
 	           bool use_pq = false, uint32_t pq_m = 0);
 
 	void Build(DataChunk &chunk, Vector &row_ids);
+	//! Thread-safe build for parallel index creation (multiple threads can call concurrently)
+	void BuildConcurrent(DataChunk &chunk, Vector &row_ids);
+	//! Parallel bulk build: allocate all nodes first, then insert in parallel using std::thread.
+	//! Called from Finalize with all accumulated vectors.
+	void BuildParallel(const std::vector<float> &all_vectors, const std::vector<row_t> &all_row_ids,
+	                   idx_t total_count, uint32_t dim, int num_threads);
 
 	// BoundIndex interface
 	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -66,26 +74,39 @@ public:
 
 	// Graph Index specific API
 	void Search(const float *query_vec, idx_t k, int ef,
-	            std::vector<row_t> &out_row_ids, std::vector<float> &out_distances);
+	            std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	            idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
 	void ANNSearch(const float *query_vec, idx_t k, int ef,
-	               std::vector<row_t> &out_row_ids, std::vector<float> &out_distances);
+	               std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	               idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
 
 	// Index Scan Interface
 	static unique_ptr<IndexScanState> TryInitializeScan(const Expression &expr, const Expression &filter_expr);
 	bool Scan(IndexScanState &state, idx_t max_count, set<row_t> &row_ids);
 
-	GraphNode *GetEntryPoint() const {
-		return graph_.entry_point;
+	bool HasEntryPoint() const {
+		return graph_.entry_point.Get() != 0;
 	}
 
 	int GetMaxLevel() const {
 		return graph_.max_level;
 	}
 
+	//! Access to graph core (for HybridIndex and testing)
+	GraphIndexCore &GetGraphCore() {
+		return graph_;
+	}
+
+	vex::VexMetric GetMetric() const {
+		return metric_;
+	}
+
 private:
 	int GetRandomLevel();
-	string SerializeToBlob() const;
+	void EnsureAllocators();
+	void DeserializeFromStorage(const IndexStorageInfo &info);
 	bool DeserializeFromBlob(const string &blob);
+	void RebuildRowIdMap();
 	void Clear();
 
 private:
@@ -95,12 +116,16 @@ private:
 	bool use_pq_;
 	uint32_t pq_m_;
 
-	//! Shared graph index core
+	//! Graph index core with allocator-based storage
 	GraphIndexCore graph_;
 
 	std::mt19937 rng_;
 	std::uniform_real_distribution<double> dist_;
+	vex::VexMetric metric_;
 	vex::distance_func_t distance_func_;
+
+	std::mutex rng_mutex_;              //! Mutex for thread-safe random level generation
+	std::once_flag dimension_init_flag_; //! For one-time dimension initialization
 };
 
 } // namespace duckdb

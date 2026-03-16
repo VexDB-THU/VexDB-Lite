@@ -245,6 +245,7 @@ void VexFunctions::Register(ExtensionLoader &loader) {
 
 	// Table functions
 	RegisterANNSearchFunction(loader);
+	RegisterIndexInfoFunction(loader);
 }
 
 } // namespace duckdb

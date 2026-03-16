@@ -206,7 +206,13 @@ uint32_t FixedSizeBuffer::GetOffset(const idx_t bitmask_count, const idx_t avail
 		return UnsafeNumericCast<uint32_t>(prev_bits + first_valid_bit);
 	}
 
-	throw InternalException("Invalid bitmask for FixedSizeAllocator");
+	throw InternalException("Invalid bitmask for FixedSizeAllocator: segment_count=%llu, available_segments=%llu, "
+	                        "bitmask_count=%llu, allocation_size=%llu, dirty=%d, loaded=%d, InMemory=%d, OnDisk=%d, "
+	                        "bitmask[0]=%llu",
+	                        (unsigned long long)segment_count, (unsigned long long)available_segments,
+	                        (unsigned long long)bitmask_count, (unsigned long long)allocation_size,
+	                        (int)dirty, (int)loaded, (int)InMemory(), (int)OnDisk(),
+	                        bitmask_count > 0 ? (unsigned long long)data[0] : 0ULL);
 }
 
 void FixedSizeBuffer::SetAllocationSize(const idx_t available_segments, const idx_t segment_size,

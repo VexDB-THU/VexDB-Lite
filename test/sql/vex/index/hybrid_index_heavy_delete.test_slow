@@ -1,0 +1,186 @@
+# name: test/sql/vex/index/hybrid_index_heavy_delete.test_slow
+# description: HybridIndex heavy delete + Phase 4 graph repair coverage
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: 4 partitions, 200 rows each
+# ============================================================
+statement ok
+CREATE TABLE hd (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx ON hd USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO hd SELECT i, 'alpha', list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(1, 201) t(i);
+
+statement ok
+INSERT INTO hd SELECT i, 'beta', list_value(cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(201, 401) t(i);
+
+statement ok
+INSERT INTO hd SELECT i, 'gamma', list_value(sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT)::FLOATVECTOR(4)
+FROM range(401, 601) t(i);
+
+statement ok
+INSERT INTO hd SELECT i, 'delta', list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOATVECTOR(4)
+FROM range(601, 801) t(i);
+
+query I
+SELECT count(*) FROM hd;
+----
+800
+
+# ============================================================
+# Test 1: Delete every 3rd from one partition, filtered search
+# ============================================================
+statement ok
+DELETE FROM hd WHERE cat = 'alpha' AND id % 3 = 0;
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'alpha' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# Other partitions unaffected
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'beta' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 2: Heavy delete (>50%) from one partition
+# ============================================================
+statement ok
+DELETE FROM hd WHERE cat = 'beta' AND id % 2 = 0;
+
+query I
+SELECT count(*) FROM hd WHERE cat = 'beta';
+----
+100
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'beta' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 3: Delete entire partition, search returns empty
+# ============================================================
+statement ok
+DELETE FROM hd WHERE cat = 'gamma';
+
+query I
+SELECT count(*) FROM hd WHERE cat = 'gamma';
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'gamma' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+0
+
+# Global search still works across remaining partitions
+query I
+SELECT count(*) FROM (SELECT id FROM hd ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 20);
+----
+20
+
+# ============================================================
+# Test 4: Reinsert into deleted partition
+# ============================================================
+statement ok
+INSERT INTO hd SELECT i, 'gamma', list_value(sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT)::FLOATVECTOR(4)
+FROM range(1001, 1101) t(i);
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'gamma' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 5: Alternating delete-insert cycles per partition
+# ============================================================
+
+loop cycle 0 5
+
+statement ok
+DELETE FROM hd WHERE cat = 'delta' AND id % (2 + ${cycle}) = 0;
+
+statement ok
+INSERT INTO hd SELECT 900 + ${cycle} * 20 + i, 'delta', list_value(sin(i + ${cycle})::FLOAT, cos(i + ${cycle})::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(0, 20) t(i);
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'delta' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+
+endloop
+
+# ============================================================
+# Test 6: Cross-partition delete (delete from all partitions at once)
+# ============================================================
+statement ok
+DELETE FROM hd WHERE id % 7 = 0;
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'alpha' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'beta' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'gamma' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'delta' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+# Global search across all partitions
+query I
+SELECT count(*) FROM (SELECT id FROM hd ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 20);
+----
+20
+
+# ============================================================
+# Test 7: UPDATE vectors in a partition (delete + insert internally)
+# ============================================================
+
+loop uid 1001 1011
+
+statement ok
+UPDATE hd SET vec = list_value(sin(${uid}*3.14)::FLOAT, cos(${uid}*2.71)::FLOAT, sin(${uid}*1.41)::FLOAT, cos(${uid}*1.73)::FLOAT)::FLOATVECTOR(4) WHERE id = ${uid};
+
+endloop
+
+query I
+SELECT count(*) FROM (SELECT id FROM hd WHERE cat = 'gamma' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 8: Delete almost everything, search on remnants
+# ============================================================
+statement ok
+DELETE FROM hd WHERE id > 5;
+
+statement ok
+SELECT count(*) FROM hd;
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM hd ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 100);
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE hd;

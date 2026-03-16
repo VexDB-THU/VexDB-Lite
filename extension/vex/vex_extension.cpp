@@ -11,34 +11,44 @@
 
 namespace duckdb {
 
-static void LoadInternal(ExtensionLoader &loader) {
-	// Register vector types
-	VexTypes::Register(loader);
-
-	// Register vector functions
-	VexFunctions::Register(loader);
-
-	// Register GRAPH_INDEX type with the global registry
-	// This ensures it's available in all DatabaseInstances
+static void RegisterIndexTypes(DBConfig &config) {
 	IndexType graph_index_type;
 	graph_index_type.name = GraphIndex::TYPE_NAME;
 	graph_index_type.create_instance = GraphIndex::Create;
 	graph_index_type.create_plan = GraphIndex::CreatePlan;
 
-	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(graph_index_type);
-
-	// Register HYBRID_INDEX type
 	IndexType hybrid_index_type;
 	hybrid_index_type.name = HybridIndex::TYPE_NAME;
 	hybrid_index_type.create_instance = HybridIndex::Create;
 	hybrid_index_type.create_plan = HybridIndex::CreatePlan;
 
+#ifdef VEX_HAS_GLOBAL_INDEX_REGISTRY
+	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(graph_index_type);
 	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(hybrid_index_type);
+#else
+	config.GetIndexTypes().RegisterIndexType(graph_index_type);
+	config.GetIndexTypes().RegisterIndexType(hybrid_index_type);
+#endif
+}
 
-	// Register optimizer extension for automatic ANN query optimization
+static void LoadInternal(ExtensionLoader &loader) {
+	VexTypes::Register(loader);
+	VexFunctions::Register(loader);
+
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
+
+	RegisterIndexTypes(config);
+
 	config.optimizer_extensions.push_back(VexOptimizerExtension());
+
+	// Register runtime configuration options
+	config.AddExtensionOption("vex_ef_search",
+	                          "Search expansion factor for VEX graph index (higher = better recall, slower)",
+	                          LogicalType::INTEGER, Value::INTEGER(GraphIndexConfig::DEFAULT_EF_SEARCH));
+	config.AddExtensionOption("vex_brute_force_threshold",
+	                          "Node count threshold below which brute-force search is used instead of graph traversal",
+	                          LogicalType::UBIGINT, Value::UBIGINT(GraphIndexCore::BRUTE_FORCE_THRESHOLD));
 }
 
 void VexExtension::Load(ExtensionLoader &loader) {

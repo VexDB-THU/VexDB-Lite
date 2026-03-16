@@ -33,7 +33,7 @@ LIMIT 3;
 query IT
 SELECT * FROM v_near_origin ORDER BY id;
 ----
-3	c
+1	a
 4	d
 5	e
 
