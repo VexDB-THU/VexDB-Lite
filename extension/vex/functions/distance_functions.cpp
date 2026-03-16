@@ -138,7 +138,7 @@ static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vect
 }
 
 // ============================================================
-// Negative Inner Product: -sum(a_i * b_i) — for ORDER BY <#> usage
+// Negative Inner Product: -sum(a_i * b_i) — for ORDER BY <~> usage
 // ============================================================
 static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	auto &vec_a = args.data[0];
@@ -174,7 +174,7 @@ static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state
 }
 
 ScalarFunctionSet VexFunctions::GetNegativeInnerProductFunction() {
-	ScalarFunctionSet set("<#>");
+	ScalarFunctionSet set("<~>");
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, NegativeInnerProductFunction,
 	                               nullptr, nullptr, nullptr, nullptr, LogicalType::ANY));
 	return set;

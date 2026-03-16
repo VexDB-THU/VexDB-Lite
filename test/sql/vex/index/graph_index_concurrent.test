@@ -209,8 +209,10 @@ SELECT id FROM t_multi_idx ORDER BY l2_distance(v2, [1.0, 0.0, 0.0]::FLOATVECTOR
 statement ok
 DELETE FROM t_multi_idx WHERE id = 1;
 
+# id=2 v1=[0,1,0] dist≈1.41, id=3 v1=[0,0,1] dist≈1.41 — same distance to [1,0,0]
+# Use [1.0, 0.1, 0.0] to break tie: id=2 dist≈0.906, id=3 dist≈1.411
 query I
-SELECT id FROM t_multi_idx ORDER BY l2_distance(v1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_multi_idx ORDER BY l2_distance(v1, [1.0, 0.1, 0.0]::FLOATVECTOR(3)) LIMIT 1;
 ----
 2
 

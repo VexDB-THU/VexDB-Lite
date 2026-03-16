@@ -3,8 +3,24 @@
 #include <cmath>
 #include <cstring>
 
+// MSVC does not support __attribute__((target(...))); on MSVC x86-64
+// SSE2 is always available and AVX2 is enabled via /arch:AVX2 compiler flag.
+#ifndef _MSC_VER
+#define VEX_TARGET_SSE  __attribute__((target("sse")))
+#define VEX_TARGET_AVX2 __attribute__((target("avx2,fma")))
+#else
+#define VEX_TARGET_SSE
+#define VEX_TARGET_AVX2
+#endif
+
 // Platform detection for SIMD intrinsics
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__EMSCRIPTEN__)
+// WebAssembly: use WASM SIMD128 when available, otherwise Generic
+#if defined(__wasm_simd128__)
+#define VEX_WASM_SIMD
+#include <wasm_simd128.h>
+#endif
+#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #define VEX_X86
 #include <immintrin.h>
 #ifdef _MSC_VER
@@ -77,7 +93,8 @@ SimdArch GetBestArch() {
 		return SimdArch::SSE;
 	}
 #endif
-	// ARM NEON is always available on aarch64, handled by compiler auto-vectorization
+	// ARM NEON is always available on aarch64
+	// WASM SIMD128 is compile-time selected via VEX_WASM_SIMD
 	return SimdArch::GENERIC;
 }
 
@@ -115,12 +132,100 @@ static float InnerProductGeneric(const float *a, const float *b, uint32_t dim) {
 }
 
 // ============================================================
+// WASM SIMD128 implementations
+// ============================================================
+
+#ifdef VEX_WASM_SIMD
+
+static float L2SqrWasmSimd(const float *a, const float *b, uint32_t dim) {
+	v128_t sum0 = wasm_f32x4_splat(0.0f);
+	v128_t sum1 = wasm_f32x4_splat(0.0f);
+	v128_t sum2 = wasm_f32x4_splat(0.0f);
+	v128_t sum3 = wasm_f32x4_splat(0.0f);
+
+	uint32_t i = 0;
+	for (; i + 16 <= dim; i += 16) {
+		v128_t a0 = wasm_v128_load(a + i);
+		v128_t b0 = wasm_v128_load(b + i);
+		v128_t d0 = wasm_f32x4_sub(a0, b0);
+		sum0 = wasm_f32x4_add(sum0, wasm_f32x4_mul(d0, d0));
+
+		v128_t a1 = wasm_v128_load(a + i + 4);
+		v128_t b1 = wasm_v128_load(b + i + 4);
+		v128_t d1 = wasm_f32x4_sub(a1, b1);
+		sum1 = wasm_f32x4_add(sum1, wasm_f32x4_mul(d1, d1));
+
+		v128_t a2 = wasm_v128_load(a + i + 8);
+		v128_t b2 = wasm_v128_load(b + i + 8);
+		v128_t d2 = wasm_f32x4_sub(a2, b2);
+		sum2 = wasm_f32x4_add(sum2, wasm_f32x4_mul(d2, d2));
+
+		v128_t a3 = wasm_v128_load(a + i + 12);
+		v128_t b3 = wasm_v128_load(b + i + 12);
+		v128_t d3 = wasm_f32x4_sub(a3, b3);
+		sum3 = wasm_f32x4_add(sum3, wasm_f32x4_mul(d3, d3));
+	}
+	for (; i + 4 <= dim; i += 4) {
+		v128_t av = wasm_v128_load(a + i);
+		v128_t bv = wasm_v128_load(b + i);
+		v128_t d = wasm_f32x4_sub(av, bv);
+		sum0 = wasm_f32x4_add(sum0, wasm_f32x4_mul(d, d));
+	}
+
+	sum0 = wasm_f32x4_add(sum0, sum1);
+	sum2 = wasm_f32x4_add(sum2, sum3);
+	sum0 = wasm_f32x4_add(sum0, sum2);
+
+	// Horizontal sum: extract 4 lanes
+	float result = wasm_f32x4_extract_lane(sum0, 0) + wasm_f32x4_extract_lane(sum0, 1) +
+	               wasm_f32x4_extract_lane(sum0, 2) + wasm_f32x4_extract_lane(sum0, 3);
+
+	for (; i < dim; i++) {
+		float diff = a[i] - b[i];
+		result += diff * diff;
+	}
+	return result;
+}
+
+static float InnerProductWasmSimd(const float *a, const float *b, uint32_t dim) {
+	v128_t sum0 = wasm_f32x4_splat(0.0f);
+	v128_t sum1 = wasm_f32x4_splat(0.0f);
+	v128_t sum2 = wasm_f32x4_splat(0.0f);
+	v128_t sum3 = wasm_f32x4_splat(0.0f);
+
+	uint32_t i = 0;
+	for (; i + 16 <= dim; i += 16) {
+		sum0 = wasm_f32x4_add(sum0, wasm_f32x4_mul(wasm_v128_load(a + i),      wasm_v128_load(b + i)));
+		sum1 = wasm_f32x4_add(sum1, wasm_f32x4_mul(wasm_v128_load(a + i + 4),  wasm_v128_load(b + i + 4)));
+		sum2 = wasm_f32x4_add(sum2, wasm_f32x4_mul(wasm_v128_load(a + i + 8),  wasm_v128_load(b + i + 8)));
+		sum3 = wasm_f32x4_add(sum3, wasm_f32x4_mul(wasm_v128_load(a + i + 12), wasm_v128_load(b + i + 12)));
+	}
+	for (; i + 4 <= dim; i += 4) {
+		sum0 = wasm_f32x4_add(sum0, wasm_f32x4_mul(wasm_v128_load(a + i), wasm_v128_load(b + i)));
+	}
+
+	sum0 = wasm_f32x4_add(sum0, sum1);
+	sum2 = wasm_f32x4_add(sum2, sum3);
+	sum0 = wasm_f32x4_add(sum0, sum2);
+
+	float result = wasm_f32x4_extract_lane(sum0, 0) + wasm_f32x4_extract_lane(sum0, 1) +
+	               wasm_f32x4_extract_lane(sum0, 2) + wasm_f32x4_extract_lane(sum0, 3);
+
+	for (; i < dim; i++) {
+		result += a[i] * b[i];
+	}
+	return result;
+}
+
+#endif // VEX_WASM_SIMD
+
+// ============================================================
 // SSE implementations
 // ============================================================
 
 #ifdef VEX_X86
 
-__attribute__((target("sse")))
+VEX_TARGET_SSE
 static float L2SqrSSE(const float *a, const float *b, uint32_t dim) {
 	__m128 sum0 = _mm_setzero_ps();
 	__m128 sum1 = _mm_setzero_ps();
@@ -179,7 +284,7 @@ static float L2SqrSSE(const float *a, const float *b, uint32_t dim) {
 	return result;
 }
 
-__attribute__((target("sse")))
+VEX_TARGET_SSE
 static float InnerProductSSE(const float *a, const float *b, uint32_t dim) {
 	__m128 sum0 = _mm_setzero_ps();
 	__m128 sum1 = _mm_setzero_ps();
@@ -217,7 +322,7 @@ static float InnerProductSSE(const float *a, const float *b, uint32_t dim) {
 // AVX2 implementations
 // ============================================================
 
-__attribute__((target("avx2,fma")))
+VEX_TARGET_AVX2
 static float L2SqrAVX2(const float *a, const float *b, uint32_t dim) {
 	__m256 sum0 = _mm256_setzero_ps();
 	__m256 sum1 = _mm256_setzero_ps();
@@ -275,7 +380,7 @@ static float L2SqrAVX2(const float *a, const float *b, uint32_t dim) {
 	return result;
 }
 
-__attribute__((target("avx2,fma")))
+VEX_TARGET_AVX2
 static float InnerProductAVX2(const float *a, const float *b, uint32_t dim) {
 	__m256 sum0 = _mm256_setzero_ps();
 	__m256 sum1 = _mm256_setzero_ps();
@@ -402,30 +507,32 @@ static float InnerProductNEON(const float *a, const float *b, uint32_t dim) {
 // ============================================================
 
 static distance_func_t SelectL2SqrFunc() {
-#ifdef VEX_X86
+#ifdef VEX_WASM_SIMD
+	return L2SqrWasmSimd;
+#elif defined(VEX_X86)
 	if (g_best_arch >= SimdArch::AVX2) {
 		return L2SqrAVX2;
 	}
 	if (g_best_arch >= SimdArch::SSE) {
 		return L2SqrSSE;
 	}
-#endif
-#ifdef VEX_ARM
+#elif defined(VEX_ARM)
 	return L2SqrNEON;
 #endif
 	return L2SqrGeneric;
 }
 
 static distance_func_t SelectInnerProductFunc() {
-#ifdef VEX_X86
+#ifdef VEX_WASM_SIMD
+	return InnerProductWasmSimd;
+#elif defined(VEX_X86)
 	if (g_best_arch >= SimdArch::AVX2) {
 		return InnerProductAVX2;
 	}
 	if (g_best_arch >= SimdArch::SSE) {
 		return InnerProductSSE;
 	}
-#endif
-#ifdef VEX_ARM
+#elif defined(VEX_ARM)
 	return InnerProductNEON;
 #endif
 	return InnerProductGeneric;
@@ -471,6 +578,64 @@ distance_func_t GetL2SqrFunc() {
 
 distance_func_t GetInnerProductFunc() {
 	return g_ip_func;
+}
+
+// Cosine internal distance for pre-normalized vectors: 1 - dot(a,b)
+static float CosineInternalDistance(const float *a, const float *b, uint32_t dim) {
+	return 1.0f - g_ip_func(a, b, dim);
+}
+
+// Negative inner product for HNSW: -dot(a,b) so smaller = more similar
+static float NegativeIPDistance(const float *a, const float *b, uint32_t dim) {
+	return -g_ip_func(a, b, dim);
+}
+
+distance_func_t GetDistanceFunc(VexMetric metric) {
+	switch (metric) {
+	case VexMetric::COSINE:
+		return CosineInternalDistance;
+	case VexMetric::INNER_PRODUCT:
+		return NegativeIPDistance;
+	case VexMetric::L2:
+	default:
+		return g_l2sqr_func;
+	}
+}
+
+VexMetric ParseMetric(const std::string &metric_str) {
+	if (metric_str == "cosine" || metric_str == "cos") {
+		return VexMetric::COSINE;
+	}
+	if (metric_str == "ip" || metric_str == "inner_product") {
+		return VexMetric::INNER_PRODUCT;
+	}
+	if (metric_str == "l2" || metric_str == "euclidean") {
+		return VexMetric::L2;
+	}
+	throw std::invalid_argument("Unknown metric '" + metric_str + "'. Supported: l2, cosine, ip (inner_product)");
+}
+
+const char *MetricName(VexMetric metric) {
+	switch (metric) {
+	case VexMetric::COSINE:
+		return "cosine";
+	case VexMetric::INNER_PRODUCT:
+		return "inner_product";
+	case VexMetric::L2:
+	default:
+		return "l2";
+	}
+}
+
+void NormalizeVector(float *vec, uint32_t dim) {
+	float norm_sq = g_ip_func(vec, vec, dim);
+	if (norm_sq < 1e-30f) {
+		return;
+	}
+	float inv_norm = 1.0f / std::sqrt(norm_sq);
+	for (uint32_t i = 0; i < dim; i++) {
+		vec[i] *= inv_norm;
+	}
 }
 
 } // namespace vex

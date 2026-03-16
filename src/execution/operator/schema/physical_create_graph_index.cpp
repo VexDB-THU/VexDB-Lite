@@ -9,6 +9,7 @@
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/parallel/task_scheduler.hpp"
 #include "vex_graph_index.hpp"
 
 namespace duckdb {
@@ -35,8 +36,17 @@ PhysicalCreateGraphIndex::PhysicalCreateGraphIndex(PhysicalPlan &physical_plan, 
 
 class CreateGraphIndexGlobalSinkState : public GlobalSinkState {
 public:
-	//! We merge the local indexes into one global index.
+	//! The global index (shared across all worker threads for GraphIndex)
 	unique_ptr<BoundIndex> global_index;
+	//! Whether the global index is a GraphIndex (supports parallel build)
+	bool is_graph_index = false;
+
+	//! Buffered vector data for parallel build (GraphIndex only)
+	std::mutex buffer_mutex;
+	std::vector<float> all_vectors;
+	std::vector<row_t> all_row_ids;
+	idx_t total_count = 0;
+	uint32_t dimension = 0;
 };
 
 class CreateGraphIndexLocalSinkState : public LocalSinkState {
@@ -44,6 +54,7 @@ public:
 	explicit CreateGraphIndexLocalSinkState(ClientContext &context) {
 	}
 
+	//! Local index for non-GraphIndex types (e.g. HybridIndex) that need merge
 	unique_ptr<BoundIndex> local_index;
 	DataChunk key_chunk;
 	vector<column_t> key_column_ids;
@@ -78,49 +89,52 @@ unique_ptr<GlobalSinkState> PhysicalCreateGraphIndex::GetGlobalSinkState(ClientC
 	);
 
 	state->global_index = index_type.create_instance(index_input);
+	state->is_graph_index = (info->index_type == GraphIndex::TYPE_NAME);
 	return (std::move(state));
 }
 
 unique_ptr<LocalSinkState> PhysicalCreateGraphIndex::GetLocalSinkState(ExecutionContext &context) const {
 	auto state = make_uniq<CreateGraphIndexLocalSinkState>(context.client);
 
-	// Create the local index using the registered index type
-	auto &config = DBConfig::GetConfig(context.client);
-	auto &index_types = config.GetIndexTypes();
-	auto index_type_ref = index_types.FindByName(info->index_type);
-
-	if (!index_type_ref) {
-		throw InternalException("Index type '%s' not found in registry", info->index_type);
+	// Build key types from unbound_expressions
+	vector<LogicalType> key_types;
+	for (auto &expr : unbound_expressions) {
+		key_types.push_back(expr->return_type);
 	}
-
-	auto &index_type = *index_type_ref;
-
-	// Prepare input for index creation
-	IndexStorageInfo storage_info;
-	CreateIndexInput index_input(
-		TableIOManager::Get(table.GetStorage()),
-		table.GetStorage().db,
-		info->constraint_type,
-		info->index_name,
-		storage_ids,
-		unbound_expressions,
-		storage_info,
-		info->options
-	);
-
-	state->local_index = index_type.create_instance(index_input);
-
-	// Initialize the local sink state.
-	state->key_chunk.Initialize(Allocator::Get(context.client), state->local_index->logical_types);
+	state->key_chunk.Initialize(Allocator::Get(context.client), key_types);
 	for (idx_t i = 0; i < state->key_chunk.ColumnCount(); i++) {
 		state->key_column_ids.push_back(i);
 	}
+
+	// For non-GraphIndex types (e.g. HybridIndex), create a local index for merge-based build
+	if (info->index_type != GraphIndex::TYPE_NAME) {
+		auto &config = DBConfig::GetConfig(context.client);
+		auto &index_types = config.GetIndexTypes();
+		auto index_type_ref = index_types.FindByName(info->index_type);
+		if (!index_type_ref) {
+			throw InternalException("Index type '%s' not found in registry", info->index_type);
+		}
+		IndexStorageInfo storage_info;
+		CreateIndexInput index_input(
+			TableIOManager::Get(table.GetStorage()),
+			table.GetStorage().db,
+			info->constraint_type,
+			info->index_name,
+			storage_ids,
+			unbound_expressions,
+			storage_info,
+			info->options
+		);
+		state->local_index = index_type_ref->create_instance(index_input);
+	}
+
 	return std::move(state);
 }
 
 SinkResultType PhysicalCreateGraphIndex::Sink(ExecutionContext &context, DataChunk &chunk,
                                             OperatorSinkInput &input) const {
 	D_ASSERT(chunk.ColumnCount() >= 2);
+	auto &g_state = input.global_state.Cast<CreateGraphIndexGlobalSinkState>();
 	auto &l_state = input.local_state.Cast<CreateGraphIndexLocalSinkState>();
 	l_state.key_chunk.ReferenceColumns(chunk, l_state.key_column_ids);
 
@@ -139,13 +153,49 @@ SinkResultType PhysicalCreateGraphIndex::Sink(ExecutionContext &context, DataChu
 		}
 	}
 
-	// Insert data into the local index using the BoundIndex API
-	auto &local_index = l_state.local_index;
 	auto &row_ids = chunk.data[chunk.ColumnCount() - 1];
 
-	// Use Append to insert data into the index
-	IndexLock lock;
-	local_index->Append(lock, l_state.key_chunk, row_ids);
+	if (g_state.is_graph_index) {
+		// GraphIndex: buffer vectors for parallel build in Finalize
+		auto count = l_state.key_chunk.size();
+		if (count == 0) return SinkResultType::NEED_MORE_INPUT;
+
+		auto &vec_vector = l_state.key_chunk.data[0];
+		vec_vector.Flatten(count);
+		row_ids.Flatten(count);
+
+		auto &validity = FlatVector::Validity(vec_vector);
+		auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+
+		// Determine dimension on first chunk
+		uint32_t dim = 0;
+		auto &vec_type = vec_vector.GetType();
+		if (vec_type.id() == LogicalTypeId::ARRAY) {
+			dim = ArrayType::GetSize(vec_type);
+		}
+
+		auto &child_vec = ArrayVector::GetEntry(vec_vector);
+		auto vec_data = FlatVector::GetData<float>(child_vec);
+
+		// Buffer valid vectors and row_ids
+		std::lock_guard<std::mutex> lock(g_state.buffer_mutex);
+		if (g_state.dimension == 0 && dim > 0) {
+			g_state.dimension = dim;
+		}
+
+		for (idx_t i = 0; i < count; i++) {
+			if (!validity.RowIsValid(i)) continue;
+			const float *vec = vec_data + i * g_state.dimension;
+			g_state.all_vectors.insert(g_state.all_vectors.end(), vec, vec + g_state.dimension);
+			g_state.all_row_ids.push_back(row_id_data[i]);
+			g_state.total_count++;
+		}
+	} else {
+		// HybridIndex and others: insert into local index, merge later
+		IndexLock lock;
+		l_state.local_index->InitializeLock(lock);
+		l_state.local_index->Append(lock, l_state.key_chunk, row_ids);
+	}
 
 	return SinkResultType::NEED_MORE_INPUT;
 }
@@ -154,13 +204,16 @@ SinkCombineResultType PhysicalCreateGraphIndex::Combine(ExecutionContext &contex
                                                       OperatorSinkCombineInput &input) const {
 	auto &g_state = input.global_state.Cast<CreateGraphIndexGlobalSinkState>();
 
-	// Merge the local index into the global index.
-	auto &l_state = input.local_state.Cast<CreateGraphIndexLocalSinkState>();
-
-	IndexLock lock;
-	if (!g_state.global_index->MergeIndexes(lock, *l_state.local_index)) {
-		throw InternalException("Failed to merge local index into global index");
+	if (!g_state.is_graph_index) {
+		// HybridIndex and others: merge local index into global
+		auto &l_state = input.local_state.Cast<CreateGraphIndexLocalSinkState>();
+		IndexLock lock;
+		g_state.global_index->InitializeLock(lock);
+		if (!g_state.global_index->MergeIndexes(lock, *l_state.local_index)) {
+			throw InternalException("Failed to merge local index into global index");
+		}
 	}
+	// GraphIndex: no-op (data buffered in Sink, build happens in Finalize)
 
 	return SinkCombineResultType::FINISHED;
 }
@@ -173,6 +226,25 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 	if (!storage.IsMainTable()) {
 		throw TransactionException(
 		    "Transaction conflict: cannot add an index to a table that has been altered or dropped");
+	}
+
+	// GraphIndex: parallel build from buffered data
+	if (state.is_graph_index && state.total_count > 0) {
+		auto &graph_index = state.global_index->Cast<GraphIndex>();
+		// Default to 1 thread (single-threaded); configurable via WITH (threads=N)
+		int num_threads = 1;
+		auto it = info->options.find("threads");
+		if (it != info->options.end()) {
+			num_threads = it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+			if (num_threads < 1) num_threads = 1;
+		}
+		graph_index.BuildParallel(state.all_vectors, state.all_row_ids,
+		                          state.total_count, state.dimension, num_threads);
+		// Free buffered data
+		state.all_vectors.clear();
+		state.all_vectors.shrink_to_fit();
+		state.all_row_ids.clear();
+		state.all_row_ids.shrink_to_fit();
 	}
 
 	auto &schema = table.schema;

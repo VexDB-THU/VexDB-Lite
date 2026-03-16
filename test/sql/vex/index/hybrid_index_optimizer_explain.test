@@ -1,0 +1,173 @@
+# name: test/sql/vex/index/hybrid_index_optimizer_explain.test
+# description: Verify optimizer replaces plan with COLUMN_DATA_GET for hybrid index queries
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup
+# ============================================================
+statement ok
+CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOAT[4]);
+
+statement ok
+INSERT INTO products VALUES
+  (1, 'electronics', [1.0, 0.0, 0.0, 0.0]),
+  (2, 'electronics', [0.9, 0.1, 0.0, 0.0]),
+  (3, 'electronics', [0.8, 0.2, 0.0, 0.0]),
+  (4, 'electronics', [0.7, 0.3, 0.0, 0.0]),
+  (5, 'clothing', [0.0, 1.0, 0.0, 0.0]),
+  (6, 'clothing', [0.0, 0.9, 0.1, 0.0]),
+  (7, 'clothing', [0.0, 0.8, 0.2, 0.0]),
+  (8, 'clothing', [0.0, 0.7, 0.3, 0.0]),
+  (9, 'food', [0.0, 0.0, 1.0, 0.0]),
+  (10, 'food', [0.0, 0.0, 0.9, 0.1]),
+  (11, 'food', [0.0, 0.0, 0.8, 0.2]),
+  (12, 'food', [0.0, 0.0, 0.7, 0.3]);
+
+statement ok
+CREATE INDEX idx_hybrid ON products USING HYBRID_INDEX (vec, category);
+
+# ============================================================
+# Test 1: Filtered search EXPLAIN should show COLUMN_DATA_GET
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products WHERE category = 'electronics' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# ============================================================
+# Test 2: Filtered search correctness
+# ============================================================
+query I
+SELECT id FROM products WHERE category = 'electronics' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+1
+2
+
+# ============================================================
+# Test 3: Different partition
+# ============================================================
+query I
+SELECT id FROM products WHERE category = 'food' ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+9
+10
+
+# ============================================================
+# Test 4: Global search (no filter) EXPLAIN should show COLUMN_DATA_GET
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+# ============================================================
+# Test 5: Global search correctness
+# ============================================================
+query I
+SELECT id FROM products ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+1
+2
+3
+
+# ============================================================
+# Test 6: Filtered with SELECT * (all columns)
+# ============================================================
+query II
+EXPLAIN SELECT * FROM products WHERE category = 'clothing' ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+query IT
+SELECT id, category FROM products WHERE category = 'clothing' ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+5	clothing
+6	clothing
+
+# ============================================================
+# Test 7: Cosine hybrid index
+# ============================================================
+statement ok
+CREATE TABLE t_hybrid_cos (id INTEGER, label VARCHAR, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t_hybrid_cos VALUES
+  (1, 'A', [1.0, 0.0, 0.0]),
+  (2, 'A', [0.9, 0.1, 0.0]),
+  (3, 'A', [0.7, 0.7, 0.0]),
+  (4, 'B', [0.0, 1.0, 0.0]),
+  (5, 'B', [0.0, 0.9, 0.1]),
+  (6, 'B', [0.0, 0.7, 0.7]);
+
+statement ok
+CREATE INDEX idx_hcos ON t_hybrid_cos USING HYBRID_INDEX (vec, label) WITH (metric='cosine');
+
+query II
+EXPLAIN SELECT id FROM t_hybrid_cos WHERE label = 'A' ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
+----
+physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
+
+query I
+SELECT id FROM t_hybrid_cos WHERE label = 'A' ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
+----
+1
+2
+
+# ============================================================
+# Test 8: Metric mismatch - cosine query on l2 hybrid index
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products WHERE category = 'electronics' ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# ============================================================
+# Test 9: Non-existent partition (should return empty)
+# ============================================================
+query I
+SELECT count(*) FROM (SELECT id FROM products WHERE category = 'nonexistent' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
+----
+0
+
+# ============================================================
+# Test 10: Non-equality filter should NOT use index (fall back to scan)
+# Optimizer must not drop the FILTER node when it can't extract equality
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products WHERE category != 'electronics' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+query I
+SELECT id FROM products WHERE category != 'electronics' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+12
+8
+11
+
+# ============================================================
+# Test 11: IN filter should NOT use index (not a simple equality)
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products WHERE category IN ('electronics', 'food') ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# ============================================================
+# Test 12: Range filter should NOT use index
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products WHERE category > 'c' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE t_hybrid_cos;

@@ -29,8 +29,9 @@ statement ok
 INSERT INTO t_null VALUES (4, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
 
 # Search should still work, returning non-NULL rows
+# Use query [1.0, 0.1, 0.0] to break tie: id=2 ([0,1,0]) dist≈1.063, id=4 ([0,0,1]) dist≈1.411
 query I
-SELECT id FROM t_null ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+SELECT id FROM t_null ORDER BY l2_distance(vec, [1.0, 0.1, 0.0]::FLOATVECTOR(3)) LIMIT 2;
 ----
 1
 2
@@ -89,8 +90,9 @@ INSERT INTO t_mixnull VALUES
   (5, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
 
 # Search should return valid vectors only
+# Use [1.0, 0.1, 0.0] to break tie between id=3 ([0,1,0]) and id=5 ([0,0,1])
 query I
-SELECT id FROM t_mixnull ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+SELECT id FROM t_mixnull ORDER BY l2_distance(vec, [1.0, 0.1, 0.0]::FLOATVECTOR(3)) LIMIT 3;
 ----
 1
 3

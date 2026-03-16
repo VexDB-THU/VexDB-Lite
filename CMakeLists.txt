@@ -20,11 +20,16 @@ if(POLICY CMP0063)
   cmake_policy(SET CMP0063 NEW)
 endif()
 
-project(DuckDB)
+project(VexDB-Lite)
 
 find_package(Threads REQUIRED)
 
 set(DUCKDB_MODULE_BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+
+# DuckDB_BINARY_DIR is needed by build_loadable_extension for metadata append
+if(NOT DEFINED DuckDB_BINARY_DIR)
+  set(DuckDB_BINARY_DIR "${PROJECT_BINARY_DIR}")
+endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 

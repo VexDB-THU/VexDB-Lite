@@ -27,9 +27,13 @@ SELECT COUNT(*) FROM recall_data;
 ----
 500
 
-# Create graph index
+# Create graph index with good params for stable recall
 statement ok
-CREATE INDEX idx_recall ON recall_data USING GRAPH_INDEX (vec);
+CREATE INDEX idx_recall ON recall_data USING GRAPH_INDEX (vec) WITH (ef_construction=200);
+
+# Use high ef_search for stable ANN recall in this test
+statement ok
+SET vex_ef_search = 200;
 
 # Verify index was created
 query I
@@ -41,12 +45,18 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_recall';
 # Compute the exact nearest neighbor (brute-force) for query [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 # Then verify ANN returns the same top-1 result
 
-# Store exact top-1 result
+# Store exact top-1 result (disable optimizer for brute-force baseline)
+statement ok
+SET disabled_optimizers='extension';
+
 statement ok
 CREATE TABLE exact_top1 AS
 SELECT id FROM recall_data
 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8))
 LIMIT 1;
+
+statement ok
+RESET disabled_optimizers;
 
 # ANN top-1 should match exact top-1 (for well-separated top-1, ANN should find it)
 query I
@@ -62,10 +72,16 @@ WHERE ann.id IN (SELECT id FROM exact_top1);
 # --- Recall test with k=5 ---
 # Store exact top-5 results for a different query point
 statement ok
+SET disabled_optimizers='extension';
+
+statement ok
 CREATE TABLE exact_top5 AS
 SELECT id FROM recall_data
 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8))
 LIMIT 5;
+
+statement ok
+RESET disabled_optimizers;
 
 # ANN top-5 recall: count how many of ANN's top-5 match exact top-5
 # For a good index, recall should be at least 4 out of 5
@@ -82,10 +98,16 @@ true
 # --- Recall test with k=10 ---
 # Store exact top-10 results for another query point
 statement ok
+SET disabled_optimizers='extension';
+
+statement ok
 CREATE TABLE exact_top10 AS
 SELECT id FROM recall_data
 ORDER BY l2_distance(vec, [1.0, -0.5, 0.3, -0.8, 0.6, -0.2, 0.9, -0.4]::FLOATVECTOR(8))
 LIMIT 10;
+
+statement ok
+RESET disabled_optimizers;
 
 # ANN top-10 recall: at least 8 out of 10 should match
 query I

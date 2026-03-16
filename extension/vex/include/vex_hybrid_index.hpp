@@ -24,7 +24,8 @@ public:
 	HybridIndex(const string &name, IndexConstraintType constraint_type,
 	            const vector<column_t> &column_ids, TableIOManager &table_io_manager,
 	            const vector<unique_ptr<Expression>> &unbound_expressions,
-	            AttachedDatabase &db, int m, int ef_construction);
+	            AttachedDatabase &db, int m, int ef_construction,
+	            vex::VexMetric metric = vex::VexMetric::L2);
 
 	void Build(DataChunk &chunk, Vector &row_ids);
 
@@ -50,18 +51,31 @@ public:
 
 	// Hybrid Index specific API
 	void FilteredSearch(const string &partition_key, const float *query_vec, idx_t k, int ef,
-	                    std::vector<row_t> &out_row_ids, std::vector<float> &out_distances);
+	                    std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                    idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
 	void GlobalSearch(const float *query_vec, idx_t k, int ef,
-	                  std::vector<row_t> &out_row_ids, std::vector<float> &out_distances);
+	                  std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                  idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
 	std::vector<string> GetPartitionKeys() const;
 	idx_t GetTotalNodeCount() const;
 	static string ValueToPartitionKey(const Value &val);
 
+	//! Access partitions (for vex_index_info)
+	const std::map<string, GraphIndexCore> &GetPartitions() const {
+		return partitions_;
+	}
+
+	vex::VexMetric GetMetric() const {
+		return metric_;
+	}
+
 private:
-	string SerializeToBlob() const;
+	string SerializeToBlob();
 	bool DeserializeFromBlob(const string &blob);
+	void DeserializeFromStorage(const IndexStorageInfo &info);
 	void Clear();
 	GraphIndexCore &GetOrCreatePartition(const string &key);
+	void EnsurePartitionAllocators(GraphIndexCore &partition);
 	int GetRandomLevel();
 
 private:
@@ -77,6 +91,7 @@ private:
 
 	std::mt19937 rng_;
 	std::uniform_real_distribution<double> dist_;
+	vex::VexMetric metric_;
 	vex::distance_func_t distance_func_;
 };
 

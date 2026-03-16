@@ -1,0 +1,216 @@
+# name: test/sql/vex/index/graph_index_concurrent_rw.test
+# description: Test concurrent read/write operations on graph index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Concurrent reads while one thread appends
+# ============================================================
+statement ok
+CREATE TABLE t_conc1 (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_conc1 SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, (i % 5)::FLOAT / 5.0]::FLOATVECTOR(3) FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_conc1 ON t_conc1 USING GRAPH_INDEX (vec);
+
+concurrentloop threadid 0 8
+
+# Thread 0: append new data
+loop i 0 20
+
+onlyif threadid=0
+statement ok
+INSERT INTO t_conc1 VALUES (1000 + ${i}, [0.5, 0.5, 0.5]::FLOATVECTOR(3));
+
+endloop
+
+# Threads 1-7: concurrent ANN searches
+loop i 0 20
+
+skipif threadid=0
+query I
+SELECT count(*) >= 1 FROM (SELECT id FROM t_conc1 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+----
+true
+
+endloop
+
+endloop
+
+# Verify final state
+query I
+SELECT count(*) FROM t_conc1;
+----
+220
+
+statement ok
+DROP TABLE t_conc1;
+
+# ============================================================
+# Test 2: Concurrent reads while one thread deletes
+# ============================================================
+statement ok
+CREATE TABLE t_conc2 (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_conc2 SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, (i % 7)::FLOAT / 7.0]::FLOATVECTOR(3) FROM range(1, 501) t(i);
+
+statement ok
+CREATE INDEX idx_conc2 ON t_conc2 USING GRAPH_INDEX (vec);
+
+concurrentloop threadid 0 6
+
+# Thread 0: delete rows
+loop i 0 10
+
+onlyif threadid=0
+statement ok
+DELETE FROM t_conc2 WHERE id = ${i} * 5 + 1;
+
+endloop
+
+# Threads 1-5: concurrent searches must not crash
+loop i 0 10
+
+skipif threadid=0
+query I
+SELECT count(*) >= 0 FROM (SELECT id FROM t_conc2 ORDER BY l2_distance(vec, [0.3, 0.3, 0.3]::FLOATVECTOR(3)) LIMIT 10);
+----
+true
+
+endloop
+
+endloop
+
+statement ok
+DROP TABLE t_conc2;
+
+# ============================================================
+# Test 3: Multiple concurrent inserters
+# ============================================================
+statement ok
+CREATE TABLE t_conc3 (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_conc3 ON t_conc3 USING GRAPH_INDEX (vec);
+
+concurrentloop threadid 0 4
+
+loop i 0 25
+
+statement ok
+INSERT INTO t_conc3 VALUES (${threadid} * 1000 + ${i}, [${threadid}::FLOAT / 4.0, ${i}::FLOAT / 25.0, 0.5]::FLOATVECTOR(3));
+
+endloop
+
+endloop
+
+# All 100 rows should be present
+query I
+SELECT count(*) FROM t_conc3;
+----
+100
+
+# Index should work correctly after concurrent inserts
+query I
+SELECT count(*) FROM (SELECT id FROM t_conc3 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t_conc3;
+
+# ============================================================
+# Test 4: Concurrent insert and delete on different rows
+# ============================================================
+statement ok
+CREATE TABLE t_conc4 (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_conc4 SELECT i, [0.1 * (i % 10)::FLOAT, 0.1 * ((i/10) % 10)::FLOAT, 0.5]::FLOATVECTOR(3) FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_conc4 ON t_conc4 USING GRAPH_INDEX (vec);
+
+concurrentloop threadid 0 4
+
+# Thread 0: delete odd ids from initial set
+loop i 0 25
+
+onlyif threadid=0
+statement ok
+DELETE FROM t_conc4 WHERE id = ${i} * 4 + 1;
+
+endloop
+
+# Thread 1: delete even ids from initial set
+loop i 0 25
+
+onlyif threadid=1
+statement ok
+DELETE FROM t_conc4 WHERE id = ${i} * 4 + 2;
+
+endloop
+
+# Thread 2: insert new rows
+loop i 0 25
+
+onlyif threadid=2
+statement ok
+INSERT INTO t_conc4 VALUES (500 + ${i}, [0.5, 0.5, 0.5]::FLOATVECTOR(3));
+
+endloop
+
+# Thread 3: search continuously
+loop i 0 25
+
+onlyif threadid=3
+query I
+SELECT count(*) >= 0 FROM (SELECT id FROM t_conc4 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+----
+true
+
+endloop
+
+endloop
+
+# Verify search still works after concurrent modifications
+query I
+SELECT count(*) FROM (SELECT id FROM t_conc4 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t_conc4;
+
+# ============================================================
+# Test 5: Concurrent searches with different query vectors
+# ============================================================
+statement ok
+CREATE TABLE t_conc5 (id INTEGER, vec FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_conc5 SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, (i % 3)::FLOAT / 3.0]::FLOATVECTOR(3) FROM range(1, 301) t(i);
+
+statement ok
+CREATE INDEX idx_conc5 ON t_conc5 USING GRAPH_INDEX (vec);
+
+concurrentloop threadid 0 10
+
+loop i 0 20
+
+# Each thread searches with a different query vector
+query I
+SELECT count(*) FROM (SELECT id FROM t_conc5 ORDER BY l2_distance(vec, [${threadid}::FLOAT / 10.0, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+----
+5
+
+endloop
+
+endloop
+
+statement ok
+DROP TABLE t_conc5;

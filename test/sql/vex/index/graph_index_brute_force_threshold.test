@@ -1,0 +1,153 @@
+# name: test/sql/vex/index/graph_index_brute_force_threshold.test
+# description: Test brute force / graph search threshold boundary (64 nodes)
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE threshold_test (id INTEGER PRIMARY KEY, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx ON threshold_test USING GRAPH_INDEX (vec);
+
+# ============================================================
+# Phase 1: Insert exactly 64 nodes (at threshold boundary)
+# ============================================================
+statement ok
+INSERT INTO threshold_test SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+FROM range(1, 65) t(i);
+
+query I
+SELECT count(*) FROM threshold_test;
+----
+64
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 2: Insert 1 more -> crosses threshold (65 nodes, graph search)
+# ============================================================
+statement ok
+INSERT INTO threshold_test VALUES (65, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4));
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 3: Delete back to 64 -> should use brute force again
+# ============================================================
+statement ok
+DELETE FROM threshold_test WHERE id = 65;
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 4: Delete to well below threshold (30 nodes)
+# ============================================================
+statement ok
+DELETE FROM threshold_test WHERE id > 30;
+
+query I
+SELECT count(*) FROM threshold_test;
+----
+30
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 5: Insert back above threshold (100 nodes)
+# ============================================================
+statement ok
+INSERT INTO threshold_test SELECT i, list_value(cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT, sin(i*0.5)::FLOAT)::FLOATVECTOR(4)
+FROM range(100, 170) t(i);
+
+query I
+SELECT count(*) FROM threshold_test;
+----
+100
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 6: Oscillate around threshold with delete+insert
+# ============================================================
+
+# Delete to 60
+statement ok
+DELETE FROM threshold_test WHERE id >= 160;
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+# Insert to 70
+statement ok
+INSERT INTO threshold_test SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(200, 210) t(i);
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+# Delete to 50
+statement ok
+DELETE FROM threshold_test WHERE id >= 150;
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+# ============================================================
+# Phase 7: Delete to very small (3 nodes), search still works
+# ============================================================
+statement ok
+DELETE FROM threshold_test WHERE id > 3;
+
+query I
+SELECT count(*) FROM threshold_test;
+----
+3
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+3
+
+# ============================================================
+# Phase 8: Delete to 1 node
+# ============================================================
+statement ok
+DELETE FROM threshold_test WHERE id > 1;
+
+query I
+SELECT count(*) FROM threshold_test;
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+1
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE threshold_test;

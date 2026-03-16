@@ -69,7 +69,7 @@ static void KMeansClustering(const float *data, uint32_t n, uint32_t dim,
 	}
 
 	// Assignment buffer
-	std::vector<uint32_t> assignments(n);
+	std::vector<uint32_t> assignments(n, 0);
 	std::vector<float> centroid_sums(static_cast<size_t>(k) * dim);
 	std::vector<uint32_t> centroid_counts(k);
 
@@ -248,6 +248,10 @@ bool ProductQuantizer::DeserializeFrom(const char *&ptr, const char *end) {
 	std::memcpy(&m, ptr, 4); ptr += 4;
 	std::memcpy(&dsub, ptr, 4); ptr += 4;
 	trained = (*ptr != 0); ptr += 1;
+
+	// Validate deserialized values to prevent integer overflow in size computation
+	if (m == 0 || dsub == 0 || m > 256 || dsub > 4096) return false;
+	if (d != m * dsub) return false;
 
 	size_t centroid_bytes = static_cast<size_t>(m) * KSUB * dsub * sizeof(float);
 	if (ptr + centroid_bytes > end) return false;

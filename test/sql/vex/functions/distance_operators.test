@@ -1,5 +1,5 @@
 # name: test/sql/vex/functions/distance_operators.test
-# description: Test distance operators <-> and <=> with FLOATVECTOR
+# description: Test distance operators <->, <=>, <~> with FLOATVECTOR
 # group: [vex]
 
 require vex
@@ -53,6 +53,19 @@ SELECT id FROM items ORDER BY v <-> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
 # ORDER BY with <=> operator
 query I
 SELECT id FROM items ORDER BY v <=> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
+----
+1
+3
+
+# <~> operator (negative inner product)
+query R
+SELECT [1.0, 2.0]::FLOATVECTOR(2) <~> [3.0, 4.0]::FLOATVECTOR(2);
+----
+-11.0
+
+# ORDER BY with <~> operator (smaller = higher inner product)
+query I
+SELECT id FROM items ORDER BY v <~> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
 ----
 1
 3

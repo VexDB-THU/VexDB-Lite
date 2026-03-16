@@ -14,7 +14,7 @@ public:
 private:
 	static void OptimizeNode(ClientContext &context, unique_ptr<LogicalOperator> &node);
 	static bool TryOptimizeTopN(ClientContext &context, unique_ptr<LogicalOperator> &node);
-	static bool TryOptimizeHybridTopN(ClientContext &context, unique_ptr<LogicalOperator> &node);
+	static bool TryOptimizeLimitOrderBy(ClientContext &context, unique_ptr<LogicalOperator> &node);
 };
 
 } // namespace duckdb

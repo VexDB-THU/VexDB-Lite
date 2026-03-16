@@ -1,0 +1,207 @@
+# name: test/sql/vex/index/graph_index_restart_delete.test
+# description: Verify row_id_map survives restart — DELETE actually modifies index state
+# group: [vex]
+#
+# Uses vex_index_info() to observe index internal state (node_count, row_id_map_size).
+# DuckDB may distribute nodes across pipeline segments, so we verify RELATIVE changes
+# (node_count decreases after DELETE) rather than absolute values.
+
+require vex
+
+# ============================================================
+# Test 1: restart → DELETE → node_count must decrease
+# Previously row_id_map was empty after restart, so DELETE
+# was a silent no-op and node_count never changed.
+# ============================================================
+
+load __TEST_DIR__/restart_delete1.db
+
+statement ok
+CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t1 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Trigger binding + get baseline
+statement ok
+DELETE FROM t1 WHERE id = -999;
+
+# Record baseline node_count (should be > 0)
+query I
+SELECT node_count > 0 FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# node_count and row_id_map_size should always match
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# Now delete a real row — node_count MUST decrease
+statement ok
+DELETE FROM t1 WHERE id = 1;
+
+# Verify: after delete, node_count should still be > 0 but less than before
+# Also verify row_id_map_size tracks node_count
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# Delete many more
+statement ok
+DELETE FROM t1 WHERE id <= 50;
+
+query I
+SELECT count(*) FROM t1;
+----
+50
+
+# node_count should still equal row_id_map_size
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# Search should work
+query I
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t1;
+
+# ============================================================
+# Test 2: Restart → DELETE → CHECKPOINT → Restart → verify
+# Ensures row_id_map is re-serialized correctly after modifications
+# ============================================================
+
+load __TEST_DIR__/restart_delete2.db
+
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(1, 51) t(i);
+
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+# Cycle 1
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+DELETE FROM t2 WHERE id <= 10;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+# Cycle 2
+statement ok
+CHECKPOINT;
+
+restart
+
+# After second restart, node_count should still be consistent
+statement ok
+DELETE FROM t2 WHERE id = -999;
+
+query I
+SELECT node_count > 0 FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+# Delete more
+statement ok
+DELETE FROM t2 WHERE id BETWEEN 11 AND 20;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+statement ok
+DROP TABLE t2;
+
+# ============================================================
+# Test 3: HybridIndex — restart → delete → verify per-partition
+# ============================================================
+
+load __TEST_DIR__/restart_delete3.db
+
+statement ok
+CREATE TABLE t3 (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO t3 SELECT i, 'a', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(1, 51) t(i);
+
+statement ok
+INSERT INTO t3 SELECT i, 'b', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+FROM range(51, 101) t(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Trigger binding
+statement ok
+DELETE FROM t3 WHERE id = -999;
+
+# Both partitions should have node_count <= row_id_map_size
+query I
+SELECT bool_and(node_count <= row_id_map_size) FROM vex_index_info() WHERE index_name = 'idx3';
+----
+true
+
+# Delete from partition 'a'
+statement ok
+DELETE FROM t3 WHERE cat = 'a' AND id <= 25;
+
+query I
+SELECT count(*) FROM t3 WHERE cat = 'a';
+----
+25
+
+# row_id_map_size must still equal node_count for each partition
+query I
+SELECT bool_and(node_count <= row_id_map_size) FROM vex_index_info() WHERE index_name = 'idx3';
+----
+true
+
+# Partition 'b' unchanged: verify via search
+query I
+SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t3;

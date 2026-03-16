@@ -36,9 +36,10 @@ CREATE TABLE main_items (id INTEGER, label VARCHAR);
 statement ok
 INSERT INTO main_items VALUES (1, 'red'), (2, 'green'), (3, 'blue');
 
+# Use [0.1, 1.0, 0.0] to break tie: id=1 [1,0,0] dist≈1.063, id=3 [0,0,1] dist≈1.411
 query IT
 SELECT v.id, m.label FROM (
-  SELECT id FROM db2.vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 2
+  SELECT id FROM db2.vectors ORDER BY l2_distance(vec, [0.1, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 2
 ) v JOIN main_items m ON v.id = m.id
 ORDER BY v.id;
 ----

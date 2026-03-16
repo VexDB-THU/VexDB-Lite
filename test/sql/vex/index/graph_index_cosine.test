@@ -1,0 +1,376 @@
+# name: test/sql/vex/index/graph_index_cosine.test
+# description: Test cosine_distance with graph index — the most common real-world scenario
+# group: [vex]
+#
+# Cosine distance is the dominant metric in production vector search (embeddings,
+# recommendation, RAG). This test verifies correctness of the optimizer path,
+# result quality, and edge cases.
+#
+# IMPORTANT: The current index internally uses L2 distance for graph traversal.
+# For normalized vectors, L2 and cosine produce identical rankings:
+#   cosine_distance(a,b) = 1 - cos(θ) and L2²(a,b) = 2·(1 - cos(θ)) for unit vectors
+# Tests use normalized vectors to match production best practices.
+
+require vex
+
+# ============================================================
+# Test 1: Basic cosine_distance search with index
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos1 (id INTEGER, vec FLOATVECTOR(3));
+
+# Normalized vectors (unit length)
+statement ok
+INSERT INTO t_cos1 VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
+  (4, [0.577, 0.577, 0.577]::FLOATVECTOR(3)),
+  (5, [0.707, 0.707, 0.0]::FLOATVECTOR(3));
+
+statement ok
+CREATE INDEX idx_cos1 ON t_cos1 USING GRAPH_INDEX (vec);
+
+# Query: find closest to [1,0,0] — should be id=1 (exact match, distance=0)
+query I
+SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+----
+1
+
+# Top-3: [1,0,0] then [0.707,0.707,0] (cos_dist≈0.293) then [0.577,0.577,0.577] (cos_dist≈0.423)
+query I
+SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+----
+1
+5
+4
+
+statement ok
+DROP TABLE t_cos1;
+
+# ============================================================
+# Test 2: Cosine search with <=> operator
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos2 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_cos2 VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (3, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)),
+  (4, [0.707, 0.707, 0.0, 0.0]::FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_cos2 ON t_cos2 USING GRAPH_INDEX (vec);
+
+# <=> is the cosine distance operator
+query I
+SELECT id FROM t_cos2 ORDER BY vec <=> [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) LIMIT 2;
+----
+1
+4
+
+statement ok
+DROP TABLE t_cos2;
+
+# ============================================================
+# Test 3: Normalized embedding-like vectors at scale
+# Simulates real-world embedding data (128-dim, normalized)
+# ============================================================
+
+statement ok
+CREATE TABLE t_embed (id INTEGER, vec FLOATVECTOR(16));
+
+# Generate 200 normalized-ish vectors using trig functions
+# sin²(x) + cos²(x) = 1, so pairs of (sin, cos) form unit-length components
+statement ok
+INSERT INTO t_embed SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
+  sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,
+  sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT,
+  sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT,
+  sin(i*0.6)::FLOAT, cos(i*0.6)::FLOAT,
+  sin(i*0.7)::FLOAT, cos(i*0.7)::FLOAT,
+  sin(i*0.8)::FLOAT, cos(i*0.8)::FLOAT
+)::FLOATVECTOR(16)
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_embed ON t_embed USING GRAPH_INDEX (vec);
+
+# Invariant check
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_embed';
+----
+true
+
+# Search should return results
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_embed
+  ORDER BY cosine_distance(vec, [1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0]::FLOATVECTOR(16))
+  LIMIT 10
+);
+----
+10
+
+# Self-search: each row finds itself as top-1
+# (For normalized vectors, cosine and L2 rankings match, so this should pass)
+query I
+SELECT count(*) FROM (
+  SELECT t.id, (
+    SELECT s.id FROM t_embed s
+    ORDER BY cosine_distance(s.vec, t.vec)
+    LIMIT 1
+  ) as found_id
+  FROM t_embed t
+) sub
+WHERE sub.id = sub.found_id;
+----
+200
+
+statement ok
+DROP TABLE t_embed;
+
+# ============================================================
+# Test 4: Cosine search after INSERT (optimizer path)
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_ins (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_cos_ins ON t_cos_ins USING GRAPH_INDEX (vec);
+
+# Batch 1
+statement ok
+INSERT INTO t_cos_ins SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(1, 101) t(i);
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_ins
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 10
+);
+----
+10
+
+# Batch 2
+statement ok
+INSERT INTO t_cos_ins SELECT i, list_value(
+  cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
+  cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(101, 201) t(i);
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_ins
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 20
+);
+----
+20
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_ins';
+----
+true
+
+statement ok
+DROP TABLE t_cos_ins;
+
+# ============================================================
+# Test 5: Cosine search after DELETE
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_del (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_cos_del SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_del ON t_cos_del USING GRAPH_INDEX (vec);
+
+statement ok
+DELETE FROM t_cos_del WHERE id <= 50;
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_del
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 10
+);
+----
+10
+
+# Deleted rows should NOT appear in results
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_del
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 50
+) sub
+WHERE sub.id <= 50;
+----
+0
+
+statement ok
+DROP TABLE t_cos_del;
+
+# ============================================================
+# Test 6: Cosine with UPDATE
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_upd (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_cos_upd SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, 0.0, 0.0
+)::FLOATVECTOR(4)
+FROM range(1, 51) t(i);
+
+statement ok
+CREATE INDEX idx_cos_upd ON t_cos_upd USING GRAPH_INDEX (vec);
+
+# Update id=1 to a distinctive vector
+statement ok
+UPDATE t_cos_upd SET vec = [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4) WHERE id = 1;
+
+# Search for the updated vector — should find id=1
+query I
+SELECT id FROM t_cos_upd ORDER BY cosine_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+1
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_upd';
+----
+true
+
+statement ok
+DROP TABLE t_cos_upd;
+
+# ============================================================
+# Test 7: Cosine with restart (persistence)
+# ============================================================
+
+load __TEST_DIR__/cosine_restart.db
+
+statement ok
+CREATE TABLE t_cos_restart (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_cos_restart SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_restart ON t_cos_restart USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Cosine search after restart
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_restart
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 10
+);
+----
+10
+
+# INSERT after restart + cosine search
+statement ok
+INSERT INTO t_cos_restart SELECT i, list_value(
+  cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
+  cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(101, 151) t(i);
+
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_restart
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 15
+);
+----
+15
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_restart';
+----
+true
+
+statement ok
+DROP TABLE t_cos_restart;
+
+# ============================================================
+# Test 8: HybridIndex with cosine_distance
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_hybrid (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_cos_hybrid ON t_cos_hybrid USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO t_cos_hybrid SELECT i, 'electronics', list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, 0.0, 0.0
+)::FLOATVECTOR(4)
+FROM range(1, 51) t(i);
+
+statement ok
+INSERT INTO t_cos_hybrid SELECT i, 'books', list_value(
+  0.0, 0.0, sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT
+)::FLOATVECTOR(4)
+FROM range(51, 101) t(i);
+
+# Cosine search within partition
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_hybrid
+  WHERE cat = 'electronics'
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 5
+);
+----
+5
+
+# Global cosine search
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_hybrid
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  LIMIT 10
+);
+----
+10
+
+query I
+SELECT bool_and(node_count <= row_id_map_size) FROM vex_index_info() WHERE index_name = 'idx_cos_hybrid';
+----
+true
+
+statement ok
+DROP TABLE t_cos_hybrid;

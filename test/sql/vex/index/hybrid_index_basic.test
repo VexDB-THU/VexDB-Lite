@@ -63,6 +63,30 @@ LIMIT 3;
 8
 6
 
+# IN filter: search across electronics + clothing partitions, food excluded
+query II
+SELECT id, category FROM products
+WHERE category IN ('electronics', 'clothing')
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+LIMIT 5;
+----
+1	electronics
+2	electronics
+3	electronics
+6	clothing
+5	clothing
+
+# Verify food is not in IN-filter results
+query I
+SELECT count(*) FROM (
+  SELECT id, category FROM products
+  WHERE category IN ('electronics', 'clothing')
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  LIMIT 10
+) WHERE category = 'food';
+----
+0
+
 # Cleanup
 statement ok
 DROP TABLE products;
