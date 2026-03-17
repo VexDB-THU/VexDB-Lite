@@ -129,9 +129,9 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 		auto &data_table = duck_table.GetStorage();
 		auto &index_list = data_table.GetDataTableInfo()->GetIndexes();
 
-		index_list.Scan([&](Index &index) {
+		for (auto &index : index_list.Indexes()) {
 			if (!index.IsBound() || index.GetIndexName() != target.index_name) {
-				return false;
+				continue;
 			}
 			auto &bound_index = index.Cast<BoundIndex>();
 
@@ -162,8 +162,8 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 					state->entries.push_back(std::move(e));
 				}
 			}
-			return true; // found the target index, stop scanning
-		});
+			break; // found the target index, stop scanning
+		}
 	}
 
 	return std::move(state);

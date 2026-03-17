@@ -6,8 +6,8 @@
 namespace duckdb {
 
 struct VexTypes {
-	static constexpr const char *FLOATVECTOR_TYPE_NAME = "FLOATVECTOR";
-	static constexpr idx_t FLOATVECTOR_MAX_DIM = 16384;
+	static inline constexpr const char *FLOATVECTOR_TYPE_NAME = "FLOATVECTOR";
+	static inline constexpr idx_t FLOATVECTOR_MAX_DIM = 16384;
 
 	static void Register(ExtensionLoader &loader);
 };

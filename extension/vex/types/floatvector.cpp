@@ -6,13 +6,17 @@
 
 namespace duckdb {
 
-static LogicalType BindFloatVectorType(const BindLogicalTypeInput &input) {
+static LogicalType BindFloatVectorType(BindLogicalTypeInput &input) {
 	auto &modifiers = input.modifiers;
 	if (modifiers.size() != 1) {
 		throw BinderException("FLOATVECTOR requires exactly one dimension argument, e.g. FLOATVECTOR(128)");
 	}
 
-	auto dim_value = modifiers[0].GetValue<int64_t>();
+	auto dim_val = modifiers[0].GetValue();
+	if (!dim_val.DefaultTryCastAs(LogicalTypeId::BIGINT)) {
+		throw BinderException("FLOATVECTOR dimension must be an integer");
+	}
+	auto dim_value = dim_val.GetValueUnsafe<int64_t>();
 	if (dim_value < 1 || static_cast<idx_t>(dim_value) > VexTypes::FLOATVECTOR_MAX_DIM) {
 		throw BinderException("FLOATVECTOR dimension must be between 1 and %d, got %lld",
 		                      VexTypes::FLOATVECTOR_MAX_DIM, dim_value);

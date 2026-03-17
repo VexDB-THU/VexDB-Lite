@@ -100,15 +100,15 @@ public:
 // Graph Index Parameters
 // ============================================================
 struct GraphIndexConfig {
-	static constexpr int DEFAULT_M = 16;
-	static constexpr int MIN_M = 2;
-	static constexpr int MAX_M = 100;
-	static constexpr int DEFAULT_EF_CONSTRUCTION = 64;
-	static constexpr int MIN_EF_CONSTRUCTION = 4;
-	static constexpr int MAX_EF_CONSTRUCTION = 1000;
-	static constexpr int DEFAULT_EF_SEARCH = 40;
-	static constexpr int MIN_EF_SEARCH = 1;
-	static constexpr int MAX_EF_SEARCH = 1000;
+	static inline constexpr int DEFAULT_M = 16;
+	static inline constexpr int MIN_M = 2;
+	static inline constexpr int MAX_M = 100;
+	static inline constexpr int DEFAULT_EF_CONSTRUCTION = 64;
+	static inline constexpr int MIN_EF_CONSTRUCTION = 4;
+	static inline constexpr int MAX_EF_CONSTRUCTION = 1000;
+	static inline constexpr int DEFAULT_EF_SEARCH = 40;
+	static inline constexpr int MIN_EF_SEARCH = 1;
+	static inline constexpr int MAX_EF_SEARCH = 1000;
 
 	int m = DEFAULT_M;
 	int ef_construction = DEFAULT_EF_CONSTRUCTION;
@@ -153,7 +153,7 @@ struct GraphIndexCore {
 	idx_t node_count = 0;
 
 	//! Below this threshold, use brute force instead of graph traversal
-	static constexpr idx_t BRUTE_FORCE_THRESHOLD = 64;
+	static inline constexpr idx_t BRUTE_FORCE_THRESHOLD = 64;
 
 	//! Index parameters (needed for segment size calculation)
 	int m = GraphIndexConfig::DEFAULT_M;
@@ -171,7 +171,7 @@ struct GraphIndexCore {
 
 	//! Deduplication: extra row_ids per node (keyed by node_ptr.Get())
 	//! Primary row_id is in the header; extras are in this map.
-	static constexpr uint16_t DEFAULT_MAX_DEDUP = 8; // max row_ids per node (1 = disabled)
+	static inline constexpr uint16_t DEFAULT_MAX_DEDUP = 8; // max row_ids per node (1 = disabled)
 	uint16_t max_dedup = DEFAULT_MAX_DEDUP;
 	unordered_map<idx_t, std::vector<row_t>> dedup_map_;
 
@@ -374,7 +374,7 @@ struct GraphIndexCore {
 
 	//! Striped spinlock array for fine-grained per-node locking during parallel build.
 	//! Uses atomic spinlocks instead of std::mutex to avoid kernel syscall overhead.
-	static constexpr idx_t STRIPE_COUNT = 1024;
+	static inline constexpr idx_t STRIPE_COUNT = 1024;
 	std::unique_ptr<SpinLock[]> node_stripes_;
 
 	//! Lock the stripe for a given node pointer

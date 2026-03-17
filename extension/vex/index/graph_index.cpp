@@ -1256,10 +1256,10 @@ idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
 	return size;
 }
 
-string GraphIndex::VerifyAndToString(IndexLock &l, const bool only_verify) {
-	if (only_verify) {
-		return "OK";
-	}
+void GraphIndex::Verify(IndexLock &l) {
+}
+
+string GraphIndex::ToString(IndexLock &l, bool display_ascii) {
 	return StringUtil::Format("GraphIndex: %d nodes, %d levels, M=%d, dim=%d",
 	                         static_cast<int>(graph_.node_count),
 	                         graph_.max_level, m_, dimension_);

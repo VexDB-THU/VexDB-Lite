@@ -40,7 +40,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterIndexTypes(config);
 
-	config.optimizer_extensions.push_back(VexOptimizerExtension());
+	config.GetCallbackManager().Register(VexOptimizerExtension());
 
 	// Register runtime configuration options
 	config.AddExtensionOption("vex_ef_search",

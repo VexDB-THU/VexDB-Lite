@@ -338,52 +338,58 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 	// Check if there are unbound VEX indexes on the target column.
 	// After DB reopen, indexes are lazy-deserialized and IsBound() returns false.
 	bool needs_bind = false;
-	storage.GetDataTableInfo()->GetIndexes().Scan([&](Index &index) {
+	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
 		if (!index.IsBound()) {
 			auto &idx_type = index.GetIndexType();
 			if (idx_type == GraphIndex::TYPE_NAME || idx_type == HybridIndex::TYPE_NAME) {
 				for (auto &idx_col : index.GetColumnIds()) {
 					if (idx_col == physical_col_id) {
 						needs_bind = true;
-						return true; // stop scan
+						break;
 					}
+				}
+				if (needs_bind) {
+					break;
 				}
 			}
 		}
-		return false;
-	});
+	}
 
 	if (needs_bind) {
 		storage.GetDataTableInfo()->GetIndexes().Bind(context, *storage.GetDataTableInfo());
 	}
 
 	// Now scan bound indexes for a match.
-	storage.GetDataTableInfo()->GetIndexes().Scan([&](Index &index) {
+	bool found_match = false;
+	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
 		if (!index.IsBound()) {
-			return false;
+			continue;
 		}
 		if (index.GetIndexType() == GraphIndex::TYPE_NAME) {
 			if (index.Cast<GraphIndex>().GetMetric() != query_metric) {
-				return false; // metric mismatch, continue scanning
+				continue; // metric mismatch, continue scanning
 			}
 			for (auto &idx_col : index.GetColumnIds()) {
 				if (idx_col == physical_col_id) {
 					match.graph_idx = &index.Cast<GraphIndex>();
-					return true;
+					found_match = true;
+					break;
 				}
 			}
 		} else if (index.GetIndexType() == HybridIndex::TYPE_NAME) {
 			if (index.Cast<HybridIndex>().GetMetric() != query_metric) {
-				return false; // metric mismatch, continue scanning
+				continue; // metric mismatch, continue scanning
 			}
 			auto &idx_col_ids = index.GetColumnIds();
 			if (!idx_col_ids.empty() && idx_col_ids[0] == physical_col_id) {
 				match.hybrid_idx = &index.Cast<HybridIndex>();
-				return true;
+				found_match = true;
 			}
 		}
-		return false;
-	});
+		if (found_match) {
+			break;
+		}
+	}
 
 	return match.graph_idx || match.hybrid_idx;
 }

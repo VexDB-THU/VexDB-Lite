@@ -10,7 +10,7 @@
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/parallel/task_scheduler.hpp"
-#include "vex_graph_index.hpp"
+#include "../../extension/vex/include/vex_graph_index.hpp"
 
 namespace duckdb {
 
@@ -78,6 +78,7 @@ unique_ptr<GlobalSinkState> PhysicalCreateGraphIndex::GetGlobalSinkState(ClientC
 	// Prepare input for index creation
 	IndexStorageInfo storage_info;
 	CreateIndexInput index_input(
+		context,
 		TableIOManager::Get(table.GetStorage()),
 		table.GetStorage().db,
 		info->constraint_type,
@@ -116,6 +117,7 @@ unique_ptr<LocalSinkState> PhysicalCreateGraphIndex::GetLocalSinkState(Execution
 		}
 		IndexStorageInfo storage_info;
 		CreateIndexInput index_input(
+			context.client,
 			TableIOManager::Get(table.GetStorage()),
 			table.GetStorage().db,
 			info->constraint_type,
@@ -269,12 +271,9 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 	} else {
 		// Ensure that there are no other indexes with that name on this table.
 		auto &indexes = storage.GetDataTableInfo()->GetIndexes();
-		indexes.Scan([&](Index &index) {
-			if (index.GetIndexName() == info->index_name) {
-				throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
-			}
-			return false;
-		});
+		if (indexes.Find(info->index_name)) {
+			throw CatalogException("an index with that name already exists for this table: %s", info->index_name);
+		}
 
 		auto &catalog = Catalog::GetCatalog(context, info->catalog);
 		catalog.Alter(context, *alter_table_info);
@@ -289,7 +288,7 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 // Source
 //===--------------------------------------------------------------------===//
 
-SourceResultType PhysicalCreateGraphIndex::GetData(ExecutionContext &context, DataChunk &chunk,
+SourceResultType PhysicalCreateGraphIndex::GetDataInternal(ExecutionContext &context, DataChunk &chunk,
                                                  OperatorSourceInput &input) const {
 	return SourceResultType::FINISHED;
 }
