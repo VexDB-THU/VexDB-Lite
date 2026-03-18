@@ -448,7 +448,7 @@ void GraphIndex::BuildParallel(const std::vector<float> &all_vectors, const std:
 		}
 
 		// Intra-batch dedup is handled during insertion phase (InsertNodeParallel),
-		// following the openGauss approach: after HNSW neighbor search finds the nearest
+		// following the VexDB approach: after HNSW neighbor search finds the nearest
 		// node at level 0, check if distance ≈ 0 and merge. This is O(ef_construction)
 		// per node instead of the previous O(n²) brute-force scan.
 

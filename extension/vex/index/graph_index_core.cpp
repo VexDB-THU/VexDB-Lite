@@ -658,7 +658,7 @@ bool GraphIndexCore::InsertNodeParallel(IndexPointer new_node_ptr, int m_param, 
 
 	// ============================================================
 	// Phase 2: Dedup check at level 0 (BEFORE any connections are made)
-	// Follows openGauss approach — O(ef_construction) instead of O(n²).
+	// Follows VexDB approach — O(ef_construction) instead of O(n²).
 	// ============================================================
 	if (max_dedup > 1 && !level_results[0].candidates.empty()) {
 		for (auto &cand : level_results[0].candidates) {

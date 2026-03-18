@@ -16,7 +16,7 @@ VexDB-Lite is the lightweight edition of the [VexDB](https://vexdb.com/) vector 
 | | VexDB | VexDB-Lite |
 |---|---|---|
 | **Purpose** | Enterprise distributed vector database | Lightweight embedded vector database |
-| **Storage Engine** | openGauss row-store engine | DuckDB columnar analytics engine |
+| **Storage Engine** | VexDB row-store engine | DuckDB columnar analytics engine |
 | **Index Algorithm** | HNSW (disk-based page storage, parallel Vacuum) | HNSW (in-memory graph, FixedSizeAllocator persistence) |
 | **Graph Repair** | Full `RepairGraphElement` with parallel Workers | Synchronous delete + repair (update entry → clean neighbors → repair connections) |
 | **Quantizer** | PQ / RaBitQ / adaptive online update | Product Quantization (PQ) |
