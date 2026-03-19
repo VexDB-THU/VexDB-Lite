@@ -11,6 +11,7 @@
 #include "vex_quantizer.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -22,6 +23,52 @@ namespace duckdb {
 // Search phases use shared (read) lock for parallelism,
 // connect/allocate phases use exclusive (write) lock.
 // ============================================================
+#ifdef VEX_MOBILE_MODE
+// Mobile-friendly RWLock: uses mutex + condvar instead of spinlock
+// to avoid wasting battery on busy-waiting.
+// Non-recursive: a thread must not re-acquire a lock it already holds.
+class SimpleRWLock {
+	std::mutex mtx_;
+	std::condition_variable cv_;
+	int readers_ = 0;
+	bool writer_ = false;
+	int writer_waiters_ = 0;
+
+public:
+	void lock_shared() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		cv_.wait(lk, [this] { return !writer_ && writer_waiters_ == 0; });
+		++readers_;
+	}
+
+	void unlock_shared() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		if (--readers_ == 0) {
+			cv_.notify_all();
+		}
+	}
+
+	void lock() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		++writer_waiters_;
+		try {
+			cv_.wait(lk, [this] { return !writer_ && readers_ == 0; });
+		} catch (...) {
+			--writer_waiters_;
+			cv_.notify_all();
+			throw;
+		}
+		--writer_waiters_;
+		writer_ = true;
+	}
+
+	void unlock() {
+		std::unique_lock<std::mutex> lk(mtx_);
+		writer_ = false;
+		cv_.notify_all();
+	}
+};
+#else
 class SimpleRWLock {
 	// Atomic-based RW lock with backoff.
 	// State encoding: >=0 = reader count, -1 = writer active
@@ -80,6 +127,7 @@ public:
 		state_.store(0, std::memory_order_release);
 	}
 };
+#endif // VEX_MOBILE_MODE
 
 //! RAII guard for shared (read) lock
 class SharedLockGuard {
@@ -338,6 +386,14 @@ struct GraphIndexCore {
 	unique_ptr<SimpleRWLock> graph_mutex_;
 
 	//! Lightweight spinlock for per-node striped locking.
+#ifdef VEX_MOBILE_MODE
+	//! Mobile-friendly: uses std::mutex instead of spinning to save battery.
+	struct SpinLock {
+		std::mutex mtx_;
+		void lock() { mtx_.lock(); }
+		void unlock() { mtx_.unlock(); }
+	};
+#else
 	//! Uses test-and-test-and-set (TTAS) pattern with pure CPU pause backoff.
 	//! No syscalls (no yield/sched_yield) to avoid kernel overhead.
 	struct SpinLock {
@@ -362,6 +418,7 @@ struct GraphIndexCore {
 			locked_.store(false, std::memory_order_release);
 		}
 	};
+#endif // VEX_MOBILE_MODE
 
 	//! RAII guard for SpinLock
 	struct SpinLockGuard {

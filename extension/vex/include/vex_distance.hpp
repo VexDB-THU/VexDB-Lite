@@ -43,10 +43,12 @@ void NormalizeVector(float *vec, uint32_t dim);
 
 // CPU feature detection
 enum class SimdArch : uint8_t {
-	GENERIC = 0,
-	SSE     = 1,
-	AVX2    = 2,
-	AVX512  = 3,
+	GENERIC   = 0,
+	SSE       = 1,
+	AVX2      = 2,
+	AVX512    = 3,
+	NEON      = 4,
+	WASM_SIMD = 5,
 };
 
 SimdArch GetBestArch();

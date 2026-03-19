@@ -1,0 +1,205 @@
+# name: test/sql/vex/index/graph_index_minimal_params.test
+# description: Test graph index with minimal parameters (memory-constrained scenarios)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: m=2 with 100 rows — should still work
+# ============================================================
+statement ok
+CREATE TABLE t_m2_100 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_m2_100 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(100) t(i);
+
+statement ok
+CREATE INDEX idx_m2_100 ON t_m2_100 USING GRAPH_INDEX (vec) WITH (m = 2);
+
+# Top-1 should be correct (data is well-separated along a line)
+query I
+SELECT id FROM t_m2_100 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+0
+
+# Search at the other end
+query I
+SELECT id FROM t_m2_100 ORDER BY l2_distance(vec, [9.9, 19.8, 29.7, 39.6]::FLOATVECTOR(4)) LIMIT 1;
+----
+99
+
+# Should return 5 results even with sparse graph
+query I
+SELECT count(*) FROM (SELECT id FROM t_m2_100 ORDER BY l2_distance(vec, [5.0, 10.0, 15.0, 20.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+statement ok
+DROP TABLE t_m2_100;
+
+# ============================================================
+# Test 2: m=4 with 500 rows — verify basic search
+# ============================================================
+statement ok
+CREATE TABLE t_m4_500 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_m4_500 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_m4_500 ON t_m4_500 USING GRAPH_INDEX (vec) WITH (m = 4);
+
+query I
+SELECT id FROM t_m4_500 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+0
+
+query I
+SELECT id FROM t_m4_500 ORDER BY l2_distance(vec, [25.0, 50.0, 75.0, 100.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+250
+
+# Top-10 should all be returned
+query I
+SELECT count(*) FROM (SELECT id FROM t_m4_500 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t_m4_500;
+
+# ============================================================
+# Test 3: ef_construction=4, m=2 — minimal resource usage
+# ============================================================
+statement ok
+CREATE TABLE t_minimal (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_minimal SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(200) t(i);
+
+statement ok
+CREATE INDEX idx_minimal ON t_minimal USING GRAPH_INDEX (vec) WITH (m = 2, ef_construction = 4);
+
+# Even with minimal params, top-1 recall should work on linearly distributed data
+query I
+SELECT id FROM t_minimal ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+0
+
+# Verify index exists and has correct properties
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_minimal';
+----
+1
+
+statement ok
+DROP TABLE t_minimal;
+
+# ============================================================
+# Test 4: Search with ef_search=1 — returns at least 1 result
+# ============================================================
+statement ok
+CREATE TABLE t_ef1 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_ef1 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(200) t(i);
+
+statement ok
+CREATE INDEX idx_ef1 ON t_ef1 USING GRAPH_INDEX (vec);
+
+statement ok
+SET vex_ef_search = 1;
+
+# Should still return at least 1 result
+query I
+SELECT count(*) FROM (SELECT id FROM t_ef1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1);
+----
+1
+
+# Should return requested number of results even with ef_search=1
+query I
+SELECT count(*) FROM (SELECT id FROM t_ef1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+----
+5
+
+statement ok
+RESET vex_ef_search;
+
+statement ok
+DROP TABLE t_ef1;
+
+# ============================================================
+# Test 5: m=2 with all supported metric types
+# ============================================================
+
+# L2 metric (default)
+statement ok
+CREATE TABLE t_m2_l2 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_m2_l2 VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (3, [0.0, 0.0, 1.0, 0.0]::FLOATVECTOR(4)),
+  (4, [0.5, 0.5, 0.0, 0.0]::FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_m2_l2 ON t_m2_l2 USING GRAPH_INDEX (vec) WITH (m = 2);
+
+query I
+SELECT id FROM t_m2_l2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_m2_l2;
+
+# Cosine metric with m=2
+statement ok
+CREATE TABLE t_m2_cos (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_m2_cos VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (3, [0.0, 0.0, 1.0, 0.0]::FLOATVECTOR(4)),
+  (4, [0.7, 0.7, 0.0, 0.0]::FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_m2_cos ON t_m2_cos USING GRAPH_INDEX (vec) WITH (m = 2, metric='cosine');
+
+query I
+SELECT id FROM t_m2_cos ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_m2_cos;
+
+# IP metric with m=2
+statement ok
+CREATE TABLE t_m2_ip (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t_m2_ip VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
+  (3, [0.5, 0.5, 0.0, 0.0]::FLOATVECTOR(4));
+
+statement ok
+CREATE INDEX idx_m2_ip ON t_m2_ip USING GRAPH_INDEX (vec) WITH (m = 2, metric='ip');
+
+# Verify index creation succeeded
+query I
+SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_m2_ip';
+----
+1
+
+# Verify IP search works with m=2
+query I
+SELECT id FROM t_m2_ip ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_m2_ip;

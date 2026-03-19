@@ -2,8 +2,12 @@
 #include "vex_types.hpp"
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
+#ifdef VEX_ENABLE_HYBRID_INDEX
 #include "vex_hybrid_index.hpp"
+#endif
+#ifdef VEX_ENABLE_OPTIMIZER
 #include "vex_optimizer.hpp"
+#endif
 
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
@@ -17,17 +21,23 @@ static void RegisterIndexTypes(DBConfig &config) {
 	graph_index_type.create_instance = GraphIndex::Create;
 	graph_index_type.create_plan = GraphIndex::CreatePlan;
 
+#ifdef VEX_ENABLE_HYBRID_INDEX
 	IndexType hybrid_index_type;
 	hybrid_index_type.name = HybridIndex::TYPE_NAME;
 	hybrid_index_type.create_instance = HybridIndex::Create;
 	hybrid_index_type.create_plan = HybridIndex::CreatePlan;
+#endif
 
 #ifdef VEX_HAS_GLOBAL_INDEX_REGISTRY
 	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(graph_index_type);
+#ifdef VEX_ENABLE_HYBRID_INDEX
 	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(hybrid_index_type);
+#endif
 #else
 	config.GetIndexTypes().RegisterIndexType(graph_index_type);
+#ifdef VEX_ENABLE_HYBRID_INDEX
 	config.GetIndexTypes().RegisterIndexType(hybrid_index_type);
+#endif
 #endif
 }
 
@@ -40,7 +50,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	RegisterIndexTypes(config);
 
+#ifdef VEX_ENABLE_OPTIMIZER
 	config.GetCallbackManager().Register(VexOptimizerExtension());
+#endif
 
 	// Register runtime configuration options
 	config.AddExtensionOption("vex_ef_search",
@@ -49,6 +61,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vex_brute_force_threshold",
 	                          "Node count threshold below which brute-force search is used instead of graph traversal",
 	                          LogicalType::UBIGINT, Value::UBIGINT(GraphIndexCore::BRUTE_FORCE_THRESHOLD));
+	config.AddExtensionOption("vex_parallel_threshold",
+	                          "Row count threshold for parallel index construction (lower on mobile)",
+	                          LogicalType::UBIGINT,
+#ifdef VEX_MOBILE_MODE
+	                          Value::UBIGINT(1000));   // Lower threshold for mobile
+#else
+	                          Value::UBIGINT(10000));  // Default for desktop
+#endif
 }
 
 void VexExtension::Load(ExtensionLoader &loader) {
