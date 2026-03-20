@@ -1235,4 +1235,18 @@ void GraphIndexCore::Clear() {
 	dedup_map_.clear();
 }
 
+// C++11/14 out-of-line definitions for static constexpr members (required for ODR-use)
+constexpr int GraphIndexConfig::DEFAULT_M;
+constexpr int GraphIndexConfig::MIN_M;
+constexpr int GraphIndexConfig::MAX_M;
+constexpr int GraphIndexConfig::DEFAULT_EF_CONSTRUCTION;
+constexpr int GraphIndexConfig::MIN_EF_CONSTRUCTION;
+constexpr int GraphIndexConfig::MAX_EF_CONSTRUCTION;
+constexpr int GraphIndexConfig::DEFAULT_EF_SEARCH;
+constexpr int GraphIndexConfig::MIN_EF_SEARCH;
+constexpr int GraphIndexConfig::MAX_EF_SEARCH;
+constexpr idx_t GraphIndexCore::BRUTE_FORCE_THRESHOLD;
+constexpr uint16_t GraphIndexCore::DEFAULT_MAX_DEDUP;
+constexpr idx_t GraphIndexCore::STRIPE_COUNT;
+
 } // namespace duckdb
