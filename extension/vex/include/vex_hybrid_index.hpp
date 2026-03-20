@@ -43,7 +43,8 @@ public:
 	IndexStorageInfo SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) override;
 	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &options) override;
 	idx_t GetInMemorySize(IndexLock &state) override;
-	string VerifyAndToString(IndexLock &l, const bool only_verify) override;
+	void Verify(IndexLock &l) override;
+	string ToString(IndexLock &l, bool display_ascii = false) override;
 	void VerifyAllocations(IndexLock &l) override;
 	void VerifyBuffers(IndexLock &l) override;
 	string GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,

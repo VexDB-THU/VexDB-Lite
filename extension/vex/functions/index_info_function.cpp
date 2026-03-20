@@ -1,6 +1,8 @@
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
+#ifdef VEX_ENABLE_HYBRID_INDEX
 #include "vex_hybrid_index.hpp"
+#endif
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -98,8 +100,11 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 		auto &schema = schema_ref.get();
 		schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 			auto &index_entry = entry.Cast<IndexCatalogEntry>();
-			if (index_entry.index_type == GraphIndex::TYPE_NAME ||
-			    index_entry.index_type == HybridIndex::TYPE_NAME) {
+			if (index_entry.index_type == GraphIndex::TYPE_NAME
+#ifdef VEX_ENABLE_HYBRID_INDEX
+			    || index_entry.index_type == HybridIndex::TYPE_NAME
+#endif
+			    ) {
 				VexIndexTarget t;
 				t.schema_name = index_entry.GetSchemaName();
 				t.table_name = index_entry.GetTableName();
@@ -129,9 +134,9 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 		auto &data_table = duck_table.GetStorage();
 		auto &index_list = data_table.GetDataTableInfo()->GetIndexes();
 
-		index_list.Scan([&](Index &index) {
+		for (auto &index : index_list.Indexes()) {
 			if (!index.IsBound() || index.GetIndexName() != target.index_name) {
-				return false;
+				continue;
 			}
 			auto &bound_index = index.Cast<BoundIndex>();
 
@@ -147,7 +152,9 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.dimension = static_cast<int32_t>(graph_idx.GetGraphCore().dimension);
 				e.row_id_map_size = static_cast<int64_t>(graph_idx.GetGraphCore().row_id_map.size());
 				state->entries.push_back(std::move(e));
-			} else if (bound_index.GetIndexType() == HybridIndex::TYPE_NAME) {
+			}
+#ifdef VEX_ENABLE_HYBRID_INDEX
+			else if (bound_index.GetIndexType() == HybridIndex::TYPE_NAME) {
 				auto &hybrid_idx = bound_index.Cast<HybridIndex>();
 				for (auto &kv : hybrid_idx.GetPartitions()) {
 					VexIndexInfoGlobalState::IndexEntry e;
@@ -162,8 +169,9 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 					state->entries.push_back(std::move(e));
 				}
 			}
-			return true; // found the target index, stop scanning
-		});
+#endif
+			break; // found the target index, stop scanning
+		}
 	}
 
 	return std::move(state);

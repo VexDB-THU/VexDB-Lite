@@ -1084,7 +1084,10 @@ idx_t HybridIndex::GetInMemorySize(IndexLock &state) {
 	return size;
 }
 
-string HybridIndex::VerifyAndToString(IndexLock &l, const bool only_verify) {
+void HybridIndex::Verify(IndexLock &l) {
+}
+
+string HybridIndex::ToString(IndexLock &l, bool display_ascii) {
 	string result = "HybridIndex: " + std::to_string(partitions_.size()) + " partitions, ";
 	result += std::to_string(GetTotalNodeCount()) + " total nodes, dim=" + std::to_string(dimension_);
 	return result;

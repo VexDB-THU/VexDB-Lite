@@ -16,6 +16,8 @@
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/catalog/dependency_catalog_set.hpp"
 
+#include "duckdb/common/printer.hpp"
+
 namespace duckdb {
 
 static void AssertMangledName(const string &mangled_name, idx_t expected_null_bytes) {
@@ -369,6 +371,9 @@ static string EntryToString(CatalogEntryInfo &info) {
 	}
 	case CatalogType::COLLATION_ENTRY: {
 		return StringUtil::Format("collation \"%s\"", info.name);
+	}
+	case CatalogType::COORDINATE_SYSTEM_ENTRY: {
+		return StringUtil::Format("coordinate system \"%s\"", info.name);
 	}
 	case CatalogType::TYPE_ENTRY: {
 		return StringUtil::Format("type \"%s\"", info.name);

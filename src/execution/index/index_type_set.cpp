@@ -32,14 +32,8 @@ vector<IndexType> GlobalIndexTypeRegistry::GetExtensionIndexTypes() const {
 // ============================================================
 
 IndexTypeSet::IndexTypeSet() {
-
-	// Register the ART index type by default
-	IndexType art_index_type;
-	art_index_type.name = ART::TYPE_NAME;
-	art_index_type.create_instance = ART::Create;
-	art_index_type.create_plan = ART::CreatePlan;
-
-	RegisterIndexType(art_index_type);
+	// Register the ART index type by default (v1.5 API)
+	RegisterIndexType(ART::GetARTIndexType());
 
 	// Load extension-registered index types from global registry
 	auto extension_types = GlobalIndexTypeRegistry::GetInstance().GetExtensionIndexTypes();

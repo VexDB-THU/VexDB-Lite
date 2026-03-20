@@ -82,7 +82,9 @@ static bool HasAVX512F() {
 #endif
 
 SimdArch GetBestArch() {
-#ifdef VEX_X86
+#ifdef VEX_WASM_SIMD
+	return SimdArch::WASM_SIMD;
+#elif defined(VEX_X86)
 	if (HasAVX512F()) {
 		return SimdArch::AVX512;
 	}
@@ -92,18 +94,20 @@ SimdArch GetBestArch() {
 	if (HasSSE()) {
 		return SimdArch::SSE;
 	}
+#elif defined(VEX_ARM)
+	return SimdArch::NEON;
 #endif
-	// ARM NEON is always available on aarch64
-	// WASM SIMD128 is compile-time selected via VEX_WASM_SIMD
 	return SimdArch::GENERIC;
 }
 
 const char *ArchName(SimdArch arch) {
 	switch (arch) {
-	case SimdArch::AVX512: return "AVX-512";
-	case SimdArch::AVX2:   return "AVX2";
-	case SimdArch::SSE:    return "SSE";
-	default:               return "Generic";
+	case SimdArch::AVX512:    return "AVX-512";
+	case SimdArch::AVX2:      return "AVX2";
+	case SimdArch::SSE:       return "SSE";
+	case SimdArch::NEON:      return "NEON";
+	case SimdArch::WASM_SIMD: return "WASM-SIMD";
+	default:                  return "Generic";
 	}
 }
 

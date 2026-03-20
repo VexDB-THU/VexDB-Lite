@@ -1,6 +1,8 @@
 #include "vex_optimizer.hpp"
 #include "vex_graph_index.hpp"
+#ifdef VEX_ENABLE_HYBRID_INDEX
 #include "vex_hybrid_index.hpp"
+#endif
 #include "vex_distance.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -319,7 +321,9 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 
 struct IndexMatch {
 	GraphIndex *graph_idx = nullptr;
+#ifdef VEX_ENABLE_HYBRID_INDEX
 	HybridIndex *hybrid_idx = nullptr;
+#endif
 };
 
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
@@ -338,54 +342,71 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 	// Check if there are unbound VEX indexes on the target column.
 	// After DB reopen, indexes are lazy-deserialized and IsBound() returns false.
 	bool needs_bind = false;
-	storage.GetDataTableInfo()->GetIndexes().Scan([&](Index &index) {
+	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
 		if (!index.IsBound()) {
 			auto &idx_type = index.GetIndexType();
-			if (idx_type == GraphIndex::TYPE_NAME || idx_type == HybridIndex::TYPE_NAME) {
+			if (idx_type == GraphIndex::TYPE_NAME
+#ifdef VEX_ENABLE_HYBRID_INDEX
+			    || idx_type == HybridIndex::TYPE_NAME
+#endif
+			    ) {
 				for (auto &idx_col : index.GetColumnIds()) {
 					if (idx_col == physical_col_id) {
 						needs_bind = true;
-						return true; // stop scan
+						break;
 					}
+				}
+				if (needs_bind) {
+					break;
 				}
 			}
 		}
-		return false;
-	});
+	}
 
 	if (needs_bind) {
 		storage.GetDataTableInfo()->GetIndexes().Bind(context, *storage.GetDataTableInfo());
 	}
 
 	// Now scan bound indexes for a match.
-	storage.GetDataTableInfo()->GetIndexes().Scan([&](Index &index) {
+	bool found_match = false;
+	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
 		if (!index.IsBound()) {
-			return false;
+			continue;
 		}
 		if (index.GetIndexType() == GraphIndex::TYPE_NAME) {
 			if (index.Cast<GraphIndex>().GetMetric() != query_metric) {
-				return false; // metric mismatch, continue scanning
+				continue; // metric mismatch, continue scanning
 			}
 			for (auto &idx_col : index.GetColumnIds()) {
 				if (idx_col == physical_col_id) {
 					match.graph_idx = &index.Cast<GraphIndex>();
-					return true;
+					found_match = true;
+					break;
 				}
 			}
-		} else if (index.GetIndexType() == HybridIndex::TYPE_NAME) {
+		}
+#ifdef VEX_ENABLE_HYBRID_INDEX
+		else if (index.GetIndexType() == HybridIndex::TYPE_NAME) {
 			if (index.Cast<HybridIndex>().GetMetric() != query_metric) {
-				return false; // metric mismatch, continue scanning
+				continue; // metric mismatch, continue scanning
 			}
 			auto &idx_col_ids = index.GetColumnIds();
 			if (!idx_col_ids.empty() && idx_col_ids[0] == physical_col_id) {
 				match.hybrid_idx = &index.Cast<HybridIndex>();
-				return true;
+				found_match = true;
 			}
 		}
-		return false;
-	});
+#endif
+		if (found_match) {
+			break;
+		}
+	}
 
-	return match.graph_idx || match.hybrid_idx;
+	return match.graph_idx
+#ifdef VEX_ENABLE_HYBRID_INDEX
+	       || match.hybrid_idx
+#endif
+	       ;
 }
 
 //===--------------------------------------------------------------------===//
@@ -400,7 +421,9 @@ static bool ExecuteANNSearch(ClientContext &context, const IndexMatch &match, Lo
 
 	if (match.graph_idx) {
 		match.graph_idx->ANNSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
-	} else if (match.hybrid_idx) {
+	}
+#ifdef VEX_ENABLE_HYBRID_INDEX
+	else if (match.hybrid_idx) {
 		bool filtered = false;
 		auto &idx_col_ids = match.hybrid_idx->GetColumnIds();
 		if (idx_col_ids.size() >= 2) {
@@ -459,7 +482,9 @@ static bool ExecuteANNSearch(ClientContext &context, const IndexMatch &match, Lo
 		if (!filtered) {
 			match.hybrid_idx->GlobalSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
 		}
-	} else {
+	}
+#endif
+	else {
 		return false;
 	}
 
@@ -697,7 +722,11 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 	// If there's a FILTER node but the index is a plain GRAPH_INDEX (not hybrid),
 	// we cannot apply the filter through ANN search — skip optimization to let
 	// the regular plan handle it (full scan + filter).
-	if (get_info.filter && !match.hybrid_idx) {
+	if (get_info.filter
+#ifdef VEX_ENABLE_HYBRID_INDEX
+	    && !match.hybrid_idx
+#endif
+	    ) {
 #ifdef VEX_OPTIMIZER_DEBUG
 		std::cerr << "[VEX] TryOptimizeANN: skipping — FILTER present but index is not hybrid" << std::endl;
 #endif
@@ -712,6 +741,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 
 	// For hybrid index with a FILTER node (pre-optimize: filter not yet pushed to GET)
 	bool did_filtered_search = false;
+#ifdef VEX_ENABLE_HYBRID_INDEX
 #ifdef VEX_OPTIMIZER_DEBUG
 	std::cerr << "[VEX] TryOptimizeANN: hybrid_idx=" << (match.hybrid_idx != nullptr)
 	          << " filter=" << (get_info.filter != nullptr)
@@ -737,6 +767,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 			}
 		}
 	}
+#endif
 
 	// If there's a FILTER node but we couldn't apply it through the index,
 	// we MUST bail out. Otherwise ReplacePlanWithResults will drop the FILTER

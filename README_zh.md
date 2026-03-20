@@ -16,7 +16,7 @@ VexDB-Lite 是 [VexDB](https://vexdb.com/) 向量数据库家族的轻量级版�
 |              | VexDB                                        | VexDB-Lite                                           |
 | ------------ | -------------------------------------------- | ---------------------------------------------------- |
 | **定位**     | 企业级分布式向量数据库                       | 轻量级嵌入式向量数据库                               |
-| **存储引擎** | 基于 openGauss 行存储引擎                    | 基于 DuckDB 列式分析引擎                             |
+| **存储引擎** | 基于 VexDB 行存储引擎                        | 基于 DuckDB 列式分析引擎                             |
 | **索引算法** | HNSW 图索引（磁盘页面存储，支持并行 Vacuum） | HNSW 图索引（内存图结构，FixedSizeAllocator 持久化） |
 | **图修复**   | 完整的 `RepairGraphElement`，支持并行 Worker | 同步删除 + 图修复（更新入口→清理邻居→修复连接）      |
 | **量化器**   | PQ / RaBitQ / 自适应在线更新                 | Product Quantization (PQ)                            |

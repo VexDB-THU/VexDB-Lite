@@ -1,0 +1,125 @@
+# name: test/sql/vex/functions/index_info.test
+# description: Test vex_index_info() table function coverage
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: vex_index_info() on empty database (no vex indexes)
+# ============================================================
+query I
+SELECT count(*) FROM vex_index_info();
+----
+0
+
+# ============================================================
+# Test 2: Create one index, verify it appears
+# ============================================================
+statement ok
+CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(4));
+
+statement ok
+INSERT INTO t1 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(100) t(i);
+
+statement ok
+CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
+
+query I
+SELECT count(*) FROM vex_index_info() WHERE index_name = 'idx1';
+----
+1
+
+# Verify returned columns
+query ITII
+SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE index_name = 'idx1';
+----
+idx1	GRAPH_INDEX	100	4
+
+# Verify table_name
+query T
+SELECT table_name FROM vex_index_info() WHERE index_name = 'idx1';
+----
+t1
+
+# Verify partition_key is NULL for GRAPH_INDEX
+query T
+SELECT partition_key FROM vex_index_info() WHERE index_name = 'idx1';
+----
+NULL
+
+# ============================================================
+# Test 3: Create multiple indexes, verify all appear
+# ============================================================
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(8));
+
+statement ok
+INSERT INTO t2 SELECT i, list_transform(range(8), x -> (x + i)::FLOAT / 100.0)::FLOATVECTOR(8) FROM range(50) t(i);
+
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+statement ok
+CREATE TABLE t3 (id INTEGER, vec FLOATVECTOR(3), cat VARCHAR);
+
+statement ok
+INSERT INTO t3 VALUES
+  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+
+statement ok
+CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);
+
+# Should have at least 3 entries (idx1, idx2, and idx3 with 2 partitions)
+query I
+SELECT count(*) FROM vex_index_info();
+----
+4
+
+# Verify idx2 details
+query ITII
+SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE index_name = 'idx2';
+----
+idx2	GRAPH_INDEX	50	8
+
+# Verify hybrid index shows partition keys
+query IT
+SELECT index_name, index_type FROM vex_index_info() WHERE index_name = 'idx3' ORDER BY partition_key;
+----
+idx3	HYBRID_INDEX
+idx3	HYBRID_INDEX
+
+# ============================================================
+# Test 4: Drop an index, verify it disappears
+# ============================================================
+statement ok
+DROP INDEX idx2;
+
+query I
+SELECT count(*) FROM vex_index_info() WHERE index_name = 'idx2';
+----
+0
+
+# idx1 and idx3 should still be present
+query I
+SELECT count(*) FROM vex_index_info() WHERE index_name = 'idx1';
+----
+1
+
+# ============================================================
+# Test 5: Drop all, verify empty again
+# ============================================================
+statement ok
+DROP TABLE t1;
+
+statement ok
+DROP TABLE t2;
+
+statement ok
+DROP TABLE t3;
+
+query I
+SELECT count(*) FROM vex_index_info();
+----
+0
