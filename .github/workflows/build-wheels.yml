@@ -23,19 +23,17 @@ jobs:
       matrix:
         include:
           # macOS Apple Silicon
-          - os: macos-14
+          - os: macos-latest
             name: macOS-arm64
-          # macOS Intel
-          - os: macos-13
-            name: macOS-x86_64
           # Linux x86_64
-          - os: ubuntu-22.04
+          - os: ubuntu-latest
             name: Linux-x86_64
-          # Linux ARM64
-          - os: ubuntu-22.04-arm
+          # Linux ARM64 (Kunpeng/鲲鹏 compatible) - uses QEMU emulation
+          - os: ubuntu-latest
             name: Linux-aarch64
+            arch: aarch64
           # Windows
-          - os: windows-2022
+          - os: windows-latest
             name: Windows-AMD64
 
     runs-on: ${{ matrix.os }}
@@ -48,17 +46,38 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
+      # ── Linux aarch64: cross-compile via Docker + QEMU ──
+      - name: Set up QEMU
+        if: matrix.arch == 'aarch64'
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build wheel (Linux aarch64)
+        if: matrix.arch == 'aarch64'
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            python:${{ env.PYTHON_VERSION }}-bookworm \
+            bash -c "
+              pip install scikit-build-core pybind11 setuptools_scm ninja wheel &&
+              bash packaging/build_wheel.sh dist
+            "
+
+      # ── Native builds (macOS / Linux x86_64 / Windows) ──
       - name: Set up Python
+        if: matrix.arch != 'aarch64'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install build dependencies
+        if: matrix.arch != 'aarch64'
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
-      # ── Build ──
       - name: Build wheel (Unix)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.arch != 'aarch64'
         run: bash packaging/build_wheel.sh dist
 
       - name: Build wheel (Windows)
@@ -67,7 +86,8 @@ jobs:
         run: bash packaging/build_wheel_windows.sh dist
 
       # ── Smoke test ──
-      - name: Smoke test
+      - name: Smoke test (native)
+        if: matrix.arch != 'aarch64'
         shell: bash
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
@@ -75,27 +95,44 @@ jobs:
           import duckdb
           con = duckdb.connect()
           print(f'DuckDB {duckdb.__version__}')
-
-          # VEX extension loaded
           r = con.execute(\"SELECT loaded FROM duckdb_extensions() WHERE extension_name='vex'\").fetchone()
           assert r and r[0], 'VEX extension not loaded!'
           print('VEX extension: loaded')
-
-          # Distance function
           r = con.execute(\"SELECT l2_distance([1,0,0]::FLOAT[3], [0,1,0]::FLOAT[3])\").fetchone()
           assert abs(r[0] - 1.4142135623730951) < 1e-6
-          print(f'l2_distance: OK')
-
-          # HNSW index + ANN search
+          print('l2_distance: OK')
           con.execute('CREATE TABLE t (id INT, v FLOAT[3])')
           con.execute(\"INSERT INTO t VALUES (1,[1,0,0]),(2,[0,1,0]),(3,[0,0,1])\")
           con.execute(\"CREATE INDEX idx ON t USING GRAPH_INDEX (v) WITH (metric='l2')\")
           r = con.execute(\"SELECT id FROM t ORDER BY l2_distance(v,[1,0,0]::FLOAT[3]) LIMIT 1\").fetchone()
           assert r[0] == 1
           print('GRAPH_INDEX + ANN: OK')
-
           print('All smoke tests passed!')
           "
+
+      - name: Smoke test (aarch64 via QEMU)
+        if: matrix.arch == 'aarch64'
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "${{ github.workspace }}:/work" \
+            -w /work \
+            python:${{ env.PYTHON_VERSION }}-bookworm \
+            bash -c "
+              pip install dist/*.whl --force-reinstall --no-deps &&
+              python -c \"
+import duckdb
+con = duckdb.connect()
+print(f'DuckDB {duckdb.__version__}')
+r = con.execute(\\\"SELECT loaded FROM duckdb_extensions() WHERE extension_name='vex'\\\").fetchone()
+assert r and r[0], 'VEX extension not loaded!'
+print('VEX extension: loaded')
+con.execute('CREATE TABLE t (id INT, v FLOAT[3])')
+con.execute(\\\"INSERT INTO t VALUES (1,[1,0,0]),(2,[0,1,0]),(3,[0,0,1])\\\")
+con.execute(\\\"CREATE INDEX idx ON t USING GRAPH_INDEX (v) WITH (metric='l2')\\\")
+print('GRAPH_INDEX: OK')
+print('All smoke tests passed!')
+\"
+            "
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
