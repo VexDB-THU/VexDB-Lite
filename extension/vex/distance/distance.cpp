@@ -7,7 +7,7 @@
 // MSVC does not support __attribute__((target(...))); on MSVC x86-64
 // SSE2 is always available and AVX2 is enabled via /arch:AVX2 compiler flag.
 #ifndef _MSC_VER
-#define VEX_TARGET_SSE  __attribute__((target("sse")))
+#define VEX_TARGET_SSE  __attribute__((target("sse4.1")))
 #define VEX_TARGET_AVX2 __attribute__((target("avx2,fma")))
 #else
 #define VEX_TARGET_SSE
