@@ -90,9 +90,8 @@ jobs:
             name: macOS-arm64
           - os: ubuntu-latest
             name: Linux-x86_64
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             name: Linux-aarch64
-            arch: aarch64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -111,49 +110,20 @@ jobs:
       - name: Extract source
         run: tar xzf duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz
 
-      # ── ccache for native builds ──
       - name: Setup ccache
-        if: matrix.arch != 'aarch64'
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: wheel-${{ matrix.name }}
 
-      # ── Linux aarch64 via QEMU ──
-      - name: Set up QEMU
-        if: matrix.arch == 'aarch64'
-        uses: docker/setup-qemu-action@v3
-        with:
-          platforms: arm64
-
-      - name: Build and test (Linux aarch64)
-        if: matrix.arch == 'aarch64'
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v "$(pwd):/work" -w /work \
-            python:${{ env.PYTHON_VERSION }}-bookworm \
-            bash -c "
-              pip install scikit-build-core pybind11 setuptools_scm ninja wheel &&
-              cd duckdb-${{ env.DUCKDB_VERSION }} &&
-              CMAKE_ARGS=\"-DBUILD_EXTENSIONS='core_functions;parquet;icu;json;vex'\" \
-              CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc) \
-              pip wheel . --no-build-isolation --no-deps -w /work/dist &&
-              pip install /work/dist/*.whl --force-reinstall --no-deps &&
-              python /work/smoke_test.py
-            "
-
-      # ── Native builds (macOS / Linux x86_64) ──
       - name: Set up Python
-        if: matrix.arch != 'aarch64'
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install build dependencies
-        if: matrix.arch != 'aarch64'
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
-      - name: Build wheel (native)
-        if: matrix.arch != 'aarch64'
+      - name: Build wheel
         run: |
           cd duckdb-${{ env.DUCKDB_VERSION }}
           CMAKE_EXTRA=""
@@ -166,8 +136,7 @@ jobs:
           export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
           pip wheel . --no-build-isolation --no-deps -w ../dist
 
-      - name: Smoke test (native)
-        if: matrix.arch != 'aarch64'
+      - name: Smoke test
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
           python smoke_test.py
