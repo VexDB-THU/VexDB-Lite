@@ -72,6 +72,11 @@ jobs:
             sed -i 's/SETUPTOOLS_SCM_PRETEND_VERSION_FOR_DUCKDB/SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VEXDB_LITE/' "$VERFILE"
           fi
 
+          # Add vexdb_lite wrapper package (auto-loads VEX on connect)
+          cp -r ${{ github.workspace }}/packaging/vexdb_lite "$BD/vexdb_lite"
+          # Register vexdb_lite as additional package in scikit-build config
+          sed -i '/^packages\.adbc_driver_duckdb/a packages.vexdb_lite = "vexdb_lite"' "$BD/pyproject.toml"
+
           # Repack
           tar czf /tmp/out/duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz -C /tmp duckdb-${{ env.DUCKDB_VERSION }}
 
