@@ -74,7 +74,6 @@ jobs:
 
           # Add vexdb_lite wrapper package (auto-loads VEX on connect)
           cp -r ${{ github.workspace }}/packaging/vexdb_lite "$BD/vexdb_lite"
-          # Register vexdb_lite as additional package in scikit-build config
           sed -i '/^packages\.adbc_driver_duckdb/a packages.vexdb_lite = "vexdb_lite"' "$BD/pyproject.toml"
 
           # Repack
@@ -86,6 +85,7 @@ jobs:
           name: vex-sdist
           path: /tmp/out/duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz
           retention-days: 1
+          compression-level: 0  # already compressed tar.gz
 
       - name: Upload smoke test
         uses: actions/upload-artifact@v4
@@ -94,7 +94,7 @@ jobs:
           path: packaging/smoke_test.py
           retention-days: 1
 
-  # ── Step 2: Build wheels in parallel (using prepared source) ──
+  # ── Step 2: Build wheels in parallel ──
   build:
     needs: prepare
     strategy:
@@ -126,12 +126,16 @@ jobs:
           name: smoke-test
 
       - name: Extract source
+        shell: bash
         run: tar xzf duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz
 
+      # ccache: max-size 500M, save on hit to maximize reuse
       - name: Setup ccache
         uses: hendrikmuhs/ccache-action@v1
         with:
           key: wheel-${{ matrix.name }}
+          max-size: 500M
+          save: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -141,12 +145,19 @@ jobs:
       - name: Install build dependencies
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
+      # Cache pip wheels to skip re-downloading build deps
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: pip-${{ matrix.name }}-${{ env.PYTHON_VERSION }}
+
       - name: Build wheel
         shell: bash
         run: |
           cd duckdb-${{ env.DUCKDB_VERSION }}
 
-          # Extract version from tag (v0.0.1 -> 0.0.1), fallback to 0.0.1
+          # Version from tag
           VEXDB_VERSION="${GITHUB_REF_NAME#v}"
           if [[ ! "$VEXDB_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
             VEXDB_VERSION="0.0.1"
@@ -161,9 +172,19 @@ jobs:
             export MACOSX_DEPLOYMENT_TARGET=11.0
             CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
           fi
+
+          # Key optimizations:
+          # - ccache: skip recompiling unchanged files
+          # - DISABLE_UNITY=OFF (default): unity builds merge .cpp files → fewer compile units
+          # - ninja: faster than make for parallel builds
           export CMAKE_ARGS="${CMAKE_EXTRA} -DBUILD_EXTENSIONS='core_functions;parquet;icu;json;vex' -DSKIP_EXTENSIONS='jemalloc' -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
           export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")
+
+          echo ">>> Build with $CMAKE_BUILD_PARALLEL_LEVEL parallel jobs, ccache enabled"
+          ccache -z  # reset stats
           pip wheel . --no-build-isolation --no-deps -w ../dist
+          echo ">>> ccache stats:"
+          ccache -s
 
       - name: Smoke test
         shell: bash
