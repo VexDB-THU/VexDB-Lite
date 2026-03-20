@@ -13,6 +13,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include <thread>
 #include <vector>
 
@@ -75,7 +79,9 @@ class SimpleRWLock {
 	std::atomic<int> state_{0};
 
 	static inline void cpu_pause() {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+		_mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
 		__builtin_ia32_pause();
 #elif defined(__aarch64__)
 		asm volatile("yield");
@@ -405,7 +411,9 @@ struct GraphIndexCore {
 				if (!locked_.exchange(true, std::memory_order_acquire)) return;
 				// Spin on read (TTAS: avoid cache line bouncing from failed CAS)
 				while (locked_.load(std::memory_order_relaxed)) {
-#if defined(__x86_64__) || defined(_M_X64)
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+					_mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
 					__builtin_ia32_pause();
 #elif defined(__aarch64__)
 					asm volatile("yield");

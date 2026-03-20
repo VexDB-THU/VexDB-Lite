@@ -107,6 +107,8 @@ jobs:
             name: Linux-x86_64
           - os: ubuntu-24.04-arm
             name: Linux-aarch64
+          - os: windows-latest
+            name: Windows-AMD64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -139,6 +141,7 @@ jobs:
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
       - name: Build wheel
+        shell: bash
         run: |
           cd duckdb-${{ env.DUCKDB_VERSION }}
 
@@ -148,7 +151,6 @@ jobs:
             VEXDB_VERSION="0.0.1"
           fi
           export OVERRIDE_GIT_DESCRIBE="v${VEXDB_VERSION}"
-          # setuptools_scm looks for pretend version by normalized package name
           export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VEXDB_LITE="${VEXDB_VERSION}"
           export SETUPTOOLS_SCM_PRETEND_VERSION="${VEXDB_VERSION}"
 
@@ -159,10 +161,11 @@ jobs:
             CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
           fi
           export CMAKE_ARGS="${CMAKE_EXTRA} -DBUILD_EXTENSIONS='core_functions;parquet;icu;json;vex' -DSKIP_EXTENSIONS='jemalloc' -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
-          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "${NUMBER_OF_PROCESSORS:-4}")
           pip wheel . --no-build-isolation --no-deps -w ../dist
 
       - name: Smoke test
+        shell: bash
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
           python smoke_test.py
