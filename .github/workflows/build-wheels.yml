@@ -101,8 +101,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-latest
-            name: macOS-arm64
+          # macOS disabled: build locally to save CI minutes (10x multiplier)
+          # - os: macos-latest
+          #   name: macOS-arm64
           - os: ubuntu-latest
             name: Linux-x86_64
           - os: ubuntu-24.04-arm

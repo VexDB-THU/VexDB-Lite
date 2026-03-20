@@ -17,51 +17,27 @@ env:
   PROFILE: ${{ inputs.profile || 'full' }}
 
 jobs:
-  ios:
-    name: "iOS ${{ matrix.name }}"
-    runs-on: macos-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Device-arm64
-            sim: 0
-          - name: Simulator-arm64
-            sim: 1
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Setup ccache
-        uses: hendrikmuhs/ccache-action@v1
-        with:
-          key: ios-${{ matrix.name }}-${{ env.PROFILE }}
-
-      - name: Build iOS
-        run: |
-          export PATH="/usr/local/opt/ccache/libexec:$PATH"
-          SIM_FLAG=""
-          [[ "${{ matrix.sim }}" == "1" ]] && SIM_FLAG="--sim"
-          bash build.sh ios $SIM_FLAG --profile ${{ env.PROFILE }}
-
-      - name: Package artifact
-        run: |
-          if [[ "${{ matrix.sim }}" == "1" ]]; then
-            BUILD_DIR="build/ios_sim${{ env.PROFILE != 'full' && format('_{0}', env.PROFILE) || '' }}"
-          else
-            BUILD_DIR="build/ios_arm64${{ env.PROFILE != 'full' && format('_{0}', env.PROFILE) || '' }}"
-          fi
-          cd "$BUILD_DIR/libvexdb"
-          tar czf /tmp/libvexdb-ios-${{ matrix.sim == '1' && 'sim' || 'arm64' }}.tar.gz libvexdb.a include/
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: ios-${{ matrix.name }}-${{ env.PROFILE }}
-          path: /tmp/libvexdb-ios-*.tar.gz
+  # iOS disabled: build locally to save CI minutes (macOS runner = 10x multiplier)
+  # Uncomment and run when needed:
+  #   gh workflow run build-mobile.yml -f profile=full
+  #
+  # ios:
+  #   name: "iOS ${{ matrix.name }}"
+  #   runs-on: macos-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - name: Device-arm64
+  #           sim: 0
+  #         - name: Simulator-arm64
+  #           sim: 1
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: hendrikmuhs/ccache-action@v1
+  #       with: { key: "ios-${{ matrix.name }}" }
+  #     - run: bash build.sh ios ${{ matrix.sim == '1' && '--sim' || '' }} --profile ${{ env.PROFILE }}
+  #     - uses: actions/upload-artifact@v4
 
   android:
     name: "Android ${{ matrix.abi }}"
@@ -114,7 +90,7 @@ jobs:
 
   # ── Collect all artifacts ──
   collect:
-    needs: [ios, android]
+    needs: [android]
     runs-on: ubuntu-latest
     steps:
       - name: Download all
