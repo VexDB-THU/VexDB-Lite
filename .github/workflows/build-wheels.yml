@@ -15,9 +15,73 @@ on:
 
 env:
   PYTHON_VERSION: ${{ inputs.python_version || '3.12' }}
+  DUCKDB_VERSION: '1.5.0'
 
 jobs:
+  # ── Step 1: Download sdist once, inject VEX, share as artifact ──
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache DuckDB sdist
+        uses: actions/cache@v4
+        with:
+          path: /tmp/duckdb-sdist.tar.gz
+          key: duckdb-sdist-${{ env.DUCKDB_VERSION }}
+
+      - name: Download sdist (if not cached)
+        run: |
+          if [ ! -f /tmp/duckdb-sdist.tar.gz ]; then
+            pip download "duckdb==${{ env.DUCKDB_VERSION }}" --no-binary :all: -d /tmp/dl
+            cp /tmp/dl/duckdb-${{ env.DUCKDB_VERSION }}.tar.gz /tmp/duckdb-sdist.tar.gz
+          fi
+
+      - name: Inject VEX into sdist
+        run: |
+          mkdir -p /tmp/out && cd /tmp
+          tar xzf duckdb-sdist.tar.gz
+          BD="/tmp/duckdb-${{ env.DUCKDB_VERSION }}"
+
+          # Copy VEX extension
+          cp -r ${{ github.workspace }}/extension/vex "$BD/external/duckdb/extension/vex"
+
+          # Copy physical_create_graph_index
+          cp ${{ github.workspace }}/src/execution/operator/schema/physical_create_graph_index.cpp \
+             "$BD/external/duckdb/src/execution/operator/schema/"
+          cp ${{ github.workspace }}/src/include/duckdb/execution/operator/schema/physical_create_graph_index.hpp \
+             "$BD/external/duckdb/src/include/duckdb/execution/operator/schema/"
+
+          # Patch CMakeLists
+          sed -i 's/physical_create_index\.cpp/physical_create_index.cpp\n  physical_create_graph_index.cpp/' \
+            "$BD/external/duckdb/src/execution/operator/schema/CMakeLists.txt"
+
+          # Add VEX to extension config
+          echo 'duckdb_extension_load(vex)' >> "$BD/external/duckdb/extension/extension_config.cmake"
+
+          # Repack
+          tar czf /tmp/out/duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz -C /tmp duckdb-${{ env.DUCKDB_VERSION }}
+
+      - name: Upload prepared source
+        uses: actions/upload-artifact@v4
+        with:
+          name: vex-sdist
+          path: /tmp/out/duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz
+          retention-days: 1
+
+      - name: Upload smoke test
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-test
+          path: packaging/smoke_test.py
+          retention-days: 1
+
+  # ── Step 2: Build wheels in parallel (using prepared source) ──
   build:
+    needs: prepare
     strategy:
       fail-fast: false
       matrix:
@@ -29,22 +93,32 @@ jobs:
           - os: ubuntu-latest
             name: Linux-aarch64
             arch: aarch64
-          # Windows disabled: VEX uses GCC builtins (__builtin_ia32_pause) and C++17 inline vars
-          # TODO: fix MSVC compatibility in vex_graph_index_core.hpp
-          # - os: windows-latest
-          #   name: Windows-AMD64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Download prepared source
+        uses: actions/download-artifact@v4
         with:
-          submodules: recursive
-          fetch-depth: 0
+          name: vex-sdist
 
-      # ── Linux aarch64: cross-compile via Docker + QEMU ──
+      - name: Download smoke test
+        uses: actions/download-artifact@v4
+        with:
+          name: smoke-test
+
+      - name: Extract source
+        run: tar xzf duckdb-vex-${{ env.DUCKDB_VERSION }}.tar.gz
+
+      # ── ccache for native builds ──
+      - name: Setup ccache
+        if: matrix.arch != 'aarch64'
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: wheel-${{ matrix.name }}
+
+      # ── Linux aarch64 via QEMU ──
       - name: Set up QEMU
         if: matrix.arch == 'aarch64'
         uses: docker/setup-qemu-action@v3
@@ -55,12 +129,19 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           docker run --rm --platform linux/arm64 \
-            -v "${{ github.workspace }}:/work" \
-            -w /work \
+            -v "$(pwd):/work" -w /work \
             python:${{ env.PYTHON_VERSION }}-bookworm \
-            bash -c "pip install scikit-build-core pybind11 setuptools_scm ninja wheel && bash packaging/build_wheel.sh dist && pip install dist/*.whl --force-reinstall --no-deps && python packaging/smoke_test.py"
+            bash -c "
+              pip install scikit-build-core pybind11 setuptools_scm ninja wheel &&
+              cd duckdb-${{ env.DUCKDB_VERSION }} &&
+              CMAKE_ARGS=\"-DBUILD_EXTENSIONS='core_functions;parquet;icu;json;vex'\" \
+              CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc) \
+              pip wheel . --no-build-isolation --no-deps -w /work/dist &&
+              pip install /work/dist/*.whl --force-reinstall --no-deps &&
+              python /work/smoke_test.py
+            "
 
-      # ── Native builds ──
+      # ── Native builds (macOS / Linux x86_64) ──
       - name: Set up Python
         if: matrix.arch != 'aarch64'
         uses: actions/setup-python@v5
@@ -71,16 +152,25 @@ jobs:
         if: matrix.arch != 'aarch64'
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
-      - name: Build wheel (Unix)
+      - name: Build wheel (native)
         if: matrix.arch != 'aarch64'
-        run: bash packaging/build_wheel.sh dist
+        run: |
+          cd duckdb-${{ env.DUCKDB_VERSION }}
+          CMAKE_EXTRA=""
+          if [[ "$(uname)" == "Darwin" ]]; then
+            ARCH=$(python3 -c "import platform; print(platform.machine())")
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+            CMAKE_EXTRA="-DCMAKE_OSX_ARCHITECTURES=$ARCH -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"
+          fi
+          export CMAKE_ARGS="${CMAKE_EXTRA} -DBUILD_EXTENSIONS='core_functions;parquet;icu;json;vex' -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+          pip wheel . --no-build-isolation --no-deps -w ../dist
 
-      - name: Smoke test
+      - name: Smoke test (native)
         if: matrix.arch != 'aarch64'
-        shell: bash
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
-          python packaging/smoke_test.py
+          python smoke_test.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -88,6 +178,7 @@ jobs:
           name: wheel-${{ matrix.name }}-py${{ env.PYTHON_VERSION }}
           path: dist/*.whl
 
+  # ── Step 3: Collect ──
   collect:
     needs: build
     runs-on: ubuntu-latest
@@ -108,6 +199,7 @@ jobs:
           name: vexdb-lite-wheels
           path: all-wheels/*.whl
 
+  # ── Step 4: Release (tag only) ──
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: collect
