@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 // MSVC does not support __attribute__((target(...))); on MSVC x86-64
 // SSE2 is always available and AVX2 is enabled via /arch:AVX2 compiler flag.
