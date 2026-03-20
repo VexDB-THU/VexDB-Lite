@@ -29,8 +29,10 @@ jobs:
           - os: ubuntu-latest
             name: Linux-aarch64
             arch: aarch64
-          - os: windows-latest
-            name: Windows-AMD64
+          # Windows disabled: VEX uses GCC builtins (__builtin_ia32_pause) and C++17 inline vars
+          # TODO: fix MSVC compatibility in vex_graph_index_core.hpp
+          # - os: windows-latest
+          #   name: Windows-AMD64
 
     runs-on: ${{ matrix.os }}
     name: ${{ matrix.name }}
@@ -70,13 +72,8 @@ jobs:
         run: pip install scikit-build-core pybind11 setuptools_scm ninja wheel
 
       - name: Build wheel (Unix)
-        if: runner.os != 'Windows' && matrix.arch != 'aarch64'
+        if: matrix.arch != 'aarch64'
         run: bash packaging/build_wheel.sh dist
-
-      - name: Build wheel (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: bash packaging/build_wheel_windows.sh dist
 
       - name: Smoke test
         if: matrix.arch != 'aarch64'

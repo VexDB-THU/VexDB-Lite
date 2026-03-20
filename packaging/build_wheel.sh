@@ -88,8 +88,9 @@ echo "    Parallel jobs: $CMAKE_BUILD_PARALLEL_LEVEL"
 
 pip3 wheel . --no-build-isolation --no-deps -w "$OUTPUT_DIR"
 
-# Step 7: Patch libc++ linking on macOS
-if [[ "$(uname)" == "Darwin" ]]; then
+# Step 7: Patch libc++ linking on macOS (only needed for macOS 26+ / Apple Clang 17+)
+# Skip in CI environments where system libc++ is fine
+if [[ "$(uname)" == "Darwin" && -z "${CI:-}" ]]; then
     WHEEL_FILE=$(ls -t "$OUTPUT_DIR"/duckdb-*.whl | head -1)
     echo ">>> Patching wheel for libc++ compatibility..."
 
