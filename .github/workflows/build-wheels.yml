@@ -22,17 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macOS Apple Silicon
           - os: macos-latest
             name: macOS-arm64
-          # Linux x86_64
           - os: ubuntu-latest
             name: Linux-x86_64
-          # Linux ARM64 (Kunpeng/鲲鹏 compatible) - uses QEMU emulation
           - os: ubuntu-latest
             name: Linux-aarch64
             arch: aarch64
-          # Windows
           - os: windows-latest
             name: Windows-AMD64
 
@@ -53,19 +49,16 @@ jobs:
         with:
           platforms: arm64
 
-      - name: Build wheel (Linux aarch64)
+      - name: Build and test (Linux aarch64)
         if: matrix.arch == 'aarch64'
         run: |
           docker run --rm --platform linux/arm64 \
             -v "${{ github.workspace }}:/work" \
             -w /work \
             python:${{ env.PYTHON_VERSION }}-bookworm \
-            bash -c "
-              pip install scikit-build-core pybind11 setuptools_scm ninja wheel &&
-              bash packaging/build_wheel.sh dist
-            "
+            bash -c "pip install scikit-build-core pybind11 setuptools_scm ninja wheel && bash packaging/build_wheel.sh dist && pip install dist/*.whl --force-reinstall --no-deps && python packaging/smoke_test.py"
 
-      # ── Native builds (macOS / Linux x86_64 / Windows) ──
+      # ── Native builds ──
       - name: Set up Python
         if: matrix.arch != 'aarch64'
         uses: actions/setup-python@v5
@@ -85,54 +78,12 @@ jobs:
         shell: bash
         run: bash packaging/build_wheel_windows.sh dist
 
-      # ── Smoke test ──
-      - name: Smoke test (native)
+      - name: Smoke test
         if: matrix.arch != 'aarch64'
         shell: bash
         run: |
           pip install dist/*.whl --force-reinstall --no-deps
-          python -c "
-          import duckdb
-          con = duckdb.connect()
-          print(f'DuckDB {duckdb.__version__}')
-          r = con.execute(\"SELECT loaded FROM duckdb_extensions() WHERE extension_name='vex'\").fetchone()
-          assert r and r[0], 'VEX extension not loaded!'
-          print('VEX extension: loaded')
-          r = con.execute(\"SELECT l2_distance([1,0,0]::FLOAT[3], [0,1,0]::FLOAT[3])\").fetchone()
-          assert abs(r[0] - 1.4142135623730951) < 1e-6
-          print('l2_distance: OK')
-          con.execute('CREATE TABLE t (id INT, v FLOAT[3])')
-          con.execute(\"INSERT INTO t VALUES (1,[1,0,0]),(2,[0,1,0]),(3,[0,0,1])\")
-          con.execute(\"CREATE INDEX idx ON t USING GRAPH_INDEX (v) WITH (metric='l2')\")
-          r = con.execute(\"SELECT id FROM t ORDER BY l2_distance(v,[1,0,0]::FLOAT[3]) LIMIT 1\").fetchone()
-          assert r[0] == 1
-          print('GRAPH_INDEX + ANN: OK')
-          print('All smoke tests passed!')
-          "
-
-      - name: Smoke test (aarch64 via QEMU)
-        if: matrix.arch == 'aarch64'
-        run: |
-          docker run --rm --platform linux/arm64 \
-            -v "${{ github.workspace }}:/work" \
-            -w /work \
-            python:${{ env.PYTHON_VERSION }}-bookworm \
-            bash -c "
-              pip install dist/*.whl --force-reinstall --no-deps &&
-              python -c \"
-import duckdb
-con = duckdb.connect()
-print(f'DuckDB {duckdb.__version__}')
-r = con.execute(\\\"SELECT loaded FROM duckdb_extensions() WHERE extension_name='vex'\\\").fetchone()
-assert r and r[0], 'VEX extension not loaded!'
-print('VEX extension: loaded')
-con.execute('CREATE TABLE t (id INT, v FLOAT[3])')
-con.execute(\\\"INSERT INTO t VALUES (1,[1,0,0]),(2,[0,1,0]),(3,[0,0,1])\\\")
-con.execute(\\\"CREATE INDEX idx ON t USING GRAPH_INDEX (v) WITH (metric='l2')\\\")
-print('GRAPH_INDEX: OK')
-print('All smoke tests passed!')
-\"
-            "
+          python packaging/smoke_test.py
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
@@ -140,7 +91,6 @@ print('All smoke tests passed!')
           name: wheel-${{ matrix.name }}-py${{ env.PYTHON_VERSION }}
           path: dist/*.whl
 
-  # ── Collect all wheels ──
   collect:
     needs: build
     runs-on: ubuntu-latest
@@ -161,7 +111,6 @@ print('All smoke tests passed!')
           name: vexdb-lite-wheels
           path: all-wheels/*.whl
 
-  # ── GitHub Release (tag push only) ──
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: collect
