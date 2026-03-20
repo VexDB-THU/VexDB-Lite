@@ -32,4 +32,8 @@ void VexTypes::Register(ExtensionLoader &loader) {
 	loader.RegisterType(FLOATVECTOR_TYPE_NAME, std::move(base_type), BindFloatVectorType);
 }
 
+// C++11/14 out-of-line definitions for static constexpr members
+constexpr const char *VexTypes::FLOATVECTOR_TYPE_NAME;
+constexpr idx_t VexTypes::FLOATVECTOR_MAX_DIM;
+
 } // namespace duckdb

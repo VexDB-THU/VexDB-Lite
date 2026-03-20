@@ -1338,4 +1338,6 @@ void GraphIndex::Clear() {
 	dimension_ = 0;
 }
 
+constexpr const char *GraphIndex::TYPE_NAME;
+
 } // namespace duckdb

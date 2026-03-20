@@ -1101,4 +1101,6 @@ string HybridIndex::GetConstraintViolationMessage(VerifyExistenceType verify_typ
 	return "Constraint violation in HYBRID_INDEX";
 }
 
+constexpr const char *HybridIndex::TYPE_NAME;
+
 } // namespace duckdb

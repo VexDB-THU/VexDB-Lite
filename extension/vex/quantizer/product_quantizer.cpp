@@ -263,5 +263,8 @@ bool ProductQuantizer::DeserializeFrom(const char *&ptr, const char *end) {
 	return true;
 }
 
+constexpr uint32_t ProductQuantizer::MAX_KMEANS_ITERS;
+constexpr uint32_t ProductQuantizer::MIN_TRAINING_POINTS;
+
 } // namespace vex
 } // namespace duckdb
