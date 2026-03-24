@@ -9,41 +9,41 @@ require vex
 # =============================================================================
 
 statement ok
-CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOAT[4]);
 
 # Category A: ids 0-199, vectors along axis 1
 statement ok
 INSERT INTO products
 SELECT i AS id, 'cat_a' AS category,
-  [(i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOATVECTOR(4)
+  [(i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Category B: ids 200-399, vectors along axis 2
 statement ok
 INSERT INTO products
 SELECT 200 + i AS id, 'cat_b' AS category,
-  [0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT]::FLOATVECTOR(4)
+  [0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT, 0.0::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Category C: ids 400-599, vectors along axis 3
 statement ok
 INSERT INTO products
 SELECT 400 + i AS id, 'cat_c' AS category,
-  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOATVECTOR(4)
+  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Category D: ids 600-799, vectors along axis 4
 statement ok
 INSERT INTO products
 SELECT 600 + i AS id, 'cat_d' AS category,
-  [(0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT]::FLOATVECTOR(4)
+  [(0.5 + i * 0.001)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Category E: ids 800-999, mixed vectors
 statement ok
 INSERT INTO products
 SELECT 800 + i AS id, 'cat_e' AS category,
-  [(i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT]::FLOATVECTOR(4)
+  [(i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT, (i * 0.005)::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Verify total count
@@ -82,7 +82,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_hybrid';
 query I
 SELECT id FROM products
 WHERE category = 'cat_a'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 0
@@ -91,7 +91,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_b'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 200
@@ -100,7 +100,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_c'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 400
@@ -109,7 +109,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_d'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 600
@@ -118,7 +118,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_e'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 800
@@ -128,7 +128,7 @@ query I
 SELECT COUNT(*) FROM (
   SELECT id FROM products
   WHERE category = 'cat_a'
-  ORDER BY l2_distance(vec, [1.0, 0.5, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [1.0, 0.5, 0.0, 0.0]::FLOAT[4])
   LIMIT 5
 ) t;
 ----
@@ -141,7 +141,7 @@ SELECT COUNT(*) FROM (
 # cat_e id=800 has [0,0,0,0], should be globally closest to origin
 query II
 SELECT id, category FROM products
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 800	cat_e
@@ -150,7 +150,7 @@ LIMIT 1;
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM products
-  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 ) t;
 ----
@@ -181,7 +181,7 @@ query I
 SELECT COUNT(*) FROM (
   SELECT id FROM products
   WHERE category = 'cat_c'
-  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 5
 ) t;
 ----
@@ -194,7 +194,7 @@ SELECT COUNT(*) FROM (
 query I
 SELECT id FROM products
 WHERE category = 'cat_a'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 0
@@ -202,7 +202,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_b'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 200
@@ -210,7 +210,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_d'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 600
@@ -218,7 +218,7 @@ LIMIT 1;
 query I
 SELECT id FROM products
 WHERE category = 'cat_e'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 800
@@ -239,7 +239,7 @@ cat_e	200
 statement ok
 INSERT INTO products
 SELECT 1000 + i AS id, 'cat_c' AS category,
-  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOATVECTOR(4)
+  [0.0::FLOAT, 0.0::FLOAT, (i * 0.01)::FLOAT, (0.5 + i * 0.001)::FLOAT]::FLOAT[4]
 FROM range(200) t(i);
 
 # Verify total count restored to 1000
@@ -259,7 +259,7 @@ SELECT COUNT(*) FROM products WHERE category = 'cat_c';
 query I
 SELECT abs(id - 1000) <= 2 FROM products
 WHERE category = 'cat_c'
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
 true
@@ -269,7 +269,7 @@ query I
 SELECT COUNT(*) FROM (
   SELECT id FROM products
   WHERE category = 'cat_c'
-  ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.5]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.5]::FLOAT[4])
   LIMIT 5
 ) t;
 ----
@@ -279,7 +279,7 @@ SELECT COUNT(*) FROM (
 query I
 SELECT COUNT(*) FROM (
   SELECT id, category FROM products
-  ORDER BY l2_distance(vec, [0.0, 0.0, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 ) t;
 ----

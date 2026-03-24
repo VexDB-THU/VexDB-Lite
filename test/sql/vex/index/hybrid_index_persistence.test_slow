@@ -10,21 +10,21 @@ load __TEST_DIR__/hybrid_persist_slow.db
 # Phase 1: Create and populate
 # ============================================================
 statement ok
-CREATE TABLE hp (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE hp (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx ON hp USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO hp SELECT i, 'cat_a', list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO hp SELECT i, 'cat_a', list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
-INSERT INTO hp SELECT i, 'cat_b', list_value(cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO hp SELECT i, 'cat_b', list_value(cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 statement ok
-INSERT INTO hp SELECT i, 'cat_c', list_value(sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO hp SELECT i, 'cat_c', list_value(sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT)::FLOAT[4]
 FROM range(201, 301) t(i);
 
 query I
@@ -46,23 +46,23 @@ SELECT count(*) FROM hp;
 300
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 # Global search
 query I
-SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 15);
+SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 15);
 ----
 15
 
@@ -88,7 +88,7 @@ SELECT count(*) FROM hp WHERE cat = 'cat_a';
 50
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -120,18 +120,18 @@ SELECT count(*) FROM hp WHERE cat = 'cat_b';
 0
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 0
 
 # Remaining partitions
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -139,7 +139,7 @@ SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance
 # Phase 5: Reinsert into deleted partition, no checkpoint, restart (WAL replay)
 # ============================================================
 statement ok
-INSERT INTO hp SELECT i, 'cat_b', list_value(cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO hp SELECT i, 'cat_b', list_value(cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT)::FLOAT[4]
 FROM range(301, 401) t(i);
 
 query I
@@ -156,7 +156,7 @@ SELECT count(*) FROM hp WHERE cat = 'cat_b';
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_b' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -167,7 +167,7 @@ statement ok
 DELETE FROM hp WHERE cat = 'cat_c' AND id BETWEEN 201 AND 250;
 
 statement ok
-INSERT INTO hp SELECT i, 'cat_c', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO hp SELECT i, 'cat_c', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(401, 451) t(i);
 
 # NO CHECKPOINT
@@ -179,7 +179,7 @@ SELECT count(*) FROM hp WHERE cat = 'cat_c';
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp WHERE cat = 'cat_c' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -198,7 +198,7 @@ statement ok
 SELECT count(*) FROM hp;
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -212,14 +212,14 @@ statement ok
 CREATE INDEX idx2 ON hp USING HYBRID_INDEX (vec, cat);
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 restart
 
 query I
-SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM hp ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 

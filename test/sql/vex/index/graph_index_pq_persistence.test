@@ -10,20 +10,20 @@ load __TEST_DIR__/pq_persist.db
 # Phase 1: Create PQ index and populate
 # ============================================================
 statement ok
-CREATE TABLE pq_p (id INTEGER PRIMARY KEY, vec FLOATVECTOR(8));
+CREATE TABLE pq_p (id INTEGER PRIMARY KEY, vec FLOAT[8]);
 
 statement ok
 INSERT INTO pq_p SELECT i, list_value(
     sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT,
     sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 301) t(i);
 
 statement ok
 CREATE INDEX idx ON pq_p USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
 
 query I
-SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -41,7 +41,7 @@ SELECT count(*) FROM pq_p;
 300
 
 query I
-SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -62,7 +62,7 @@ SELECT count(*) FROM pq_p;
 250
 
 query I
-SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -79,7 +79,7 @@ statement ok
 SELECT count(*) FROM pq_p;
 
 query I
-SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -90,7 +90,7 @@ statement ok
 INSERT INTO pq_p SELECT i, list_value(
     cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT,
     cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.9)::FLOAT, sin(i*1.0)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(301, 501) t(i);
 
 statement ok
@@ -102,7 +102,7 @@ statement ok
 SELECT count(*) FROM pq_p;
 
 query I
-SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 

@@ -18,29 +18,29 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos1 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_cos1 (id INTEGER, vec FLOAT[3]);
 
 # Normalized vectors (unit length)
 statement ok
 INSERT INTO t_cos1 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, [0.577, 0.577, 0.577]::FLOATVECTOR(3)),
-  (5, [0.707, 0.707, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [0.577, 0.577, 0.577]::FLOAT[3]),
+  (5, [0.707, 0.707, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_cos1 ON t_cos1 USING GRAPH_INDEX (vec);
 
 # Query: find closest to [1,0,0] — should be id=1 (exact match, distance=0)
 query I
-SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 # Top-3: [1,0,0] then [0.707,0.707,0] (cos_dist≈0.293) then [0.577,0.577,0.577] (cos_dist≈0.423)
 query I
-SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+SELECT id FROM t_cos1 ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
 ----
 1
 5
@@ -54,21 +54,21 @@ DROP TABLE t_cos1;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_cos2 VALUES
-  (1, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (2, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (3, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)),
-  (4, [0.707, 0.707, 0.0, 0.0]::FLOATVECTOR(4));
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (3, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]),
+  (4, [0.707, 0.707, 0.0, 0.0]::FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_cos2 ON t_cos2 USING GRAPH_INDEX (vec);
 
 # <=> is the cosine distance operator
 query I
-SELECT id FROM t_cos2 ORDER BY vec <=> [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) LIMIT 2;
+SELECT id FROM t_cos2 ORDER BY vec <=> [1.0, 0.0, 0.0, 0.0]::FLOAT[4] LIMIT 2;
 ----
 1
 4
@@ -82,7 +82,7 @@ DROP TABLE t_cos2;
 # ============================================================
 
 statement ok
-CREATE TABLE t_embed (id INTEGER, vec FLOATVECTOR(16));
+CREATE TABLE t_embed (id INTEGER, vec FLOAT[16]);
 
 # Generate 200 normalized-ish vectors using trig functions
 # sin²(x) + cos²(x) = 1, so pairs of (sin, cos) form unit-length components
@@ -96,7 +96,7 @@ INSERT INTO t_embed SELECT i, list_value(
   sin(i*0.6)::FLOAT, cos(i*0.6)::FLOAT,
   sin(i*0.7)::FLOAT, cos(i*0.7)::FLOAT,
   sin(i*0.8)::FLOAT, cos(i*0.8)::FLOAT
-)::FLOATVECTOR(16)
+)::FLOAT[16]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -112,7 +112,7 @@ true
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_embed
-  ORDER BY cosine_distance(vec, [1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0]::FLOATVECTOR(16))
+  ORDER BY cosine_distance(vec, [1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0,1.0,0.0]::FLOAT[16])
   LIMIT 10
 );
 ----
@@ -141,7 +141,7 @@ DROP TABLE t_embed;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_ins (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_ins (id INTEGER, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_cos_ins ON t_cos_ins USING GRAPH_INDEX (vec);
@@ -151,13 +151,13 @@ statement ok
 INSERT INTO t_cos_ins SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_ins
-  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -168,13 +168,13 @@ statement ok
 INSERT INTO t_cos_ins SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
   cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_ins
-  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 20
 );
 ----
@@ -193,13 +193,13 @@ DROP TABLE t_cos_ins;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_del (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_del (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_cos_del SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -211,7 +211,7 @@ DELETE FROM t_cos_del WHERE id <= 50;
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_del
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -221,7 +221,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_del
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 50
 ) sub
 WHERE sub.id <= 50;
@@ -236,12 +236,12 @@ DROP TABLE t_cos_del;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_upd (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_upd (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_cos_upd SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
@@ -249,11 +249,11 @@ CREATE INDEX idx_cos_upd ON t_cos_upd USING GRAPH_INDEX (vec);
 
 # Update id=1 to a distinctive vector
 statement ok
-UPDATE t_cos_upd SET vec = [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4) WHERE id = 1;
+UPDATE t_cos_upd SET vec = [0.0, 0.0, 0.0, 1.0]::FLOAT[4] WHERE id = 1;
 
 # Search for the updated vector — should find id=1
 query I
-SELECT id FROM t_cos_upd ORDER BY cosine_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM t_cos_upd ORDER BY cosine_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]) LIMIT 1;
 ----
 1
 
@@ -272,13 +272,13 @@ DROP TABLE t_cos_upd;
 load __TEST_DIR__/cosine_restart.db
 
 statement ok
-CREATE TABLE t_cos_restart (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_restart (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_cos_restart SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -293,7 +293,7 @@ restart
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_restart
-  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -304,13 +304,13 @@ statement ok
 INSERT INTO t_cos_restart SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
   cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_restart
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 15
 );
 ----
@@ -329,7 +329,7 @@ DROP TABLE t_cos_restart;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_hybrid (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_hybrid (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_cos_hybrid ON t_cos_hybrid USING HYBRID_INDEX (vec, cat);
@@ -337,13 +337,13 @@ CREATE INDEX idx_cos_hybrid ON t_cos_hybrid USING HYBRID_INDEX (vec, cat);
 statement ok
 INSERT INTO t_cos_hybrid SELECT i, 'electronics', list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
 INSERT INTO t_cos_hybrid SELECT i, 'books', list_value(
   0.0, 0.0, sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 # Cosine search within partition
@@ -351,7 +351,7 @@ query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_hybrid
   WHERE cat = 'electronics'
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 5
 );
 ----
@@ -361,7 +361,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_hybrid
-  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 );
 ----

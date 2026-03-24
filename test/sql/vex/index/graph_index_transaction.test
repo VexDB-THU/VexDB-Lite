@@ -10,23 +10,23 @@ require vex
 # Test 1: INSERT then search (auto-commit)
 # ============================================================
 statement ok
-CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t1 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t1 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
 
 statement ok
-INSERT INTO t1 VALUES (4, [0.99, 0.01, 0.0]::FLOATVECTOR(3));
+INSERT INTO t1 VALUES (4, [0.99, 0.01, 0.0]::FLOAT[3]);
 
 # id=4 is closest to [0.98, 0.02, 0]
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 4
 
@@ -37,13 +37,13 @@ DROP TABLE t1;
 # Test 2: DELETE then search (auto-commit)
 # ============================================================
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t2 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
@@ -69,12 +69,12 @@ DROP TABLE t2;
 # Test 3: BEGIN + INSERT + COMMIT
 # ============================================================
 statement ok
-CREATE TABLE t3 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t3 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t3 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx3 ON t3 USING GRAPH_INDEX (vec);
@@ -83,14 +83,14 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t3 VALUES (3, [0.99, 0.0, 0.01]::FLOATVECTOR(3));
+INSERT INTO t3 VALUES (3, [0.99, 0.0, 0.01]::FLOAT[3]);
 
 statement ok
 COMMIT;
 
 # id=3 should be findable after commit
 query I
-SELECT id FROM t3 ORDER BY l2_distance(vec, [0.98, 0.0, 0.02]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t3 ORDER BY l2_distance(vec, [0.98, 0.0, 0.02]::FLOAT[3]) LIMIT 1;
 ----
 3
 
@@ -101,13 +101,13 @@ DROP TABLE t3;
 # Test 4: BEGIN + DELETE + COMMIT
 # ============================================================
 statement ok
-CREATE TABLE t4 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t4 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t4 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx4 ON t4 USING GRAPH_INDEX (vec);
@@ -134,13 +134,13 @@ DROP TABLE t4;
 # Test 5: BEGIN + INSERT + DELETE + COMMIT (combined ops)
 # ============================================================
 statement ok
-CREATE TABLE t5 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t5 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t5 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx5 ON t5 USING GRAPH_INDEX (vec);
@@ -149,7 +149,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t5 VALUES (4, [0.9, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO t5 VALUES (4, [0.9, 0.0, 0.0]::FLOAT[3]);
 
 statement ok
 DELETE FROM t5 WHERE id = 2;
@@ -180,12 +180,12 @@ DROP TABLE t5;
 # Test 6: CREATE INDEX inside transaction, then ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE t6 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t6 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t6 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 BEGIN;
@@ -209,7 +209,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx6';
 
 # Data should still be accessible without index
 query I
-SELECT id FROM t6 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t6 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -220,12 +220,12 @@ DROP TABLE t6;
 # Test 7: DROP INDEX inside transaction, then ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE t7 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t7 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t7 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx7 ON t7 USING GRAPH_INDEX (vec);
@@ -257,19 +257,19 @@ DROP TABLE t7;
 # Test 8: Multiple sequential commits
 # ============================================================
 statement ok
-CREATE TABLE t8 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t8 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 CREATE INDEX idx8 ON t8 USING GRAPH_INDEX (vec);
 
 statement ok
-INSERT INTO t8 VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO t8 VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO t8 VALUES (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO t8 VALUES (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO t8 VALUES (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+INSERT INTO t8 VALUES (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 query I
 SELECT count(*) FROM t8;
@@ -277,7 +277,7 @@ SELECT count(*) FROM t8;
 3
 
 query I
-SELECT id FROM t8 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t8 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -288,12 +288,12 @@ DROP TABLE t8;
 # Test 9: BEGIN + INSERT + ROLLBACK (data should not be visible)
 # ============================================================
 statement ok
-CREATE TABLE t9 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t9 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t9 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx9 ON t9 USING GRAPH_INDEX (vec);
@@ -302,10 +302,10 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t9 VALUES (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+INSERT INTO t9 VALUES (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO t9 VALUES (4, [0.5, 0.5, 0.0]::FLOATVECTOR(3));
+INSERT INTO t9 VALUES (4, [0.5, 0.5, 0.0]::FLOAT[3]);
 
 statement ok
 ROLLBACK;
@@ -318,12 +318,12 @@ SELECT count(*) FROM t9;
 
 # Search should still work correctly
 query I
-SELECT id FROM t9 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t9 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 query I
-SELECT id FROM t9 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t9 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2
 
@@ -334,13 +334,13 @@ DROP TABLE t9;
 # Test 10: BEGIN + DELETE + ROLLBACK (deleted data should still be visible)
 # ============================================================
 statement ok
-CREATE TABLE t10 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t10 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t10 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx10 ON t10 USING GRAPH_INDEX (vec);
@@ -368,7 +368,7 @@ SELECT count(*) FROM t10;
 
 # id=1 should be searchable again
 query I
-SELECT id FROM t10 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t10 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -379,13 +379,13 @@ DROP TABLE t10;
 # Test 11: BEGIN + INSERT + DELETE + ROLLBACK (mixed ops rollback)
 # ============================================================
 statement ok
-CREATE TABLE t11 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t11 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t11 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx11 ON t11 USING GRAPH_INDEX (vec);
@@ -394,7 +394,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t11 VALUES (4, [0.5, 0.5, 0.0]::FLOATVECTOR(3));
+INSERT INTO t11 VALUES (4, [0.5, 0.5, 0.0]::FLOAT[3]);
 
 statement ok
 DELETE FROM t11 WHERE id = 2;
@@ -425,12 +425,12 @@ DROP TABLE t11;
 # Test 12: Consecutive ROLLBACK then COMMIT
 # ============================================================
 statement ok
-CREATE TABLE t12 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t12 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t12 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx12 ON t12 USING GRAPH_INDEX (vec);
@@ -440,7 +440,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t12 VALUES (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+INSERT INTO t12 VALUES (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 ROLLBACK;
@@ -455,7 +455,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t12 VALUES (4, [0.5, 0.5, 0.5]::FLOATVECTOR(3));
+INSERT INTO t12 VALUES (4, [0.5, 0.5, 0.5]::FLOAT[3]);
 
 statement ok
 COMMIT;
@@ -477,7 +477,7 @@ SELECT count(*) FROM t12 WHERE id = 4;
 
 # Search should find id=4
 query I
-SELECT id FROM t12 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t12 ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT 1;
 ----
 4
 
@@ -490,13 +490,13 @@ DROP TABLE t12;
 # has uncommitted data, otherwise newly inserted rows are missed.
 # ============================================================
 statement ok
-CREATE TABLE t13 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t13 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t13 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx13 ON t13 USING GRAPH_INDEX (vec);
@@ -505,11 +505,11 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO t13 VALUES (4, [0.99, 0.01, 0.0]::FLOATVECTOR(3));
+INSERT INTO t13 VALUES (4, [0.99, 0.01, 0.0]::FLOAT[3]);
 
 # Within the uncommitted transaction, vector search must see id=4
 query I
-SELECT id FROM t13 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t13 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 4
 
@@ -517,7 +517,7 @@ SELECT id FROM t13 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOATVECTOR(3)) 
 query I
 SELECT count(*) FROM (
   SELECT id FROM t13
-  ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOATVECTOR(3))
+  ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOAT[3])
   LIMIT 2
 ) t;
 ----
@@ -528,7 +528,7 @@ COMMIT;
 
 # After commit, search should still find id=4
 query I
-SELECT id FROM t13 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t13 ORDER BY l2_distance(vec, [0.98, 0.02, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 4
 
@@ -539,13 +539,13 @@ DROP TABLE t13;
 # Test 14: Vector search within uncommitted DELETE transaction
 # ============================================================
 statement ok
-CREATE TABLE t14 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t14 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t14 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx14 ON t14 USING GRAPH_INDEX (vec);
@@ -558,7 +558,7 @@ DELETE FROM t14 WHERE id = 1;
 
 # Within the uncommitted transaction, vector search must NOT find id=1
 query I
-SELECT id FROM t14 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t14 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2
 
@@ -572,13 +572,13 @@ DROP TABLE t14;
 # Test 15: Vector search within uncommitted INSERT+DELETE transaction
 # ============================================================
 statement ok
-CREATE TABLE t15 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t15 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t15 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx15 ON t15 USING GRAPH_INDEX (vec);
@@ -591,11 +591,11 @@ statement ok
 DELETE FROM t15 WHERE id = 1;
 
 statement ok
-INSERT INTO t15 VALUES (4, [0.95, 0.05, 0.0]::FLOATVECTOR(3));
+INSERT INTO t15 VALUES (4, [0.95, 0.05, 0.0]::FLOAT[3]);
 
 # Vector search should find id=4 (not deleted id=1)
 query I
-SELECT id FROM t15 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t15 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 4
 

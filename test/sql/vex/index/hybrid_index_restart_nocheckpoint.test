@@ -14,17 +14,17 @@ require vex
 load __TEST_DIR__/hybrid_nocp1.db
 
 statement ok
-CREATE TABLE t1 (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t1 (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO t1 SELECT i, 'alpha', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, 'alpha', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
-INSERT INTO t1 SELECT i, 'beta', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, 'beta', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 # NO CHECKPOINT
@@ -49,7 +49,7 @@ SELECT count(*) FROM t1 WHERE cat = 'beta';
 query I
 SELECT count(*) FROM (
   SELECT id FROM t1 WHERE cat = 'alpha'
-  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 5
+  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 5
 );
 ----
 5
@@ -57,7 +57,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t1 WHERE cat = 'beta'
-  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 5
+  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 5
 );
 ----
 5
@@ -85,7 +85,7 @@ SELECT count(*) FROM t1;
 query I
 SELECT count(*) FROM (
   SELECT id FROM t1 WHERE cat = 'alpha'
-  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 5
+  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 5
 );
 ----
 5
@@ -96,7 +96,7 @@ SELECT count(*) FROM (
 
 # Insert new partition
 statement ok
-INSERT INTO t1 SELECT i, 'gamma', list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.1, 0.2)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, 'gamma', list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.1, 0.2)::FLOAT[4]
 FROM range(101, 131) t(i);
 
 # Delete entire beta partition
@@ -130,7 +130,7 @@ SELECT count(*) FROM t1;
 query I
 SELECT count(*) FROM (
   SELECT id FROM t1 WHERE cat = 'gamma'
-  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10
+  ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10
 );
 ----
 10

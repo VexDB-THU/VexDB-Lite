@@ -22,12 +22,12 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE t_inv1 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_inv1 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_inv1 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -55,7 +55,7 @@ DROP TABLE t_inv1;
 # ============================================================
 
 statement ok
-CREATE TABLE t_inv2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_inv2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_inv2 ON t_inv2 USING GRAPH_INDEX (vec);
@@ -64,7 +64,7 @@ CREATE INDEX idx_inv2 ON t_inv2 USING GRAPH_INDEX (vec);
 statement ok
 INSERT INTO t_inv2 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 query I
@@ -76,7 +76,7 @@ true
 statement ok
 INSERT INTO t_inv2 SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 query I
@@ -88,7 +88,7 @@ true
 statement ok
 INSERT INTO t_inv2 SELECT i, list_value(
   sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(201, 401) t(i);
 
 query I
@@ -106,12 +106,12 @@ DROP TABLE t_inv2;
 # ============================================================
 
 statement ok
-CREATE TABLE t_inv3 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_inv3 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_inv3 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -153,12 +153,12 @@ DROP TABLE t_inv3;
 # ============================================================
 
 statement ok
-CREATE TABLE t_inv4 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_inv4 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_inv4 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -166,7 +166,7 @@ CREATE INDEX idx_inv4 ON t_inv4 USING GRAPH_INDEX (vec);
 
 # Single UPDATE
 statement ok
-UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id = 1;
+UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id = 1;
 
 query I
 SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv4';
@@ -175,7 +175,7 @@ true
 
 # Batch UPDATE
 statement ok
-UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id <= 50;
+UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id <= 50;
 
 query I
 SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv4';
@@ -193,13 +193,13 @@ DROP TABLE t_inv4;
 # ============================================================
 
 statement ok
-CREATE TABLE t_self (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_self (id INTEGER, vec FLOAT[4]);
 
 # Use well-separated vectors to avoid ambiguous top-1
 statement ok
 INSERT INTO t_self SELECT i, list_value(
   (i * 100.0)::FLOAT, 0.0, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -239,17 +239,17 @@ DROP TABLE t_self;
 # ============================================================
 
 statement ok
-CREATE TABLE t_hybrid_inv (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t_hybrid_inv (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_hybrid_inv ON t_hybrid_inv USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO t_hybrid_inv SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t_hybrid_inv SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
-INSERT INTO t_hybrid_inv SELECT i, 'y', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t_hybrid_inv SELECT i, 'y', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 # Every partition must satisfy the invariant

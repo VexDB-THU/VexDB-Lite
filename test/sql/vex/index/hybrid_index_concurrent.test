@@ -8,10 +8,10 @@ require vex
 # Test 1: Concurrent reads on hybrid index while inserting
 # ============================================================
 statement ok
-CREATE TABLE t_hyb1 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE t_hyb1 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
-INSERT INTO t_hyb1 SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, 0.5]::FLOATVECTOR(3), CASE WHEN i % 3 = 0 THEN 'A' WHEN i % 3 = 1 THEN 'B' ELSE 'C' END FROM range(1, 151) t(i);
+INSERT INTO t_hyb1 SELECT i, [(i % 10)::FLOAT / 10.0, ((i / 10) % 10)::FLOAT / 10.0, 0.5]::FLOAT[3], CASE WHEN i % 3 = 0 THEN 'A' WHEN i % 3 = 1 THEN 'B' ELSE 'C' END FROM range(1, 151) t(i);
 
 statement ok
 CREATE INDEX idx_hyb1 ON t_hyb1 USING HYBRID_INDEX (vec, category);
@@ -23,7 +23,7 @@ loop i 0 10
 
 onlyif threadid=0
 statement ok
-INSERT INTO t_hyb1 VALUES (1000 + ${i}, [0.5, 0.5, 0.5]::FLOATVECTOR(3), 'A');
+INSERT INTO t_hyb1 VALUES (1000 + ${i}, [0.5, 0.5, 0.5]::FLOAT[3], 'A');
 
 endloop
 
@@ -32,7 +32,7 @@ loop i 0 10
 
 skipif threadid=0
 query I
-SELECT count(*) >= 0 FROM (SELECT id FROM t_hyb1 WHERE category = 'B' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+SELECT count(*) >= 0 FROM (SELECT id FROM t_hyb1 WHERE category = 'B' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT 5);
 ----
 true
 
@@ -47,7 +47,7 @@ DROP TABLE t_hyb1;
 # Test 2: Concurrent inserts into different partitions
 # ============================================================
 statement ok
-CREATE TABLE t_hyb2 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE t_hyb2 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 CREATE INDEX idx_hyb2 ON t_hyb2 USING HYBRID_INDEX (vec, category);
@@ -57,7 +57,7 @@ concurrentloop threadid 0 4
 loop i 0 20
 
 statement ok
-INSERT INTO t_hyb2 VALUES (${threadid} * 1000 + ${i}, [${threadid}::FLOAT / 4.0, ${i}::FLOAT / 20.0, 0.5]::FLOATVECTOR(3), CASE WHEN ${threadid} = 0 THEN 'X' WHEN ${threadid} = 1 THEN 'Y' WHEN ${threadid} = 2 THEN 'Z' ELSE 'W' END);
+INSERT INTO t_hyb2 VALUES (${threadid} * 1000 + ${i}, [${threadid}::FLOAT / 4.0, ${i}::FLOAT / 20.0, 0.5]::FLOAT[3], CASE WHEN ${threadid} = 0 THEN 'X' WHEN ${threadid} = 1 THEN 'Y' WHEN ${threadid} = 2 THEN 'Z' ELSE 'W' END);
 
 endloop
 
@@ -80,7 +80,7 @@ Z	20
 
 # Search within each partition works
 query I
-SELECT count(*) FROM (SELECT id FROM t_hyb2 WHERE category = 'X' ORDER BY l2_distance(vec, [0.0, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t_hyb2 WHERE category = 'X' ORDER BY l2_distance(vec, [0.0, 0.5, 0.5]::FLOAT[3]) LIMIT 5);
 ----
 5
 
@@ -91,10 +91,10 @@ DROP TABLE t_hyb2;
 # Test 3: Concurrent delete and search on hybrid index
 # ============================================================
 statement ok
-CREATE TABLE t_hyb3 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE t_hyb3 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
-INSERT INTO t_hyb3 SELECT i, [(i % 10)::FLOAT / 10.0, 0.5, 0.5]::FLOATVECTOR(3), CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END FROM range(1, 201) t(i);
+INSERT INTO t_hyb3 SELECT i, [(i % 10)::FLOAT / 10.0, 0.5, 0.5]::FLOAT[3], CASE WHEN i % 2 = 0 THEN 'even' ELSE 'odd' END FROM range(1, 201) t(i);
 
 statement ok
 CREATE INDEX idx_hyb3 ON t_hyb3 USING HYBRID_INDEX (vec, category);
@@ -125,7 +125,7 @@ loop i 0 10
 skipif threadid=0
 skipif threadid=1
 query I
-SELECT count(*) >= 0 FROM (SELECT id FROM t_hyb3 WHERE category = 'even' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOATVECTOR(3)) LIMIT 5);
+SELECT count(*) >= 0 FROM (SELECT id FROM t_hyb3 WHERE category = 'even' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT 5);
 ----
 true
 

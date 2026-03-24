@@ -26,7 +26,7 @@ SELECT
     cos(i * 1.4 + 12.0)::FLOAT,
     sin(i * 1.5 + 13.0)::FLOAT,
     cos(i * 1.6 + 14.0)::FLOAT
-  ]::FLOATVECTOR(16) AS vec
+  ]::FLOAT[16] AS vec
 FROM range(1, 1001) t(i);
 
 # Verify dataset size
@@ -57,7 +57,7 @@ LIMIT 1;
 # Search near origin - should return some results with positive distances
 query I
 SELECT COUNT(*) FROM (
-  SELECT id, l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16)) AS dist
+  SELECT id, l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[16]) AS dist
   FROM scale_data
   ORDER BY dist
   LIMIT 10
@@ -70,7 +70,7 @@ WHERE dist >= 0;
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM scale_data
-  ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOATVECTOR(16))
+  ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOAT[16])
   LIMIT 5
 ) t;
 ----
@@ -99,7 +99,7 @@ SELECT
     cos((1000 + i) * 1.4 + 12.0)::FLOAT,
     sin((1000 + i) * 1.5 + 13.0)::FLOAT,
     cos((1000 + i) * 1.6 + 14.0)::FLOAT
-  ]::FLOATVECTOR(16) AS vec
+  ]::FLOAT[16] AS vec
 FROM range(1, 101) t(i);
 
 # Verify new total count
@@ -121,13 +121,13 @@ LIMIT 1;
 statement ok
 INSERT INTO scale_data VALUES (
   9999,
-  [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]::FLOATVECTOR(16)
+  [0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001, 0.001]::FLOAT[16]
 );
 
 # The newly inserted near-origin vector should be closest to the origin
 query I
 SELECT id FROM scale_data
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[16])
 LIMIT 1;
 ----
 9999
@@ -147,7 +147,7 @@ SELECT COUNT(*) FROM scale_data WHERE id = 9999;
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM scale_data
-  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[16])
   LIMIT 5
 ) t;
 ----
@@ -175,7 +175,7 @@ LIMIT 1;
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM scale_data
-  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16))
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[16])
   LIMIT 20
 ) t
 WHERE t.id BETWEEN 1 AND 100;

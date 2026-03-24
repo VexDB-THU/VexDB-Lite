@@ -9,15 +9,15 @@ require vex
 # =============================================================================
 
 statement ok
-CREATE TABLE vecs64 (id INTEGER, vec FLOATVECTOR(64));
+CREATE TABLE vecs64 (id INTEGER, vec FLOAT[64]);
 
 # Insert 20 rows with deterministic vectors based on id
 statement ok
-INSERT INTO vecs64 SELECT i, list_transform(range(64), x -> CASE WHEN x = i % 64 THEN 1.0 ELSE (x + i)::FLOAT / 1000.0 END)::FLOATVECTOR(64) FROM range(1, 21) t(i);
+INSERT INTO vecs64 SELECT i, list_transform(range(64), x -> CASE WHEN x = i % 64 THEN 1.0 ELSE (x + i)::FLOAT / 1000.0 END)::FLOAT[64] FROM range(1, 21) t(i);
 
 # Insert a known "needle" vector: all zeros except position 0 = 10.0
 statement ok
-INSERT INTO vecs64 VALUES (99, list_transform(range(64), x -> CASE WHEN x = 0 THEN 10.0 ELSE 0.0 END)::FLOATVECTOR(64));
+INSERT INTO vecs64 VALUES (99, list_transform(range(64), x -> CASE WHEN x = 0 THEN 10.0 ELSE 0.0 END)::FLOAT[64]);
 
 statement ok
 CREATE INDEX idx64 ON vecs64 USING GRAPH_INDEX (vec);
@@ -31,7 +31,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx64';
 # Search for the needle vector - querying near [10,0,0,...,0] should return id=99
 query I
 SELECT id FROM vecs64
-ORDER BY l2_distance(vec, list_transform(range(64), x -> CASE WHEN x = 0 THEN 10.0 ELSE 0.0 END)::FLOATVECTOR(64))
+ORDER BY l2_distance(vec, list_transform(range(64), x -> CASE WHEN x = 0 THEN 10.0 ELSE 0.0 END)::FLOAT[64])
 LIMIT 1;
 ----
 99
@@ -40,7 +40,7 @@ LIMIT 1;
 # id=5 has 1.0 at position 5, others are small
 query I
 SELECT id FROM vecs64
-ORDER BY l2_distance(vec, list_transform(range(64), x -> CASE WHEN x = 5 THEN 1.0 ELSE 0.0 END)::FLOATVECTOR(64))
+ORDER BY l2_distance(vec, list_transform(range(64), x -> CASE WHEN x = 5 THEN 1.0 ELSE 0.0 END)::FLOAT[64])
 LIMIT 1;
 ----
 5
@@ -56,15 +56,15 @@ SELECT COUNT(*) FROM vecs64;
 # =============================================================================
 
 statement ok
-CREATE TABLE vecs128 (id INTEGER, vec FLOATVECTOR(128));
+CREATE TABLE vecs128 (id INTEGER, vec FLOAT[128]);
 
 # Insert 20 rows where each row has a "hot" dimension at position (id % 128)
 statement ok
-INSERT INTO vecs128 SELECT i, list_transform(range(128), x -> CASE WHEN x = i % 128 THEN 5.0 ELSE (x * i)::FLOAT / 10000.0 END)::FLOATVECTOR(128) FROM range(1, 21) t(i);
+INSERT INTO vecs128 SELECT i, list_transform(range(128), x -> CASE WHEN x = i % 128 THEN 5.0 ELSE (x * i)::FLOAT / 10000.0 END)::FLOAT[128] FROM range(1, 21) t(i);
 
 # Insert a distinct outlier vector: all 1.0s
 statement ok
-INSERT INTO vecs128 VALUES (100, list_transform(range(128), x -> 1.0)::FLOATVECTOR(128));
+INSERT INTO vecs128 VALUES (100, list_transform(range(128), x -> 1.0)::FLOAT[128]);
 
 statement ok
 CREATE INDEX idx128 ON vecs128 USING GRAPH_INDEX (vec);
@@ -78,7 +78,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx128';
 # Query for the all-ones vector should return id=100
 query I
 SELECT id FROM vecs128
-ORDER BY l2_distance(vec, list_transform(range(128), x -> 1.0)::FLOATVECTOR(128))
+ORDER BY l2_distance(vec, list_transform(range(128), x -> 1.0)::FLOAT[128])
 LIMIT 1;
 ----
 100
@@ -86,18 +86,18 @@ LIMIT 1;
 # Query for vector hot at position 10 should return id=10
 query I
 SELECT id FROM vecs128
-ORDER BY l2_distance(vec, list_transform(range(128), x -> CASE WHEN x = 10 THEN 5.0 ELSE 0.0 END)::FLOATVECTOR(128))
+ORDER BY l2_distance(vec, list_transform(range(128), x -> CASE WHEN x = 10 THEN 5.0 ELSE 0.0 END)::FLOAT[128])
 LIMIT 1;
 ----
 10
 
 # Insert additional rows after index creation and search again
 statement ok
-INSERT INTO vecs128 VALUES (200, list_transform(range(128), x -> 2.0)::FLOATVECTOR(128));
+INSERT INTO vecs128 VALUES (200, list_transform(range(128), x -> 2.0)::FLOAT[128]);
 
 query I
 SELECT id FROM vecs128
-ORDER BY l2_distance(vec, list_transform(range(128), x -> 2.0)::FLOATVECTOR(128))
+ORDER BY l2_distance(vec, list_transform(range(128), x -> 2.0)::FLOAT[128])
 LIMIT 1;
 ----
 200

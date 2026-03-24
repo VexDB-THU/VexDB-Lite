@@ -8,22 +8,22 @@ require vex
 # Test 1: Auto-commit INSERT + search
 # ============================================================
 statement ok
-CREATE TABLE h1 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h1 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h1 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h1 ON h1 USING HYBRID_INDEX (vec, category);
 
 statement ok
-INSERT INTO h1 VALUES (4, [0.99, 0.01, 0.0]::FLOATVECTOR(3), 'A');
+INSERT INTO h1 VALUES (4, [0.99, 0.01, 0.0]::FLOAT[3], 'A');
 
 query I
-SELECT id FROM h1 WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM h1 WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -39,13 +39,13 @@ DROP TABLE h1;
 # Test 2: Auto-commit DELETE + search
 # ============================================================
 statement ok
-CREATE TABLE h2 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h2 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h2 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h2 ON h2 USING HYBRID_INDEX (vec, category);
@@ -70,12 +70,12 @@ DROP TABLE h2;
 # Test 3: BEGIN + INSERT + COMMIT
 # ============================================================
 statement ok
-CREATE TABLE h3 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h3 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h3 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h3 ON h3 USING HYBRID_INDEX (vec, category);
@@ -84,7 +84,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO h3 VALUES (3, [0.5, 0.5, 0.0]::FLOATVECTOR(3), 'A');
+INSERT INTO h3 VALUES (3, [0.5, 0.5, 0.0]::FLOAT[3], 'A');
 
 statement ok
 COMMIT;
@@ -106,13 +106,13 @@ DROP TABLE h3;
 # Test 4: BEGIN + DELETE + COMMIT
 # ============================================================
 statement ok
-CREATE TABLE h4 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h4 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h4 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h4 ON h4 USING HYBRID_INDEX (vec, category);
@@ -143,12 +143,12 @@ DROP TABLE h4;
 # Test 5: BEGIN + INSERT + ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE h5 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h5 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h5 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h5 ON h5 USING HYBRID_INDEX (vec, category);
@@ -157,10 +157,10 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO h5 VALUES (3, [0.5, 0.5, 0.0]::FLOATVECTOR(3), 'A');
+INSERT INTO h5 VALUES (3, [0.5, 0.5, 0.0]::FLOAT[3], 'A');
 
 statement ok
-INSERT INTO h5 VALUES (4, [0.0, 0.5, 0.5]::FLOATVECTOR(3), 'B');
+INSERT INTO h5 VALUES (4, [0.0, 0.5, 0.5]::FLOAT[3], 'B');
 
 statement ok
 ROLLBACK;
@@ -188,13 +188,13 @@ DROP TABLE h5;
 # Test 6: BEGIN + DELETE + ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE h6 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h6 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h6 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h6 ON h6 USING HYBRID_INDEX (vec, category);
@@ -231,13 +231,13 @@ DROP TABLE h6;
 # Test 7: BEGIN + INSERT + DELETE + ROLLBACK (mixed ops)
 # ============================================================
 statement ok
-CREATE TABLE h7 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h7 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h7 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h7 ON h7 USING HYBRID_INDEX (vec, category);
@@ -246,7 +246,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO h7 VALUES (4, [0.5, 0.5, 0.0]::FLOATVECTOR(3), 'A');
+INSERT INTO h7 VALUES (4, [0.5, 0.5, 0.0]::FLOAT[3], 'A');
 
 statement ok
 DELETE FROM h7 WHERE id = 2;
@@ -277,12 +277,12 @@ DROP TABLE h7;
 # Test 8: CREATE INDEX inside transaction + ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE h8 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h8 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h8 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'B');
 
 statement ok
 BEGIN;
@@ -311,12 +311,12 @@ DROP TABLE h8;
 # Test 9: DROP INDEX inside transaction + ROLLBACK
 # ============================================================
 statement ok
-CREATE TABLE h9 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h9 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h9 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h9 ON h9 USING HYBRID_INDEX (vec, category);
@@ -348,12 +348,12 @@ DROP TABLE h9;
 # Test 10: Consecutive ROLLBACK then COMMIT
 # ============================================================
 statement ok
-CREATE TABLE h10 (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE h10 (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO h10 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_h10 ON h10 USING HYBRID_INDEX (vec, category);
@@ -363,7 +363,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO h10 VALUES (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'A');
+INSERT INTO h10 VALUES (3, [0.0, 0.0, 1.0]::FLOAT[3], 'A');
 
 statement ok
 ROLLBACK;
@@ -378,7 +378,7 @@ statement ok
 BEGIN;
 
 statement ok
-INSERT INTO h10 VALUES (4, [0.5, 0.5, 0.5]::FLOATVECTOR(3), 'B');
+INSERT INTO h10 VALUES (4, [0.5, 0.5, 0.5]::FLOAT[3], 'B');
 
 statement ok
 COMMIT;

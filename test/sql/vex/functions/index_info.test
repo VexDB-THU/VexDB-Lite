@@ -16,10 +16,10 @@ SELECT count(*) FROM vex_index_info();
 # Test 2: Create one index, verify it appears
 # ============================================================
 statement ok
-CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t1 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t1 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(100) t(i);
+INSERT INTO t1 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(100) t(i);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
@@ -51,22 +51,22 @@ NULL
 # Test 3: Create multiple indexes, verify all appear
 # ============================================================
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[8]);
 
 statement ok
-INSERT INTO t2 SELECT i, list_transform(range(8), x -> (x + i)::FLOAT / 100.0)::FLOATVECTOR(8) FROM range(50) t(i);
+INSERT INTO t2 SELECT i, list_transform(range(8), x -> (x + i)::FLOAT / 100.0)::FLOAT[8] FROM range(50) t(i);
 
 statement ok
 CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
 
 statement ok
-CREATE TABLE t3 (id INTEGER, vec FLOATVECTOR(3), cat VARCHAR);
+CREATE TABLE t3 (id INTEGER, vec FLOAT[3], cat VARCHAR);
 
 statement ok
 INSERT INTO t3 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);

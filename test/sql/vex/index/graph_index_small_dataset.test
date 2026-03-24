@@ -8,21 +8,21 @@ require vex
 # Test 1: Single row — create index, search for it
 # ============================================================
 statement ok
-CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t1 (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO t1 VALUES (1, [1.0, 2.0, 3.0]::FLOATVECTOR(3));
+INSERT INTO t1 VALUES (1, [1.0, 2.0, 3.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
 
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [1.0, 2.0, 3.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -33,29 +33,29 @@ DROP TABLE t1;
 # Test 2: Two rows — verify both can be found
 # ============================================================
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t2 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
 
 query I
-SELECT id FROM t2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 query I
-SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2
 
 # Return both rows
 query I
-SELECT id FROM t2 ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+SELECT id FROM t2 ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOAT[3]) LIMIT 2;
 ----
 1
 2
@@ -67,21 +67,21 @@ DROP TABLE t2;
 # Test 3: Five rows — search with k=5 (return all)
 # ============================================================
 statement ok
-CREATE TABLE t5 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t5 (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t5 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, [1.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (5, [0.0, 1.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [1.0, 1.0, 0.0]::FLOAT[3]),
+  (5, [0.0, 1.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx5 ON t5 USING GRAPH_INDEX (vec);
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5);
 ----
 5
 
@@ -92,23 +92,23 @@ DROP TABLE t5;
 # Test 4: Ten rows — verify recall (nearest neighbor is exact)
 # ============================================================
 statement ok
-CREATE TABLE t10 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t10 (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO t10 SELECT i, [(i * 0.1)::FLOAT, 0.0, 0.0]::FLOATVECTOR(3) FROM range(10) t(i);
+INSERT INTO t10 SELECT i, [(i * 0.1)::FLOAT, 0.0, 0.0]::FLOAT[3] FROM range(10) t(i);
 
 statement ok
 CREATE INDEX idx10 ON t10 USING GRAPH_INDEX (vec);
 
 # Closest to [0,0,0] should be id=0
 query I
-SELECT id FROM t10 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t10 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 0
 
 # Closest to [0.9,0,0] should be id=9
 query I
-SELECT id FROM t10 ORDER BY l2_distance(vec, [0.9, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t10 ORDER BY l2_distance(vec, [0.9, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 9
 
@@ -119,25 +119,25 @@ DROP TABLE t10;
 # Test 5: Very low dimensions (dim=2, dim=3)
 # ============================================================
 statement ok
-CREATE TABLE t_dim2 (id INTEGER, vec FLOATVECTOR(2));
+CREATE TABLE t_dim2 (id INTEGER, vec FLOAT[2]);
 
 statement ok
 INSERT INTO t_dim2 VALUES
-  (1, [0.0, 0.0]::FLOATVECTOR(2)),
-  (2, [1.0, 0.0]::FLOATVECTOR(2)),
-  (3, [0.0, 1.0]::FLOATVECTOR(2)),
-  (4, [1.0, 1.0]::FLOATVECTOR(2));
+  (1, [0.0, 0.0]::FLOAT[2]),
+  (2, [1.0, 0.0]::FLOAT[2]),
+  (3, [0.0, 1.0]::FLOAT[2]),
+  (4, [1.0, 1.0]::FLOAT[2]);
 
 statement ok
 CREATE INDEX idx_dim2 ON t_dim2 USING GRAPH_INDEX (vec);
 
 query I
-SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [0.0, 0.0]::FLOATVECTOR(2)) LIMIT 1;
+SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [0.0, 0.0]::FLOAT[2]) LIMIT 1;
 ----
 1
 
 query I
-SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [1.0, 1.0]::FLOATVECTOR(2)) LIMIT 1;
+SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [1.0, 1.0]::FLOAT[2]) LIMIT 1;
 ----
 4
 
@@ -148,17 +148,17 @@ DROP TABLE t_dim2;
 # Test 6: Brute force threshold boundary (exactly 64 rows)
 # ============================================================
 statement ok
-CREATE TABLE t_bf64 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_bf64 (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO t_bf64 SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0]::FLOATVECTOR(3) FROM range(64) t(i);
+INSERT INTO t_bf64 SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0]::FLOAT[3] FROM range(64) t(i);
 
 statement ok
 CREATE INDEX idx_bf64 ON t_bf64 USING GRAPH_INDEX (vec);
 
 # Default brute_force_threshold is 64, so 64 rows should use brute force
 query I
-SELECT id FROM t_bf64 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_bf64 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 0
 
@@ -169,23 +169,23 @@ DROP TABLE t_bf64;
 # Test 7: Just above brute force threshold (65 rows)
 # ============================================================
 statement ok
-CREATE TABLE t_bf65 (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_bf65 (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO t_bf65 SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0]::FLOATVECTOR(3) FROM range(65) t(i);
+INSERT INTO t_bf65 SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0]::FLOAT[3] FROM range(65) t(i);
 
 statement ok
 CREATE INDEX idx_bf65 ON t_bf65 USING GRAPH_INDEX (vec);
 
 # 65 rows should use HNSW graph traversal
 query I
-SELECT id FROM t_bf65 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_bf65 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 0
 
 # Top-3 should be the 3 closest
 query I
-SELECT id FROM t_bf65 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+SELECT id FROM t_bf65 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
 ----
 0
 1
@@ -198,26 +198,26 @@ DROP TABLE t_bf65;
 # Test 8: k larger than table size (should return all rows)
 # ============================================================
 statement ok
-CREATE TABLE t_klarge (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_klarge (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t_klarge VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_klarge ON t_klarge USING GRAPH_INDEX (vec);
 
 # Request k=10 but only 3 rows exist
 query I
-SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 10);
 ----
 3
 
 # Request k=100 but only 3 rows exist
 query I
-SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 100);
+SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 100);
 ----
 3
 

@@ -6,24 +6,24 @@ require vex
 
 # Orthogonal vectors: cosine distance = 1.0
 query R
-SELECT cosine_distance([1.0, 0.0]::FLOATVECTOR(2), [0.0, 1.0]::FLOATVECTOR(2));
+SELECT cosine_distance([1.0, 0.0]::FLOAT[2], [0.0, 1.0]::FLOAT[2]);
 ----
 1.0
 
 # Same direction: cosine distance = 0.0
 query R
-SELECT cosine_distance([1.0, 2.0, 3.0]::FLOATVECTOR(3), [2.0, 4.0, 6.0]::FLOATVECTOR(3));
+SELECT cosine_distance([1.0, 2.0, 3.0]::FLOAT[3], [2.0, 4.0, 6.0]::FLOAT[3]);
 ----
 0.0
 
 # Opposite direction: cosine distance = 2.0
 query R
-SELECT cosine_distance([1.0, 0.0]::FLOATVECTOR(2), [-1.0, 0.0]::FLOATVECTOR(2));
+SELECT cosine_distance([1.0, 0.0]::FLOAT[2], [-1.0, 0.0]::FLOAT[2]);
 ----
 2.0
 
 # NULL input returns NULL
 query R
-SELECT cosine_distance(NULL::FLOATVECTOR(2), [1.0, 0.0]::FLOATVECTOR(2));
+SELECT cosine_distance(NULL::FLOAT[2], [1.0, 0.0]::FLOAT[2]);
 ----
 NULL

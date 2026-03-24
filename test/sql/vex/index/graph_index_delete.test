@@ -6,25 +6,25 @@ require vex
 
 # Setup
 statement ok
-CREATE TABLE vecs (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE vecs (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO vecs VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, [1.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (5, [0.0, 1.0, 1.0]::FLOATVECTOR(3)),
-  (6, [1.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (7, [0.5, 0.5, 0.5]::FLOATVECTOR(3)),
-  (8, [0.2, 0.2, 0.2]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [1.0, 1.0, 0.0]::FLOAT[3]),
+  (5, [0.0, 1.0, 1.0]::FLOAT[3]),
+  (6, [1.0, 0.0, 1.0]::FLOAT[3]),
+  (7, [0.5, 0.5, 0.5]::FLOAT[3]),
+  (8, [0.2, 0.2, 0.2]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx ON vecs USING GRAPH_INDEX (vec);
 
 # Verify initial search works
 query I
-SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 8
 
@@ -34,7 +34,7 @@ DELETE FROM vecs WHERE id = 8;
 
 # After delete, next closest should be found
 query I
-SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 7
 
@@ -50,10 +50,10 @@ SELECT count(*) FROM vecs;
 
 # Insert new data after delete
 statement ok
-INSERT INTO vecs VALUES (9, [0.1, 0.1, 0.1]::FLOATVECTOR(3));
+INSERT INTO vecs VALUES (9, [0.1, 0.1, 0.1]::FLOAT[3]);
 
 query I
-SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 9
 

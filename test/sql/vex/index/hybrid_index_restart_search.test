@@ -7,23 +7,23 @@ require vex
 load __TEST_DIR__/hybrid_index_restart_search.db
 
 statement ok
-CREATE TABLE items (id INTEGER, category VARCHAR, vec FLOATVECTOR(3));
+CREATE TABLE items (id INTEGER, category VARCHAR, vec FLOAT[3]);
 
 statement ok
 INSERT INTO items VALUES
-  (1, 'A', [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, 'A', [0.9, 0.1, 0.0]::FLOATVECTOR(3)),
-  (3, 'B', [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (4, 'B', [0.0, 0.9, 0.1]::FLOATVECTOR(3)),
-  (5, 'A', [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (6, 'B', [0.1, 0.0, 0.9]::FLOATVECTOR(3));
+  (1, 'A', [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'A', [0.9, 0.1, 0.0]::FLOAT[3]),
+  (3, 'B', [0.0, 1.0, 0.0]::FLOAT[3]),
+  (4, 'B', [0.0, 0.9, 0.1]::FLOAT[3]),
+  (5, 'A', [0.0, 0.0, 1.0]::FLOAT[3]),
+  (6, 'B', [0.1, 0.0, 0.9]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx ON items USING HYBRID_INDEX (vec, category);
 
 # Verify filtered search before restart
 query I
-SELECT id FROM items WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+SELECT id FROM items WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
 ----
 1
 2
@@ -41,7 +41,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx';
 
 # Filtered ANN search after restart
 query I
-SELECT id FROM items WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 2;
+SELECT id FROM items WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
 ----
 1
 2

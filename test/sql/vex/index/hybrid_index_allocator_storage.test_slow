@@ -10,17 +10,17 @@ require vex
 load __TEST_DIR__/hybrid_alloc_test1.db
 
 statement ok
-CREATE TABLE t1 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t1 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO t1 SELECT i, 'a', list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, 'a', list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
-INSERT INTO t1 SELECT i, 'b', list_value(cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, 'b', list_value(cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 query I
@@ -44,7 +44,7 @@ SELECT count(*) FROM t1 WHERE cat = 'a';
 
 # Verify search still works after delete-post-restart
 query I
-SELECT count(*) FROM (SELECT id FROM t1 WHERE cat = 'a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t1 WHERE cat = 'a' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -59,7 +59,7 @@ statement ok
 DELETE FROM t1 WHERE id % 3 = 0;
 
 query I
-SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -70,7 +70,7 @@ CHECKPOINT;
 restart
 
 query I
-SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -84,13 +84,13 @@ DROP TABLE t1;
 load __TEST_DIR__/hybrid_alloc_test2.db
 
 statement ok
-CREATE TABLE t2 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t2 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx2 ON t2 USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO t2 SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
@@ -100,12 +100,12 @@ restart
 
 # Insert into existing partition after restart
 statement ok
-INSERT INTO t2 SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.5, 0.5)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.5, 0.5)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 # Insert into NEW partition after restart
 statement ok
-INSERT INTO t2 SELECT i, 'y', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, 'y', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 query I
@@ -125,12 +125,12 @@ SELECT count(*) FROM t2 WHERE cat = 'y';
 
 # Verify search works with mixed old+new data
 query I
-SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'x' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'x' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'y' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'y' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -146,12 +146,12 @@ SELECT count(*) FROM t2;
 150
 
 query I
-SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'x' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'x' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'y' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t2 WHERE cat = 'y' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -164,7 +164,7 @@ DROP TABLE t2;
 load __TEST_DIR__/hybrid_alloc_test3.db
 
 statement ok
-CREATE TABLE t3 (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t3 (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);
@@ -187,12 +187,12 @@ SELECT count(*) FROM t3;
 
 # Insert after restart on empty index
 statement ok
-INSERT INTO t3 VALUES (1, 'a', [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
-                      (2, 'a', [0.9, 0.1, 0.0, 0.0]::FLOATVECTOR(4)),
-                      (3, 'b', [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4));
+INSERT INTO t3 VALUES (1, 'a', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+                      (2, 'a', [0.9, 0.1, 0.0, 0.0]::FLOAT[4]),
+                      (3, 'b', [0.0, 1.0, 0.0, 0.0]::FLOAT[4]);
 
 query I
-SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'a' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 2);
+SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'a' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2);
 ----
 2
 
@@ -208,12 +208,12 @@ SELECT count(*) FROM t3;
 
 # Filtered search on each partition after restart
 query I
-SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'a' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 2);
+SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'a' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 2);
 ----
 2
 
 query I
-SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1);
+SELECT count(*) FROM (SELECT id FROM t3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1);
 ----
 1
 
@@ -226,13 +226,13 @@ DROP TABLE t3;
 load __TEST_DIR__/hybrid_alloc_test4.db
 
 statement ok
-CREATE TABLE t4 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t4 (id INTEGER PRIMARY KEY, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx4 ON t4 USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO t4 SELECT i, 'p' || (i % 3)::VARCHAR, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO t4 SELECT i, 'p' || (i % 3)::VARCHAR, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 61) t(i);
 
 # Cycle 1
@@ -247,7 +247,7 @@ SELECT count(*) FROM t4;
 60
 
 query I
-SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -256,7 +256,7 @@ statement ok
 DELETE FROM t4 WHERE id % 4 = 0;
 
 statement ok
-INSERT INTO t4 SELECT i, 'p_new', list_value(0.0, 0.0, sin(i)::FLOAT, cos(i)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO t4 SELECT i, 'p_new', list_value(0.0, 0.0, sin(i)::FLOAT, cos(i)::FLOAT)::FLOAT[4]
 FROM range(61, 76) t(i);
 
 statement ok
@@ -265,7 +265,7 @@ CHECKPOINT;
 restart
 
 query I
-SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -276,7 +276,7 @@ CHECKPOINT;
 restart
 
 query I
-SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t4 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -290,7 +290,7 @@ CHECKPOINT;
 restart
 
 statement ok
-INSERT INTO t4 SELECT i, 'p0', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t4 SELECT i, 'p0', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(100, 120) t(i);
 
 statement ok
@@ -304,7 +304,7 @@ SELECT count(*) FROM t4 WHERE cat = 'p0';
 20
 
 query I
-SELECT count(*) FROM (SELECT id FROM t4 WHERE cat = 'p0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t4 WHERE cat = 'p0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -317,7 +317,7 @@ DROP TABLE t4;
 load __TEST_DIR__/hybrid_alloc_test5.db
 
 statement ok
-CREATE TABLE t5 (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t5 (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx5 ON t5 USING HYBRID_INDEX (vec, cat);
@@ -325,7 +325,7 @@ CREATE INDEX idx5 ON t5 USING HYBRID_INDEX (vec, cat);
 # Insert 500 rows across 50 partitions (10 rows each)
 statement ok
 INSERT INTO t5 SELECT i, 'partition_' || (i % 50)::VARCHAR,
-  list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+  list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 501) t(i);
 
 query I
@@ -340,17 +340,17 @@ SELECT count(*) FROM t5;
 
 # Verify filtered search on a few partitions
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_25' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_25' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_49' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_49' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -371,23 +371,23 @@ SELECT count(DISTINCT cat) FROM t5;
 50
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_0' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_25' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_25' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_49' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t5 WHERE cat = 'partition_49' ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 # Global search across 50 partitions
 query I
-SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 
@@ -411,7 +411,7 @@ SELECT count(*) FROM t5;
 450
 
 query I
-SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t5 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 

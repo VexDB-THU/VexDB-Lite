@@ -8,7 +8,7 @@ require vex
 # Setup: Create table with graph index
 # ============================================================
 statement ok
-CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOATVECTOR(8));
+CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOAT[8]);
 
 statement ok
 CREATE INDEX idx_stable ON vectors USING GRAPH_INDEX (vec);
@@ -22,7 +22,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(1, 101) t(i);
+)::FLOAT[8] FROM range(1, 101) t(i);
 
 # Verify count and search after batch 1
 query I
@@ -31,7 +31,7 @@ SELECT count(*) FROM vectors;
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 1);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 1);
 ----
 1
 
@@ -40,28 +40,28 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(101, 201) t(i);
+)::FLOAT[8] FROM range(101, 201) t(i);
 
 # Batch 3: rows 201-300
 statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(201, 301) t(i);
+)::FLOAT[8] FROM range(201, 301) t(i);
 
 # Batch 4: rows 301-400
 statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(301, 401) t(i);
+)::FLOAT[8] FROM range(301, 401) t(i);
 
 # Batch 5: rows 401-500
 statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(401, 501) t(i);
+)::FLOAT[8] FROM range(401, 501) t(i);
 
 query I
 SELECT count(*) FROM vectors;
@@ -70,7 +70,7 @@ SELECT count(*) FROM vectors;
 
 # Search should still work after 500 inserts
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -89,7 +89,7 @@ SELECT count(*) FROM vectors;
 
 # Search after delete
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -104,7 +104,7 @@ SELECT count(*) FROM vectors;
 
 # Search after second delete
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -116,7 +116,7 @@ CHECKPOINT;
 
 # Search after checkpoint
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -125,7 +125,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.2)::FLOAT, cos(i * 0.3)::FLOAT, sin(i * 0.4)::FLOAT, cos(i * 0.5)::FLOAT,
     sin(i * 0.6)::FLOAT, cos(i * 0.7)::FLOAT, sin(i * 0.8)::FLOAT, cos(i * 0.9)::FLOAT
-)::FLOATVECTOR(8) FROM range(501, 601) t(i);
+)::FLOAT[8] FROM range(501, 601) t(i);
 
 query I
 SELECT count(*) FROM vectors;
@@ -145,7 +145,7 @@ SELECT count(*) FROM vectors;
 
 # ANN search must not crash after massive delete
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 20);
 ----
 20
 
@@ -156,7 +156,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     cos(i * 0.15)::FLOAT, sin(i * 0.25)::FLOAT, cos(i * 0.35)::FLOAT, sin(i * 0.45)::FLOAT,
     cos(i * 0.55)::FLOAT, sin(i * 0.65)::FLOAT, cos(i * 0.75)::FLOAT, sin(i * 0.85)::FLOAT
-)::FLOATVECTOR(8) FROM range(601, 901) t(i);
+)::FLOAT[8] FROM range(601, 901) t(i);
 
 query I
 SELECT count(*) FROM vectors;
@@ -165,7 +165,7 @@ SELECT count(*) FROM vectors;
 
 # Search after reinsert
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOATVECTOR(8)) LIMIT 15);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOAT[8]) LIMIT 15);
 ----
 15
 
@@ -186,7 +186,7 @@ SELECT count(*) FROM vectors;
 
 # Search the deserialized + modified index
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -199,13 +199,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(901, 951) t(i);
+)::FLOAT[8] FROM range(901, 951) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 351 AND 375;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -214,13 +214,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(951, 1001) t(i);
+)::FLOAT[8] FROM range(951, 1001) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 376 AND 400;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -229,13 +229,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1001, 1051) t(i);
+)::FLOAT[8] FROM range(1001, 1051) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 701 AND 725;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -244,13 +244,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1051, 1101) t(i);
+)::FLOAT[8] FROM range(1051, 1101) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 726 AND 750;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -259,13 +259,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1101, 1151) t(i);
+)::FLOAT[8] FROM range(1101, 1151) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 751 AND 775;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -277,13 +277,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1151, 1201) t(i);
+)::FLOAT[8] FROM range(1151, 1201) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 776 AND 800;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, 0.0, -1.0, 0.0, -1.0, 0.0, -1.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, 0.0, -1.0, 0.0, -1.0, 0.0, -1.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -292,13 +292,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1201, 1251) t(i);
+)::FLOAT[8] FROM range(1201, 1251) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 801 AND 825;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -307,13 +307,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1251, 1301) t(i);
+)::FLOAT[8] FROM range(1251, 1301) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 826 AND 850;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -322,13 +322,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1301, 1351) t(i);
+)::FLOAT[8] FROM range(1301, 1351) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 851 AND 875;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -337,13 +337,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
     sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
-)::FLOATVECTOR(8) FROM range(1351, 1401) t(i);
+)::FLOAT[8] FROM range(1351, 1401) t(i);
 
 statement ok
 DELETE FROM vectors WHERE id BETWEEN 876 AND 900;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
 ----
 5
 
@@ -363,7 +363,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(1, 201) t(i);
+)::FLOAT[8] FROM range(1, 201) t(i);
 
 query I
 SELECT count(*) FROM vectors;
@@ -371,7 +371,7 @@ SELECT count(*) FROM vectors;
 200
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -385,7 +385,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(201, 301) t(i);
+)::FLOAT[8] FROM range(201, 301) t(i);
 
 statement ok
 CHECKPOINT;
@@ -400,7 +400,7 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(301, 401) t(i);
+)::FLOAT[8] FROM range(301, 401) t(i);
 
 statement ok
 CHECKPOINT;
@@ -411,7 +411,7 @@ SELECT count(*) FROM vectors;
 349
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 20);
 ----
 20
 
@@ -428,7 +428,7 @@ SELECT count(*) FROM vectors;
 
 # Single row search
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 1);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 1);
 ----
 1
 
@@ -443,7 +443,7 @@ SELECT count(*) FROM vectors;
 
 # Search empty index should return 0 rows
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 0
 
@@ -452,13 +452,13 @@ statement ok
 INSERT INTO vectors SELECT i, list_value(
     sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
     sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
-)::FLOATVECTOR(8) FROM range(1, 101) t(i);
+)::FLOAT[8] FROM range(1, 101) t(i);
 
 statement ok
 CHECKPOINT;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -472,7 +472,7 @@ statement ok
 DROP TABLE vectors;
 
 statement ok
-CREATE TABLE vectors_hd (id INTEGER PRIMARY KEY, vec FLOATVECTOR(128));
+CREATE TABLE vectors_hd (id INTEGER PRIMARY KEY, vec FLOAT[128]);
 
 statement ok
 CREATE INDEX idx_hd ON vectors_hd USING GRAPH_INDEX (vec);
@@ -514,7 +514,7 @@ SELECT i,
         sin(i*1.17)::FLOAT, cos(i*1.18)::FLOAT, sin(i*1.19)::FLOAT, cos(i*1.20)::FLOAT,
         sin(i*1.21)::FLOAT, cos(i*1.22)::FLOAT, sin(i*1.23)::FLOAT, cos(i*1.24)::FLOAT,
         sin(i*1.25)::FLOAT, cos(i*1.26)::FLOAT, sin(i*1.27)::FLOAT, cos(i*1.28)::FLOAT
-    )::FLOATVECTOR(128)
+    )::FLOAT[128]
 FROM range(1, 301) t(i);
 
 query I

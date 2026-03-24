@@ -9,7 +9,7 @@ require vex
 # ============================================================
 statement ok
 CREATE TABLE t_dedup1 AS
-SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOATVECTOR(4) AS vec
+SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOAT[4] AS vec
 FROM range(1, 11) t(i);
 
 statement ok
@@ -30,7 +30,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup1';
 # Search must still return all 10 rows
 query I
 SELECT COUNT(*) FROM (
-  SELECT id FROM t_dedup1 ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0]::FLOATVECTOR(4)) LIMIT 10
+  SELECT id FROM t_dedup1 ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]) LIMIT 10
 ) t;
 ----
 10
@@ -42,19 +42,19 @@ DROP TABLE t_dedup1;
 # Test 2: Mixed vectors — only identical duplicates are merged
 # ============================================================
 statement ok
-CREATE TABLE t_dedup2(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup2(id INT, vec FLOAT[4]);
 
 # 5 rows with vector A, 5 rows with vector B, 3 unique
 statement ok
-INSERT INTO t_dedup2 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(1, 6) t(i);
+INSERT INTO t_dedup2 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
 
 statement ok
-INSERT INTO t_dedup2 SELECT i, [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(6, 11) t(i);
+INSERT INTO t_dedup2 SELECT i, [0.0, 1.0, 0.0, 0.0]::FLOAT[4] FROM range(6, 11) t(i);
 
 statement ok
-INSERT INTO t_dedup2 VALUES (11, [0.1, 0.2, 0.3, 0.4]::FLOATVECTOR(4)),
-                            (12, [0.5, 0.6, 0.7, 0.8]::FLOATVECTOR(4)),
-                            (13, [0.9, 0.8, 0.7, 0.6]::FLOATVECTOR(4));
+INSERT INTO t_dedup2 VALUES (11, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]),
+                            (12, [0.5, 0.6, 0.7, 0.8]::FLOAT[4]),
+                            (13, [0.9, 0.8, 0.7, 0.6]::FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_dedup2 ON t_dedup2 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
@@ -78,7 +78,7 @@ DROP TABLE t_dedup2;
 # ============================================================
 statement ok
 CREATE TABLE t_dedup3 AS
-SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOATVECTOR(4) AS vec
+SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOAT[4] AS vec
 FROM range(1, 6) t(i);
 
 statement ok
@@ -97,10 +97,10 @@ DROP TABLE t_dedup3;
 # Test 4: Delete with dedup — extra row_ids removed, node survives
 # ============================================================
 statement ok
-CREATE TABLE t_dedup4(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup4(id INT, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_dedup4 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(1, 6) t(i);
+INSERT INTO t_dedup4 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
 
 statement ok
 CREATE INDEX idx_dedup4 ON t_dedup4 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
@@ -124,7 +124,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup4';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup4
-  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5
 ) t;
 ----
 2
@@ -150,14 +150,14 @@ DROP TABLE t_dedup4;
 # Test 5: Search correctness — brute force baseline comparison
 # ============================================================
 statement ok
-CREATE TABLE t_dedup5(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup5(id INT, vec FLOAT[4]);
 
 # 100 rows: 10 groups of 10 identical vectors
 statement ok
 INSERT INTO t_dedup5
 SELECT i AS id,
   [sin(((i-1)//10)*0.5)::FLOAT, cos(((i-1)//10)*0.7)::FLOAT,
-   sin(((i-1)//10)*1.1)::FLOAT, cos(((i-1)//10)*1.3)::FLOAT]::FLOATVECTOR(4) AS vec
+   sin(((i-1)//10)*1.1)::FLOAT, cos(((i-1)//10)*1.3)::FLOAT]::FLOAT[4] AS vec
 FROM range(1, 101) t(i);
 
 statement ok
@@ -180,7 +180,7 @@ SET disabled_optimizers='extension';
 
 statement ok
 CREATE TABLE bf5 AS SELECT id FROM t_dedup5
-ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOATVECTOR(4)) LIMIT 20;
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOAT[4]) LIMIT 20;
 
 statement ok
 RESET disabled_optimizers;
@@ -189,7 +189,7 @@ RESET disabled_optimizers;
 query I
 SELECT COUNT(*) >= 15 FROM (
   SELECT id FROM t_dedup5
-  ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOATVECTOR(4)) LIMIT 20
+  ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOAT[4]) LIMIT 20
 ) ann WHERE ann.id IN (SELECT id FROM bf5);
 ----
 true
@@ -204,10 +204,10 @@ DROP TABLE t_dedup5;
 # Test 6: UPDATE scenario (DELETE + INSERT internally)
 # ============================================================
 statement ok
-CREATE TABLE t_dedup6(id INT PRIMARY KEY, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup6(id INT PRIMARY KEY, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_dedup6 SELECT i, [i*0.1, i*0.2, i*0.3, i*0.4]::FLOATVECTOR(4) FROM range(1, 51) t(i);
+INSERT INTO t_dedup6 SELECT i, [i*0.1, i*0.2, i*0.3, i*0.4]::FLOAT[4] FROM range(1, 51) t(i);
 
 statement ok
 CREATE INDEX idx_dedup6 ON t_dedup6 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
@@ -220,7 +220,7 @@ SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_dedup6';
 
 # UPDATE 10 rows to the same vector → internal DELETE old 10 + INSERT new 10
 statement ok
-UPDATE t_dedup6 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id <= 10;
+UPDATE t_dedup6 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id <= 10;
 
 # Old 10 nodes removed; new 10 dedup'd into fewer → total < 50
 query I
@@ -237,7 +237,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup6';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup6
-  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 50
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 50
 ) results;
 ----
 50
@@ -249,10 +249,10 @@ DROP TABLE t_dedup6;
 # Test 7: Parameter validation
 # ============================================================
 statement ok
-CREATE TABLE t_dedup7(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup7(id INT, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_dedup7 VALUES (1, [1.0, 2.0, 3.0, 4.0]::FLOATVECTOR(4));
+INSERT INTO t_dedup7 VALUES (1, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]);
 
 # max_dedup=0 is invalid (minimum is 1)
 statement error
@@ -280,17 +280,17 @@ DROP TABLE t_dedup7;
 # Test 8: INSERT after CREATE INDEX — dedup into existing graph
 # ============================================================
 statement ok
-CREATE TABLE t_dedup8(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup8(id INT, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(1, 4) t(i);
+INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 4) t(i);
 
 statement ok
 CREATE INDEX idx_dedup8 ON t_dedup8 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
 
 # Insert more identical vectors after index creation
 statement ok
-INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(4, 7) t(i);
+INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(4, 7) t(i);
 
 query I
 SELECT node_count < 6 FROM vex_index_info() WHERE index_name = 'idx_dedup8';
@@ -306,7 +306,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup8';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup8
-  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 6
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 6
 ) t;
 ----
 6
@@ -318,10 +318,10 @@ DROP TABLE t_dedup8;
 # Test 9: Persistence — dedup state survives restart
 # ============================================================
 statement ok
-CREATE TABLE t_dedup9(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup9(id INT, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_dedup9 SELECT i, [2.0, 3.0, 4.0, 5.0]::FLOATVECTOR(4) FROM range(1, 9) t(i);
+INSERT INTO t_dedup9 SELECT i, [2.0, 3.0, 4.0, 5.0]::FLOAT[4] FROM range(1, 9) t(i);
 
 statement ok
 CREATE INDEX idx_dedup9 ON t_dedup9 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
@@ -357,7 +357,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup9';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup9
-  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOATVECTOR(4)) LIMIT 8
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 8
 ) t;
 ----
 8
@@ -374,7 +374,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup9';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup9
-  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOATVECTOR(4)) LIMIT 8
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 8
 ) t;
 ----
 4
@@ -387,7 +387,7 @@ DROP TABLE t_dedup9;
 # ============================================================
 statement ok
 CREATE TABLE t_dedup10 AS
-SELECT i AS id, [1.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4) AS vec
+SELECT i AS id, [1.0, 1.0, 0.0, 0.0]::FLOAT[4] AS vec
 FROM range(1, 9) t(i);
 
 statement ok
@@ -409,7 +409,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup10';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup10
-  ORDER BY cosine_distance(vec, [1.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 8
+  ORDER BY cosine_distance(vec, [1.0, 1.0, 0.0, 0.0]::FLOAT[4]) LIMIT 8
 ) t;
 ----
 8
@@ -422,7 +422,7 @@ DROP TABLE t_dedup10;
 # ============================================================
 statement ok
 CREATE TABLE t_dedup11 AS
-SELECT i AS id, [5.0, 5.0, 5.0, 5.0]::FLOATVECTOR(4) AS vec
+SELECT i AS id, [5.0, 5.0, 5.0, 5.0]::FLOAT[4] AS vec
 FROM range(1, 21) t(i);
 
 # max_dedup=4 means at most 4 row_ids per node
@@ -445,7 +445,7 @@ SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup11';
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM t_dedup11
-  ORDER BY l2_distance(vec, [5.0, 5.0, 5.0, 5.0]::FLOATVECTOR(4)) LIMIT 20
+  ORDER BY l2_distance(vec, [5.0, 5.0, 5.0, 5.0]::FLOAT[4]) LIMIT 20
 ) t;
 ----
 20
@@ -457,14 +457,14 @@ DROP TABLE t_dedup11;
 # Test 12: Search result distances — dedup'd rows have same distance
 # ============================================================
 statement ok
-CREATE TABLE t_dedup12(id INT, vec FLOATVECTOR(4));
+CREATE TABLE t_dedup12(id INT, vec FLOAT[4]);
 
 # 5 identical vectors at [1,0,0,0], 1 different vector at [0,0,0,1]
 statement ok
-INSERT INTO t_dedup12 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) FROM range(1, 6) t(i);
+INSERT INTO t_dedup12 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
 
 statement ok
-INSERT INTO t_dedup12 VALUES (6, [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4));
+INSERT INTO t_dedup12 VALUES (6, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_dedup12 ON t_dedup12 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
@@ -472,7 +472,7 @@ CREATE INDEX idx_dedup12 ON t_dedup12 USING GRAPH_INDEX (vec) WITH (max_dedup = 
 # Query from [1,0,0,0]: dedup'd rows should all have distance 0
 query I
 SELECT COUNT(*) FROM (
-  SELECT id, l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) AS dist
+  SELECT id, l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) AS dist
   FROM t_dedup12
   ORDER BY dist LIMIT 6
 ) t WHERE dist < 0.001;

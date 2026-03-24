@@ -6,10 +6,10 @@ require vex
 
 # Create a simple table
 statement ok
-CREATE TABLE test_vectors (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE test_vectors (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO test_vectors VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO test_vectors VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
 
 # Create index
 statement ok

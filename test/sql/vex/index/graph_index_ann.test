@@ -6,23 +6,23 @@ require vex
 
 # Create a dataset for ANN search
 statement ok
-CREATE TABLE products (id INTEGER, name VARCHAR, vec FLOATVECTOR(3));
+CREATE TABLE products (id INTEGER, name VARCHAR, vec FLOAT[3]);
 
 # Insert sample products with 3D vectors
 statement ok
-INSERT INTO products VALUES (1, 'Zero', [0.0, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO products VALUES (1, 'Zero', [0.0, 0.0, 0.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO products VALUES (2, 'Ones', [1.0, 1.0, 1.0]::FLOATVECTOR(3));
+INSERT INTO products VALUES (2, 'Ones', [1.0, 1.0, 1.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO products VALUES (3, 'Mixed', [0.5, 0.5, 0.5]::FLOATVECTOR(3));
+INSERT INTO products VALUES (3, 'Mixed', [0.5, 0.5, 0.5]::FLOAT[3]);
 
 statement ok
-INSERT INTO products VALUES (4, 'Small', [0.1, 0.1, 0.1]::FLOATVECTOR(3));
+INSERT INTO products VALUES (4, 'Small', [0.1, 0.1, 0.1]::FLOAT[3]);
 
 statement ok
-INSERT INTO products VALUES (5, 'Large', [0.9, 0.9, 0.9]::FLOATVECTOR(3));
+INSERT INTO products VALUES (5, 'Large', [0.9, 0.9, 0.9]::FLOAT[3]);
 
 # Create graph index
 statement ok
@@ -36,7 +36,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_products_vec';
 
 # ANN query: find products closest to origin [0,0,0]
 query III
-SELECT id, name, l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) as dist
+SELECT id, name, l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) as dist
 FROM products
 ORDER BY dist
 LIMIT 3;
@@ -47,7 +47,7 @@ LIMIT 3;
 
 # Find products closest to [1,1,1]
 query III
-SELECT id, name, l2_distance(vec, [1.0, 1.0, 1.0]::FLOATVECTOR(3)) as dist
+SELECT id, name, l2_distance(vec, [1.0, 1.0, 1.0]::FLOAT[3]) as dist
 FROM products
 ORDER BY dist
 LIMIT 3;

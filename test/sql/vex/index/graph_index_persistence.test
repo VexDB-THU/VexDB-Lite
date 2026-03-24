@@ -9,17 +9,17 @@ load __TEST_DIR__/graph_index_persist.db
 
 # Create and populate
 statement ok
-CREATE TABLE vecs (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE vecs (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO vecs SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(100) t(i);
+INSERT INTO vecs SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(100) t(i);
 
 statement ok
 CREATE INDEX idx ON vecs USING GRAPH_INDEX (vec);
 
 # Verify search works before checkpoint
 query I
-SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 0
 

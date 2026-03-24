@@ -10,7 +10,7 @@ CREATE TABLE recall_del AS
 SELECT i AS id,
   [sin(i*0.07)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.19+1)::FLOAT, cos(i*0.23+2)::FLOAT,
    sin(i*0.29+3)::FLOAT, cos(i*0.31+4)::FLOAT, sin(i*0.37+5)::FLOAT, cos(i*0.41+6)::FLOAT
-  ]::FLOATVECTOR(8) AS vec
+  ]::FLOAT[8] AS vec
 FROM range(1, 2001) t(i);
 
 statement ok
@@ -25,7 +25,7 @@ SET disabled_optimizers='extension';
 
 statement ok
 CREATE TABLE bf AS SELECT id FROM recall_del
-ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOATVECTOR(8)) LIMIT 10;
+ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10;
 
 statement ok
 RESET disabled_optimizers;
@@ -33,7 +33,7 @@ RESET disabled_optimizers;
 query I
 SELECT COUNT(*) >= 8 FROM (
   SELECT id FROM recall_del
-  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOATVECTOR(8)) LIMIT 10
+  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10
 ) ann WHERE ann.id IN (SELECT id FROM bf);
 ----
 true
@@ -50,7 +50,7 @@ DROP TABLE bf;
 
 statement ok
 CREATE TABLE bf AS SELECT id FROM recall_del
-ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOATVECTOR(8)) LIMIT 10;
+ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10;
 
 statement ok
 RESET disabled_optimizers;
@@ -64,7 +64,7 @@ SET disabled_optimizers='extension';
 query I
 SELECT COUNT(*) >= 8 FROM (
   SELECT id FROM recall_del
-  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOATVECTOR(8)) LIMIT 10
+  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10
 ) ann WHERE ann.id IN (SELECT id FROM bf);
 ----
 true

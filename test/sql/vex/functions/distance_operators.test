@@ -6,72 +6,72 @@ require vex
 
 # <-> operator (L2 distance)
 query R
-SELECT [1.0, 0.0, 0.0]::FLOATVECTOR(3) <-> [0.0, 1.0, 0.0]::FLOATVECTOR(3);
+SELECT [1.0, 0.0, 0.0]::FLOAT[3] <-> [0.0, 1.0, 0.0]::FLOAT[3];
 ----
 1.4142135
 
 # <=> operator (cosine distance)
 query R
-SELECT [1.0, 0.0]::FLOATVECTOR(2) <=> [0.0, 1.0]::FLOATVECTOR(2);
+SELECT [1.0, 0.0]::FLOAT[2] <=> [0.0, 1.0]::FLOAT[2];
 ----
 1.0
 
 # Same direction: cosine distance = 0
 query R
-SELECT [1.0, 2.0]::FLOATVECTOR(2) <=> [2.0, 4.0]::FLOATVECTOR(2);
+SELECT [1.0, 2.0]::FLOAT[2] <=> [2.0, 4.0]::FLOAT[2];
 ----
 0.0
 
 # array_inner_product works with FLOATVECTOR
 query R
-SELECT array_inner_product([1.0, 2.0, 3.0]::FLOATVECTOR(3), [4.0, 5.0, 6.0]::FLOATVECTOR(3));
+SELECT array_inner_product([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3]);
 ----
 32.0
 
 # array_cosine_similarity works with FLOATVECTOR
 query R
-SELECT array_cosine_similarity([1.0, 0.0]::FLOATVECTOR(2), [1.0, 0.0]::FLOATVECTOR(2));
+SELECT array_cosine_similarity([1.0, 0.0]::FLOAT[2], [1.0, 0.0]::FLOAT[2]);
 ----
 1.0
 
 # ORDER BY with <-> operator
 statement ok
-CREATE TABLE items (id INT, v FLOATVECTOR(3));
+CREATE TABLE items (id INT, v FLOAT[3]);
 
 statement ok
 INSERT INTO items VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.5, 0.5, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.5, 0.5, 0.0]::FLOAT[3]);
 
 query I
-SELECT id FROM items ORDER BY v <-> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
+SELECT id FROM items ORDER BY v <-> [1.0, 0.0, 0.0]::FLOAT[3] LIMIT 2;
 ----
 1
 3
 
 # ORDER BY with <=> operator
 query I
-SELECT id FROM items ORDER BY v <=> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
+SELECT id FROM items ORDER BY v <=> [1.0, 0.0, 0.0]::FLOAT[3] LIMIT 2;
 ----
 1
 3
 
 # <~> operator (negative inner product)
 query R
-SELECT [1.0, 2.0]::FLOATVECTOR(2) <~> [3.0, 4.0]::FLOATVECTOR(2);
+SELECT [1.0, 2.0]::FLOAT[2] <~> [3.0, 4.0]::FLOAT[2];
 ----
 -11.0
 
 # ORDER BY with <~> operator (smaller = higher inner product)
 query I
-SELECT id FROM items ORDER BY v <~> [1.0, 0.0, 0.0]::FLOATVECTOR(3) LIMIT 2;
+SELECT id FROM items ORDER BY v <~> [1.0, 0.0, 0.0]::FLOAT[3] LIMIT 2;
 ----
 1
 3
 
 # negative_inner_product function for max inner product search
 query R
-SELECT array_negative_inner_product([1.0, 2.0]::FLOATVECTOR(2), [3.0, 4.0]::FLOATVECTOR(2));
+SELECT array_negative_inner_product([1.0, 2.0]::FLOAT[2], [3.0, 4.0]::FLOAT[2]);
 ----
 -11.0

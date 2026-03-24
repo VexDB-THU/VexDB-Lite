@@ -11,10 +11,10 @@ require vex
 load __TEST_DIR__/restart_drop1.db
 
 statement ok
-CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t1 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t1 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t1 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -43,7 +43,7 @@ SELECT count(*) FROM t1;
 
 # Search without index (scan fallback)
 query I
-SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -57,10 +57,10 @@ DROP TABLE t1;
 load __TEST_DIR__/restart_drop2.db
 
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t2 SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
@@ -80,7 +80,7 @@ CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
 
 # New index should work
 query I
-SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -118,10 +118,10 @@ DROP TABLE t2;
 load __TEST_DIR__/restart_drop3.db
 
 statement ok
-CREATE TABLE t3 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t3 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.1, 0.2)::FLOATVECTOR(4)
+INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.1, 0.2)::FLOAT[4]
 FROM range(1, 81) t(i);
 
 statement ok

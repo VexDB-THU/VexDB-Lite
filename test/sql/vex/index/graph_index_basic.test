@@ -6,10 +6,10 @@ require vex
 
 # Test basic index creation
 statement ok
-CREATE TABLE vectors (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE vectors (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO vectors VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO vectors VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx ON vectors USING GRAPH_INDEX (vec);
@@ -22,10 +22,10 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx';
 
 # Test index creation with data
 statement ok
-CREATE TABLE vectors2 (id INTEGER, vec FLOATVECTOR(128));
+CREATE TABLE vectors2 (id INTEGER, vec FLOAT[128]);
 
 statement ok
-INSERT INTO vectors2 SELECT i, list_transform(range(128), x -> (x + i)::FLOAT / 256.0)::FLOATVECTOR(128) FROM range(100) t(i);
+INSERT INTO vectors2 SELECT i, list_transform(range(128), x -> (x + i)::FLOAT / 256.0)::FLOAT[128] FROM range(100) t(i);
 
 statement ok
 CREATE INDEX idx2 ON vectors2 USING GRAPH_INDEX (vec);
@@ -38,7 +38,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx2';
 
 # Test multiple dimensions
 statement ok
-CREATE TABLE vec256 (id INTEGER, vec FLOATVECTOR(256));
+CREATE TABLE vec256 (id INTEGER, vec FLOAT[256]);
 
 statement ok
 CREATE INDEX idx256 ON vec256 USING GRAPH_INDEX (vec);
@@ -51,7 +51,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx256';
 
 # Test index on different sized vectors
 statement ok
-CREATE TABLE vec64 (id INTEGER, vec FLOATVECTOR(64));
+CREATE TABLE vec64 (id INTEGER, vec FLOAT[64]);
 
 statement ok
 CREATE INDEX idx64 ON vec64 USING GRAPH_INDEX (vec);

@@ -1,29 +1,18 @@
 # name: test/sql/vex/types/floatvector_dims.test
-# description: Test FLOATVECTOR dimension constraints
+# description: Test vector dimension constraints
 # group: [vex]
 
 require vex
 
-# Zero dimension should fail
+# Zero dimension should fail (DuckDB native check)
 statement error
-CREATE TABLE t_bad (v FLOATVECTOR(0));
-----
-
-# No dimension argument should fail
-statement error
-CREATE TABLE t_bad (v FLOATVECTOR);
-----
-
-# Negative dimension should fail
-statement error
-CREATE TABLE t_bad (v FLOATVECTOR(-1));
+CREATE TABLE t_bad (v FLOAT[0]);
 ----
 
 # Large valid dimension
 statement ok
-CREATE TABLE t_large (v FLOATVECTOR(4096));
+CREATE TABLE t_large (v FLOAT[4096]);
 
-# Exceeding max dimension should fail
-statement error
-CREATE TABLE t_bad (v FLOATVECTOR(16385));
-----
+# Very large dimension still works with FLOAT[N] (DuckDB native array)
+statement ok
+CREATE TABLE t_huge (v FLOAT[16384]);

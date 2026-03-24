@@ -5,7 +5,7 @@
 require vex
 
 statement ok
-CREATE TABLE threshold_test (id INTEGER PRIMARY KEY, vec FLOATVECTOR(4));
+CREATE TABLE threshold_test (id INTEGER PRIMARY KEY, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx ON threshold_test USING GRAPH_INDEX (vec);
@@ -14,7 +14,7 @@ CREATE INDEX idx ON threshold_test USING GRAPH_INDEX (vec);
 # Phase 1: Insert exactly 64 nodes (at threshold boundary)
 # ============================================================
 statement ok
-INSERT INTO threshold_test SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO threshold_test SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 65) t(i);
 
 query I
@@ -23,7 +23,7 @@ SELECT count(*) FROM threshold_test;
 64
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -31,10 +31,10 @@ SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0
 # Phase 2: Insert 1 more -> crosses threshold (65 nodes, graph search)
 # ============================================================
 statement ok
-INSERT INTO threshold_test VALUES (65, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4));
+INSERT INTO threshold_test VALUES (65, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]);
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -45,7 +45,7 @@ statement ok
 DELETE FROM threshold_test WHERE id = 65;
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -61,7 +61,7 @@ SELECT count(*) FROM threshold_test;
 30
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -69,7 +69,7 @@ SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0
 # Phase 5: Insert back above threshold (100 nodes)
 # ============================================================
 statement ok
-INSERT INTO threshold_test SELECT i, list_value(cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT, sin(i*0.5)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO threshold_test SELECT i, list_value(cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT, sin(i*0.5)::FLOAT)::FLOAT[4]
 FROM range(100, 170) t(i);
 
 query I
@@ -78,7 +78,7 @@ SELECT count(*) FROM threshold_test;
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -91,17 +91,17 @@ statement ok
 DELETE FROM threshold_test WHERE id >= 160;
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 # Insert to 70
 statement ok
-INSERT INTO threshold_test SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO threshold_test SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(200, 210) t(i);
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -110,7 +110,7 @@ statement ok
 DELETE FROM threshold_test WHERE id >= 150;
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -126,7 +126,7 @@ SELECT count(*) FROM threshold_test;
 3
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 3
 
@@ -142,7 +142,7 @@ SELECT count(*) FROM threshold_test;
 1
 
 query I
-SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 1
 

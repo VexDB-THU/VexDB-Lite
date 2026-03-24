@@ -9,18 +9,18 @@ require vex
 load __TEST_DIR__/multi_restart.db
 
 statement ok
-CREATE TABLE multi (id INTEGER, vec1 FLOATVECTOR(3), vec2 FLOATVECTOR(4));
+CREATE TABLE multi (id INTEGER, vec1 FLOAT[3], vec2 FLOAT[4]);
 
 statement ok
 INSERT INTO multi VALUES
-  (1,  [1.0, 0.0, 0.0]::FLOATVECTOR(3), [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4)),
-  (2,  [0.9, 0.1, 0.0]::FLOATVECTOR(3), [0.0, 0.0, 1.0, 0.0]::FLOATVECTOR(4)),
-  (3,  [0.0, 1.0, 0.0]::FLOATVECTOR(3), [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (4,  [0.0, 0.0, 1.0]::FLOATVECTOR(3), [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (5,  [0.5, 0.5, 0.0]::FLOATVECTOR(3), [0.0, 0.5, 0.5, 0.0]::FLOATVECTOR(4)),
-  (6,  [0.0, 0.5, 0.5]::FLOATVECTOR(3), [0.5, 0.0, 0.0, 0.5]::FLOATVECTOR(4)),
-  (7,  [0.5, 0.0, 0.5]::FLOATVECTOR(3), [0.5, 0.5, 0.0, 0.0]::FLOATVECTOR(4)),
-  (8,  [0.3, 0.3, 0.3]::FLOATVECTOR(3), [0.25, 0.25, 0.25, 0.25]::FLOATVECTOR(4));
+  (1,  [1.0, 0.0, 0.0]::FLOAT[3], [0.0, 0.0, 0.0, 1.0]::FLOAT[4]),
+  (2,  [0.9, 0.1, 0.0]::FLOAT[3], [0.0, 0.0, 1.0, 0.0]::FLOAT[4]),
+  (3,  [0.0, 1.0, 0.0]::FLOAT[3], [0.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (4,  [0.0, 0.0, 1.0]::FLOAT[3], [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+  (5,  [0.5, 0.5, 0.0]::FLOAT[3], [0.0, 0.5, 0.5, 0.0]::FLOAT[4]),
+  (6,  [0.0, 0.5, 0.5]::FLOAT[3], [0.5, 0.0, 0.0, 0.5]::FLOAT[4]),
+  (7,  [0.5, 0.0, 0.5]::FLOAT[3], [0.5, 0.5, 0.0, 0.0]::FLOAT[4]),
+  (8,  [0.3, 0.3, 0.3]::FLOAT[3], [0.25, 0.25, 0.25, 0.25]::FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_v1 ON multi USING GRAPH_INDEX (vec1);
@@ -50,13 +50,13 @@ true
 
 # Search on vec1: nearest to [1,0,0] should be id=1
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 # Search on vec2: nearest to [1,0,0,0] should be id=4
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec2, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec2, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 4
 
@@ -76,13 +76,13 @@ true
 
 # Nearest to [1,0,0] in vec1 should now be id=2 (vec1=[0.9,0.1,0])
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2
 
 # Nearest to [0,0,0,1] in vec2 should no longer be id=1
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec2, [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec2, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]) LIMIT 1;
 ----
 6
 
@@ -112,12 +112,12 @@ true
 
 # Both searches still correct after second restart
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec1, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2
 
 query I
-SELECT id FROM multi ORDER BY l2_distance(vec2, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM multi ORDER BY l2_distance(vec2, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 4
 

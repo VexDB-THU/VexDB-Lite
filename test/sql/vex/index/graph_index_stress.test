@@ -9,11 +9,11 @@ require vex
 # =============================================================================
 
 statement ok
-CREATE TABLE stress_vecs (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE stress_vecs (id INTEGER, vec FLOAT[4]);
 
 # Row 0 = [0,0,0,0], Row 1 = [0.01,0.02,0.03,0.04], etc.
 statement ok
-INSERT INTO stress_vecs SELECT i AS id, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT]::FLOATVECTOR(4) FROM range(2000) t(i);
+INSERT INTO stress_vecs SELECT i AS id, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT]::FLOAT[4] FROM range(2000) t(i);
 
 query I
 SELECT COUNT(*) FROM stress_vecs;
@@ -33,13 +33,13 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_stress';
 # =============================================================================
 
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 0
 
 # Row 1000 should be closest to its own vector
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOAT[4]) LIMIT 1;
 ----
 1000
 
@@ -64,7 +64,7 @@ SELECT COUNT(*) FROM stress_vecs WHERE id < 500;
 # Search near origin should NOT return any id < 500
 # Closest remaining is id=500 with vec [5.0, 10.0, 15.0, 20.0]
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 500
 
@@ -72,7 +72,7 @@ SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM stress_vecs
-  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 5
 ) t
 WHERE t.id >= 500;
@@ -85,7 +85,7 @@ WHERE t.id >= 500;
 
 # Insert rows with id 2000..2499, vectors near origin to test they are found
 statement ok
-INSERT INTO stress_vecs SELECT 2000 + i AS id, [(i * 0.005)::FLOAT, (i * 0.01)::FLOAT, (i * 0.015)::FLOAT, (i * 0.02)::FLOAT]::FLOATVECTOR(4) FROM range(500) t(i);
+INSERT INTO stress_vecs SELECT 2000 + i AS id, [(i * 0.005)::FLOAT, (i * 0.01)::FLOAT, (i * 0.015)::FLOAT, (i * 0.02)::FLOAT]::FLOAT[4] FROM range(500) t(i);
 
 query I
 SELECT COUNT(*) FROM stress_vecs;
@@ -94,7 +94,7 @@ SELECT COUNT(*) FROM stress_vecs;
 
 # New row id=2000 has vec [0,0,0,0] - should be closest to origin
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 2000
 
@@ -104,20 +104,20 @@ SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT
 
 # Search 1: Near [10, 20, 30, 40] - should find id=1000
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOAT[4]) LIMIT 1;
 ----
 1000
 
 # Search 2: Near [15, 30, 45, 60] - should find id=1500
 query I
-SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [15.0, 30.0, 45.0, 60.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [15.0, 30.0, 45.0, 60.0]::FLOAT[4]) LIMIT 1;
 ----
 1500
 
 # Search 3: Near [19.99, 39.98, 59.97, 79.96] - should find id close to 1999
 # HNSW is approximate; accept any of the nearest neighbors
 query I
-SELECT abs(id - 1999) <= 2 FROM stress_vecs ORDER BY l2_distance(vec, [19.99, 39.98, 59.97, 79.96]::FLOATVECTOR(4)) LIMIT 1;
+SELECT abs(id - 1999) <= 2 FROM stress_vecs ORDER BY l2_distance(vec, [19.99, 39.98, 59.97, 79.96]::FLOAT[4]) LIMIT 1;
 ----
 true
 
@@ -125,7 +125,7 @@ true
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM stress_vecs
-  ORDER BY l2_distance(vec, [5.0, 10.0, 15.0, 20.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [5.0, 10.0, 15.0, 20.0]::FLOAT[4])
   LIMIT 10
 ) t;
 ----
@@ -135,7 +135,7 @@ SELECT COUNT(*) FROM (
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM stress_vecs
-  ORDER BY l2_distance(vec, [0.5, 1.0, 1.5, 2.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.5, 1.0, 1.5, 2.0]::FLOAT[4])
   LIMIT 20
 ) t;
 ----
@@ -145,7 +145,7 @@ SELECT COUNT(*) FROM (
 query I
 SELECT COUNT(*) FROM (
   SELECT id FROM stress_vecs
-  ORDER BY cosine_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4])
   LIMIT 10
 ) t;
 ----
@@ -158,7 +158,7 @@ SELECT COUNT(*) FROM (
 # Every search in the top-10 should have non-negative distance
 query I
 SELECT COUNT(*) FROM (
-  SELECT id, l2_distance(vec, [7.5, 15.0, 22.5, 30.0]::FLOATVECTOR(4)) AS dist
+  SELECT id, l2_distance(vec, [7.5, 15.0, 22.5, 30.0]::FLOAT[4]) AS dist
   FROM stress_vecs
   ORDER BY dist
   LIMIT 10

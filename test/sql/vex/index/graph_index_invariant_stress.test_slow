@@ -14,7 +14,7 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE t_stress1 (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE t_stress1 (id INTEGER, vec FLOAT[8]);
 
 statement ok
 CREATE INDEX idx_s1 ON t_stress1 USING GRAPH_INDEX (vec);
@@ -24,7 +24,7 @@ statement ok
 INSERT INTO t_stress1 SELECT i, list_value(
   sin(i*0.01)::FLOAT, cos(i*0.02)::FLOAT, sin(i*0.03)::FLOAT, cos(i*0.04)::FLOAT,
   sin(i*0.05)::FLOAT, cos(i*0.06)::FLOAT, sin(i*0.07)::FLOAT, cos(i*0.08)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 501) t(i);
 
 query I
@@ -37,7 +37,7 @@ statement ok
 INSERT INTO t_stress1 SELECT i, list_value(
   cos(i*0.01)::FLOAT, sin(i*0.02)::FLOAT, cos(i*0.03)::FLOAT, sin(i*0.04)::FLOAT,
   cos(i*0.05)::FLOAT, sin(i*0.06)::FLOAT, cos(i*0.07)::FLOAT, sin(i*0.08)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(501, 801) t(i);
 
 query I
@@ -49,7 +49,7 @@ true
 statement ok
 INSERT INTO t_stress1 SELECT i, list_value(
   0.0, 0.0, 0.0, 0.0, sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(801, 811) t(i);
 
 query I
@@ -62,7 +62,7 @@ statement ok
 INSERT INTO t_stress1 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
   sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(811, 1811) t(i);
 
 query I
@@ -76,7 +76,7 @@ SELECT count(*) FROM t_stress1;
 1810
 
 query I
-SELECT count(*) FROM (SELECT id FROM t_stress1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOATVECTOR(8)) LIMIT 50);
+SELECT count(*) FROM (SELECT id FROM t_stress1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOAT[8]) LIMIT 50);
 ----
 50
 
@@ -88,12 +88,12 @@ DROP TABLE t_stress1;
 # ============================================================
 
 statement ok
-CREATE TABLE t_stress2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_stress2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_stress2 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 501) t(i);
 
 statement ok
@@ -116,7 +116,7 @@ true
 statement ok
 INSERT INTO t_stress2 SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(501, 701) t(i);
 
 query I
@@ -136,7 +136,7 @@ true
 statement ok
 INSERT INTO t_stress2 SELECT i, list_value(
   sin(i)::FLOAT, cos(i)::FLOAT, 0.1, 0.2
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(701, 801) t(i);
 
 query I
@@ -146,7 +146,7 @@ true
 
 # Cycle 3: UPDATE (= DELETE + INSERT)
 statement ok
-UPDATE t_stress2 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id BETWEEN 301 AND 400;
+UPDATE t_stress2 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id BETWEEN 301 AND 400;
 
 query I
 SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_s2';
@@ -155,7 +155,7 @@ true
 
 # Verify final state
 query I
-SELECT count(*) FROM (SELECT id FROM t_stress2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t_stress2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 
@@ -168,13 +168,13 @@ DROP TABLE t_stress2;
 # ============================================================
 
 statement ok
-CREATE TABLE t_self500 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_self500 (id INTEGER, vec FLOAT[4]);
 
 # Use widely spaced vectors so each is unambiguously its own nearest neighbor
 statement ok
 INSERT INTO t_self500 SELECT i, list_value(
   (i * 1000.0)::FLOAT, 0.0, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 501) t(i);
 
 statement ok
@@ -212,12 +212,12 @@ DROP TABLE t_self500;
 load __TEST_DIR__/invariant_restart.db
 
 statement ok
-CREATE TABLE t_restart_inv (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_restart_inv (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_restart_inv SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 301) t(i);
 
 statement ok
@@ -237,7 +237,7 @@ restart
 statement ok
 INSERT INTO t_restart_inv SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(301, 501) t(i);
 
 query I
@@ -256,7 +256,7 @@ true
 
 # UPDATE 50 rows → DELETE old + INSERT new
 statement ok
-UPDATE t_restart_inv SET vec = [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id BETWEEN 101 AND 150;
+UPDATE t_restart_inv SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id BETWEEN 101 AND 150;
 
 query I
 SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_ri';
@@ -269,7 +269,7 @@ SELECT count(*) FROM t_restart_inv;
 400
 
 query I
-SELECT count(*) FROM (SELECT id FROM t_restart_inv ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t_restart_inv ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 

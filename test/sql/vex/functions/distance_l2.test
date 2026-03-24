@@ -6,35 +6,35 @@ require vex
 
 # Basic L2 distance
 query R
-SELECT l2_distance([1.0, 0.0, 0.0]::FLOATVECTOR(3), [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+SELECT l2_distance([1.0, 0.0, 0.0]::FLOAT[3], [0.0, 1.0, 0.0]::FLOAT[3]);
 ----
 1.4142135623730951
 
 # Distance to self is 0
 query R
-SELECT l2_distance([1.0, 2.0, 3.0]::FLOATVECTOR(3), [1.0, 2.0, 3.0]::FLOATVECTOR(3));
+SELECT l2_distance([1.0, 2.0, 3.0]::FLOAT[3], [1.0, 2.0, 3.0]::FLOAT[3]);
 ----
 0.0
 
 # Simple distance
 query R
-SELECT l2_distance([0.0, 0.0]::FLOATVECTOR(2), [3.0, 4.0]::FLOATVECTOR(2));
+SELECT l2_distance([0.0, 0.0]::FLOAT[2], [3.0, 4.0]::FLOAT[2]);
 ----
 5.0
 
 # Table scan with ordering
 statement ok
-CREATE TABLE items (id INT, v FLOATVECTOR(3));
+CREATE TABLE items (id INT, v FLOAT[3]);
 
 statement ok
 INSERT INTO items VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, [1.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [1.0, 1.0, 0.0]::FLOAT[3]);
 
 query I
-SELECT id FROM items ORDER BY l2_distance(v, [1.0, 0.0, 0.0]::FLOATVECTOR(3)), id LIMIT 3;
+SELECT id FROM items ORDER BY l2_distance(v, [1.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 3;
 ----
 1
 4
@@ -42,6 +42,6 @@ SELECT id FROM items ORDER BY l2_distance(v, [1.0, 0.0, 0.0]::FLOATVECTOR(3)), i
 
 # NULL input returns NULL
 query R
-SELECT l2_distance(NULL::FLOATVECTOR(3), [1.0, 2.0, 3.0]::FLOATVECTOR(3));
+SELECT l2_distance(NULL::FLOAT[3], [1.0, 2.0, 3.0]::FLOAT[3]);
 ----
 NULL

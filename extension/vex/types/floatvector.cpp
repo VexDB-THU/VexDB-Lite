@@ -27,7 +27,8 @@ static LogicalType BindFloatVectorType(BindLogicalTypeInput &input) {
 }
 
 void VexTypes::Register(ExtensionLoader &loader) {
-	auto base_type = LogicalType::ARRAY(LogicalType::FLOAT, 0);
+	// Use dimension 1 as placeholder; actual dimension is resolved by BindFloatVectorType
+	auto base_type = LogicalType::ARRAY(LogicalType::FLOAT, 1);
 	base_type.SetAlias(FLOATVECTOR_TYPE_NAME);
 	loader.RegisterType(FLOATVECTOR_TYPE_NAME, std::move(base_type), BindFloatVectorType);
 }

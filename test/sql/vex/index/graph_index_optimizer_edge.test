@@ -8,18 +8,18 @@ require vex
 # Setup
 # ============================================================
 statement ok
-CREATE TABLE t_opt (id INTEGER, val FLOAT, vec FLOATVECTOR(3));
+CREATE TABLE t_opt (id INTEGER, val FLOAT, vec FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_opt ON t_opt USING GRAPH_INDEX (vec);
 
 statement ok
 INSERT INTO t_opt VALUES
-  (1, 10.0, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, 20.0, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, 30.0, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, 40.0, [0.5, 0.5, 0.0]::FLOATVECTOR(3)),
-  (5, 50.0, [0.0, 0.5, 0.5]::FLOATVECTOR(3));
+  (1, 10.0, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 20.0, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, 30.0, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, 40.0, [0.5, 0.5, 0.0]::FLOAT[3]),
+  (5, 50.0, [0.0, 0.5, 0.5]::FLOAT[3]);
 
 # ============================================================
 # Test 1: ORDER BY non-distance column (should NOT use index)
@@ -34,7 +34,7 @@ SELECT id FROM t_opt ORDER BY val LIMIT 2;
 # Test 2: ORDER BY distance DESC (farthest first - should work via scan)
 # ============================================================
 query I
-SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) DESC LIMIT 2;
+SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 2;
 ----
 2
 3
@@ -43,7 +43,7 @@ SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) 
 # Test 3: No LIMIT clause (full sort, should not use index)
 # ============================================================
 query I
-SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]);
 ----
 1
 4
@@ -55,7 +55,7 @@ SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
 # Test 4: Multiple ORDER BY columns
 # ============================================================
 query I
-SELECT id FROM t_opt ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)), id LIMIT 3;
+SELECT id FROM t_opt ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 3;
 ----
 4
 5
@@ -65,7 +65,7 @@ SELECT id FROM t_opt ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)),
 # Test 5: OFFSET without LIMIT
 # ============================================================
 query I
-SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 2 OFFSET 1;
+SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2 OFFSET 1;
 ----
 4
 5
@@ -74,7 +74,7 @@ SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) 
 # Test 6: Large OFFSET exceeding result count
 # ============================================================
 query I
-SELECT count(*) FROM (SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3 OFFSET 100);
+SELECT count(*) FROM (SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3 OFFSET 100);
 ----
 0
 
@@ -82,12 +82,12 @@ SELECT count(*) FROM (SELECT id FROM t_opt ORDER BY l2_distance(vec, [1.0, 0.0, 
 # Test 7: distance between two columns (no constant vector)
 # ============================================================
 statement ok
-CREATE TABLE t_two (id INTEGER, v1 FLOATVECTOR(3), v2 FLOATVECTOR(3));
+CREATE TABLE t_two (id INTEGER, v1 FLOAT[3], v2 FLOAT[3]);
 
 statement ok
 INSERT INTO t_two VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.5, 0.5, 0.0]::FLOATVECTOR(3), [0.5, 0.5, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], [0.0, 1.0, 0.0]::FLOAT[3]),
+  (2, [0.5, 0.5, 0.0]::FLOAT[3], [0.5, 0.5, 0.0]::FLOAT[3]);
 
 # This should NOT use index (two column refs, no constant)
 query I
@@ -111,7 +111,7 @@ INSERT INTO t_meta VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
 query IT
 SELECT t_opt.id, t_meta.label
 FROM t_opt JOIN t_meta ON t_opt.id = t_meta.id
-ORDER BY l2_distance(t_opt.vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3))
+ORDER BY l2_distance(t_opt.vec, [1.0, 0.0, 0.0]::FLOAT[3])
 LIMIT 2;
 ----
 1	a

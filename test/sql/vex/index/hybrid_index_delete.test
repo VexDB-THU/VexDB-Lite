@@ -5,16 +5,16 @@
 require vex
 
 statement ok
-CREATE TABLE items (id INTEGER, color VARCHAR, vec FLOATVECTOR(3));
+CREATE TABLE items (id INTEGER, color VARCHAR, vec FLOAT[3]);
 
 statement ok
 INSERT INTO items VALUES
-  (1, 'red', [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, 'red', [0.9, 0.1, 0.0]::FLOATVECTOR(3)),
-  (3, 'blue', [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, 'blue', [0.0, 0.1, 0.9]::FLOATVECTOR(3)),
-  (5, 'green', [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (6, 'green', [0.1, 0.9, 0.0]::FLOATVECTOR(3));
+  (1, 'red', [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'red', [0.9, 0.1, 0.0]::FLOAT[3]),
+  (3, 'blue', [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, 'blue', [0.0, 0.1, 0.9]::FLOAT[3]),
+  (5, 'green', [0.0, 1.0, 0.0]::FLOAT[3]),
+  (6, 'green', [0.1, 0.9, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx ON items USING HYBRID_INDEX (vec, color);
@@ -27,7 +27,7 @@ DELETE FROM items WHERE id = 1;
 query I
 SELECT id FROM items
 WHERE color = 'red'
-ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3))
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
 LIMIT 1;
 ----
 2
@@ -43,12 +43,12 @@ SELECT count(*) FROM items WHERE color = 'blue';
 
 # Insert new items after delete
 statement ok
-INSERT INTO items VALUES (7, 'red', [0.95, 0.05, 0.0]::FLOATVECTOR(3));
+INSERT INTO items VALUES (7, 'red', [0.95, 0.05, 0.0]::FLOAT[3]);
 
 query I
 SELECT id FROM items
 WHERE color = 'red'
-ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3))
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
 LIMIT 1;
 ----
 7

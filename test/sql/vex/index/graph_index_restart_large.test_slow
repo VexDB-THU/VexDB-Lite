@@ -10,13 +10,13 @@ require vex
 load __TEST_DIR__/restart_large.db
 
 statement ok
-CREATE TABLE big (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE big (id INTEGER, vec FLOAT[8]);
 
 statement ok
 INSERT INTO big SELECT i, list_value(
   sin(i*0.01)::FLOAT, cos(i*0.02)::FLOAT, sin(i*0.03)::FLOAT, cos(i*0.04)::FLOAT,
   sin(i*0.05)::FLOAT, cos(i*0.06)::FLOAT, sin(i*0.07)::FLOAT, cos(i*0.08)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 5001) t(i);
 
 statement ok
@@ -29,7 +29,7 @@ SELECT count(*) FROM big;
 5000
 
 query I
-SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOATVECTOR(8)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOAT[8]) LIMIT 20);
 ----
 20
 
@@ -68,7 +68,7 @@ true
 
 # Search still works
 query I
-SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOATVECTOR(8)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOAT[8]) LIMIT 20);
 ----
 20
 
@@ -77,7 +77,7 @@ statement ok
 INSERT INTO big SELECT i, list_value(
   cos(i*0.01)::FLOAT, sin(i*0.02)::FLOAT, cos(i*0.03)::FLOAT, sin(i*0.04)::FLOAT,
   cos(i*0.05)::FLOAT, sin(i*0.06)::FLOAT, cos(i*0.07)::FLOAT, sin(i*0.08)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(5001, 7001) t(i);
 
 query I
@@ -105,7 +105,7 @@ SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'i
 true
 
 query I
-SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOATVECTOR(8)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM big ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOAT[8]) LIMIT 20);
 ----
 20
 

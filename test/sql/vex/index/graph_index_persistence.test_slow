@@ -11,13 +11,13 @@ load __TEST_DIR__/graph_index_persist_slow.db
 # Phase 1: Create and populate index
 # ============================================================
 statement ok
-CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOATVECTOR(4));
+CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_persist ON vectors USING GRAPH_INDEX (vec);
 
 statement ok
-INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 query I
@@ -26,7 +26,7 @@ SELECT count(*) FROM vectors;
 200
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -41,12 +41,12 @@ SELECT count(*) FROM vectors;
 200
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -57,7 +57,7 @@ statement ok
 DELETE FROM vectors WHERE id BETWEEN 1 AND 50;
 
 statement ok
-INSERT INTO vectors SELECT i, list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO vectors SELECT i, list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOAT[4]
 FROM range(201, 301) t(i);
 
 query I
@@ -84,7 +84,7 @@ SELECT count(*) FROM vectors WHERE id BETWEEN 1 AND 50;
 0
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)) LIMIT 15);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 15);
 ----
 15
 
@@ -106,7 +106,7 @@ statement ok
 SELECT count(*) FROM vectors;
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -127,13 +127,13 @@ SELECT count(*) FROM vectors;
 0
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 0
 
 # Insert into empty index after restart
 statement ok
-INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO vectors SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 query I
@@ -142,7 +142,7 @@ SELECT count(*) FROM vectors;
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -161,14 +161,14 @@ statement ok
 CREATE INDEX idx_persist2 ON vectors USING GRAPH_INDEX (vec);
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 restart
 
 query I
-SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 

@@ -14,7 +14,7 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE t_recall (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE t_recall (id INTEGER, vec FLOAT[8]);
 
 # Generate 300 vectors with trig-based components (pseudo-normalized)
 statement ok
@@ -23,14 +23,14 @@ INSERT INTO t_recall SELECT i, list_value(
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
   sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,
   sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 301) t(i);
 
 # Brute-force cosine top-10 (no index)
 statement ok
 CREATE TABLE t_bf_result AS
 SELECT id FROM t_recall
-ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOATVECTOR(8))
+ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[8])
 LIMIT 10;
 
 # Now create the index
@@ -41,7 +41,7 @@ CREATE INDEX idx_recall ON t_recall USING GRAPH_INDEX (vec);
 statement ok
 CREATE TABLE t_idx_result AS
 SELECT id FROM t_recall
-ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOATVECTOR(8))
+ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[8])
 LIMIT 10;
 
 # Count overlap between brute-force and index results
@@ -66,13 +66,13 @@ DROP TABLE t_recall;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_self (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_self (id INTEGER, vec FLOAT[4]);
 
 # Well-separated vectors: each row has a unique dominant dimension direction
 statement ok
 INSERT INTO t_cos_self SELECT i, list_value(
   (i * 1000.0)::FLOAT, 0.0, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 301) t(i);
 
 statement ok
@@ -86,7 +86,7 @@ DROP TABLE t_cos_self;
 
 # Use well-separated angular directions
 statement ok
-CREATE TABLE t_cos_self2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_self2 (id INTEGER, vec FLOAT[4]);
 
 # Each vector points in a distinct angular direction
 statement ok
@@ -95,7 +95,7 @@ INSERT INTO t_cos_self2 SELECT i, list_value(
   sin(i * 0.1)::FLOAT,
   cos(i * 0.3)::FLOAT,
   sin(i * 0.3)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -130,13 +130,13 @@ DROP TABLE t_cos_self2;
 # ============================================================
 
 statement ok
-CREATE TABLE t_mixed (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_mixed (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_mixed SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -146,7 +146,7 @@ CREATE INDEX idx_mixed ON t_mixed USING GRAPH_INDEX (vec);
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_mixed
-  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -156,7 +156,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_mixed
-  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -166,7 +166,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_mixed
-  ORDER BY vec <=> [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)
+  ORDER BY vec <=> [0.5, 0.5, 0.5, 0.5]::FLOAT[4]
   LIMIT 10
 );
 ----
@@ -176,7 +176,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_mixed
-  ORDER BY vec <-> [0.5, 0.5, 0.5, 0.5]::FLOATVECTOR(4)
+  ORDER BY vec <-> [0.5, 0.5, 0.5, 0.5]::FLOAT[4]
   LIMIT 10
 );
 ----
@@ -190,13 +190,13 @@ DROP TABLE t_mixed;
 # ============================================================
 
 statement ok
-CREATE TABLE t_cos_cycle (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_cos_cycle (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_cos_cycle SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -211,14 +211,14 @@ statement ok
 INSERT INTO t_cos_cycle SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
   cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 # Cosine search should work correctly after mutations
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_cycle
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 10
 );
 ----
@@ -228,7 +228,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_cos_cycle
-  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 100
 ) sub
 WHERE sub.id <= 50;

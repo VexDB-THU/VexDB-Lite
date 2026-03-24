@@ -11,7 +11,7 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE leak1 (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE leak1 (id INTEGER, vec FLOAT[8]);
 
 statement ok
 CREATE INDEX lidx1 ON leak1 USING GRAPH_INDEX (vec);
@@ -21,7 +21,7 @@ statement ok
 INSERT INTO leak1 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT,
   sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 201) t(i);
 
 query I
@@ -43,11 +43,11 @@ statement ok
 INSERT INTO leak1 SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT,
   cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(201, 401) t(i);
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -60,11 +60,11 @@ statement ok
 INSERT INTO leak1 SELECT i, list_value(
   sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT,
   sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.9)::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(401, 601) t(i);
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOATVECTOR(8)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]::FLOAT[8]) LIMIT 10);
 ----
 10
 
@@ -76,13 +76,13 @@ DROP TABLE leak1;
 # ============================================================
 
 statement ok
-CREATE TABLE leak2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE leak2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX lidx2 ON leak2 USING GRAPH_INDEX (vec);
 
 statement ok
-INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 # Delete half
@@ -96,7 +96,7 @@ SELECT count(*) FROM leak2;
 
 # Insert same amount back
 statement ok
-INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.5, 0.5)::FLOATVECTOR(4)
+INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.5, 0.5)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 query I
@@ -106,7 +106,7 @@ SELECT count(*) FROM leak2;
 
 # All 100 searchable
 query I
-SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 
@@ -115,11 +115,11 @@ statement ok
 DELETE FROM leak2;
 
 statement ok
-INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 1.0, 1.0)::FLOATVECTOR(4)
+INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 1.0, 1.0)::FLOAT[4]
 FROM range(151, 251) t(i);
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -131,17 +131,17 @@ DROP TABLE leak2;
 # ============================================================
 
 statement ok
-CREATE TABLE leak3 (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE leak3 (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX lidx3 ON leak3 USING HYBRID_INDEX (vec, cat);
 
 statement ok
-INSERT INTO leak3 SELECT i, 'a', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO leak3 SELECT i, 'a', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
-INSERT INTO leak3 SELECT i, 'b', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO leak3 SELECT i, 'b', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 # Delete entire partition 'a'
@@ -150,17 +150,17 @@ DELETE FROM leak3 WHERE cat = 'a';
 
 # Reinsert into 'a'
 statement ok
-INSERT INTO leak3 SELECT i, 'a', list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.5, 0.5)::FLOATVECTOR(4)
+INSERT INTO leak3 SELECT i, 'a', list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.5, 0.5)::FLOAT[4]
 FROM range(201, 301) t(i);
 
 # Both partitions functional
 query I
-SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'a' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'a' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -169,11 +169,11 @@ statement ok
 DELETE FROM leak3 WHERE cat = 'b';
 
 statement ok
-INSERT INTO leak3 SELECT i, 'b', list_value(0.0, 0.0, sin(i)::FLOAT, cos(i)::FLOAT)::FLOATVECTOR(4)
+INSERT INTO leak3 SELECT i, 'b', list_value(0.0, 0.0, sin(i)::FLOAT, cos(i)::FLOAT)::FLOAT[4]
 FROM range(301, 401) t(i);
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak3 WHERE cat = 'b' ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -187,21 +187,21 @@ DROP TABLE leak3;
 load __TEST_DIR__/leak_persist.db
 
 statement ok
-CREATE TABLE leak4 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE leak4 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX lidx4 ON leak4 USING GRAPH_INDEX (vec);
 
 # Insert 100, delete all, insert 100 again
 statement ok
-INSERT INTO leak4 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO leak4 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
 DELETE FROM leak4;
 
 statement ok
-INSERT INTO leak4 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.5, 0.5)::FLOATVECTOR(4)
+INSERT INTO leak4 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.5, 0.5)::FLOAT[4]
 FROM range(101, 201) t(i);
 
 statement ok
@@ -215,7 +215,7 @@ SELECT count(*) FROM leak4;
 100
 
 query I
-SELECT count(*) FROM (SELECT id FROM leak4 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM leak4 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 

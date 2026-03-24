@@ -16,22 +16,22 @@ require vex
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_neg (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_ip_neg (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t_ip_neg VALUES
-  (1, [10.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (4, [-1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (5, [-10.0, 0.0, 0.0]::FLOATVECTOR(3));
+  (1, [10.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 0.0]::FLOAT[3]),
+  (4, [-1.0, 0.0, 0.0]::FLOAT[3]),
+  (5, [-10.0, 0.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_ip_neg ON t_ip_neg USING GRAPH_INDEX (vec) WITH (metric='ip');
 
 # Highest IP first: id=1(10), id=2(1), id=3(0), id=4(-1), id=5(-10)
 query I
-SELECT id FROM t_ip_neg ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) DESC LIMIT 3;
+SELECT id FROM t_ip_neg ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 3;
 ----
 1
 2
@@ -50,22 +50,22 @@ DROP TABLE t_ip_neg;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_large (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_ip_large (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_ip_large VALUES
-  (1, [1e5, 1e5, 0.0, 0.0]::FLOATVECTOR(4)),
-  (2, [1e3, 1e3, 0.0, 0.0]::FLOATVECTOR(4)),
-  (3, [1.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (4, [0.001, 0.001, 0.0, 0.0]::FLOATVECTOR(4)),
-  (5, [1e5, 0.0, 1e5, 0.0]::FLOATVECTOR(4));
+  (1, [1e5, 1e5, 0.0, 0.0]::FLOAT[4]),
+  (2, [1e3, 1e3, 0.0, 0.0]::FLOAT[4]),
+  (3, [1.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (4, [0.001, 0.001, 0.0, 0.0]::FLOAT[4]),
+  (5, [1e5, 0.0, 1e5, 0.0]::FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_ip_large ON t_ip_large USING GRAPH_INDEX (vec) WITH (metric='ip');
 
 # Query [1,1,0,0]: id=1(2e5), id=5(1e5), id=2(2e3), id=3(2), id=4(0.002)
 query I
-SELECT id FROM t_ip_large ORDER BY inner_product(vec, [1.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC LIMIT 3;
+SELECT id FROM t_ip_large ORDER BY inner_product(vec, [1.0, 1.0, 0.0, 0.0]::FLOAT[4]) DESC LIMIT 3;
 ----
 1
 5
@@ -80,13 +80,13 @@ DROP TABLE t_ip_large;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_zero (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_ip_zero (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t_ip_zero VALUES
-  (1, [0.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [0.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_ip_zero ON t_ip_zero USING GRAPH_INDEX (vec) WITH (metric='ip');
@@ -95,7 +95,7 @@ CREATE INDEX idx_ip_zero ON t_ip_zero USING GRAPH_INDEX (vec) WITH (metric='ip')
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_zero
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC
   LIMIT 3
 );
 ----
@@ -117,7 +117,7 @@ DROP TABLE t_ip_zero;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_scale (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_ip_scale (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_ip_scale SELECT i, list_value(
@@ -125,7 +125,7 @@ INSERT INTO t_ip_scale SELECT i, list_value(
   (i * cos(i * 0.5))::FLOAT,
   (i * sin(i * 1.3))::FLOAT,
   (i * cos(i * 1.3))::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -140,7 +140,7 @@ true
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_scale
-  ORDER BY inner_product(vec, [1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4]) DESC
   LIMIT 20
 );
 ----
@@ -152,7 +152,7 @@ SELECT count(*) FROM (
 query I
 SELECT id > 100 FROM (
   SELECT id FROM t_ip_scale
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 1
 );
 ----
@@ -166,7 +166,7 @@ DROP TABLE t_ip_scale;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_recall (id INTEGER, vec FLOATVECTOR(8));
+CREATE TABLE t_ip_recall (id INTEGER, vec FLOAT[8]);
 
 statement ok
 INSERT INTO t_ip_recall SELECT i, list_value(
@@ -174,14 +174,14 @@ INSERT INTO t_ip_recall SELECT i, list_value(
   (i * sin(i*0.2))::FLOAT, (i * cos(i*0.2))::FLOAT,
   (i * sin(i*0.3))::FLOAT, (i * cos(i*0.3))::FLOAT,
   (i * sin(i*0.4))::FLOAT, (i * cos(i*0.4))::FLOAT
-)::FLOATVECTOR(8)
+)::FLOAT[8]
 FROM range(1, 301) t(i);
 
 # Brute-force top-10 (no index)
 statement ok
 CREATE TABLE t_ip_bf AS
 SELECT id FROM t_ip_recall
-ORDER BY inner_product(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOATVECTOR(8)) DESC
+ORDER BY inner_product(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOAT[8]) DESC
 LIMIT 10;
 
 statement ok
@@ -195,7 +195,7 @@ SET vex_ef_search = 200;
 statement ok
 CREATE TABLE t_ip_idx AS
 SELECT id FROM t_ip_recall
-ORDER BY inner_product(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOATVECTOR(8)) DESC
+ORDER BY inner_product(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOAT[8]) DESC
 LIMIT 10;
 
 # Recall >= 80%
@@ -218,13 +218,13 @@ DROP TABLE t_ip_recall;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_mut (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_ip_mut (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_ip_mut SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
   sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -241,7 +241,7 @@ true
 
 # UPDATE 20
 statement ok
-UPDATE t_ip_mut SET vec = [100.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4) WHERE id BETWEEN 31 AND 50;
+UPDATE t_ip_mut SET vec = [100.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id BETWEEN 31 AND 50;
 
 query I
 SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_ip_mut';
@@ -252,7 +252,7 @@ true
 statement ok
 INSERT INTO t_ip_mut SELECT i, list_value(
   (i * 50.0)::FLOAT, 0.0, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 query I
@@ -264,7 +264,7 @@ true
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_mut
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 10
 );
 ----
@@ -274,7 +274,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_mut
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 120
 ) sub
 WHERE sub.id <= 30;
@@ -291,12 +291,12 @@ DROP TABLE t_ip_mut;
 load __TEST_DIR__/ip_metric_restart.db
 
 statement ok
-CREATE TABLE t_ip_r (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_ip_r (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t_ip_r SELECT i, list_value(
   (i * sin(i))::FLOAT, (i * cos(i))::FLOAT, 0.1, 0.2
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -311,7 +311,7 @@ restart
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_r
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 10
 );
 ----
@@ -321,7 +321,7 @@ SELECT count(*) FROM (
 statement ok
 INSERT INTO t_ip_r SELECT i, list_value(
   (i * 1000.0)::FLOAT, 0.0, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 121) t(i);
 
 query I
@@ -356,7 +356,7 @@ true
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_r
-  ORDER BY inner_product(vec, [1.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 1.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 10
 );
 ----
@@ -371,26 +371,26 @@ DROP TABLE t_ip_r;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_mm (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_ip_mm (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t_ip_mm VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_ip_mm ON t_ip_mm USING GRAPH_INDEX (vec) WITH (metric='ip');
 
 # L2 query on IP index — optimizer skips, brute-force used
 query I
-SELECT id FROM t_ip_mm ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_ip_mm ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 # Cosine query on IP index — optimizer skips, brute-force used
 query I
-SELECT id FROM t_ip_mm ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_ip_mm ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -402,7 +402,7 @@ DROP TABLE t_ip_mm;
 # ============================================================
 
 statement ok
-CREATE TABLE t_hyb_ip (id INTEGER, cat VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE t_hyb_ip (id INTEGER, cat VARCHAR, vec FLOAT[4]);
 
 statement ok
 CREATE INDEX idx_hyb_ip ON t_hyb_ip USING HYBRID_INDEX (vec, cat) WITH (metric='ip');
@@ -410,13 +410,13 @@ CREATE INDEX idx_hyb_ip ON t_hyb_ip USING HYBRID_INDEX (vec, cat) WITH (metric='
 statement ok
 INSERT INTO t_hyb_ip SELECT i, 'cat_a', list_value(
   (i * sin(i))::FLOAT, (i * cos(i))::FLOAT, 0.0, 0.0
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
 INSERT INTO t_hyb_ip SELECT i, 'cat_b', list_value(
   0.0, 0.0, (i * sin(i))::FLOAT, (i * cos(i))::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 query I
@@ -429,7 +429,7 @@ query I
 SELECT count(*) FROM (
   SELECT id FROM t_hyb_ip
   WHERE cat = 'cat_a'
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC
   LIMIT 5
 );
 ----
@@ -453,15 +453,15 @@ DROP TABLE t_hyb_ip;
 # ============================================================
 
 statement ok
-CREATE TABLE t_ip_dup (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_ip_dup (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t_ip_dup VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (3, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (4, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (5, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (3, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (4, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (5, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_ip_dup ON t_ip_dup USING GRAPH_INDEX (vec) WITH (metric='ip');
@@ -475,7 +475,7 @@ true
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_dup
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC
   LIMIT 5
 );
 ----
@@ -485,7 +485,7 @@ SELECT count(*) FROM (
 query I
 SELECT count(*) FROM (
   SELECT id FROM t_ip_dup
-  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) DESC
+  ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC
   LIMIT 3
 ) sub
 WHERE sub.id IN (1, 2, 3);

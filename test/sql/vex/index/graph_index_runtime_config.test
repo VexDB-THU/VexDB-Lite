@@ -76,10 +76,10 @@ SELECT current_setting('vex_brute_force_threshold');
 # Test 4: ef_search affects search results (higher ef = better recall)
 # ============================================================
 statement ok
-CREATE TABLE t_config (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t_config (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t_config SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOATVECTOR(4) FROM range(500) t(i);
+INSERT INTO t_config SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(500) t(i);
 
 statement ok
 CREATE INDEX idx_config ON t_config USING GRAPH_INDEX (vec);
@@ -89,7 +89,7 @@ statement ok
 SET vex_ef_search = 10;
 
 query I
-SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
@@ -98,13 +98,13 @@ statement ok
 SET vex_ef_search = 200;
 
 query I
-SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 5);
+SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
 ----
 5
 
 # The top-1 result should be id=0 regardless of ef
 query I
-SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 0
 
@@ -120,7 +120,7 @@ statement ok
 SET vex_brute_force_threshold = 1000;
 
 query I
-SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 0
 
@@ -129,7 +129,7 @@ statement ok
 SET vex_brute_force_threshold = 0;
 
 query I
-SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
 ----
 0
 
@@ -143,13 +143,13 @@ DROP TABLE t_config;
 # Test 6: Configuration works with HybridIndex
 # ============================================================
 statement ok
-CREATE TABLE t_hybrid_cfg (id INTEGER, vec FLOATVECTOR(3), category VARCHAR);
+CREATE TABLE t_hybrid_cfg (id INTEGER, vec FLOAT[3], category VARCHAR);
 
 statement ok
 INSERT INTO t_hybrid_cfg VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3), 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3), 'B');
+  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
 
 statement ok
 CREATE INDEX idx_hybrid_cfg ON t_hybrid_cfg USING HYBRID_INDEX (vec, category);
@@ -158,7 +158,7 @@ statement ok
 SET vex_ef_search = 100;
 
 query I
-SELECT id FROM t_hybrid_cfg WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_hybrid_cfg WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 

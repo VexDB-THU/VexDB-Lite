@@ -14,22 +14,22 @@ require vex
 load __TEST_DIR__/restart_update1.db
 
 statement ok
-CREATE TABLE t1 (id INTEGER, label VARCHAR, vec FLOATVECTOR(3));
+CREATE TABLE t1 (id INTEGER, label VARCHAR, vec FLOAT[3]);
 
 statement ok
 INSERT INTO t1 VALUES
-  (1, 'a', [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, 'b', [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, 'c', [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, 'd', [0.5, 0.5, 0.0]::FLOATVECTOR(3)),
-  (5, 'e', [0.0, 0.5, 0.5]::FLOATVECTOR(3));
+  (1, 'a', [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'b', [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, 'c', [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, 'd', [0.5, 0.5, 0.0]::FLOAT[3]),
+  (5, 'e', [0.0, 0.5, 0.5]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
 
 # Before restart: nearest to origin is id=4 or id=5 (both dist ~0.707)
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 4
 
@@ -40,11 +40,11 @@ restart
 
 # UPDATE vector column: move id=1 to origin
 statement ok
-UPDATE t1 SET vec = [0.01, 0.01, 0.01]::FLOATVECTOR(3) WHERE id = 1;
+UPDATE t1 SET vec = [0.01, 0.01, 0.01]::FLOAT[3] WHERE id = 1;
 
 # Now id=1 should be nearest to origin
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -69,7 +69,7 @@ statement ok
 UPDATE t1 SET label = 'updated' WHERE id = 2;
 
 query IT
-SELECT id, label FROM t1 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id, label FROM t1 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 2	updated
 
@@ -84,11 +84,11 @@ true
 
 # Bulk update all vectors
 statement ok
-UPDATE t1 SET vec = [(id * 0.1)::FLOAT, 0.0, 0.0]::FLOATVECTOR(3);
+UPDATE t1 SET vec = [(id * 0.1)::FLOAT, 0.0, 0.0]::FLOAT[3];
 
 # After bulk update: id=1→[0.1,0,0], id=2→[0.2,0,0], etc.
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
@@ -108,12 +108,12 @@ statement ok
 DELETE FROM t1 WHERE id = -999;
 
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 
 query I
-SELECT id FROM t1 ORDER BY l2_distance(vec, [0.5, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 5
 
@@ -132,12 +132,12 @@ DROP TABLE t1;
 load __TEST_DIR__/restart_update2.db
 
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t2 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 201) t(i);
 
 statement ok
@@ -150,7 +150,7 @@ restart
 
 # Update every 10th row to a known position near origin
 statement ok
-UPDATE t2 SET vec = [0.001, 0.001, 0.001, 0.001]::FLOATVECTOR(4) WHERE id % 10 = 0;
+UPDATE t2 SET vec = [0.001, 0.001, 0.001, 0.001]::FLOAT[4] WHERE id % 10 = 0;
 
 # Verify consistency (dedup may reduce node_count for identical updated vectors)
 query I
@@ -160,7 +160,7 @@ true
 
 # The nearest to origin should be one of the updated rows (id divisible by 10)
 query I
-SELECT id % 10 = 0 FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 1;
+SELECT id % 10 = 0 FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 1;
 ----
 true
 
@@ -171,7 +171,7 @@ SELECT count(*) FROM t2;
 200
 
 query I
-SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 

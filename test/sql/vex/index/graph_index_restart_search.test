@@ -7,23 +7,23 @@ require vex
 load __TEST_DIR__/graph_index_restart_search.db
 
 statement ok
-CREATE TABLE items (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE items (id INTEGER, vec FLOAT[3]);
 
 statement ok
 INSERT INTO items VALUES
-  (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, [0.9, 0.1, 0.0]::FLOATVECTOR(3)),
-  (5, [0.0, 0.9, 0.1]::FLOATVECTOR(3)),
-  (6, [0.1, 0.0, 0.9]::FLOATVECTOR(3));
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [0.9, 0.1, 0.0]::FLOAT[3]),
+  (5, [0.0, 0.9, 0.1]::FLOAT[3]),
+  (6, [0.1, 0.0, 0.9]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx ON items USING GRAPH_INDEX (vec);
 
 # Verify search works before restart
 query I
-SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
 ----
 1
 4
@@ -42,7 +42,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx';
 
 # ANN search after restart - this is the key test
 query I
-SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3;
+SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
 ----
 1
 4

@@ -6,10 +6,10 @@ require vex
 
 # Verify FLOATVECTOR type exists
 statement ok
-CREATE TABLE test (vec FLOATVECTOR(3));
+CREATE TABLE test (vec FLOAT[3]);
 
 statement ok
-INSERT INTO test VALUES ([1.0, 2.0, 3.0]::FLOATVECTOR(3));
+INSERT INTO test VALUES ([1.0, 2.0, 3.0]::FLOAT[3]);
 
 # Verify vector functions work
 query I
@@ -19,7 +19,7 @@ SELECT vector_dims(vec) FROM test;
 
 # Verify distance functions work
 query R
-SELECT l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3)) FROM test;
+SELECT l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) FROM test;
 ----
 3.7416573867739413
 

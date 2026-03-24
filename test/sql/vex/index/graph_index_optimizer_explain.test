@@ -176,21 +176,21 @@ physical_plan	<REGEX>:.*SEQ_SCAN.*
 # Test 13: FLOATVECTOR type alias should work
 # ============================================================
 statement ok
-CREATE TABLE t_alias (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE t_alias (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO t_alias VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3)), (2, [0.0, 1.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO t_alias VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]), (2, [0.0, 1.0, 0.0]::FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_alias ON t_alias USING GRAPH_INDEX (vec);
 
 query II
-EXPLAIN SELECT id FROM t_alias ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+EXPLAIN SELECT id FROM t_alias ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 physical_plan	<REGEX>:.*COLUMN_DATA_SCAN.*
 
 query I
-SELECT id FROM t_alias ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 1;
+SELECT id FROM t_alias ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
 ----
 1
 

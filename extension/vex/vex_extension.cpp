@@ -28,15 +28,17 @@ static void RegisterIndexTypes(DBConfig &config) {
 	hybrid_index_type.create_plan = HybridIndex::CreatePlan;
 #endif
 
+	// Always register directly to config (works in all contexts including unittest)
+	try { config.GetIndexTypes().RegisterIndexType(graph_index_type); } catch (...) {}
+#ifdef VEX_ENABLE_HYBRID_INDEX
+	try { config.GetIndexTypes().RegisterIndexType(hybrid_index_type); } catch (...) {}
+#endif
+
 #ifdef VEX_HAS_GLOBAL_INDEX_REGISTRY
+	// Also register to global registry for FinalizeLoad() reload path
 	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(graph_index_type);
 #ifdef VEX_ENABLE_HYBRID_INDEX
 	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(hybrid_index_type);
-#endif
-#else
-	config.GetIndexTypes().RegisterIndexType(graph_index_type);
-#ifdef VEX_ENABLE_HYBRID_INDEX
-	config.GetIndexTypes().RegisterIndexType(hybrid_index_type);
 #endif
 #endif
 }

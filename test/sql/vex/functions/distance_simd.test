@@ -6,21 +6,21 @@ require vex
 
 # Small dimension (scalar tail path)
 query R
-SELECT l2_distance([1.0, 2.0, 3.0]::FLOATVECTOR(3), [4.0, 5.0, 6.0]::FLOATVECTOR(3));
+SELECT l2_distance([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3]);
 ----
 5.196152422706632
 
 # dim=4 (exactly one SSE register / one NEON register)
 query R
-SELECT l2_distance([1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4), [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4));
+SELECT l2_distance([1.0, 0.0, 0.0, 0.0]::FLOAT[4], [0.0, 1.0, 0.0, 0.0]::FLOAT[4]);
 ----
 1.4142135623730951
 
 # dim=8 (one AVX register)
 query R
 SELECT inner_product(
-  [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOATVECTOR(8),
-  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOATVECTOR(8));
+  [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8],
+  [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8]);
 ----
 36.0
 
@@ -29,13 +29,13 @@ statement ok
 CREATE TABLE vec16 AS
   SELECT 1 AS id,
          [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(16) AS v;
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[16] AS v;
 
 statement ok
 INSERT INTO vec16
   SELECT 2 AS id,
          [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(16) AS v;
+          0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]::FLOAT[16] AS v;
 
 query R
 SELECT l2_distance(
@@ -50,18 +50,18 @@ SELECT cosine_distance(
   [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOATVECTOR(32),
+   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[32],
   [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
    0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(32));
+   0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]::FLOAT[32]);
 ----
 1.0
 
 # Large dimension correctness: distance to self should be 0
 statement ok
 CREATE TABLE big_vec AS
-  SELECT i AS id, list_transform(range(128), x -> (x + i)::FLOAT / 128.0)::FLOATVECTOR(128) AS v
+  SELECT i AS id, list_transform(range(128), x -> (x + i)::FLOAT / 128.0)::FLOAT[128] AS v
   FROM range(10) t(i);
 
 query R
@@ -79,7 +79,7 @@ WHERE l2_distance(b1.v, b2.v) >= 0;
 # Inner product of unit vectors with self should be ~1
 query I
 SELECT abs(inner_product(
-  l2_normalize([1.0, 2.0, 3.0]::FLOATVECTOR(3)),
-  l2_normalize([1.0, 2.0, 3.0]::FLOATVECTOR(3))) - 1.0) < 0.0001;
+  l2_normalize([1.0, 2.0, 3.0]::FLOAT[3]),
+  l2_normalize([1.0, 2.0, 3.0]::FLOAT[3])) - 1.0) < 0.0001;
 ----
 true

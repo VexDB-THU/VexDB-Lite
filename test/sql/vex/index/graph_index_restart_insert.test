@@ -14,12 +14,12 @@ require vex
 load __TEST_DIR__/restart_insert1.db
 
 statement ok
-CREATE TABLE t1 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t1 (id INTEGER, vec FLOAT[4]);
 
 statement ok
 INSERT INTO t1 SELECT i, list_value(
   sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(1, 101) t(i);
 
 statement ok
@@ -44,7 +44,7 @@ true
 statement ok
 INSERT INTO t1 SELECT i, list_value(
   cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT
-)::FLOATVECTOR(4)
+)::FLOAT[4]
 FROM range(101, 151) t(i);
 
 # Verify new rows are searchable
@@ -54,7 +54,7 @@ SELECT count(*) FROM t1;
 150
 
 query I
-SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 20);
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 20);
 ----
 20
 
@@ -80,7 +80,7 @@ SELECT count(*) FROM t1;
 
 # Search still works
 query I
-SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -95,10 +95,10 @@ DROP TABLE t1;
 load __TEST_DIR__/restart_insert2.db
 
 statement ok
-CREATE TABLE t2 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(1, 51) t(i);
 
 statement ok
@@ -111,7 +111,7 @@ restart
 
 # INSERT after first restart
 statement ok
-INSERT INTO t2 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOATVECTOR(4)
+INSERT INTO t2 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
 FROM range(51, 101) t(i);
 
 query I
@@ -154,7 +154,7 @@ SELECT count(*) FROM t2;
 95
 
 query I
-SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 10);
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
 ----
 10
 
@@ -169,10 +169,10 @@ DROP TABLE t2;
 load __TEST_DIR__/restart_insert3.db
 
 statement ok
-CREATE TABLE t3 (id INTEGER, vec FLOATVECTOR(4));
+CREATE TABLE t3 (id INTEGER, vec FLOAT[4]);
 
 statement ok
-INSERT INTO t3 SELECT i, list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.1, 0.2)::FLOATVECTOR(4)
+INSERT INTO t3 SELECT i, list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.1, 0.2)::FLOAT[4]
 FROM range(1, 81) t(i);
 
 statement ok
@@ -188,7 +188,7 @@ statement ok
 DELETE FROM t3 WHERE id <= 20;
 
 statement ok
-INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.3, 0.4)::FLOATVECTOR(4)
+INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.3, 0.4)::FLOAT[4]
 FROM range(81, 101) t(i);
 
 # After mixed DELETE+INSERT, node_count should match row_id_map_size
@@ -202,7 +202,7 @@ statement ok
 DELETE FROM t3 WHERE id BETWEEN 21 AND 40;
 
 statement ok
-INSERT INTO t3 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.5, 0.6)::FLOATVECTOR(4)
+INSERT INTO t3 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.5, 0.6)::FLOAT[4]
 FROM range(101, 121) t(i);
 
 query I
@@ -217,7 +217,7 @@ SELECT count(*) FROM t3;
 80
 
 query I
-SELECT count(*) FROM (SELECT id FROM t3 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOATVECTOR(4)) LIMIT 15);
+SELECT count(*) FROM (SELECT id FROM t3 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 15);
 ----
 15
 

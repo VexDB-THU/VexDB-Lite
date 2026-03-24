@@ -6,20 +6,20 @@ require vex
 
 # Create table with vector + scalar partition column
 statement ok
-CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOATVECTOR(4));
+CREATE TABLE products (id INTEGER, category VARCHAR, vec FLOAT[4]);
 
 # Insert products in different categories
 statement ok
 INSERT INTO products VALUES
-  (1, 'electronics', [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (2, 'electronics', [0.9, 0.1, 0.0, 0.0]::FLOATVECTOR(4)),
-  (3, 'electronics', [0.8, 0.2, 0.0, 0.0]::FLOATVECTOR(4)),
-  (4, 'clothing', [0.0, 1.0, 0.0, 0.0]::FLOATVECTOR(4)),
-  (5, 'clothing', [0.0, 0.9, 0.1, 0.0]::FLOATVECTOR(4)),
-  (6, 'clothing', [0.0, 0.8, 0.2, 0.0]::FLOATVECTOR(4)),
-  (7, 'food', [0.0, 0.0, 1.0, 0.0]::FLOATVECTOR(4)),
-  (8, 'food', [0.0, 0.0, 0.9, 0.1]::FLOATVECTOR(4)),
-  (9, 'food', [0.0, 0.0, 0.8, 0.2]::FLOATVECTOR(4));
+  (1, 'electronics', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+  (2, 'electronics', [0.9, 0.1, 0.0, 0.0]::FLOAT[4]),
+  (3, 'electronics', [0.8, 0.2, 0.0, 0.0]::FLOAT[4]),
+  (4, 'clothing', [0.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (5, 'clothing', [0.0, 0.9, 0.1, 0.0]::FLOAT[4]),
+  (6, 'clothing', [0.0, 0.8, 0.2, 0.0]::FLOAT[4]),
+  (7, 'food', [0.0, 0.0, 1.0, 0.0]::FLOAT[4]),
+  (8, 'food', [0.0, 0.0, 0.9, 0.1]::FLOAT[4]),
+  (9, 'food', [0.0, 0.0, 0.8, 0.2]::FLOAT[4]);
 
 # Create hybrid index on (vec, category)
 statement ok
@@ -36,7 +36,7 @@ SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_hybrid';
 query II
 SELECT id, category FROM products
 WHERE category = 'electronics'
-ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 2;
 ----
 1	electronics
@@ -46,7 +46,7 @@ LIMIT 2;
 query II
 SELECT id, category FROM products
 WHERE category = 'food'
-ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4])
 LIMIT 2;
 ----
 7	food
@@ -56,7 +56,7 @@ LIMIT 2;
 # Distances: id=9: sqrt(0.64+0.64)=1.13, id=8: sqrt(0.81+0.81)=1.27, id=6: sqrt(0.64+0.04+1)=1.30
 query I
 SELECT id FROM products
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOAT[4])
 LIMIT 3;
 ----
 9
@@ -67,7 +67,7 @@ LIMIT 3;
 query II
 SELECT id, category FROM products
 WHERE category IN ('electronics', 'clothing')
-ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
 LIMIT 5;
 ----
 1	electronics
@@ -81,7 +81,7 @@ query I
 SELECT count(*) FROM (
   SELECT id, category FROM products
   WHERE category IN ('electronics', 'clothing')
-  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOATVECTOR(4))
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
   LIMIT 10
 ) WHERE category = 'food';
 ----

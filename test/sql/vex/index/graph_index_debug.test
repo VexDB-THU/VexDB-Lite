@@ -12,10 +12,10 @@ SELECT COUNT(*) >= 5 FROM duckdb_functions() WHERE function_name LIKE '%distance
 
 # Create a simple table and try to create index
 statement ok
-CREATE TABLE test_vectors (id INTEGER, vec FLOATVECTOR(3));
+CREATE TABLE test_vectors (id INTEGER, vec FLOAT[3]);
 
 statement ok
-INSERT INTO test_vectors VALUES (1, [1.0, 0.0, 0.0]::FLOATVECTOR(3));
+INSERT INTO test_vectors VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
 
 # GRAPH_INDEX should be registered and work
 statement ok

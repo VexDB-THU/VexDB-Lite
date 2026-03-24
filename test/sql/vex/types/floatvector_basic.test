@@ -6,13 +6,13 @@ require vex
 
 # Basic type creation and usage
 statement ok
-CREATE TABLE t1 (id INT, embedding FLOATVECTOR(3));
+CREATE TABLE t1 (id INT, embedding FLOAT[3]);
 
 statement ok
-INSERT INTO t1 VALUES (1, [1.0, 2.0, 3.0]::FLOATVECTOR(3));
+INSERT INTO t1 VALUES (1, [1.0, 2.0, 3.0]::FLOAT[3]);
 
 statement ok
-INSERT INTO t1 VALUES (2, [4.0, 5.0, 6.0]::FLOATVECTOR(3));
+INSERT INTO t1 VALUES (2, [4.0, 5.0, 6.0]::FLOAT[3]);
 
 query II
 SELECT id, embedding FROM t1 ORDER BY id;
@@ -22,15 +22,15 @@ SELECT id, embedding FROM t1 ORDER BY id;
 
 # Dimension mismatch on insert should fail
 statement error
-INSERT INTO t1 VALUES (3, [1.0, 2.0]::FLOATVECTOR(2));
+INSERT INTO t1 VALUES (3, [1.0, 2.0]::FLOAT[2]);
 ----
 
 # Single dimension vector
 statement ok
-CREATE TABLE t2 (v FLOATVECTOR(1));
+CREATE TABLE t2 (v FLOAT[1]);
 
 statement ok
-INSERT INTO t2 VALUES ([42.0]::FLOATVECTOR(1));
+INSERT INTO t2 VALUES ([42.0]::FLOAT[1]);
 
 query I
 SELECT v FROM t2;

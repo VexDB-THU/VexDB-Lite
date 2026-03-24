@@ -8,18 +8,18 @@ require vex
 # Setup
 # ============================================================
 statement ok
-CREATE TABLE items (id INTEGER, name VARCHAR, vec FLOATVECTOR(3));
+CREATE TABLE items (id INTEGER, name VARCHAR, vec FLOAT[3]);
 
 statement ok
 CREATE INDEX idx_items ON items USING GRAPH_INDEX (vec);
 
 statement ok
 INSERT INTO items VALUES
-  (1, 'a', [1.0, 0.0, 0.0]::FLOATVECTOR(3)),
-  (2, 'b', [0.0, 1.0, 0.0]::FLOATVECTOR(3)),
-  (3, 'c', [0.0, 0.0, 1.0]::FLOATVECTOR(3)),
-  (4, 'd', [0.7, 0.7, 0.0]::FLOATVECTOR(3)),
-  (5, 'e', [0.0, 0.7, 0.7]::FLOATVECTOR(3));
+  (1, 'a', [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'b', [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, 'c', [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, 'd', [0.7, 0.7, 0.0]::FLOAT[3]),
+  (5, 'e', [0.0, 0.7, 0.7]::FLOAT[3]);
 
 # ============================================================
 # Test 1: Simple view on ANN query
@@ -27,7 +27,7 @@ INSERT INTO items VALUES
 statement ok
 CREATE VIEW v_near_origin AS
 SELECT id, name FROM items
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOATVECTOR(3))
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3])
 LIMIT 3;
 
 query IT
@@ -46,7 +46,7 @@ DROP VIEW v_near_origin;
 statement ok
 CREATE VIEW v_near_x AS
 SELECT id FROM items
-ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3))
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
 LIMIT 2;
 
 query I
@@ -57,7 +57,7 @@ SELECT id FROM v_near_x;
 
 # Insert a closer vector
 statement ok
-INSERT INTO items VALUES (6, 'f', [0.95, 0.05, 0.0]::FLOATVECTOR(3));
+INSERT INTO items VALUES (6, 'f', [0.95, 0.05, 0.0]::FLOAT[3]);
 
 # View should reflect new data
 query I
@@ -75,7 +75,7 @@ DROP VIEW v_near_x;
 query I
 WITH nearest AS (
   SELECT id, name FROM items
-  ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOATVECTOR(3))
+  ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3])
   LIMIT 3
 ),
 filtered AS (
@@ -97,7 +97,7 @@ INSERT INTO categories VALUES (1, 'X'), (2, 'Y'), (3, 'Z'), (4, 'X'), (5, 'Y'), 
 
 query IT
 SELECT n.id, c.cat FROM (
-  SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOATVECTOR(3)) LIMIT 3
+  SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3
 ) n JOIN categories c ON n.id = c.id
 ORDER BY n.id;
 ----
