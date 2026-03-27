@@ -56,27 +56,29 @@ static idx_t GetBruteForceThreshold(ClientContext &context) {
 }
 
 static bool IsDistanceFunction(const string &name) {
-	return name == "list_distance" || name == "<->" ||
+	return name == "list_distance" || name == "<->" || name == "array_distance" ||
 	       name == "l2_distance" ||
-	       name == "list_cosine_distance" || name == "<=>" ||
+	       name == "list_cosine_distance" || name == "<=>" || name == "array_cosine_distance" ||
 	       name == "cosine_distance" ||
-	       name == "list_negative_inner_product" ||
+	       name == "list_negative_inner_product" || name == "array_negative_inner_product" ||
 	       name == "<~>" ||
-	       name == "inner_product";
+	       name == "inner_product" || name == "array_inner_product" || name == "list_inner_product";
 }
 
 static vex::VexMetric GetFunctionMetric(const string &name) {
-	if (name == "list_cosine_distance" || name == "<=>" || name == "cosine_distance") {
+	if (name == "list_cosine_distance" || name == "<=>" || name == "cosine_distance" || name == "array_cosine_distance") {
 		return vex::VexMetric::COSINE;
 	}
-	if (name == "list_negative_inner_product" || name == "<~>" || name == "inner_product") {
+	if (name == "list_negative_inner_product" || name == "array_negative_inner_product" || name == "<~>" || name == "inner_product" || name == "array_inner_product" || name == "list_inner_product") {
 		return vex::VexMetric::INNER_PRODUCT;
 	}
 	return vex::VexMetric::L2;
 }
 
 static bool RequiresDescending(const string &name) {
-	return name == "inner_product";
+	// Only positive inner_product requires DESC ordering
+	// Negative inner product (<~>, list_negative_inner_product) uses ASC like L2/Cosine
+	return name == "inner_product" || name == "array_inner_product" || name == "list_inner_product";
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
