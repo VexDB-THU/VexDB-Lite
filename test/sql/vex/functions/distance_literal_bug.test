@@ -1,0 +1,41 @@
+# name: test/sql/vex/functions/distance_literal_bug.test
+# description: Test distance functions with uncast literal arrays
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t_vec(c1 INTEGER, c2 FLOATVECTOR(3));
+
+statement ok
+INSERT INTO t_vec VALUES(1, [1.0, 2.0, 3.0]);
+
+# l2_distance with uncast literal array
+query R
+SELECT l2_distance(c2, [0.0, 0.0, 0.0]) FROM t_vec;
+----
+3.7416573867739413
+
+# cosine_distance with uncast literal array
+query R
+SELECT cosine_distance(c2, [1.0, 0.0, 0.0]) FROM t_vec;
+----
+0.732738733291626
+
+# inner_product with uncast literal array
+query R
+SELECT inner_product(c2, [1.0, 0.0, 0.0]) FROM t_vec;
+----
+1.0
+
+# ORDER BY LIMIT with uncast literal
+query IR
+SELECT c1, l2_distance(c2, [0.0, 0.0, 0.0]) AS dist FROM t_vec ORDER BY dist LIMIT 1;
+----
+1	3.7416573867739413
+
+# ORDER BY LIMIT with cosine_distance and uncast literal
+query IR
+SELECT c1, cosine_distance(c2, [1.0, 0.0, 0.0]) AS dist FROM t_vec ORDER BY dist LIMIT 1;
+----
+1	0.732738733291626

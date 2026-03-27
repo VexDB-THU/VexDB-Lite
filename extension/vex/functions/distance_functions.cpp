@@ -8,6 +8,32 @@
 
 namespace duckdb {
 
+// Bind function for distance functions: resolve ANY parameters to matching ARRAY types
+static unique_ptr<FunctionData> BindDistanceFunction(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
+	auto &left_type = arguments[0]->return_type;
+	auto &right_type = arguments[1]->return_type;
+
+	// If left is unknown (e.g. prepared statement parameter), try to resolve from right
+	if (left_type.id() == LogicalTypeId::UNKNOWN && right_type.id() == LogicalTypeId::UNKNOWN) {
+		throw ParameterNotResolvedException();
+	}
+
+	// Resolve types: use the known ARRAY type to cast the other argument
+	LogicalType resolved_type;
+	if (left_type.id() == LogicalTypeId::ARRAY) {
+		resolved_type = left_type;
+	} else if (right_type.id() == LogicalTypeId::ARRAY) {
+		resolved_type = right_type;
+	} else {
+		resolved_type = left_type;
+	}
+	bound_function.arguments[0] = resolved_type;
+	bound_function.arguments[1] = resolved_type;
+
+	return nullptr;
+}
+
 static void CheckDimensions(idx_t dim_a, idx_t dim_b) {
 	if (dim_a != dim_b) {
 		throw InvalidInputException("Vector dimension mismatch: %d vs %d", dim_a, dim_b);
@@ -54,7 +80,7 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
 ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
 	ScalarFunctionSet set("l2_distance");
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, L2DistanceFunction,
-	                               nullptr, nullptr, nullptr, nullptr, LogicalType::ANY));
+	                               BindDistanceFunction));
 	return set;
 }
 
@@ -97,7 +123,7 @@ static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector
 ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
 	ScalarFunctionSet set("inner_product");
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, InnerProductFunction,
-	                               nullptr, nullptr, nullptr, nullptr, LogicalType::ANY));
+	                               BindDistanceFunction));
 	return set;
 }
 
@@ -176,14 +202,14 @@ static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state
 ScalarFunctionSet VexFunctions::GetNegativeInnerProductFunction() {
 	ScalarFunctionSet set("<~>");
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, NegativeInnerProductFunction,
-	                               nullptr, nullptr, nullptr, nullptr, LogicalType::ANY));
+	                               BindDistanceFunction));
 	return set;
 }
 
 ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
 	ScalarFunctionSet set("cosine_distance");
 	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, CosineDistanceFunction,
-	                               nullptr, nullptr, nullptr, nullptr, LogicalType::ANY));
+	                               BindDistanceFunction));
 	return set;
 }
 
