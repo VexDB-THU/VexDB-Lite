@@ -28,7 +28,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 	for (auto &expr : input.unbound_expressions) {
 		auto &type = expr->return_type;
 		if (type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(type).id() != LogicalTypeId::FLOAT) {
-			throw InvalidInputException("GRAPH_INDEX can only be created on FLOATVECTOR (ARRAY(FLOAT)) columns, got %s",
+			throw InvalidInputException("GRAPH_INDEX can only be created on FLOAT[N] (ARRAY(FLOAT)) columns, got %s",
 			                            type.ToString());
 		}
 	}

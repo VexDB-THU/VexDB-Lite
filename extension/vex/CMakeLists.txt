@@ -32,13 +32,14 @@ endif()
 # Conditionally include source files
 set(VEX_EXTENSION_FILES
     vex_extension.cpp
-    types/floatvector.cpp
     functions/distance_functions.cpp
     functions/vector_functions.cpp
     functions/ann_search_functions.cpp
     functions/index_info_function.cpp
     distance/distance.cpp
     quantizer/product_quantizer.cpp
+    quantizer/polar_quantizer.cpp
+    quantizer/qjl_quantizer.cpp
     index/graph_index_core.cpp
     index/graph_index.cpp)
 

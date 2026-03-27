@@ -26,11 +26,11 @@ namespace duckdb {
 // ============================================================
 
 unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
-	// Validate: first column must be ARRAY(FLOAT) (FLOATVECTOR)
+	// Validate: first column must be ARRAY(FLOAT)
 	if (!input.unbound_expressions.empty()) {
 		auto &vec_type = input.unbound_expressions[0]->return_type;
 		if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
-			throw InvalidInputException("HYBRID_INDEX first column must be FLOATVECTOR (ARRAY(FLOAT)), got %s",
+			throw InvalidInputException("HYBRID_INDEX first column must be FLOAT[N] (ARRAY(FLOAT)), got %s",
 			                            vec_type.ToString());
 		}
 	}

@@ -4,7 +4,7 @@
 
 require vex
 
-# Verify FLOATVECTOR type exists
+# Verify FLOAT[N] vector type exists
 statement ok
 CREATE TABLE test (vec FLOAT[3]);
 

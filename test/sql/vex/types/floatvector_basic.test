@@ -1,5 +1,5 @@
 # name: test/sql/vex/types/floatvector_basic.test
-# description: Test FLOATVECTOR type basics
+# description: Test FLOAT[N] vector type basics
 # group: [vex]
 
 require vex

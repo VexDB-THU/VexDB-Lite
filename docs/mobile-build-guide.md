@@ -76,10 +76,10 @@ duckdb::DuckDB db("/path/to/app/data/vexdb.db");
 duckdb::Connection con(db);
 
 // 创建向量表
-con.Query("CREATE TABLE docs (id INT, title VARCHAR, embedding FLOATVECTOR(384))");
+con.Query("CREATE TABLE docs (id INT, title VARCHAR, embedding FLOAT[384])");
 
 // 插入数据
-con.Query("INSERT INTO docs VALUES (1, 'hello', [0.1, 0.2, ...]::FLOATVECTOR(384))");
+con.Query("INSERT INTO docs VALUES (1, 'hello', [0.1, 0.2, ...]::FLOAT[384])");
 
 // 创建 HNSW 索引
 con.Query("CREATE INDEX idx ON docs USING GRAPH_INDEX (embedding)");
@@ -87,7 +87,7 @@ con.Query("CREATE INDEX idx ON docs USING GRAPH_INDEX (embedding)");
 // 向量搜索
 auto result = con.Query(
     "SELECT id, title FROM docs "
-    "ORDER BY l2_distance(embedding, [0.15, 0.25, ...]::FLOATVECTOR(384)) "
+    "ORDER BY l2_distance(embedding, [0.15, 0.25, ...]::FLOAT[384]) "
     "LIMIT 10"
 );
 
@@ -95,7 +95,7 @@ auto result = con.Query(
 auto result = con.Query(
     "SELECT d.title, u.name "
     "FROM docs d JOIN users u ON d.user_id = u.id "
-    "ORDER BY l2_distance(d.embedding, ?::FLOATVECTOR(384)) "
+    "ORDER BY l2_distance(d.embedding, ?::FLOAT[384]) "
     "LIMIT 5"
 );
 ```

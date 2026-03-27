@@ -1,5 +1,4 @@
 #include "vex_extension.hpp"
-#include "vex_types.hpp"
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
 #ifdef VEX_ENABLE_HYBRID_INDEX
@@ -44,7 +43,6 @@ static void RegisterIndexTypes(DBConfig &config) {
 }
 
 static void LoadInternal(ExtensionLoader &loader) {
-	VexTypes::Register(loader);
 	VexFunctions::Register(loader);
 
 	auto &db = loader.GetDatabaseInstance();

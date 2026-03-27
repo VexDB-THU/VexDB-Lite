@@ -5,7 +5,7 @@
 require vex
 
 statement ok
-CREATE TABLE t_def(c1 INTEGER, c2 FLOATVECTOR(3));
+CREATE TABLE t_def(c1 INTEGER, c2 FLOAT[3]);
 
 statement ok
 INSERT INTO t_def VALUES

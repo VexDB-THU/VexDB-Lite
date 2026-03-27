@@ -73,7 +73,7 @@ static void ExtractVectorFromValue(const Value &val, vector<float> &out_vec) {
 			out_vec[i] = children[i].GetValue<float>();
 		}
 	} else {
-		throw InvalidInputException("query_vector must be a FLOATVECTOR (ARRAY or LIST)");
+		throw InvalidInputException("query_vector must be a FLOAT[N] (ARRAY or LIST)");
 	}
 }
 

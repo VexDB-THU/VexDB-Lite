@@ -173,7 +173,7 @@ EXPLAIN SELECT id FROM t_ip ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3
 physical_plan	<REGEX>:.*SEQ_SCAN.*
 
 # ============================================================
-# Test 13: FLOATVECTOR type alias should work
+# Test 13: FLOAT[N] vector type should work
 # ============================================================
 statement ok
 CREATE TABLE t_alias (id INTEGER, vec FLOAT[3]);

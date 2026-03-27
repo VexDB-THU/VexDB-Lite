@@ -1,5 +1,5 @@
 # name: test/sql/vex/functions/distance_operators.test
-# description: Test distance operators <->, <=>, <~> with FLOATVECTOR
+# description: Test distance operators <->, <=>, <~> with FLOAT[N]
 # group: [vex]
 
 require vex
@@ -22,13 +22,13 @@ SELECT [1.0, 2.0]::FLOAT[2] <=> [2.0, 4.0]::FLOAT[2];
 ----
 0.0
 
-# array_inner_product works with FLOATVECTOR
+# array_inner_product works with FLOAT[N]
 query R
 SELECT array_inner_product([1.0, 2.0, 3.0]::FLOAT[3], [4.0, 5.0, 6.0]::FLOAT[3]);
 ----
 32.0
 
-# array_cosine_similarity works with FLOATVECTOR
+# array_cosine_similarity works with FLOAT[N]
 query R
 SELECT array_cosine_similarity([1.0, 0.0]::FLOAT[2], [1.0, 0.0]::FLOAT[2]);
 ----
