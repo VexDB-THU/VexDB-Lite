@@ -1,4 +1,4 @@
-# name: test/sql/vex/types/floatvector_basic.test
+# name: test/sql/vex/types/float_array_basic.test
 # description: Test FLOAT[N] vector type basics
 # group: [vex]
 

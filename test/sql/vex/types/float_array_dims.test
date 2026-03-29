@@ -1,4 +1,4 @@
-# name: test/sql/vex/types/floatvector_dims.test
+# name: test/sql/vex/types/float_array_dims.test
 # description: Test vector dimension constraints
 # group: [vex]
 
