@@ -26,7 +26,8 @@ static unique_ptr<FunctionData> BindDistanceFunction(ClientContext &context, Sca
 	} else if (right_type.id() == LogicalTypeId::ARRAY) {
 		resolved_type = right_type;
 	} else {
-		resolved_type = left_type;
+		// Neither side is ARRAY (e.g. two uncast LIST literals) — let DuckDB handle default casting
+		return nullptr;
 	}
 	bound_function.arguments[0] = resolved_type;
 	bound_function.arguments[1] = resolved_type;
@@ -41,9 +42,11 @@ static void CheckDimensions(idx_t dim_a, idx_t dim_b) {
 }
 
 // ============================================================
-// L2 Distance: sqrt(sum((a_i - b_i)^2)) — SIMD optimized
+// Common distance function template — all distance functions share
+// the same flatten/validate/iterate logic, only the final compute differs
 // ============================================================
-static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+template <typename ComputeFn>
+static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector &result, ComputeFn compute) {
 	auto &vec_a = args.data[0];
 	auto &vec_b = args.data[1];
 	auto count = args.size();
@@ -57,10 +60,8 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
 
 	vec_a.Flatten(count);
 	vec_b.Flatten(count);
-	auto &child_a = ArrayVector::GetEntry(vec_a);
-	auto &child_b = ArrayVector::GetEntry(vec_b);
-	auto data_a = FlatVector::GetData<float>(child_a);
-	auto data_b = FlatVector::GetData<float>(child_b);
+	auto data_a = FlatVector::GetData<float>(ArrayVector::GetEntry(vec_a));
+	auto data_b = FlatVector::GetData<float>(ArrayVector::GetEntry(vec_b));
 	auto &validity_a = FlatVector::Validity(vec_a);
 	auto &validity_b = FlatVector::Validity(vec_b);
 
@@ -70,11 +71,14 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
 			result_validity.SetInvalid(i);
 			continue;
 		}
-		const float *a = data_a + i * dim_a;
-		const float *b = data_b + i * dim_a;
-		float l2sqr = vex::L2SqrDistance(a, b, dim);
-		result_data[i] = std::sqrt(static_cast<double>(l2sqr));
+		result_data[i] = compute(data_a + i * dim_a, data_b + i * dim_a, dim);
 	}
+}
+
+static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint32_t d) {
+		return std::sqrt(static_cast<double>(vex::L2SqrDistance(a, b, d)));
+	});
 }
 
 ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
@@ -84,40 +88,10 @@ ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
 	return set;
 }
 
-// ============================================================
-// Inner Product: sum(a_i * b_i) — SIMD optimized
-// ============================================================
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &vec_a = args.data[0];
-	auto &vec_b = args.data[1];
-	auto count = args.size();
-
-	auto dim_a = ArrayType::GetSize(vec_a.GetType());
-	auto dim_b = ArrayType::GetSize(vec_b.GetType());
-	CheckDimensions(dim_a, dim_b);
-
-	auto result_data = FlatVector::GetData<double>(result);
-	auto &result_validity = FlatVector::Validity(result);
-
-	vec_a.Flatten(count);
-	vec_b.Flatten(count);
-	auto &child_a = ArrayVector::GetEntry(vec_a);
-	auto &child_b = ArrayVector::GetEntry(vec_b);
-	auto data_a = FlatVector::GetData<float>(child_a);
-	auto data_b = FlatVector::GetData<float>(child_b);
-	auto &validity_a = FlatVector::Validity(vec_a);
-	auto &validity_b = FlatVector::Validity(vec_b);
-
-	auto dim = static_cast<uint32_t>(dim_a);
-	for (idx_t i = 0; i < count; i++) {
-		if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-		const float *a = data_a + i * dim_a;
-		const float *b = data_b + i * dim_a;
-		result_data[i] = static_cast<double>(vex::InnerProductDistance(a, b, dim));
-	}
+	DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint32_t d) {
+		return static_cast<double>(vex::InnerProductDistance(a, b, d));
+	});
 }
 
 ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
@@ -127,76 +101,16 @@ ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
 	return set;
 }
 
-// ============================================================
-// Cosine Distance: 1 - (dot(a,b) / (norm(a) * norm(b))) — SIMD optimized
-// ============================================================
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &vec_a = args.data[0];
-	auto &vec_b = args.data[1];
-	auto count = args.size();
-
-	auto dim_a = ArrayType::GetSize(vec_a.GetType());
-	auto dim_b = ArrayType::GetSize(vec_b.GetType());
-	CheckDimensions(dim_a, dim_b);
-
-	auto result_data = FlatVector::GetData<double>(result);
-	auto &result_validity = FlatVector::Validity(result);
-
-	vec_a.Flatten(count);
-	vec_b.Flatten(count);
-	auto &child_a = ArrayVector::GetEntry(vec_a);
-	auto &child_b = ArrayVector::GetEntry(vec_b);
-	auto data_a = FlatVector::GetData<float>(child_a);
-	auto data_b = FlatVector::GetData<float>(child_b);
-	auto &validity_a = FlatVector::Validity(vec_a);
-	auto &validity_b = FlatVector::Validity(vec_b);
-
-	auto dim = static_cast<uint32_t>(dim_a);
-	for (idx_t i = 0; i < count; i++) {
-		if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-		const float *a = data_a + i * dim_a;
-		const float *b = data_b + i * dim_a;
-		result_data[i] = static_cast<double>(vex::CosineDistance(a, b, dim));
-	}
+	DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint32_t d) {
+		return static_cast<double>(vex::CosineDistance(a, b, d));
+	});
 }
 
-// ============================================================
-// Negative Inner Product: -sum(a_i * b_i) — for ORDER BY <~> usage
-// ============================================================
 static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	auto &vec_a = args.data[0];
-	auto &vec_b = args.data[1];
-	auto count = args.size();
-
-	auto dim_a = ArrayType::GetSize(vec_a.GetType());
-	auto dim_b = ArrayType::GetSize(vec_b.GetType());
-	CheckDimensions(dim_a, dim_b);
-
-	auto result_data = FlatVector::GetData<double>(result);
-	auto &result_validity = FlatVector::Validity(result);
-
-	vec_a.Flatten(count);
-	vec_b.Flatten(count);
-	auto &child_a = ArrayVector::GetEntry(vec_a);
-	auto &child_b = ArrayVector::GetEntry(vec_b);
-	auto data_a = FlatVector::GetData<float>(child_a);
-	auto data_b = FlatVector::GetData<float>(child_b);
-	auto &validity_a = FlatVector::Validity(vec_a);
-	auto &validity_b = FlatVector::Validity(vec_b);
-
-	auto dim = static_cast<uint32_t>(dim_a);
-	for (idx_t i = 0; i < count; i++) {
-		if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {
-			result_validity.SetInvalid(i);
-			continue;
-		}
-		const float *a = data_a + i * dim_a;
-		const float *b = data_b + i * dim_a;
-		result_data[i] = -static_cast<double>(vex::InnerProductDistance(a, b, dim));
-	}
+	DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint32_t d) {
+		return -static_cast<double>(vex::InnerProductDistance(a, b, d));
+	});
 }
 
 ScalarFunctionSet VexFunctions::GetNegativeInnerProductFunction() {
