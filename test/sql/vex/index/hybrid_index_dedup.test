@@ -1,0 +1,221 @@
+# name: test/sql/vex/index/hybrid_index_dedup.test
+# description: Test HYBRID_INDEX dedup — duplicate vectors in partitioned index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Dedup via INSERT (single-row path, dedup works)
+# ============================================================
+statement ok
+CREATE TABLE t_hd1(id INT, cat VARCHAR, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_hd1 ON t_hd1 USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO t_hd1 VALUES (1, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd1 VALUES (2, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd1 VALUES (3, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+# Dedup should merge identical vectors → 1 node, 3 row_ids
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_hd1';
+----
+1
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_hd1';
+----
+3
+
+# All 3 rows must be searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_hd1
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3
+);
+----
+3
+
+statement ok
+DROP TABLE t_hd1;
+
+# ============================================================
+# Test 2: Dedup persistence — survives checkpoint + restart
+# (BUG: dedup_map_ not serialized in HybridIndex)
+# ============================================================
+statement ok
+CREATE TABLE t_hd2(id INT, cat VARCHAR, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_hd2 ON t_hd2 USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO t_hd2 VALUES (1, 'P', [2.0, 3.0, 4.0, 5.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd2 VALUES (2, 'P', [2.0, 3.0, 4.0, 5.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd2 VALUES (3, 'P', [2.0, 3.0, 4.0, 5.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd2 VALUES (4, 'P', [2.0, 3.0, 4.0, 5.0]::FLOAT[4]);
+
+# Before checkpoint: dedup working
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_hd2';
+----
+1
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_hd2';
+----
+4
+
+# Force checkpoint (simulates restart)
+statement ok
+CHECKPOINT;
+
+# After checkpoint: dedup state must be preserved
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_hd2';
+----
+1
+
+# Critical: all 4 rows must still be found after checkpoint
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_hd2
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 4
+);
+----
+4
+
+# Delete after checkpoint must work
+statement ok
+DELETE FROM t_hd2 WHERE id <= 2;
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_hd2
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 4
+);
+----
+2
+
+statement ok
+DROP TABLE t_hd2;
+
+# ============================================================
+# Test 3: Dedup delete — extra row promoted to primary
+# ============================================================
+statement ok
+CREATE TABLE t_hd3(id INT, cat VARCHAR, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_hd3 ON t_hd3 USING HYBRID_INDEX (vec, cat);
+
+statement ok
+INSERT INTO t_hd3 VALUES (1, 'X', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd3 VALUES (2, 'X', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd3 VALUES (3, 'X', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd3 VALUES (4, 'X', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd3 VALUES (5, 'X', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+# 5 identical vectors → 1 node
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_hd3';
+----
+1
+
+# Delete first 3 rows
+statement ok
+DELETE FROM t_hd3 WHERE id <= 3;
+
+# Node should survive (extras promoted)
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_hd3';
+----
+2
+
+# Remaining 2 rows still searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_hd3
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5
+);
+----
+2
+
+# Delete all remaining
+statement ok
+DELETE FROM t_hd3 WHERE id > 0;
+
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_hd3';
+----
+0
+
+statement ok
+DROP TABLE t_hd3;
+
+# ============================================================
+# Test 4: Dedup across multiple partitions via INSERT
+# ============================================================
+statement ok
+CREATE TABLE t_hd4(id INT, cat VARCHAR, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_hd4 ON t_hd4 USING HYBRID_INDEX (vec, cat);
+
+# Partition A: 3 identical vectors
+statement ok
+INSERT INTO t_hd4 VALUES (1, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd4 VALUES (2, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd4 VALUES (3, 'A', [1.0, 0.0, 0.0, 0.0]::FLOAT[4]);
+
+# Partition B: 3 identical vectors (different from A)
+statement ok
+INSERT INTO t_hd4 VALUES (4, 'B', [0.0, 1.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd4 VALUES (5, 'B', [0.0, 1.0, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+INSERT INTO t_hd4 VALUES (6, 'B', [0.0, 1.0, 0.0, 0.0]::FLOAT[4]);
+
+# Each partition should have 1 node (dedup within partition), total 2 nodes
+query I
+SELECT SUM(node_count) FROM vex_index_info() WHERE index_name = 'idx_hd4';
+----
+2
+
+# All 6 rows searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_hd4
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.0, 0.0]::FLOAT[4]) LIMIT 6
+);
+----
+6
+
+statement ok
+DROP TABLE t_hd4;

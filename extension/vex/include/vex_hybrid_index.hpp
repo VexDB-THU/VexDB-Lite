@@ -5,6 +5,7 @@
 #include "duckdb/common/types/vector.hpp"
 #include "vex_graph_index_core.hpp"
 
+#include <mutex>
 #include <random>
 #include <map>
 
@@ -25,7 +26,8 @@ public:
 	            const vector<column_t> &column_ids, TableIOManager &table_io_manager,
 	            const vector<unique_ptr<Expression>> &unbound_expressions,
 	            AttachedDatabase &db, int m, int ef_construction,
-	            vex::VexMetric metric = vex::VexMetric::L2);
+	            vex::VexMetric metric = vex::VexMetric::L2,
+	            uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP);
 
 	void Build(DataChunk &chunk, Vector &row_ids);
 
@@ -90,7 +92,9 @@ private:
 	//! Reverse lookup: row_id -> partition key (for O(1) delete)
 	unordered_map<row_t, string> row_partition_map_;
 
+	uint16_t max_dedup_;
 	std::mt19937 rng_;
+	std::mutex rng_mutex_;
 	std::uniform_real_distribution<double> dist_;
 	vex::VexMetric metric_;
 	vex::distance_func_t distance_func_;

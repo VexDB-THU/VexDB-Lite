@@ -52,6 +52,16 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 		metric = vex::ParseMetric(metric_it->second.GetValue<string>());
 	}
 
+	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
+	auto dedup_it = input.options.find("max_dedup");
+	if (dedup_it != input.options.end()) {
+		int val = dedup_it->second.GetValue<int>();
+		if (val < 1 || val > 65535) {
+			throw InvalidInputException("max_dedup must be between 1 and 65535, got %d", val);
+		}
+		max_dedup = static_cast<uint16_t>(val);
+	}
+
 	auto hybrid_index = make_uniq<HybridIndex>(
 		input.name,
 		input.constraint_type,
@@ -61,7 +71,8 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 		input.db,
 		m,
 		ef_construction,
-		metric
+		metric,
+		max_dedup
 	);
 
 	// Deserialize from allocator-based storage if available
@@ -133,12 +144,13 @@ HybridIndex::HybridIndex(const string &name, IndexConstraintType constraint_type
                          const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                          const vector<unique_ptr<Expression>> &unbound_expressions,
                          AttachedDatabase &db, int m, int ef_construction,
-                         vex::VexMetric metric)
+                         vex::VexMetric metric, uint16_t max_dedup)
     : BoundIndex(name, HybridIndex::TYPE_NAME, constraint_type, column_ids, table_io_manager,
                  unbound_expressions, db),
       m_(m),
       ef_construction_(ef_construction),
       dimension_(0),
+      max_dedup_(max_dedup),
       rng_(std::random_device{}()),
       dist_(0.0, 1.0),
       metric_(metric) {
@@ -187,6 +199,7 @@ GraphIndexCore &HybridIndex::GetOrCreatePartition(const string &key) {
 		return it->second;
 	}
 	auto &partition = partitions_[key];
+	partition.max_dedup = max_dedup_;
 	if (dimension_ > 0) {
 		EnsurePartitionAllocators(partition);
 	}
@@ -194,6 +207,7 @@ GraphIndexCore &HybridIndex::GetOrCreatePartition(const string &key) {
 }
 
 int HybridIndex::GetRandomLevel() {
+	std::lock_guard<std::mutex> lock(rng_mutex_);
 	double ml = GraphIndexConfig::GetMl(m_);
 	double r = dist_(rng_);
 	if (r == 0.0) r = std::numeric_limits<double>::min();
@@ -537,18 +551,37 @@ bool HybridIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 
 		auto &other_partition = kv.second;
 
-		// Re-insert each node from other partition
+		unordered_set<idx_t> seen_nodes;
+
 		for (auto &rm_kv : other_partition.row_id_map) {
-			auto rid = rm_kv.first;
 			auto nptr = rm_kv.second;
+			if (!seen_nodes.insert(nptr.Get()).second) continue;
+
 			auto *header = other_partition.GetNode(nptr);
 			if (header->deleted) continue;
 
 			auto *vec = other_partition.GetVector(header->vector_ptr);
-			IndexPointer new_node = my_partition.AllocateNode(rid, vec, dimension_, header->level);
-			my_partition.InsertNode(new_node, m_, ef_construction_, distance_func_);
 
-			row_partition_map_[rid] = kv.first;
+			std::vector<row_t> all_row_ids;
+			other_partition.CollectNodeRowIds(nptr, all_row_ids);
+
+			row_t primary_rid = all_row_ids[0];
+
+			// Insert primary: try dedup first, fall back to full insert
+			if (!(my_partition.max_dedup > 1 && my_partition.TryDedup(primary_rid, vec, dimension_, distance_func_))) {
+				IndexPointer new_node = my_partition.AllocateNode(primary_rid, vec, dimension_, header->level);
+				my_partition.InsertNode(new_node, m_, ef_construction_, distance_func_);
+			}
+			row_partition_map_[primary_rid] = kv.first;
+
+			// Insert extras: try dedup, fall back to new node
+			for (idx_t r = 1; r < all_row_ids.size(); r++) {
+				if (!my_partition.TryDedup(all_row_ids[r], vec, dimension_, distance_func_)) {
+					IndexPointer extra_node = my_partition.AllocateNode(all_row_ids[r], vec, dimension_, 0);
+					my_partition.InsertNode(extra_node, m_, ef_construction_, distance_func_);
+				}
+				row_partition_map_[all_row_ids[r]] = kv.first;
+			}
 		}
 	}
 	other.partitions_.clear();
@@ -823,6 +856,8 @@ void HybridIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 		int32_t max_level;
 		uint64_t entry_point;
 		std::vector<std::pair<row_t, uint64_t>> row_entries; // row_id -> IndexPointer raw
+		uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
+		unordered_map<idx_t, std::vector<row_t>> dedup_entries;
 	};
 	std::vector<PartitionMeta> partition_metas;
 	partition_metas.reserve(num_partitions);
@@ -861,6 +896,35 @@ void HybridIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 			memcpy(&ptr_val, ptr, sizeof(ptr_val));
 			ptr += sizeof(ptr_val);
 			pm.row_entries.push_back(std::make_pair(rid, ptr_val));
+		}
+
+		// Read max_dedup and dedup_map_ (added in dedup persistence fix)
+		if (ptr + sizeof(uint16_t) <= end) {
+			memcpy(&pm.max_dedup, ptr, sizeof(pm.max_dedup));
+			ptr += sizeof(pm.max_dedup);
+		}
+		if (ptr + sizeof(uint64_t) <= end) {
+			uint64_t num_dedup_nodes;
+			memcpy(&num_dedup_nodes, ptr, sizeof(num_dedup_nodes));
+			ptr += sizeof(num_dedup_nodes);
+			for (uint64_t d = 0; d < num_dedup_nodes && ptr + 2 * sizeof(uint64_t) <= end; d++) {
+				uint64_t node_key, num_extras;
+				memcpy(&node_key, ptr, sizeof(node_key));
+				ptr += sizeof(node_key);
+				memcpy(&num_extras, ptr, sizeof(num_extras));
+				ptr += sizeof(num_extras);
+				std::vector<row_t> extras;
+				extras.reserve(static_cast<size_t>(num_extras));
+				for (uint64_t j = 0; j < num_extras && ptr + sizeof(row_t) <= end; j++) {
+					row_t extra_rid;
+					memcpy(&extra_rid, ptr, sizeof(extra_rid));
+					ptr += sizeof(extra_rid);
+					extras.push_back(extra_rid);
+				}
+				if (!extras.empty()) {
+					pm.dedup_entries[static_cast<idx_t>(node_key)] = std::move(extras);
+				}
+			}
 		}
 
 		partition_metas.push_back(std::move(pm));
@@ -903,6 +967,15 @@ void HybridIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 			partition.row_id_map[entry.first] = nptr;
 			row_partition_map_[entry.first] = pm.key;
 		}
+
+		// Restore dedup state
+		partition.max_dedup = pm.max_dedup;
+		partition.dedup_map_ = std::move(pm.dedup_entries);
+		for (auto &dd_kv : partition.dedup_map_) {
+			for (auto &extra_rid : dd_kv.second) {
+				row_partition_map_[extra_rid] = pm.key;
+			}
+		}
 	}
 }
 
@@ -913,6 +986,22 @@ void HybridIndex::Clear() {
 	partitions_.clear();
 	row_partition_map_.clear();
 	dimension_ = 0;
+}
+
+static void SerializePartitionDedupMap(const GraphIndexCore &partition, string &blob) {
+	uint16_t p_max_dedup = partition.max_dedup;
+	blob.append(reinterpret_cast<const char *>(&p_max_dedup), sizeof(p_max_dedup));
+	uint64_t num_dedup_nodes = partition.dedup_map_.size();
+	blob.append(reinterpret_cast<const char *>(&num_dedup_nodes), sizeof(num_dedup_nodes));
+	for (auto &dd_kv : partition.dedup_map_) {
+		uint64_t node_key = dd_kv.first;
+		uint64_t num_extras = dd_kv.second.size();
+		blob.append(reinterpret_cast<const char *>(&node_key), sizeof(node_key));
+		blob.append(reinterpret_cast<const char *>(&num_extras), sizeof(num_extras));
+		for (auto &rid : dd_kv.second) {
+			blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
+		}
+	}
 }
 
 IndexStorageInfo HybridIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
@@ -958,6 +1047,8 @@ IndexStorageInfo HybridIndex::SerializeToDisk(QueryContext context, const case_i
 			partition_meta_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
 			partition_meta_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
 		}
+
+		SerializePartitionDedupMap(kv.second, partition_meta_blob);
 	}
 	info.options["num_partitions"] = Value::UINTEGER(num_partitions);
 	if (!partition_meta_blob.empty()) {
@@ -1031,6 +1122,8 @@ IndexStorageInfo HybridIndex::SerializeToWAL(const case_insensitive_map_t<Value>
 			partition_meta_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
 			partition_meta_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
 		}
+
+		SerializePartitionDedupMap(kv.second, partition_meta_blob);
 	}
 	info.options["num_partitions"] = Value::UINTEGER(num_partitions);
 	if (!partition_meta_blob.empty()) {
@@ -1080,7 +1173,12 @@ idx_t HybridIndex::GetInMemorySize(IndexLock &state) {
 		if (partition.node_alloc) size += partition.node_alloc->GetInMemorySize();
 		if (partition.vector_alloc) size += partition.vector_alloc->GetInMemorySize();
 		if (partition.upper_alloc) size += partition.upper_alloc->GetInMemorySize();
+		static constexpr idx_t HASH_ENTRY_OVERHEAD = 32; // unordered_map per-entry overhead
+		size += partition.row_id_map.size() * (sizeof(row_t) + sizeof(IndexPointer) + HASH_ENTRY_OVERHEAD);
 	}
+	static constexpr idx_t HASH_ENTRY_OVERHEAD = 32;
+	static constexpr idx_t AVG_PARTITION_KEY_SIZE = 16;
+	size += row_partition_map_.size() * (sizeof(row_t) + AVG_PARTITION_KEY_SIZE + HASH_ENTRY_OVERHEAD);
 	return size;
 }
 
