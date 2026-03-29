@@ -38,8 +38,6 @@ set(VEX_EXTENSION_FILES
     functions/index_info_function.cpp
     distance/distance.cpp
     quantizer/product_quantizer.cpp
-    quantizer/polar_quantizer.cpp
-    quantizer/qjl_quantizer.cpp
     index/graph_index_core.cpp
     index/graph_index.cpp)
 
