@@ -692,8 +692,10 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 
 static void ReplacePlanWithResults(unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> &child_owner,
                                    const GetChildInfo &info, unique_ptr<LogicalColumnDataGet> column_data_get) {
+	auto cardinality = column_data_get->estimated_cardinality;
 	if (info.proj) {
 		child_owner->children[0] = std::move(column_data_get);
+		child_owner->SetEstimatedCardinality(cardinality);
 		node = std::move(child_owner);
 	} else {
 		node = std::move(column_data_get);
@@ -849,7 +851,9 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 #endif
 
 	auto collection = FetchRowsByIds(context, duck_table, get, result_row_ids, limit, offset);
+	auto actual_count = collection->Count();
 	auto column_data_get = make_uniq<LogicalColumnDataGet>(get->table_index, GetOutputTypes(get), std::move(collection));
+	column_data_get->SetEstimatedCardinality(actual_count);
 
 	ReplacePlanWithResults(node, get_owner, get_info, std::move(column_data_get));
 	return true;
