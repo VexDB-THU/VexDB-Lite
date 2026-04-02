@@ -40,7 +40,7 @@ struct VexIndexInfoGlobalState : public GlobalTableFunctionState {
 		int32_t max_level;
 		int32_t dimension;
 		int64_t row_id_map_size;
-		string partition_key; // empty for GraphIndex
+		int32_t partition_count; // 0 for GraphIndex, N for HybridIndex
 	};
 
 	std::vector<IndexEntry> entries;
@@ -61,8 +61,8 @@ static unique_ptr<FunctionData> VexIndexInfoBind(ClientContext &context, TableFu
 	names.push_back("table_name");
 	return_types.push_back(LogicalType::VARCHAR);
 
-	names.push_back("partition_key");
-	return_types.push_back(LogicalType::VARCHAR);
+	names.push_back("partition_count");
+	return_types.push_back(LogicalType::INTEGER);
 
 	names.push_back("node_count");
 	return_types.push_back(LogicalType::BIGINT);
@@ -146,7 +146,7 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.index_name = target.index_name;
 				e.index_type = "GRAPH_INDEX";
 				e.table_name = target.table_name;
-				e.partition_key = "";
+				e.partition_count = 0;
 				e.node_count = static_cast<int64_t>(graph_idx.GetGraphCore().node_count);
 				e.max_level = graph_idx.GetGraphCore().max_level;
 				e.dimension = static_cast<int32_t>(graph_idx.GetGraphCore().dimension);
@@ -156,18 +156,27 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 #ifdef VEX_ENABLE_HYBRID_INDEX
 			else if (bound_index.GetIndexType() == HybridIndex::TYPE_NAME) {
 				auto &hybrid_idx = bound_index.Cast<HybridIndex>();
-				for (auto &kv : hybrid_idx.GetPartitions()) {
-					VexIndexInfoGlobalState::IndexEntry e;
-					e.index_name = target.index_name;
-					e.index_type = "HYBRID_INDEX";
-					e.table_name = target.table_name;
-					e.partition_key = kv.first;
-					e.node_count = static_cast<int64_t>(kv.second.node_count);
-					e.max_level = kv.second.max_level;
-					e.dimension = static_cast<int32_t>(kv.second.dimension);
-					e.row_id_map_size = static_cast<int64_t>(kv.second.row_id_map.size());
-					state->entries.push_back(std::move(e));
+				VexIndexInfoGlobalState::IndexEntry e;
+				e.index_name = target.index_name;
+				e.index_type = "HYBRID_INDEX";
+				e.table_name = target.table_name;
+				auto &partitions = hybrid_idx.GetPartitions();
+				e.partition_count = static_cast<int32_t>(partitions.size());
+				e.node_count = 0;
+				e.max_level = 0;
+				e.dimension = 0;
+				e.row_id_map_size = 0;
+				for (auto &kv : partitions) {
+					e.node_count += static_cast<int64_t>(kv.second.node_count);
+					e.row_id_map_size += static_cast<int64_t>(kv.second.row_id_map.size());
+					if (kv.second.max_level > e.max_level) {
+						e.max_level = kv.second.max_level;
+					}
+					if (e.dimension == 0) {
+						e.dimension = static_cast<int32_t>(kv.second.dimension);
+					}
 				}
+				state->entries.push_back(std::move(e));
 			}
 #endif
 			break; // found the target index, stop scanning
@@ -189,27 +198,21 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
 	auto &name_vec = output.data[0];
 	auto &type_vec = output.data[1];
 	auto &table_vec = output.data[2];
-	auto &part_vec = output.data[3];
 	auto name_data = FlatVector::GetData<string_t>(name_vec);
 	auto type_data = FlatVector::GetData<string_t>(type_vec);
 	auto table_data = FlatVector::GetData<string_t>(table_vec);
-	auto part_data = FlatVector::GetData<string_t>(part_vec);
+	auto part_count_data = FlatVector::GetData<int32_t>(output.data[3]);
 	auto node_data = FlatVector::GetData<int64_t>(output.data[4]);
 	auto level_data = FlatVector::GetData<int32_t>(output.data[5]);
 	auto dim_data = FlatVector::GetData<int32_t>(output.data[6]);
 	auto rmap_data = FlatVector::GetData<int64_t>(output.data[7]);
-	auto &part_validity = FlatVector::Validity(part_vec);
 
 	while (state.current_offset < state.entries.size() && count < max_count) {
 		auto &e = state.entries[state.current_offset];
 		name_data[count] = StringVector::AddString(name_vec, e.index_name);
 		type_data[count] = StringVector::AddString(type_vec, e.index_type);
 		table_data[count] = StringVector::AddString(table_vec, e.table_name);
-		if (e.partition_key.empty()) {
-			part_validity.SetInvalid(count);
-		} else {
-			part_data[count] = StringVector::AddString(part_vec, e.partition_key);
-		}
+		part_count_data[count] = e.partition_count;
 		node_data[count] = e.node_count;
 		level_data[count] = e.max_level;
 		dim_data[count] = e.dimension;

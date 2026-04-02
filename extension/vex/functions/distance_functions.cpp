@@ -11,26 +11,16 @@ namespace duckdb {
 // Bind function for distance functions: resolve ANY parameters to matching ARRAY types
 static unique_ptr<FunctionData> BindDistanceFunction(ClientContext &context, ScalarFunction &bound_function,
                                                      vector<unique_ptr<Expression>> &arguments) {
-	auto &left_type = arguments[0]->return_type;
-	auto &right_type = arguments[1]->return_type;
-
-	// If left is unknown (e.g. prepared statement parameter), try to resolve from right
-	if (left_type.id() == LogicalTypeId::UNKNOWN && right_type.id() == LogicalTypeId::UNKNOWN) {
+	if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN &&
+	    arguments[1]->return_type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
 
-	// Resolve types: use the known ARRAY type to cast the other argument
-	LogicalType resolved_type;
-	if (left_type.id() == LogicalTypeId::ARRAY) {
-		resolved_type = left_type;
-	} else if (right_type.id() == LogicalTypeId::ARRAY) {
-		resolved_type = right_type;
-	} else {
-		// Neither side is ARRAY (e.g. two uncast LIST literals) — let DuckDB handle default casting
-		return nullptr;
-	}
-	bound_function.arguments[0] = resolved_type;
-	bound_function.arguments[1] = resolved_type;
+	// Resolve from whichever side has a known type (prefer left, fallback to right)
+	auto &primary = arguments[0]->return_type.id() != LogicalTypeId::UNKNOWN ? *arguments[0] : *arguments[1];
+	auto resolved = ResolveToFloatArray(context, primary);
+	bound_function.arguments[0] = resolved;
+	bound_function.arguments[1] = resolved;
 
 	return nullptr;
 }

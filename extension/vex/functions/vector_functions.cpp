@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
@@ -9,24 +10,56 @@
 
 namespace duckdb {
 
-// Bind function: propagate input array type as return type (for single-arg functions)
-static unique_ptr<FunctionData> BindUnaryArrayReturn(ClientContext &context, ScalarFunction &bound_function,
-                                                     vector<unique_ptr<Expression>> &arguments) {
+LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
+	auto &type = expr.return_type;
+	if (type.id() == LogicalTypeId::ARRAY) {
+		if (ArrayType::GetChildType(type).id() != LogicalTypeId::FLOAT) {
+			return LogicalType::ARRAY(LogicalType::FLOAT, ArrayType::GetSize(type));
+		}
+		return type;
+	}
+	if (type.id() == LogicalTypeId::LIST) {
+		if (!expr.IsFoldable()) {
+			throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got non-constant LIST");
+		}
+		auto val = ExpressionExecutor::EvaluateScalar(context, expr, false);
+		if (val.IsNull()) {
+			throw InvalidInputException("Vector functions do not accept NULL vector inputs");
+		}
+		auto &list_children = ListValue::GetChildren(val);
+		if (list_children.empty()) {
+			throw InvalidInputException("Vector functions require non-empty vector inputs");
+		}
+		return LogicalType::ARRAY(LogicalType::FLOAT, list_children.size());
+	}
+	throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got %s", type.ToString());
+}
+
+// Bind helper: resolve first argument to FLOAT[N]
+static unique_ptr<FunctionData> BindResolveInput(ClientContext &context, ScalarFunction &bound_function,
+                                                  vector<unique_ptr<Expression>> &arguments) {
 	if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
 		throw ParameterNotResolvedException();
 	}
-	bound_function.return_type = arguments[0]->return_type;
+	auto resolved = ResolveToFloatArray(context, *arguments[0]);
+	bound_function.arguments[0] = resolved;
 	return nullptr;
 }
 
-// Bind function: propagate input array type as return type (for binary functions)
+// Bind for unary functions that return array (l2_normalize)
+static unique_ptr<FunctionData> BindUnaryArrayReturn(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
+	BindResolveInput(context, bound_function, arguments);
+	bound_function.return_type = bound_function.arguments[0];
+	return nullptr;
+}
+
+// Bind for binary functions that return array (vector_add, vector_sub)
 static unique_ptr<FunctionData> BindBinaryArrayReturn(ClientContext &context, ScalarFunction &bound_function,
                                                       vector<unique_ptr<Expression>> &arguments) {
-	if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
-		throw ParameterNotResolvedException();
-	}
-	bound_function.return_type = arguments[0]->return_type;
-	bound_function.arguments[1] = arguments[1]->return_type;
+	BindResolveInput(context, bound_function, arguments);
+	bound_function.arguments[1] = bound_function.arguments[0];
+	bound_function.return_type = bound_function.arguments[0];
 	return nullptr;
 }
 
@@ -53,7 +86,7 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 }
 
 ScalarFunction VexFunctions::GetVectorDimsFunction() {
-	return ScalarFunction("vector_dims", {LogicalType::ANY}, LogicalType::INTEGER, VectorDimsFunction);
+	return ScalarFunction("vector_dims", {LogicalType::ANY}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput);
 }
 
 // ============================================================
@@ -88,7 +121,7 @@ static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &
 }
 
 ScalarFunction VexFunctions::GetVectorNormFunction() {
-	return ScalarFunction("vector_norm", {LogicalType::ANY}, LogicalType::DOUBLE, VectorNormFunction);
+	return ScalarFunction("vector_norm", {LogicalType::ANY}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput);
 }
 
 // ============================================================

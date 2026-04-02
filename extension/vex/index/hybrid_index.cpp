@@ -288,9 +288,12 @@ void HybridIndex::Build(DataChunk &chunk, Vector &row_ids) {
 }
 
 ErrorData HybridIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
-	// During CREATE INDEX (Sink), key_chunk has only indexed columns
-	// During INSERT (AppendToIndexes), table_chunk has ALL table columns
-	if (chunk.ColumnCount() != logical_types.size()) {
+	// CREATE INDEX: chunk has only indexed columns already in index order.
+	// INSERT: chunk has ALL table columns in table order — need to remap via column_ids.
+	// When column counts match, check if first column type matches index expectation.
+	bool needs_remap = (chunk.ColumnCount() != logical_types.size()) ||
+	                   (chunk.data[0].GetType().id() != logical_types[0].id());
+	if (needs_remap) {
 		DataChunk key_chunk;
 		key_chunk.InitializeEmpty(logical_types);
 		for (idx_t i = 0; i < column_ids.size() && i < logical_types.size(); i++) {

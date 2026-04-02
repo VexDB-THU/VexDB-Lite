@@ -6,6 +6,12 @@
 
 namespace duckdb {
 
+// Resolve a single expression's type to FLOAT[N]:
+// - ARRAY → ensure child type is FLOAT
+// - LIST literal → evaluate to get size, then convert to FLOAT[N]
+// - Other → throw
+LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr);
+
 struct VexFunctions {
 	static void Register(ExtensionLoader &loader);
 

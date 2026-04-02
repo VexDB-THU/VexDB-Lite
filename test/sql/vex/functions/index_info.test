@@ -41,11 +41,11 @@ SELECT table_name FROM vex_index_info() WHERE index_name = 'idx1';
 ----
 t1
 
-# Verify partition_key is NULL for GRAPH_INDEX
-query T
-SELECT partition_key FROM vex_index_info() WHERE index_name = 'idx1';
+# Verify partition_count is 0 for GRAPH_INDEX
+query I
+SELECT partition_count FROM vex_index_info() WHERE index_name = 'idx1';
 ----
-NULL
+0
 
 # ============================================================
 # Test 3: Create multiple indexes, verify all appear
@@ -71,11 +71,11 @@ INSERT INTO t3 VALUES
 statement ok
 CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);
 
-# Should have at least 3 entries (idx1, idx2, and idx3 with 2 partitions)
+# Should have 3 entries (idx1, idx2, and idx3 — one row per index)
 query I
 SELECT count(*) FROM vex_index_info();
 ----
-4
+3
 
 # Verify idx2 details
 query ITII
@@ -83,12 +83,11 @@ SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE
 ----
 idx2	GRAPH_INDEX	50	8
 
-# Verify hybrid index shows partition keys
-query IT
-SELECT index_name, index_type FROM vex_index_info() WHERE index_name = 'idx3' ORDER BY partition_key;
+# Verify hybrid index shows one row with partition count
+query ITI
+SELECT index_name, index_type, partition_count FROM vex_index_info() WHERE index_name = 'idx3';
 ----
-idx3	HYBRID_INDEX
-idx3	HYBRID_INDEX
+idx3	HYBRID_INDEX	2
 
 # ============================================================
 # Test 4: Drop an index, verify it disappears
