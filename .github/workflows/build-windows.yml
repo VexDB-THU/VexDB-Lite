@@ -21,7 +21,9 @@ jobs:
           cmake -S . -B build/release \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNITTESTS=OFF \
-            -DEXTENSION_STATIC_BUILD=OFF \
+            -DEXTENSION_STATIC_BUILD=ON \
+            -DBUILD_EXTENSIONS="core_functions;parquet;icu;json;vex" \
+            -DSKIP_EXTENSIONS="jemalloc" \
             -G "Visual Studio 17 2022" -A x64
           cmake --build build/release --config Release --target duckdb -j
 
