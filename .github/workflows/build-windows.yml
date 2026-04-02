@@ -1,0 +1,50 @@
+name: Build Windows Binary
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Windows x86_64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build Release
+        shell: bash
+        run: |
+          cd duckdb
+          mkdir -p build/release
+          cmake -S . -B build/release \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_UNITTESTS=OFF \
+            -DEXTENSION_STATIC_BUILD=OFF \
+            -G "Visual Studio 17 2022" -A x64
+          cmake --build build/release --config Release --target duckdb -j
+
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp duckdb/build/release/src/Release/duckdb.exe dist/ 2>/dev/null || cp duckdb/build/release/src/duckdb.exe dist/
+          # 复制可能需要的 DLL
+          cp duckdb/build/release/src/Release/*.dll dist/ 2>/dev/null || true
+          echo "=== dist contents ==="
+          ls -lh dist/
+
+      - name: Smoke Test
+        shell: bash
+        run: |
+          echo "SELECT l2_distance([1,0,0]::FLOAT[3], [0,1,0]::FLOAT[3]);" | dist/duckdb.exe
+          echo "SELECT cosine_distance([1.0,0.0,0.0], [2.0,0.0,0.0]) AS same_dir;" | dist/duckdb.exe
+
+      - name: Upload Binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vexdb-lite-windows
+          path: dist/*
