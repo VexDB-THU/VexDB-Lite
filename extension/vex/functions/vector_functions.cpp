@@ -32,6 +32,29 @@ LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
 		}
 		return LogicalType::ARRAY(LogicalType::FLOAT, list_children.size());
 	}
+	// VARCHAR/STRING_LITERAL → FLOAT[N]: parse '[1.0, 2.0, 3.0]' string to determine dimension
+	if (type.id() == LogicalTypeId::VARCHAR || type.id() == LogicalTypeId::STRING_LITERAL) {
+		if (!expr.IsFoldable()) {
+			throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got non-constant VARCHAR");
+		}
+		auto val = ExpressionExecutor::EvaluateScalar(context, expr, false);
+		if (val.IsNull()) {
+			throw InvalidInputException("Vector functions do not accept NULL vector inputs");
+		}
+		auto str = StringValue::Get(val);
+		// Count elements by counting commas: dimension = commas + 1
+		// Validate that string starts with '[' and ends with ']'
+		if (str.empty() || str.front() != '[' || str.back() != ']') {
+			throw InvalidInputException("Vector string must be in format '[1.0, 2.0, ...]', got '%s'", str);
+		}
+		idx_t dim = 1;
+		for (auto c : str) {
+			if (c == ',') {
+				dim++;
+			}
+		}
+		return LogicalType::ARRAY(LogicalType::FLOAT, dim);
+	}
 	throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got %s", type.ToString());
 }
 

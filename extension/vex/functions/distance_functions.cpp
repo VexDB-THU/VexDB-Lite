@@ -8,7 +8,7 @@
 
 namespace duckdb {
 
-// Bind function for distance functions: resolve ANY parameters to matching ARRAY types
+// Bind function: resolve parameters to matching FLOAT[N] ARRAY types
 static unique_ptr<FunctionData> BindDistanceFunction(ClientContext &context, ScalarFunction &bound_function,
                                                      vector<unique_ptr<Expression>> &arguments) {
 	if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN &&
@@ -71,24 +71,10 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
 	});
 }
 
-ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
-	ScalarFunctionSet set("l2_distance");
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, L2DistanceFunction,
-	                               BindDistanceFunction));
-	return set;
-}
-
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
 	DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint32_t d) {
 		return static_cast<double>(vex::InnerProductDistance(a, b, d));
 	});
-}
-
-ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
-	ScalarFunctionSet set("inner_product");
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, InnerProductFunction,
-	                               BindDistanceFunction));
-	return set;
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -103,17 +89,41 @@ static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state
 	});
 }
 
+// Helper: add all overloads (ANY+ANY, VARCHAR combos) for a distance function
+static void AddDistanceOverloads(ScalarFunctionSet &set, scalar_function_t func) {
+	// Primary: ARRAY/LIST inputs (resolved by BindDistanceFunction)
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, func,
+	                               BindDistanceFunction));
+	// VARCHAR overloads: STRING_LITERAL only matches concrete types, not ANY
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::DOUBLE, func,
+	                               BindDistanceFunction));
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::DOUBLE, func,
+	                               BindDistanceFunction));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::DOUBLE, func,
+	                               BindDistanceFunction));
+}
+
+ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
+	ScalarFunctionSet set("l2_distance");
+	AddDistanceOverloads(set, L2DistanceFunction);
+	return set;
+}
+
+ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
+	ScalarFunctionSet set("inner_product");
+	AddDistanceOverloads(set, InnerProductFunction);
+	return set;
+}
+
 ScalarFunctionSet VexFunctions::GetNegativeInnerProductFunction() {
 	ScalarFunctionSet set("<~>");
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, NegativeInnerProductFunction,
-	                               BindDistanceFunction));
+	AddDistanceOverloads(set, NegativeInnerProductFunction);
 	return set;
 }
 
 ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
 	ScalarFunctionSet set("cosine_distance");
-	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::DOUBLE, CosineDistanceFunction,
-	                               BindDistanceFunction));
+	AddDistanceOverloads(set, CosineDistanceFunction);
 	return set;
 }
 
