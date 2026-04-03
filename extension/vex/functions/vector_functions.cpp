@@ -42,14 +42,13 @@ LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
 			throw InvalidInputException("Vector functions do not accept NULL vector inputs");
 		}
 		auto str = StringValue::Get(val);
-		// Count elements by counting commas: dimension = commas + 1
-		// Validate that string starts with '[' and ends with ']'
-		if (str.empty() || str.front() != '[' || str.back() != ']') {
+		if (str.size() < 3 || str.front() != '[' || str.back() != ']') {
 			throw InvalidInputException("Vector string must be in format '[1.0, 2.0, ...]', got '%s'", str);
 		}
+		// Count commas between brackets to determine dimension
 		idx_t dim = 1;
-		for (auto c : str) {
-			if (c == ',') {
+		for (idx_t i = 1; i + 1 < str.size(); i++) {
+			if (str[i] == ',') {
 				dim++;
 			}
 		}
