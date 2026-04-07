@@ -41,10 +41,16 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 	auto m_it = input.options.find("m");
 	if (m_it != input.options.end()) {
 		m = m_it->second.GetValue<int>();
+		if (m < 2 || m > 128) {
+			throw InvalidInputException("HYBRID_INDEX: 'm' must be between 2 and 128, got %d", m);
+		}
 	}
 	auto ef_it = input.options.find("ef_construction");
 	if (ef_it != input.options.end()) {
 		ef_construction = ef_it->second.GetValue<int>();
+		if (ef_construction < 1 || ef_construction > 4096) {
+			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be between 1 and 4096, got %d", ef_construction);
+		}
 	}
 	vex::VexMetric metric = vex::VexMetric::L2;
 	auto metric_it = input.options.find("metric");

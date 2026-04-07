@@ -41,10 +41,16 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 	auto m_it = input.options.find("m");
 	if (m_it != input.options.end()) {
 		m = m_it->second.GetValue<int>();
+		if (m < 2 || m > 128) {
+			throw InvalidInputException("GRAPH_INDEX: 'm' must be between 2 and 128, got %d", m);
+		}
 	}
 	auto ef_it = input.options.find("ef_construction");
 	if (ef_it != input.options.end()) {
 		ef_construction = ef_it->second.GetValue<int>();
+		if (ef_construction < 1 || ef_construction > 4096) {
+			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be between 1 and 4096, got %d", ef_construction);
+		}
 	}
 	auto q_it = input.options.find("quantizer");
 	if (q_it != input.options.end()) {
@@ -56,6 +62,9 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 	auto pqm_it = input.options.find("pq_m");
 	if (pqm_it != input.options.end()) {
 		pq_m = static_cast<uint32_t>(pqm_it->second.GetValue<int>());
+		if (pq_m < 1 || pq_m > 256) {
+			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %d", pq_m);
+		}
 	}
 	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
 	auto dedup_it = input.options.find("max_dedup");

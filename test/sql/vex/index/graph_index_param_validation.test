@@ -1,0 +1,140 @@
+# name: test/sql/vex/index/graph_index_param_validation.test
+# description: Test index creation parameter validation (TAPD Bug 1077654)
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t_val (id BIGINT, v FLOAT[4]);
+
+statement ok
+INSERT INTO t_val SELECT i, [(i*0.1)::FLOAT, (i*0.2)::FLOAT, (i*0.3)::FLOAT, (i*0.4)::FLOAT]::FLOAT[4] FROM range(100) t(i);
+
+# ============================================================
+# threads parameter validation
+# ============================================================
+
+# threads = -1 should fail
+statement error
+CREATE INDEX idx_neg ON t_val USING GRAPH_INDEX (v) WITH (threads = -1);
+----
+threads
+
+# threads = 0 should fail
+statement error
+CREATE INDEX idx_zero ON t_val USING GRAPH_INDEX (v) WITH (threads = 0);
+----
+threads
+
+# threads = 10000000 should fail
+statement error
+CREATE INDEX idx_huge ON t_val USING GRAPH_INDEX (v) WITH (threads = 10000000);
+----
+threads
+
+# threads = 'aaa' should fail
+statement error
+CREATE INDEX idx_str ON t_val USING GRAPH_INDEX (v) WITH (threads = 'aaa');
+----
+threads
+
+# threads = 1 should succeed
+statement ok
+CREATE INDEX idx_ok1 ON t_val USING GRAPH_INDEX (v) WITH (threads = 1);
+
+statement ok
+DROP INDEX idx_ok1;
+
+# threads = 4 should succeed
+statement ok
+CREATE INDEX idx_ok4 ON t_val USING GRAPH_INDEX (v) WITH (threads = 4);
+
+statement ok
+DROP INDEX idx_ok4;
+
+# ============================================================
+# m parameter validation
+# ============================================================
+
+# m = 0 should fail
+statement error
+CREATE INDEX idx_m0 ON t_val USING GRAPH_INDEX (v) WITH (m = 0);
+----
+m
+
+# m = 1 should fail
+statement error
+CREATE INDEX idx_m1 ON t_val USING GRAPH_INDEX (v) WITH (m = 1);
+----
+m
+
+# m = 200 should fail
+statement error
+CREATE INDEX idx_m200 ON t_val USING GRAPH_INDEX (v) WITH (m = 200);
+----
+m
+
+# m = 8 should succeed
+statement ok
+CREATE INDEX idx_m8 ON t_val USING GRAPH_INDEX (v) WITH (m = 8);
+
+statement ok
+DROP INDEX idx_m8;
+
+# ============================================================
+# ef_construction parameter validation
+# ============================================================
+
+# ef_construction = 0 should fail
+statement error
+CREATE INDEX idx_ef0 ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 0);
+----
+ef_construction
+
+# ef_construction = -1 should fail
+statement error
+CREATE INDEX idx_efn ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = -1);
+----
+ef_construction
+
+# ef_construction = 5000 should fail
+statement error
+CREATE INDEX idx_ef5k ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 5000);
+----
+ef_construction
+
+# ef_construction = 200 should succeed
+statement ok
+CREATE INDEX idx_ef200 ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 200);
+
+statement ok
+DROP INDEX idx_ef200;
+
+# ============================================================
+# HYBRID_INDEX parameter validation
+# ============================================================
+
+statement ok
+CREATE TABLE t_hyb (id BIGINT, v FLOAT[4], cat VARCHAR);
+
+statement ok
+INSERT INTO t_hyb VALUES (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 'A');
+
+# HYBRID_INDEX m = 0 should fail
+statement error
+CREATE INDEX idx_hyb_m0 ON t_hyb USING HYBRID_INDEX (v, cat) WITH (m = 0);
+----
+m
+
+# HYBRID_INDEX ef_construction = -1 should fail
+statement error
+CREATE INDEX idx_hyb_efn ON t_hyb USING HYBRID_INDEX (v, cat) WITH (ef_construction = -1);
+----
+ef_construction
+
+# Clean up
+statement ok
+DROP TABLE t_val;
+
+statement ok
+DROP TABLE t_hyb;

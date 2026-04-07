@@ -237,8 +237,16 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 		int num_threads = 1;
 		auto it = info->options.find("threads");
 		if (it != info->options.end()) {
-			num_threads = it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-			if (num_threads < 1) num_threads = 1;
+			try {
+				num_threads = it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+			} catch (...) {
+				throw InvalidInputException("GRAPH_INDEX: 'threads' must be a valid integer, got '%s'",
+				                            it->second.ToString());
+			}
+			if (num_threads < 1 || num_threads > 1024) {
+				throw InvalidInputException("GRAPH_INDEX: 'threads' must be between 1 and 1024, got %d",
+				                            num_threads);
+			}
 		}
 		graph_index.BuildParallel(state.all_vectors, state.all_row_ids,
 		                          state.total_count, state.dimension, num_threads);
