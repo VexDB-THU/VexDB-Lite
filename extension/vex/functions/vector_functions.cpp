@@ -93,6 +93,8 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto count = args.size();
 	auto dim = static_cast<int32_t>(ArrayType::GetSize(vec.GetType()));
 
+	bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
+
 	vec.Flatten(count);
 	auto result_data = FlatVector::GetData<int32_t>(result);
 	auto &result_validity = FlatVector::Validity(result);
@@ -104,6 +106,10 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 			continue;
 		}
 		result_data[i] = dim;
+	}
+
+	if (is_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }
 
@@ -118,6 +124,8 @@ static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &
 	auto &vec = args.data[0];
 	auto count = args.size();
 	auto dim = ArrayType::GetSize(vec.GetType());
+
+	bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
 	auto result_data = FlatVector::GetData<double>(result);
 	auto &result_validity = FlatVector::Validity(result);
@@ -140,6 +148,10 @@ static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &
 		}
 		result_data[i] = std::sqrt(sum);
 	}
+
+	if (is_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
 }
 
 ScalarFunction VexFunctions::GetVectorNormFunction() {
@@ -153,6 +165,8 @@ static void L2NormalizeFunction(DataChunk &args, ExpressionState &state, Vector 
 	auto &vec = args.data[0];
 	auto count = args.size();
 	auto dim = ArrayType::GetSize(vec.GetType());
+
+	bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
 	vec.Flatten(count);
 	auto &child_in = ArrayVector::GetEntry(vec);
@@ -186,6 +200,10 @@ static void L2NormalizeFunction(DataChunk &args, ExpressionState &state, Vector 
 			}
 		}
 	}
+
+	if (is_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
 }
 
 ScalarFunction VexFunctions::GetL2NormalizeFunction() {
@@ -205,6 +223,9 @@ static void VectorAddFunction(DataChunk &args, ExpressionState &state, Vector &r
 	if (dim_a != dim_b) {
 		throw InvalidInputException("Vector dimension mismatch: %d vs %d", dim_a, dim_b);
 	}
+
+	bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
+	                    vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
 	vec_a.Flatten(count);
 	vec_b.Flatten(count);
@@ -231,6 +252,10 @@ static void VectorAddFunction(DataChunk &args, ExpressionState &state, Vector &r
 			out[d] = a[d] + b[d];
 		}
 	}
+
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
+	}
 }
 
 ScalarFunction VexFunctions::GetVectorAddFunction() {
@@ -249,6 +274,9 @@ static void VectorSubFunction(DataChunk &args, ExpressionState &state, Vector &r
 	if (dim_a != dim_b) {
 		throw InvalidInputException("Vector dimension mismatch: %d vs %d", dim_a, dim_b);
 	}
+
+	bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
+	                    vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
 	vec_a.Flatten(count);
 	vec_b.Flatten(count);
@@ -274,6 +302,10 @@ static void VectorSubFunction(DataChunk &args, ExpressionState &state, Vector &r
 		for (idx_t d = 0; d < dim_a; d++) {
 			out[d] = a[d] - b[d];
 		}
+	}
+
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }
 

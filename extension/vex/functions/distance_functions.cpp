@@ -45,6 +45,9 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
 	auto dim_b = ArrayType::GetSize(vec_b.GetType());
 	CheckDimensions(dim_a, dim_b);
 
+	bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
+	                    vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
+
 	auto result_data = FlatVector::GetData<double>(result);
 	auto &result_validity = FlatVector::Validity(result);
 
@@ -62,6 +65,10 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
 			continue;
 		}
 		result_data[i] = compute(data_a + i * dim_a, data_b + i * dim_a, dim);
+	}
+
+	if (all_constant) {
+		result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	}
 }
 

@@ -71,6 +71,15 @@ public:
 	vex::VexMetric GetMetric() const {
 		return metric_;
 	}
+	int GetM() const {
+		return m_;
+	}
+	int GetEfConstruction() const {
+		return ef_construction_;
+	}
+	uint32_t GetDimension() const {
+		return dimension_;
+	}
 
 private:
 	string SerializeToBlob();

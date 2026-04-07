@@ -47,6 +47,12 @@ SELECT partition_count FROM vex_index_info() WHERE index_name = 'idx1';
 ----
 0
 
+# Verify build parameters for GRAPH_INDEX (default: m=16, ef_construction=200, metric=l2, no PQ)
+query IITII
+SELECT m, ef_construction, metric, use_pq::INTEGER, pq_m FROM vex_index_info() WHERE index_name = 'idx1';
+----
+16	64	l2	0	0
+
 # ============================================================
 # Test 3: Create multiple indexes, verify all appear
 # ============================================================
@@ -88,6 +94,12 @@ query ITI
 SELECT index_name, index_type, partition_count FROM vex_index_info() WHERE index_name = 'idx3';
 ----
 idx3	HYBRID_INDEX	2
+
+# Verify build parameters for HYBRID_INDEX
+query IITII
+SELECT m, ef_construction, metric, use_pq::INTEGER, pq_m FROM vex_index_info() WHERE index_name = 'idx3';
+----
+16	64	l2	0	0
 
 # ============================================================
 # Test 4: Drop an index, verify it disappears

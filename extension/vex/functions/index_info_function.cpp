@@ -1,5 +1,6 @@
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
+#include "vex_distance.hpp"
 #ifdef VEX_ENABLE_HYBRID_INDEX
 #include "vex_hybrid_index.hpp"
 #endif
@@ -41,6 +42,12 @@ struct VexIndexInfoGlobalState : public GlobalTableFunctionState {
 		int32_t dimension;
 		int64_t row_id_map_size;
 		int32_t partition_count; // 0 for GraphIndex, N for HybridIndex
+		// Build parameters
+		int32_t m;
+		int32_t ef_construction;
+		string metric;
+		bool use_pq;
+		int32_t pq_m;
 	};
 
 	std::vector<IndexEntry> entries;
@@ -75,6 +82,21 @@ static unique_ptr<FunctionData> VexIndexInfoBind(ClientContext &context, TableFu
 
 	names.push_back("row_id_map_size");
 	return_types.push_back(LogicalType::BIGINT);
+
+	names.push_back("m");
+	return_types.push_back(LogicalType::INTEGER);
+
+	names.push_back("ef_construction");
+	return_types.push_back(LogicalType::INTEGER);
+
+	names.push_back("metric");
+	return_types.push_back(LogicalType::VARCHAR);
+
+	names.push_back("use_pq");
+	return_types.push_back(LogicalType::BOOLEAN);
+
+	names.push_back("pq_m");
+	return_types.push_back(LogicalType::INTEGER);
 
 	return make_uniq<VexIndexInfoBindData>();
 }
@@ -151,6 +173,11 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.max_level = graph_idx.GetGraphCore().max_level;
 				e.dimension = static_cast<int32_t>(graph_idx.GetGraphCore().dimension);
 				e.row_id_map_size = static_cast<int64_t>(graph_idx.GetGraphCore().row_id_map.size());
+				e.m = graph_idx.GetM();
+				e.ef_construction = graph_idx.GetEfConstruction();
+				e.metric = vex::MetricName(graph_idx.GetMetric());
+				e.use_pq = graph_idx.GetUsePQ();
+				e.pq_m = static_cast<int32_t>(graph_idx.GetPQM());
 				state->entries.push_back(std::move(e));
 			}
 #ifdef VEX_ENABLE_HYBRID_INDEX
@@ -176,6 +203,11 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 						e.dimension = static_cast<int32_t>(kv.second.dimension);
 					}
 				}
+				e.m = hybrid_idx.GetM();
+				e.ef_construction = hybrid_idx.GetEfConstruction();
+				e.metric = vex::MetricName(hybrid_idx.GetMetric());
+				e.use_pq = false;
+				e.pq_m = 0;
 				state->entries.push_back(std::move(e));
 			}
 #endif
@@ -206,6 +238,12 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
 	auto level_data = FlatVector::GetData<int32_t>(output.data[5]);
 	auto dim_data = FlatVector::GetData<int32_t>(output.data[6]);
 	auto rmap_data = FlatVector::GetData<int64_t>(output.data[7]);
+	auto m_data = FlatVector::GetData<int32_t>(output.data[8]);
+	auto ef_data = FlatVector::GetData<int32_t>(output.data[9]);
+	auto &metric_vec = output.data[10];
+	auto metric_data = FlatVector::GetData<string_t>(metric_vec);
+	auto pq_data = FlatVector::GetData<bool>(output.data[11]);
+	auto pqm_data = FlatVector::GetData<int32_t>(output.data[12]);
 
 	while (state.current_offset < state.entries.size() && count < max_count) {
 		auto &e = state.entries[state.current_offset];
@@ -217,6 +255,11 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
 		level_data[count] = e.max_level;
 		dim_data[count] = e.dimension;
 		rmap_data[count] = e.row_id_map_size;
+		m_data[count] = e.m;
+		ef_data[count] = e.ef_construction;
+		metric_data[count] = StringVector::AddString(metric_vec, e.metric);
+		pq_data[count] = e.use_pq;
+		pqm_data[count] = e.pq_m;
 		count++;
 		state.current_offset++;
 	}
