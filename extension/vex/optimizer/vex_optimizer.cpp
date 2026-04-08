@@ -13,6 +13,7 @@
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/operator/logical_column_data_get.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
@@ -21,8 +22,10 @@
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+#include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "vex_physical_index_scan.hpp"
 
 // #define VEX_OPTIMIZER_DEBUG
 #ifdef VEX_OPTIMIZER_DEBUG
@@ -253,9 +256,11 @@ static bool TryExtractConstantVector(const Expression &expr, vector<float> &out_
 
 struct DistanceOrderInfo {
 	BoundFunctionExpression *func_expr = nullptr;
-	vector<float> query_vec;
+	vector<float> query_vec;           // constant path: extracted at optimize time
+	Expression *query_vec_expr = nullptr; // deferred path: expression to evaluate at runtime
 	idx_t col_index = 0;
 	bool needs_desc = false;
+	bool deferred = false;             // true = query_vec_expr needs runtime evaluation
 };
 
 static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, LogicalProjection *proj,
@@ -340,6 +345,7 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 	}
 #endif
 
+	// Try direct constant extraction first (fastest path)
 	if (IsColumnRefFromTable(*info.func_expr->children[0], get->table_index, info.col_index) &&
 	    TryExtractConstantVector(*info.func_expr->children[1], info.query_vec)) {
 		return true;
@@ -348,6 +354,28 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 	    TryExtractConstantVector(*info.func_expr->children[0], info.query_vec)) {
 		return true;
 	}
+
+	// Fallback: accept non-constant vector expression for deferred (runtime) evaluation.
+	// This handles cases like subqueries: ORDER BY dist(col, (SELECT vec FROM tmp)) LIMIT k
+	// where the query vector is not known at optimize time.
+	for (idx_t col_side = 0; col_side < 2; col_side++) {
+		idx_t vec_side = 1 - col_side;
+		if (IsColumnRefFromTable(*info.func_expr->children[col_side], get->table_index, info.col_index)) {
+			// The other side is a non-constant expression (subquery result, parameter, etc.)
+			// Verify it is NOT also a column ref from the same table (that would be col-vs-col, not ANN)
+			idx_t dummy_col;
+			if (IsColumnRefFromTable(*info.func_expr->children[vec_side], get->table_index, dummy_col)) {
+				continue; // both sides are columns from the same table — not an ANN pattern
+			}
+			info.query_vec_expr = info.func_expr->children[vec_side].get();
+			info.deferred = true;
+#ifdef VEX_OPTIMIZER_DEBUG
+			std::cerr << "[VEX] TryResolveDistanceOrder: deferred mode — query vector expression at runtime" << std::endl;
+#endif
+			return true;
+		}
+	}
+
 	return false;
 }
 
@@ -666,6 +694,8 @@ struct GetChildInfo {
 	LogicalGet *get = nullptr;
 	LogicalProjection *proj = nullptr;
 	LogicalFilter *filter = nullptr;
+	LogicalOperator *cross_product = nullptr;  // non-null when GET was found inside CROSS_PRODUCT
+	idx_t subquery_child_idx = 0;              // index of the subquery child in cross_product
 };
 
 // Find the GET node through optional PROJECTION and FILTER layers.
@@ -689,10 +719,25 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 		cur = cur->children[0].get();
 	}
 
-	// Must end at GET
+	// Direct GET
 	if (cur->type == LogicalOperatorType::LOGICAL_GET) {
 		info.get = &cur->Cast<LogicalGet>();
 		return true;
+	}
+
+	// CROSS_PRODUCT from scalar subquery flattening:
+	// DuckDB converts `ORDER BY dist(col, (SELECT ...))` into
+	// CROSS_PRODUCT -> [GET, subquery_pipeline].
+	// The GET side is the main table; the other side is the single-row subquery result.
+	if (cur->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT && cur->children.size() == 2) {
+		for (idx_t i = 0; i < 2; i++) {
+			if (cur->children[i]->type == LogicalOperatorType::LOGICAL_GET) {
+				info.get = &cur->children[i]->Cast<LogicalGet>();
+				info.cross_product = cur;
+				info.subquery_child_idx = 1 - i;
+				return true;
+			}
+		}
 	}
 
 	return false;
@@ -769,6 +814,63 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 		std::cerr << "[VEX] TryOptimizeANN: skipping — FILTER present but index is not hybrid" << std::endl;
 #endif
 		return false;
+	}
+
+	//--- Deferred path: query vector not known at optimize time ---
+	// Generate a LogicalVexIndexScan that will be converted to PhysicalVexIndexScan
+	// during physical planning. The physical operator evaluates the query vector
+	// expression and executes the ANN search at runtime.
+	//
+	// For subqueries, DuckDB flattens `ORDER BY dist(col, (SELECT ...))` into:
+	//   LIMIT -> ORDER_BY -> PROJECTION -> CROSS_PRODUCT -> [GET, subquery]
+	// We replace CROSS_PRODUCT with LogicalVexIndexScan, keeping the subquery
+	// as a child. The PROJECTION, ORDER_BY and LIMIT stay in place (ORDER_BY and
+	// LIMIT become no-ops since the index returns pre-sorted top-k results).
+	if (dist_info.deferred) {
+		if (!match.graph_idx) {
+#ifdef VEX_OPTIMIZER_DEBUG
+			std::cerr << "[VEX] TryOptimizeANN: deferred mode only supports GraphIndex" << std::endl;
+#endif
+			return false;
+		}
+		if (!get_info.cross_product) {
+#ifdef VEX_OPTIMIZER_DEBUG
+			std::cerr << "[VEX] TryOptimizeANN: deferred mode requires CROSS_PRODUCT (subquery)" << std::endl;
+#endif
+			return false;
+		}
+#ifdef VEX_OPTIMIZER_DEBUG
+		std::cerr << "[VEX] TryOptimizeANN: deferred mode — emitting LogicalVexIndexScan" << std::endl;
+#endif
+		idx_t k = limit + offset;
+
+		auto output_types = GetOutputTypes(get);
+		auto &column_ids = get->GetColumnIds();
+
+		auto scan = make_uniq<LogicalVexIndexScan>(
+		    get->table_index, output_types,
+		    duck_table, *match.graph_idx,
+		    dist_info.query_vec_expr->Copy(),
+		    k,
+		    column_ids, get->returned_types);
+		scan->SetEstimatedCardinality(k);
+
+		// Keep the subquery pipeline as a child so its column bindings are
+		// available for the inner PROJECTION's distance expression.
+		scan->children.push_back(
+		    std::move(get_info.cross_product->children[get_info.subquery_child_idx]));
+
+		// Replace CROSS_PRODUCT with LogicalVexIndexScan in the plan.
+		// The PROJECTION, ORDER_BY and LIMIT stay intact above.
+		if (get_info.proj) {
+			// PROJECTION -> CROSS_PRODUCT  =>  PROJECTION -> LogicalVexIndexScan
+			get_info.proj->children[0] = std::move(scan);
+		} else if (get_info.filter) {
+			// FILTER -> CROSS_PRODUCT  =>  FILTER -> LogicalVexIndexScan
+			get_info.filter->children[0] = std::move(scan);
+		}
+		// Don't replace `node` — the LIMIT/ORDER_BY stay in the plan.
+		return true;
 	}
 
 	idx_t k = limit + offset;

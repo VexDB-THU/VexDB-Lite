@@ -47,7 +47,9 @@ if(VEX_ENABLE_HYBRID_INDEX)
 endif()
 
 if(VEX_ENABLE_OPTIMIZER)
-    list(APPEND VEX_EXTENSION_FILES optimizer/vex_optimizer.cpp)
+    list(APPEND VEX_EXTENSION_FILES
+        optimizer/vex_optimizer.cpp
+        optimizer/vex_physical_index_scan.cpp)
     add_definitions(-DVEX_ENABLE_OPTIMIZER)
 endif()
 
