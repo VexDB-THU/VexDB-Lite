@@ -239,7 +239,7 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 		if (it != info->options.end()) {
 			try {
 				num_threads = it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-			} catch (...) {
+			} catch (const std::exception &) {
 				throw InvalidInputException("GRAPH_INDEX: 'threads' must be a valid integer, got '%s'",
 				                            it->second.ToString());
 			}

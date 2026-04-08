@@ -63,7 +63,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 	if (pqm_it != input.options.end()) {
 		pq_m = static_cast<uint32_t>(pqm_it->second.GetValue<int>());
 		if (pq_m < 1 || pq_m > 256) {
-			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %d", pq_m);
+			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %u", pq_m);
 		}
 	}
 	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
