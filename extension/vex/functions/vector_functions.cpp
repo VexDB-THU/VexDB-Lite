@@ -113,8 +113,11 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 	}
 }
 
-ScalarFunction VexFunctions::GetVectorDimsFunction() {
-	return ScalarFunction("vector_dims", {LogicalType::ANY}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput);
+ScalarFunctionSet VexFunctions::GetVectorDimsFunction() {
+	ScalarFunctionSet set("vector_dims");
+	set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput));
+	return set;
 }
 
 // ============================================================
@@ -154,8 +157,11 @@ static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &
 	}
 }
 
-ScalarFunction VexFunctions::GetVectorNormFunction() {
-	return ScalarFunction("vector_norm", {LogicalType::ANY}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput);
+ScalarFunctionSet VexFunctions::GetVectorNormFunction() {
+	ScalarFunctionSet set("vector_norm");
+	set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput));
+	return set;
 }
 
 // ============================================================
@@ -206,9 +212,11 @@ static void L2NormalizeFunction(DataChunk &args, ExpressionState &state, Vector 
 	}
 }
 
-ScalarFunction VexFunctions::GetL2NormalizeFunction() {
-	auto func = ScalarFunction("l2_normalize", {LogicalType::ANY}, LogicalType::ANY, L2NormalizeFunction, BindUnaryArrayReturn);
-	return func;
+ScalarFunctionSet VexFunctions::GetL2NormalizeFunction() {
+	ScalarFunctionSet set("l2_normalize");
+	set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::ANY, L2NormalizeFunction, BindUnaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::ANY, L2NormalizeFunction, BindUnaryArrayReturn));
+	return set;
 }
 
 // ============================================================
@@ -258,8 +266,13 @@ static void VectorAddFunction(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
-ScalarFunction VexFunctions::GetVectorAddFunction() {
-	return ScalarFunction("vector_add", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, VectorAddFunction, BindBinaryArrayReturn);
+ScalarFunctionSet VexFunctions::GetVectorAddFunction() {
+	ScalarFunctionSet set("vector_add");
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, VectorAddFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, VectorAddFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY, VectorAddFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY, VectorAddFunction, BindBinaryArrayReturn));
+	return set;
 }
 
 // ============================================================
@@ -309,8 +322,13 @@ static void VectorSubFunction(DataChunk &args, ExpressionState &state, Vector &r
 	}
 }
 
-ScalarFunction VexFunctions::GetVectorSubFunction() {
-	return ScalarFunction("vector_sub", {LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, VectorSubFunction, BindBinaryArrayReturn);
+ScalarFunctionSet VexFunctions::GetVectorSubFunction() {
+	ScalarFunctionSet set("vector_sub");
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY, VectorSubFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY, VectorSubFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY, VectorSubFunction, BindBinaryArrayReturn));
+	set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY, VectorSubFunction, BindBinaryArrayReturn));
+	return set;
 }
 
 // ============================================================
