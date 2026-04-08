@@ -25,12 +25,15 @@ namespace duckdb {
 // ============================================================
 
 unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
-	for (auto &expr : input.unbound_expressions) {
-		auto &type = expr->return_type;
-		if (type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(type).id() != LogicalTypeId::FLOAT) {
-			throw InvalidInputException("GRAPH_INDEX can only be created on FLOAT[N] (ARRAY(FLOAT)) columns, got %s",
-			                            type.ToString());
-		}
+	// First column must be FLOAT[N] (vector column)
+	// Subsequent columns are metadata columns (for filtered search)
+	if (input.unbound_expressions.empty()) {
+		throw InvalidInputException("GRAPH_INDEX requires at least one column");
+	}
+	auto &vec_type = input.unbound_expressions[0]->return_type;
+	if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
+		throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N] (ARRAY(FLOAT)), got %s",
+		                            vec_type.ToString());
 	}
 
 	int m = GraphIndexConfig::DEFAULT_M;
@@ -87,6 +90,28 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 		input.name, input.constraint_type, input.column_ids, input.table_io_manager,
 		input.unbound_expressions, input.db, m, ef_construction, metric, use_pq, pq_m);
 	graph_index->graph_.max_dedup = max_dedup;
+
+	// Setup metadata columns (columns after the first vector column)
+	if (input.unbound_expressions.size() > 1) {
+		uint32_t meta_offset = 0;
+		for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
+			auto &col_type = input.unbound_expressions[i]->return_type;
+			auto type_id = col_type.id();
+			uint32_t type_size = vex::MetaColumnDesc::GetTypeSize(type_id);
+
+			vex::MetaColumnDesc desc;
+			desc.type_id = type_id;
+			desc.offset = meta_offset;
+			desc.size = type_size;
+			graph_index->graph_.meta_columns.push_back(desc);
+			graph_index->meta_col_types_.push_back(col_type);
+			if (i < input.column_ids.size()) {
+				graph_index->meta_col_ids_.push_back(input.column_ids[i]);
+			}
+			meta_offset += type_size;
+		}
+		graph_index->graph_.meta_segment_size = meta_offset;
+	}
 
 	// Deserialize from storage if available (allocator-based)
 	// Only deserialize if we have actual data (dimension stored means there was data)
@@ -273,7 +298,16 @@ void GraphIndex::Build(DataChunk &chunk, Vector &row_ids) {
 
 		int level = GetRandomLevel();
 
-		IndexPointer node_ptr = graph_.AllocateNode(row_id, vec, dimension_, static_cast<uint8_t>(level));
+		// Extract metadata if we have metadata columns
+		std::vector<uint8_t> meta_buf;
+		const uint8_t *meta_ptr = nullptr;
+		if (graph_.meta_segment_size > 0 && chunk.ColumnCount() > 1) {
+			meta_buf.resize(graph_.meta_segment_size, 0);
+			ExtractMetadata(chunk, i, meta_buf.data());
+			meta_ptr = meta_buf.data();
+		}
+
+		IndexPointer node_ptr = graph_.AllocateNode(row_id, vec, dimension_, static_cast<uint8_t>(level), meta_ptr);
 		graph_.InsertNode(node_ptr, m_, ef_construction_, distance_func_);
 	}
 }
@@ -417,7 +451,8 @@ void GraphIndex::BuildConcurrent(DataChunk &chunk, Vector &row_ids) {
 // ============================================================
 
 void GraphIndex::BuildParallel(const std::vector<float> &all_vectors, const std::vector<row_t> &all_row_ids,
-                                idx_t total_count, uint32_t dim, int num_threads) {
+                                idx_t total_count, uint32_t dim, int num_threads,
+                                const std::vector<uint8_t> &all_metadata) {
 	if (total_count == 0) return;
 
 	// Initialize dimension and allocators (single-threaded)
@@ -463,7 +498,12 @@ void GraphIndex::BuildParallel(const std::vector<float> &all_vectors, const std:
 		// node at level 0, check if distance ≈ 0 and merge. This is O(ef_construction)
 		// per node instead of the previous O(n²) brute-force scan.
 
-		nodes[i].node_ptr = graph_.AllocateNode(all_row_ids[i], vec, dimension_, static_cast<uint8_t>(level));
+		const uint8_t *meta_ptr = nullptr;
+		if (graph_.meta_segment_size > 0 && !all_metadata.empty()) {
+			meta_ptr = all_metadata.data() + i * graph_.meta_segment_size;
+		}
+
+		nodes[i].node_ptr = graph_.AllocateNode(all_row_ids[i], vec, dimension_, static_cast<uint8_t>(level), meta_ptr);
 	}
 
 	// Set entry point to first non-skipped node (single-threaded)
@@ -857,6 +897,42 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
 		info.options["dedup_map"] = Value::BLOB(const_data_ptr_cast(dedup_blob.data()), dedup_blob.size());
 	}
 
+	// Serialize metadata column schema
+	if (!graph_.meta_columns.empty()) {
+		string meta_schema_blob;
+		uint32_t num_meta_cols = static_cast<uint32_t>(graph_.meta_columns.size());
+		meta_schema_blob.append(reinterpret_cast<const char *>(&num_meta_cols), sizeof(num_meta_cols));
+		for (auto &mc : graph_.meta_columns) {
+			uint8_t tid = static_cast<uint8_t>(mc.type_id);
+			meta_schema_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
+			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.offset), sizeof(mc.offset));
+			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.size), sizeof(mc.size));
+		}
+		info.options["meta_segment_size"] = Value::UINTEGER(graph_.meta_segment_size);
+		info.options["meta_schema"] = Value::BLOB(const_data_ptr_cast(meta_schema_blob.data()), meta_schema_blob.size());
+
+		// Serialize metadata column types
+		string meta_types_blob;
+		uint32_t num_types = static_cast<uint32_t>(meta_col_types_.size());
+		meta_types_blob.append(reinterpret_cast<const char *>(&num_types), sizeof(num_types));
+		for (auto &t : meta_col_types_) {
+			uint8_t tid = static_cast<uint8_t>(t.id());
+			meta_types_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
+		}
+		info.options["meta_col_types"] = Value::BLOB(const_data_ptr_cast(meta_types_blob.data()), meta_types_blob.size());
+
+		// Serialize metadata column IDs
+		if (!meta_col_ids_.empty()) {
+			string meta_ids_blob;
+			uint32_t num_ids = static_cast<uint32_t>(meta_col_ids_.size());
+			meta_ids_blob.append(reinterpret_cast<const char *>(&num_ids), sizeof(num_ids));
+			for (auto &id : meta_col_ids_) {
+				meta_ids_blob.append(reinterpret_cast<const char *>(&id), sizeof(id));
+			}
+			info.options["meta_col_ids"] = Value::BLOB(const_data_ptr_cast(meta_ids_blob.data()), meta_ids_blob.size());
+		}
+	}
+
 	// Serialize allocator buffers to disk
 	auto &block_manager = table_io_manager.GetIndexBlockManager();
 	PartialBlockManager partial_block_manager(context, block_manager, PartialBlockType::FULL_CHECKPOINT);
@@ -864,12 +940,18 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
 	graph_.node_alloc->SerializeBuffers(partial_block_manager);
 	graph_.vector_alloc->SerializeBuffers(partial_block_manager);
 	graph_.upper_alloc->SerializeBuffers(partial_block_manager);
+	if (graph_.meta_alloc) {
+		graph_.meta_alloc->SerializeBuffers(partial_block_manager);
+	}
 	partial_block_manager.FlushPartialBlocks();
 
 	// Collect allocator infos
 	info.allocator_infos.push_back(graph_.node_alloc->GetInfo());
 	info.allocator_infos.push_back(graph_.vector_alloc->GetInfo());
 	info.allocator_infos.push_back(graph_.upper_alloc->GetInfo());
+	if (graph_.meta_alloc) {
+		info.allocator_infos.push_back(graph_.meta_alloc->GetInfo());
+	}
 
 	// PQ data stored as BLOB in options (PQ codes are relatively small)
 	if (use_pq_ && graph_.pq.trained) {
@@ -939,14 +1021,54 @@ IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> 
 		info.options["dedup_map"] = Value::BLOB(const_data_ptr_cast(dedup_blob.data()), dedup_blob.size());
 	}
 
+	// Serialize metadata schema (same as SerializeToDisk)
+	if (!graph_.meta_columns.empty()) {
+		string meta_schema_blob;
+		uint32_t num_meta_cols = static_cast<uint32_t>(graph_.meta_columns.size());
+		meta_schema_blob.append(reinterpret_cast<const char *>(&num_meta_cols), sizeof(num_meta_cols));
+		for (auto &mc : graph_.meta_columns) {
+			uint8_t tid = static_cast<uint8_t>(mc.type_id);
+			meta_schema_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
+			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.offset), sizeof(mc.offset));
+			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.size), sizeof(mc.size));
+		}
+		info.options["meta_segment_size"] = Value::UINTEGER(graph_.meta_segment_size);
+		info.options["meta_schema"] = Value::BLOB(const_data_ptr_cast(meta_schema_blob.data()), meta_schema_blob.size());
+
+		string meta_types_blob;
+		uint32_t num_types = static_cast<uint32_t>(meta_col_types_.size());
+		meta_types_blob.append(reinterpret_cast<const char *>(&num_types), sizeof(num_types));
+		for (auto &t : meta_col_types_) {
+			uint8_t tid = static_cast<uint8_t>(t.id());
+			meta_types_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
+		}
+		info.options["meta_col_types"] = Value::BLOB(const_data_ptr_cast(meta_types_blob.data()), meta_types_blob.size());
+
+		if (!meta_col_ids_.empty()) {
+			string meta_ids_blob;
+			uint32_t num_ids = static_cast<uint32_t>(meta_col_ids_.size());
+			meta_ids_blob.append(reinterpret_cast<const char *>(&num_ids), sizeof(num_ids));
+			for (auto &id : meta_col_ids_) {
+				meta_ids_blob.append(reinterpret_cast<const char *>(&id), sizeof(id));
+			}
+			info.options["meta_col_ids"] = Value::BLOB(const_data_ptr_cast(meta_ids_blob.data()), meta_ids_blob.size());
+		}
+	}
+
 	// WAL serialization: include buffer data
 	info.buffers.push_back(graph_.node_alloc->InitSerializationToWAL());
 	info.buffers.push_back(graph_.vector_alloc->InitSerializationToWAL());
 	info.buffers.push_back(graph_.upper_alloc->InitSerializationToWAL());
+	if (graph_.meta_alloc) {
+		info.buffers.push_back(graph_.meta_alloc->InitSerializationToWAL());
+	}
 
 	info.allocator_infos.push_back(graph_.node_alloc->GetInfo());
 	info.allocator_infos.push_back(graph_.vector_alloc->GetInfo());
 	info.allocator_infos.push_back(graph_.upper_alloc->GetInfo());
+	if (graph_.meta_alloc) {
+		info.allocator_infos.push_back(graph_.meta_alloc->GetInfo());
+	}
 
 	// PQ data
 	if (use_pq_ && graph_.pq.trained) {
@@ -1012,6 +1134,71 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 		graph_.max_dedup = dedup_opt->second.GetValue<uint16_t>();
 	}
 
+	// Deserialize metadata schema
+	auto meta_seg_it = info.options.find("meta_segment_size");
+	if (meta_seg_it != info.options.end()) {
+		graph_.meta_segment_size = meta_seg_it->second.GetValue<uint32_t>();
+	}
+
+	auto meta_schema_it = info.options.find("meta_schema");
+	if (meta_schema_it != info.options.end()) {
+		auto blob = meta_schema_it->second.GetValueUnsafe<string>();
+		const char *ptr = blob.data();
+		const char *end = ptr + blob.size();
+		if (ptr + sizeof(uint32_t) <= end) {
+			uint32_t num_cols;
+			memcpy(&num_cols, ptr, sizeof(num_cols));
+			ptr += sizeof(num_cols);
+			graph_.meta_columns.clear();
+			for (uint32_t i = 0; i < num_cols && ptr + 9 <= end; i++) {
+				vex::MetaColumnDesc desc;
+				uint8_t tid;
+				memcpy(&tid, ptr, 1); ptr += 1;
+				desc.type_id = static_cast<LogicalTypeId>(tid);
+				memcpy(&desc.offset, ptr, 4); ptr += 4;
+				memcpy(&desc.size, ptr, 4); ptr += 4;
+				graph_.meta_columns.push_back(desc);
+			}
+		}
+	}
+
+	auto meta_types_it = info.options.find("meta_col_types");
+	if (meta_types_it != info.options.end()) {
+		auto blob = meta_types_it->second.GetValueUnsafe<string>();
+		const char *ptr = blob.data();
+		const char *end = ptr + blob.size();
+		if (ptr + sizeof(uint32_t) <= end) {
+			uint32_t num_types;
+			memcpy(&num_types, ptr, sizeof(num_types));
+			ptr += sizeof(num_types);
+			meta_col_types_.clear();
+			for (uint32_t i = 0; i < num_types && ptr + 1 <= end; i++) {
+				uint8_t tid;
+				memcpy(&tid, ptr, 1); ptr += 1;
+				meta_col_types_.push_back(LogicalType(static_cast<LogicalTypeId>(tid)));
+			}
+		}
+	}
+
+	auto meta_ids_it = info.options.find("meta_col_ids");
+	if (meta_ids_it != info.options.end()) {
+		auto blob = meta_ids_it->second.GetValueUnsafe<string>();
+		const char *ptr = blob.data();
+		const char *end = ptr + blob.size();
+		if (ptr + sizeof(uint32_t) <= end) {
+			uint32_t num_ids;
+			memcpy(&num_ids, ptr, sizeof(num_ids));
+			ptr += sizeof(num_ids);
+			meta_col_ids_.clear();
+			for (uint32_t i = 0; i < num_ids && ptr + sizeof(column_t) <= end; i++) {
+				column_t col_id;
+				memcpy(&col_id, ptr, sizeof(col_id));
+				ptr += sizeof(col_id);
+				meta_col_ids_.push_back(col_id);
+			}
+		}
+	}
+
 	// Create allocators WITHOUT slot-0 reservation.
 	// The serialized bitmask already has slot 0 reserved from the original InitAllocators().
 	// Calling EnsureAllocators() here would reserve slot 0 again (adding buffer 0 to
@@ -1025,6 +1212,9 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 		graph_.node_alloc = make_uniq<FixedSizeAllocator>(vex::HNSWNodeHeader::SegmentSize(graph_.m), block_manager);
 		graph_.vector_alloc = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(dimension_) * sizeof(float), block_manager);
 		graph_.upper_alloc = make_uniq<FixedSizeAllocator>(vex::HNSWUpperLevel::SegmentSize(graph_.m), block_manager);
+		if (graph_.meta_segment_size > 0) {
+			graph_.meta_alloc = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(graph_.meta_segment_size), block_manager);
+		}
 	}
 
 	// Initialize allocators from storage info (lazy disk loading)
@@ -1032,6 +1222,9 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 		graph_.node_alloc->Init(info.allocator_infos[0]);
 		graph_.vector_alloc->Init(info.allocator_infos[1]);
 		graph_.upper_alloc->Init(info.allocator_infos[2]);
+		if (info.allocator_infos.size() >= 4 && graph_.meta_alloc) {
+			graph_.meta_alloc->Init(info.allocator_infos[3]);
+		}
 	}
 
 	// Restore row_id_map from serialized BLOB
@@ -1263,6 +1456,7 @@ idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
 	if (graph_.node_alloc) size += graph_.node_alloc->GetInMemorySize();
 	if (graph_.vector_alloc) size += graph_.vector_alloc->GetInMemorySize();
 	if (graph_.upper_alloc) size += graph_.upper_alloc->GetInMemorySize();
+	if (graph_.meta_alloc) size += graph_.meta_alloc->GetInMemorySize();
 	size += graph_.row_id_map.size() * (sizeof(row_t) + sizeof(IndexPointer));
 	return size;
 }
@@ -1342,6 +1536,98 @@ void GraphIndex::ANNSearch(const float *query_vec, idx_t k, int ef,
                            std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
                            idx_t brute_force_threshold) {
 	Search(query_vec, k, ef, out_row_ids, out_distances, brute_force_threshold);
+}
+
+void GraphIndex::FilteredSearch(const float *query_vec, idx_t k, int ef,
+                                std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+                                const vex::FilterPredicate &filter,
+                                idx_t brute_force_threshold) {
+	// For cosine metric, normalize query vector
+	std::vector<float> norm_query;
+	const float *search_vec = query_vec;
+	if (metric_ == vex::VexMetric::COSINE && graph_.dimension > 0) {
+		norm_query.assign(query_vec, query_vec + graph_.dimension);
+		vex::NormalizeVector(norm_query.data(), graph_.dimension);
+		search_vec = norm_query.data();
+	}
+
+	graph_.FilteredSearch(search_vec, k, ef, out_row_ids, out_distances,
+	                      distance_func_, filter, brute_force_threshold);
+}
+
+void GraphIndex::SerializeMetaValue(const Value &val, LogicalTypeId type_id, uint8_t *dest, uint32_t size) {
+	std::memset(dest, 0, size);
+	if (val.IsNull()) return;
+	switch (type_id) {
+	case LogicalTypeId::BOOLEAN: {
+		uint8_t v = BooleanValue::Get(val) ? 1 : 0;
+		std::memcpy(dest, &v, 1);
+		break;
+	}
+	case LogicalTypeId::TINYINT: {
+		auto v = TinyIntValue::Get(val);
+		std::memcpy(dest, &v, 1);
+		break;
+	}
+	case LogicalTypeId::SMALLINT: {
+		auto v = SmallIntValue::Get(val);
+		std::memcpy(dest, &v, 2);
+		break;
+	}
+	case LogicalTypeId::INTEGER: {
+		auto v = IntegerValue::Get(val);
+		std::memcpy(dest, &v, 4);
+		break;
+	}
+	case LogicalTypeId::BIGINT: {
+		auto v = BigIntValue::Get(val);
+		std::memcpy(dest, &v, 8);
+		break;
+	}
+	case LogicalTypeId::UINTEGER: {
+		auto v = UIntegerValue::Get(val);
+		std::memcpy(dest, &v, 4);
+		break;
+	}
+	case LogicalTypeId::UBIGINT: {
+		auto v = UBigIntValue::Get(val);
+		std::memcpy(dest, &v, 8);
+		break;
+	}
+	case LogicalTypeId::FLOAT: {
+		auto v = FloatValue::Get(val);
+		std::memcpy(dest, &v, 4);
+		break;
+	}
+	case LogicalTypeId::DOUBLE: {
+		auto v = DoubleValue::Get(val);
+		std::memcpy(dest, &v, 8);
+		break;
+	}
+	default: {
+		// For other types, try to cast to BIGINT and store as 8 bytes
+		try {
+			auto v = val.DefaultCastAs(LogicalType::BIGINT);
+			auto iv = BigIntValue::Get(v);
+			std::memcpy(dest, &iv, std::min(size, static_cast<uint32_t>(8)));
+		} catch (...) {
+			// Leave as zero
+		}
+		break;
+	}
+	}
+}
+
+void GraphIndex::ExtractMetadata(DataChunk &chunk, idx_t row_idx, uint8_t *meta_buf) {
+	auto &meta_cols = graph_.meta_columns;
+	for (idx_t col = 0; col < meta_cols.size(); col++) {
+		idx_t chunk_col = col + 1; // skip vector column at index 0
+		if (chunk_col >= chunk.ColumnCount()) break;
+		auto &vec = chunk.data[chunk_col];
+		auto val = vec.GetValue(row_idx);
+		SerializeMetaValue(val, meta_cols[col].type_id,
+		                   meta_buf + meta_cols[col].offset, meta_cols[col].size);
+	}
 }
 
 void GraphIndex::Clear() {

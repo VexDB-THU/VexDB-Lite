@@ -47,6 +47,10 @@ public:
 	std::vector<row_t> all_row_ids;
 	idx_t total_count = 0;
 	uint32_t dimension = 0;
+
+	//! Buffered metadata for parallel build (flat byte arrays, meta_segment_size per row)
+	std::vector<uint8_t> all_metadata;
+	uint32_t meta_segment_size = 0;
 };
 
 class CreateGraphIndexLocalSinkState : public LocalSinkState {
@@ -54,7 +58,7 @@ public:
 	explicit CreateGraphIndexLocalSinkState(ClientContext &context) {
 	}
 
-	//! Local index for non-GraphIndex types (e.g. HybridIndex) that need merge
+	//! Local index for non-GraphIndex types that need merge
 	unique_ptr<BoundIndex> local_index;
 	DataChunk key_chunk;
 	vector<column_t> key_column_ids;
@@ -107,7 +111,7 @@ unique_ptr<LocalSinkState> PhysicalCreateGraphIndex::GetLocalSinkState(Execution
 		state->key_column_ids.push_back(i);
 	}
 
-	// For non-GraphIndex types (e.g. HybridIndex), create a local index for merge-based build
+	// For non-GraphIndex types, create a local index for merge-based build
 	if (info->index_type != GraphIndex::TYPE_NAME) {
 		auto &config = DBConfig::GetConfig(context.client);
 		auto &index_types = config.GetIndexTypes();
@@ -179,10 +183,17 @@ SinkResultType PhysicalCreateGraphIndex::Sink(ExecutionContext &context, DataChu
 		auto &child_vec = ArrayVector::GetEntry(vec_vector);
 		auto vec_data = FlatVector::GetData<float>(child_vec);
 
-		// Buffer valid vectors and row_ids
+		// Buffer valid vectors, row_ids, and metadata
 		std::lock_guard<std::mutex> lock(g_state.buffer_mutex);
 		if (g_state.dimension == 0 && dim > 0) {
 			g_state.dimension = dim;
+		}
+
+		// Check if the index has metadata columns
+		auto &graph_idx = g_state.global_index->Cast<GraphIndex>();
+		uint32_t meta_seg = graph_idx.GetGraphCore().meta_segment_size;
+		if (g_state.meta_segment_size == 0 && meta_seg > 0) {
+			g_state.meta_segment_size = meta_seg;
 		}
 
 		for (idx_t i = 0; i < count; i++) {
@@ -190,10 +201,19 @@ SinkResultType PhysicalCreateGraphIndex::Sink(ExecutionContext &context, DataChu
 			const float *vec = vec_data + i * g_state.dimension;
 			g_state.all_vectors.insert(g_state.all_vectors.end(), vec, vec + g_state.dimension);
 			g_state.all_row_ids.push_back(row_id_data[i]);
+
+			// Extract metadata if present
+			if (g_state.meta_segment_size > 0 && l_state.key_chunk.ColumnCount() > 1) {
+				size_t meta_start = g_state.all_metadata.size();
+				g_state.all_metadata.resize(meta_start + g_state.meta_segment_size, 0);
+				graph_idx.ExtractMetadata(l_state.key_chunk, i,
+				                         g_state.all_metadata.data() + meta_start);
+			}
+
 			g_state.total_count++;
 		}
 	} else {
-		// HybridIndex and others: insert into local index, merge later
+		// Other index types: insert into local index, merge later
 		IndexLock lock;
 		l_state.local_index->InitializeLock(lock);
 		l_state.local_index->Append(lock, l_state.key_chunk, row_ids);
@@ -207,7 +227,7 @@ SinkCombineResultType PhysicalCreateGraphIndex::Combine(ExecutionContext &contex
 	auto &g_state = input.global_state.Cast<CreateGraphIndexGlobalSinkState>();
 
 	if (!g_state.is_graph_index) {
-		// HybridIndex and others: merge local index into global
+		// Other index types: merge local index into global
 		auto &l_state = input.local_state.Cast<CreateGraphIndexLocalSinkState>();
 		IndexLock lock;
 		g_state.global_index->InitializeLock(lock);
@@ -249,12 +269,15 @@ SinkFinalizeType PhysicalCreateGraphIndex::Finalize(Pipeline &pipeline, Event &e
 			}
 		}
 		graph_index.BuildParallel(state.all_vectors, state.all_row_ids,
-		                          state.total_count, state.dimension, num_threads);
+		                          state.total_count, state.dimension, num_threads,
+		                          state.all_metadata);
 		// Free buffered data
 		state.all_vectors.clear();
 		state.all_vectors.shrink_to_fit();
 		state.all_row_ids.clear();
 		state.all_row_ids.shrink_to_fit();
+		state.all_metadata.clear();
+		state.all_metadata.shrink_to_fit();
 	}
 
 	auto &schema = table.schema;

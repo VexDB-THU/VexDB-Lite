@@ -139,31 +139,3 @@ RESET vex_brute_force_threshold;
 statement ok
 DROP TABLE t_config;
 
-# ============================================================
-# Test 6: Configuration works with HybridIndex
-# ============================================================
-statement ok
-CREATE TABLE t_hybrid_cfg (id INTEGER, vec FLOAT[3], category VARCHAR);
-
-statement ok
-INSERT INTO t_hybrid_cfg VALUES
-  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
-
-statement ok
-CREATE INDEX idx_hybrid_cfg ON t_hybrid_cfg USING HYBRID_INDEX (vec, category);
-
-statement ok
-SET vex_ef_search = 100;
-
-query I
-SELECT id FROM t_hybrid_cfg WHERE category = 'A' ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
-----
-1
-
-statement ok
-RESET vex_ef_search;
-
-statement ok
-DROP TABLE t_hybrid_cfg;

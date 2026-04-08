@@ -1,9 +1,6 @@
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
 #include "vex_distance.hpp"
-#ifdef VEX_ENABLE_HYBRID_INDEX
-#include "vex_hybrid_index.hpp"
-#endif
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/table_function.hpp"
@@ -41,7 +38,7 @@ struct VexIndexInfoGlobalState : public GlobalTableFunctionState {
 		int32_t max_level;
 		int32_t dimension;
 		int64_t row_id_map_size;
-		int32_t partition_count; // 0 for GraphIndex, N for HybridIndex
+		int32_t partition_count; // reserved (always 0)
 		// Build parameters
 		int32_t m;
 		int32_t ef_construction;
@@ -122,11 +119,7 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 		auto &schema = schema_ref.get();
 		schema.Scan(context, CatalogType::INDEX_ENTRY, [&](CatalogEntry &entry) {
 			auto &index_entry = entry.Cast<IndexCatalogEntry>();
-			if (index_entry.index_type == GraphIndex::TYPE_NAME
-#ifdef VEX_ENABLE_HYBRID_INDEX
-			    || index_entry.index_type == HybridIndex::TYPE_NAME
-#endif
-			    ) {
+			if (index_entry.index_type == GraphIndex::TYPE_NAME) {
 				VexIndexTarget t;
 				t.schema_name = index_entry.GetSchemaName();
 				t.table_name = index_entry.GetTableName();
@@ -180,37 +173,6 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.pq_m = static_cast<int32_t>(graph_idx.GetPQM());
 				state->entries.push_back(std::move(e));
 			}
-#ifdef VEX_ENABLE_HYBRID_INDEX
-			else if (bound_index.GetIndexType() == HybridIndex::TYPE_NAME) {
-				auto &hybrid_idx = bound_index.Cast<HybridIndex>();
-				VexIndexInfoGlobalState::IndexEntry e;
-				e.index_name = target.index_name;
-				e.index_type = "HYBRID_INDEX";
-				e.table_name = target.table_name;
-				auto &partitions = hybrid_idx.GetPartitions();
-				e.partition_count = static_cast<int32_t>(partitions.size());
-				e.node_count = 0;
-				e.max_level = 0;
-				e.dimension = 0;
-				e.row_id_map_size = 0;
-				for (auto &kv : partitions) {
-					e.node_count += static_cast<int64_t>(kv.second.node_count);
-					e.row_id_map_size += static_cast<int64_t>(kv.second.row_id_map.size());
-					if (kv.second.max_level > e.max_level) {
-						e.max_level = kv.second.max_level;
-					}
-					if (e.dimension == 0) {
-						e.dimension = static_cast<int32_t>(kv.second.dimension);
-					}
-				}
-				e.m = hybrid_idx.GetM();
-				e.ef_construction = hybrid_idx.GetEfConstruction();
-				e.metric = vex::MetricName(hybrid_idx.GetMetric());
-				e.use_pq = false;
-				e.pq_m = 0;
-				state->entries.push_back(std::move(e));
-			}
-#endif
 			break; // found the target index, stop scanning
 		}
 	}

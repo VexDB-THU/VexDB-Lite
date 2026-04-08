@@ -111,30 +111,3 @@ statement ok
 DROP INDEX idx_ef200;
 
 # ============================================================
-# HYBRID_INDEX parameter validation
-# ============================================================
-
-statement ok
-CREATE TABLE t_hyb (id BIGINT, v FLOAT[4], cat VARCHAR);
-
-statement ok
-INSERT INTO t_hyb VALUES (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 'A');
-
-# HYBRID_INDEX m = 0 should fail
-statement error
-CREATE INDEX idx_hyb_m0 ON t_hyb USING HYBRID_INDEX (v, cat) WITH (m = 0);
-----
-m
-
-# HYBRID_INDEX ef_construction = -1 should fail
-statement error
-CREATE INDEX idx_hyb_efn ON t_hyb USING HYBRID_INDEX (v, cat) WITH (ef_construction = -1);
-----
-ef_construction
-
-# Clean up
-statement ok
-DROP TABLE t_val;
-
-statement ok
-DROP TABLE t_hyb;
