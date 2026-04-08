@@ -57,6 +57,8 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 		auto q_val = q_it->second.GetValue<string>();
 		if (q_val == "pq") {
 			use_pq = true;
+		} else if (q_val != "none") {
+			throw InvalidInputException("GRAPH_INDEX: 'quantizer' must be 'pq' or 'none', got '%s'", q_val);
 		}
 	}
 	auto pqm_it = input.options.find("pq_m");
