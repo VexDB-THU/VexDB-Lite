@@ -1,5 +1,6 @@
 #include "vex_physical_index_scan.hpp"
 #include "vex_graph_index.hpp"
+#include "vex_fetch_utils.hpp"
 
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -139,43 +140,33 @@ unique_ptr<OperatorState> PhysicalVexIndexScan::GetOperatorState(ExecutionContex
 // Helper: extract float vector from a Value
 //===--------------------------------------------------------------------===//
 
+static bool ExtractFloatVectorFromChildren(const vector<Value> &children, LogicalTypeId child_type_id,
+                                           vector<float> &out_vec) {
+	out_vec.clear();
+	out_vec.reserve(children.size());
+	bool is_float = (child_type_id == LogicalTypeId::FLOAT);
+	for (auto &child : children) {
+		try {
+			out_vec.push_back(is_float ? FloatValue::Get(child)
+			                           : FloatValue::Get(child.DefaultCastAs(LogicalType::FLOAT)));
+		} catch (const std::exception &) {
+			out_vec.clear();
+			return false;
+		}
+	}
+	return !out_vec.empty();
+}
+
 static bool ExtractFloatVector(const Value &val, vector<float> &out_vec) {
 	auto &type = val.type();
-
-	// Handle ARRAY type (FLOAT[N])
 	if (type.id() == LogicalTypeId::ARRAY) {
-		auto &children = ArrayValue::GetChildren(val);
-		out_vec.clear();
-		out_vec.reserve(children.size());
-		for (auto &child : children) {
-			try {
-				auto float_val = child.DefaultCastAs(LogicalType::FLOAT);
-				out_vec.push_back(FloatValue::Get(float_val));
-			} catch (...) {
-				out_vec.clear();
-				return false;
-			}
-		}
-		return !out_vec.empty();
+		return ExtractFloatVectorFromChildren(ArrayValue::GetChildren(val),
+		                                     ArrayType::GetChildType(type).id(), out_vec);
 	}
-
-	// Handle LIST type
 	if (type.id() == LogicalTypeId::LIST) {
-		auto &children = ListValue::GetChildren(val);
-		out_vec.clear();
-		out_vec.reserve(children.size());
-		for (auto &child : children) {
-			try {
-				auto float_val = child.DefaultCastAs(LogicalType::FLOAT);
-				out_vec.push_back(FloatValue::Get(float_val));
-			} catch (...) {
-				out_vec.clear();
-				return false;
-			}
-		}
-		return !out_vec.empty();
+		return ExtractFloatVectorFromChildren(ListValue::GetChildren(val),
+		                                     ListType::GetChildType(type).id(), out_vec);
 	}
-
 	return false;
 }
 
@@ -189,8 +180,8 @@ static unique_ptr<ColumnDataCollection> PerformSearchAndFetch(
     const vector<ColumnIndex> &column_ids, const vector<LogicalType> &returned_types,
     const vector<LogicalType> &output_types) {
 
-	// Read ef_search and brute_force_threshold from settings
-	int ef = static_cast<int>(k) * 2;
+	// Read ef_search and brute_force_threshold — same logic as GetEfSearch/GetBruteForceThreshold in vex_optimizer.cpp
+	int ef = GraphIndexConfig::DEFAULT_EF_SEARCH;
 	Value ef_val;
 	if (client_context.TryGetCurrentSetting("vex_ef_search", ef_val)) {
 		ef = ef_val.GetValue<int>();
@@ -205,7 +196,12 @@ static unique_ptr<ColumnDataCollection> PerformSearchAndFetch(
 	idx_t bf_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD;
 	Value bf_val;
 	if (client_context.TryGetCurrentSetting("vex_brute_force_threshold", bf_val)) {
-		bf_threshold = bf_val.GetValue<idx_t>();
+		auto v = bf_val.GetValue<idx_t>();
+		if (v > 1000000) {
+			throw InvalidInputException("vex_brute_force_threshold must be <= 1000000, got %llu",
+			                            static_cast<unsigned long long>(v));
+		}
+		bf_threshold = v;
 	}
 
 	// Execute ANN search
@@ -218,107 +214,9 @@ static unique_ptr<ColumnDataCollection> PerformSearchAndFetch(
 	          << " results for k=" << k << std::endl;
 #endif
 
-	// Build output types from column_ids
-	vector<LogicalType> get_output_types;
-	get_output_types.reserve(column_ids.size());
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		if (column_ids[i].IsVirtualColumn()) {
-			get_output_types.push_back(LogicalType::ROW_TYPE);
-		} else {
-			idx_t physical_idx = column_ids[i].GetPrimaryIndex();
-			if (physical_idx < returned_types.size()) {
-				get_output_types.push_back(returned_types[physical_idx]);
-			} else {
-				throw InternalException("VEX PhysicalScan: column physical index %llu out of range", physical_idx);
-			}
-		}
-	}
-
-	auto collection = make_uniq<ColumnDataCollection>(client_context, output_types);
-
-	if (result_row_ids.empty()) {
-		return collection;
-	}
-
-	// Filter by transaction visibility
-	auto &storage = table.GetStorage();
-	auto &db = table.ParentCatalog().GetAttached();
-	auto &transaction = DuckTransaction::Get(client_context, db);
-
-	vector<row_t> visible_row_ids;
-	visible_row_ids.reserve(result_row_ids.size());
-	for (auto &rid : result_row_ids) {
-		if (storage.CanFetch(transaction, rid)) {
-			visible_row_ids.push_back(rid);
-		}
-	}
-
-	if (visible_row_ids.empty()) {
-		return collection;
-	}
-
-	// Separate physical columns from virtual (row_id) columns
-	vector<StorageIndex> fetch_col_ids;
-	vector<idx_t> fetch_output_positions;
-	vector<idx_t> rowid_positions;
-
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		if (column_ids[i].IsVirtualColumn()) {
-			rowid_positions.push_back(i);
-		} else {
-			fetch_col_ids.emplace_back(column_ids[i].GetPrimaryIndex());
-			fetch_output_positions.push_back(i);
-		}
-	}
-
-	vector<LogicalType> fetch_types;
-	for (idx_t pos : fetch_output_positions) {
-		fetch_types.push_back(get_output_types[pos]);
-	}
-
-	ColumnFetchState fetch_state;
-	DataChunk fetch_chunk;
-	fetch_chunk.Initialize(client_context, fetch_types);
-	DataChunk output_chunk;
-	output_chunk.Initialize(client_context, output_types);
-
-	idx_t total = visible_row_ids.size();
-	for (idx_t off = 0; off < total;) {
-		idx_t batch = MinValue<idx_t>(STANDARD_VECTOR_SIZE, total - off);
-		fetch_chunk.Reset();
-		output_chunk.Reset();
-
-		Vector row_id_vec(LogicalType::ROW_TYPE, batch);
-		auto row_id_data = FlatVector::GetData<row_t>(row_id_vec);
-		for (idx_t i = 0; i < batch; i++) {
-			row_id_data[i] = visible_row_ids[off + i];
-		}
-
-		storage.Fetch(transaction, fetch_chunk, fetch_col_ids, row_id_vec, batch, fetch_state);
-
-		// Map fetched columns to output positions
-		for (idx_t f = 0; f < fetch_output_positions.size(); f++) {
-			output_chunk.data[fetch_output_positions[f]].Reference(fetch_chunk.data[f]);
-		}
-
-		// Fill in row_id columns
-		for (idx_t rid_pos : rowid_positions) {
-			auto rowid_data_ptr = FlatVector::GetData<row_t>(output_chunk.data[rid_pos]);
-			for (idx_t i = 0; i < batch; i++) {
-				rowid_data_ptr[i] = visible_row_ids[off + i];
-			}
-		}
-
-		output_chunk.SetCardinality(batch);
-		collection->Append(output_chunk);
-		off += batch;
-	}
-
-#ifdef VEX_PHYSICAL_SCAN_DEBUG
-	std::cerr << "[VEX PhysicalScan] collection count=" << collection->Count() << std::endl;
-#endif
-
-	return collection;
+	auto get_output_types = BuildOutputTypes(column_ids, returned_types);
+	return FetchRowsByRowIds(client_context, table, column_ids, output_types.empty() ? get_output_types : output_types,
+	                         result_row_ids);
 }
 
 //===--------------------------------------------------------------------===//
@@ -399,16 +297,12 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
 					output_chunk.data[i].Reference(fetch_chunk.data[i]);
 				}
 
-				// Fill in subquery columns (constant: same query vector for every row)
-				// The subquery columns come from the input chunk (row 0)
+				// Fill subquery columns with constant value (same for every row)
 				idx_t subquery_col_start = get_types.size();
 				for (idx_t i = subquery_col_start; i < types.size(); i++) {
 					idx_t input_col = i - subquery_col_start;
 					if (input_col < input.ColumnCount()) {
-						auto val = input.data[input_col].GetValue(0);
-						for (idx_t r = 0; r < fetch_chunk.size(); r++) {
-							output_chunk.data[i].SetValue(r, val);
-						}
+						output_chunk.data[i].Reference(input.data[input_col].GetValue(0));
 					}
 				}
 

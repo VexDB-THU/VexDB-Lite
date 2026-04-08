@@ -25,6 +25,7 @@
 #include "duckdb/planner/operator/logical_cross_product.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "vex_fetch_utils.hpp"
 #include "vex_physical_index_scan.hpp"
 
 // #define VEX_OPTIMIZER_DEBUG
@@ -562,128 +563,19 @@ static bool ExecuteANNSearch(ClientContext &context, const IndexMatch &match, Lo
 // Get the output types for a LogicalGet node.
 // In pre-optimize stage, get->types may be empty. returned_types is indexed by
 // physical column position, but column_ids may be in arbitrary order.
-// We must build the output types by mapping column_ids through returned_types.
 static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
 	if (!get->types.empty()) {
 		return get->types;
 	}
-	// Build output types from column_ids + returned_types
-	auto &column_ids = get->GetColumnIds();
-	vector<LogicalType> output_types;
-	output_types.reserve(column_ids.size());
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		if (column_ids[i].IsVirtualColumn()) {
-			output_types.push_back(LogicalType::ROW_TYPE);
-		} else {
-			idx_t physical_idx = column_ids[i].GetPrimaryIndex();
-			if (physical_idx < get->returned_types.size()) {
-				output_types.push_back(get->returned_types[physical_idx]);
-			} else {
-				throw InternalException("VEX optimizer: column physical index %llu out of range (returned_types size %llu)",
-				                        physical_idx, get->returned_types.size());
-			}
-		}
-	}
-	return output_types;
+	return BuildOutputTypes(get->GetColumnIds(), get->returned_types);
 }
 
 static unique_ptr<ColumnDataCollection> FetchRowsByIds(ClientContext &context, DuckTableEntry &duck_table,
                                                        LogicalGet *get, const vector<row_t> &result_row_ids,
                                                        idx_t limit, idx_t offset) {
-	auto &storage = duck_table.GetStorage();
-	auto &db = duck_table.ParentCatalog().GetAttached();
-	auto &transaction = DuckTransaction::Get(context, db);
-
-	vector<row_t> visible_row_ids;
-	visible_row_ids.reserve(result_row_ids.size());
-	for (auto &rid : result_row_ids) {
-		if (storage.CanFetch(transaction, rid)) {
-			visible_row_ids.push_back(rid);
-		}
-	}
-
 	auto output_types = GetOutputTypes(get);
-	auto &column_ids = get->GetColumnIds();
-
-	vector<StorageIndex> fetch_col_ids;
-	vector<idx_t> fetch_output_positions;
-	vector<idx_t> rowid_positions;
-
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		if (column_ids[i].IsVirtualColumn()) {
-			rowid_positions.push_back(i);
-		} else {
-			fetch_col_ids.emplace_back(column_ids[i].GetPrimaryIndex());
-			fetch_output_positions.push_back(i);
-		}
-	}
-
-	idx_t total = visible_row_ids.size();
-	idx_t start = offset;
-	idx_t count = (start >= total) ? 0 : MinValue<idx_t>(limit, total - start);
-
-	vector<LogicalType> fetch_types;
-	for (idx_t pos : fetch_output_positions) {
-		fetch_types.push_back(output_types[pos]);
-	}
-
-	auto collection = make_uniq<ColumnDataCollection>(context, output_types);
-
-	if (count == 0) {
-		return collection;
-	}
-
-	ColumnFetchState fetch_state;
-	DataChunk fetch_chunk;
-	fetch_chunk.Initialize(context, fetch_types);
-	DataChunk output_chunk;
-	output_chunk.Initialize(context, output_types);
-
-	for (idx_t off = start; off < start + count;) {
-		idx_t batch = MinValue<idx_t>(STANDARD_VECTOR_SIZE, start + count - off);
-		fetch_chunk.Reset();
-		output_chunk.Reset();
-
-		Vector row_id_vec(LogicalType::ROW_TYPE, batch);
-		auto row_id_data = FlatVector::GetData<row_t>(row_id_vec);
-		for (idx_t i = 0; i < batch; i++) {
-			row_id_data[i] = visible_row_ids[off + i];
-		}
-
-		storage.Fetch(transaction, fetch_chunk, fetch_col_ids, row_id_vec, batch, fetch_state);
-
-#ifdef VEX_OPTIMIZER_DEBUG
-		std::cerr << "[VEX] FetchRowsByIds: batch=" << batch
-		          << " fetch_chunk.size()=" << fetch_chunk.size()
-		          << " fetch_col_ids.size()=" << fetch_col_ids.size() << std::endl;
-		for (idx_t i = 0; i < output_types.size(); i++) {
-			std::cerr << "[VEX]   output_type[" << i << "]=" << output_types[i].ToString() << std::endl;
-		}
-		for (idx_t i = 0; i < fetch_types.size(); i++) {
-			std::cerr << "[VEX]   fetch_type[" << i << "]=" << fetch_types[i].ToString() << std::endl;
-		}
-#endif
-
-		for (idx_t f = 0; f < fetch_output_positions.size(); f++) {
-			output_chunk.data[fetch_output_positions[f]].Reference(fetch_chunk.data[f]);
-		}
-		for (idx_t rid_pos : rowid_positions) {
-			auto rowid_data_ptr = FlatVector::GetData<row_t>(output_chunk.data[rid_pos]);
-			for (idx_t i = 0; i < batch; i++) {
-				rowid_data_ptr[i] = visible_row_ids[off + i];
-			}
-		}
-
-		output_chunk.SetCardinality(batch);
-		collection->Append(output_chunk);
-		off += batch;
-	}
-
-#ifdef VEX_OPTIMIZER_DEBUG
-	std::cerr << "[VEX] FetchRowsByIds: collection count=" << collection->Count() << std::endl;
-#endif
-
-	return collection;
+	return FetchRowsByRowIds(context, duck_table, get->GetColumnIds(), output_types,
+	                         result_row_ids, limit, offset);
 }
 
 //===--------------------------------------------------------------------===//
