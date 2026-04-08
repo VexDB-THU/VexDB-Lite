@@ -40,6 +40,12 @@ static int GetEfSearch(ClientContext &context, idx_t k) {
 	int ef = GraphIndexConfig::DEFAULT_EF_SEARCH;
 	if (context.TryGetCurrentSetting("vex_ef_search", val)) {
 		ef = val.GetValue<int>();
+		if (ef < 1) {
+			throw InvalidInputException("vex_ef_search must be >= 1, got %d", ef);
+		}
+		if (ef > 10000) {
+			throw InvalidInputException("vex_ef_search must be <= 10000, got %d", ef);
+		}
 	}
 	if (static_cast<int>(k) > ef) {
 		ef = static_cast<int>(k) * 2;
@@ -50,7 +56,12 @@ static int GetEfSearch(ClientContext &context, idx_t k) {
 static idx_t GetBruteForceThreshold(ClientContext &context) {
 	Value val;
 	if (context.TryGetCurrentSetting("vex_brute_force_threshold", val)) {
-		return val.GetValue<idx_t>();
+		auto v = val.GetValue<idx_t>();
+		if (v > 1000000) {
+			throw InvalidInputException("vex_brute_force_threshold must be <= 1000000, got %llu",
+			                            static_cast<unsigned long long>(v));
+		}
+		return v;
 	}
 	return GraphIndexCore::BRUTE_FORCE_THRESHOLD;
 }

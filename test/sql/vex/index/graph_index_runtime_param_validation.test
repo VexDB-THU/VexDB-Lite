@@ -1,0 +1,97 @@
+# name: test/sql/vex/index/graph_index_runtime_param_validation.test
+# description: Test runtime parameter validation (vex_ef_search, vex_brute_force_threshold)
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t_param (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_param SELECT i, [(i*0.1)::FLOAT, (i*0.2)::FLOAT, (i*0.3)::FLOAT, (i*0.4)::FLOAT]::FLOAT[4] FROM range(100) t(i);
+
+statement ok
+CREATE INDEX idx_param ON t_param USING GRAPH_INDEX (vec);
+
+# ============================================================
+# vex_ef_search validation
+# ============================================================
+
+# Negative value should fail
+statement ok
+SET vex_ef_search = -1;
+
+statement error
+SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5;
+----
+vex_ef_search
+
+# Zero should fail
+statement ok
+SET vex_ef_search = 0;
+
+statement error
+SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5;
+----
+vex_ef_search
+
+# Extremely large value should fail
+statement ok
+SET vex_ef_search = 99999;
+
+statement error
+SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5;
+----
+vex_ef_search
+
+# Valid value should succeed
+statement ok
+SET vex_ef_search = 40;
+
+query I
+SELECT count(*) FROM (SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Large but valid value should succeed
+statement ok
+SET vex_ef_search = 5000;
+
+query I
+SELECT count(*) FROM (SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Reset to default
+statement ok
+RESET vex_ef_search;
+
+# ============================================================
+# vex_brute_force_threshold validation
+# ============================================================
+
+# Extremely large value should fail
+statement ok
+SET vex_brute_force_threshold = 99999999;
+
+statement error
+SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5;
+----
+vex_brute_force_threshold
+
+# Valid value should succeed
+statement ok
+SET vex_brute_force_threshold = 100;
+
+query I
+SELECT count(*) FROM (SELECT * FROM t_param ORDER BY l2_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Reset
+statement ok
+RESET vex_brute_force_threshold;
+
+# Clean up
+statement ok
+DROP TABLE t_param;
