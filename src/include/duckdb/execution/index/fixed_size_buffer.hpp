@@ -80,6 +80,22 @@ private:
 
 	//! Load a buffer from disk, if not in memory.
 	void LoadFromDisk();
+
+public:
+	//! Evict this buffer from memory if safe (clean, on-disk, no readers).
+	//! Re-registers block_handle so LoadFromDisk() can reload later.
+	//! Mirrors the release pattern in Serialize().
+	bool TryEvict() {
+		lock_guard<mutex> l(lock);
+		if (readers == 0 && OnDisk() && !dirty && InMemory()) {
+			buffer_handle.Destroy();
+			block_handle = block_manager.RegisterBlock(block_pointer.block_id);
+			loaded = false;
+			return true;
+		}
+		return false;
+	}
+private:
 	//! Returns the first free offset in a bitmask
 	uint32_t GetOffset(const idx_t bitmask_count, const idx_t available_segments);
 	//! Sets the allocation size, if dirty
@@ -138,9 +154,6 @@ public:
 		buffer_ptr->readers--;
 		buffer_ptr = nullptr;
 		ptr = nullptr;
-
-		// FIXME: Enable unpinning buffers with zero readers while preventing oscillation.
-		// FIXME: loaded must be set to true.
 	}
 
 	SegmentHandle(const SegmentHandle &) = delete;

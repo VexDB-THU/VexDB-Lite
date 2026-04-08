@@ -277,11 +277,22 @@ struct GraphIndexCore {
 	//! Clear buffer caches (call after parallel ops complete)
 	void ClearBufferCaches();
 
+	//! Evict clean, on-disk buffers from memory to reduce footprint.
+	//! Call only when no SegmentHandles or raw pointers reference index data.
+	idx_t EvictCleanBuffers() {
+		if (!node_alloc || !vector_alloc || !upper_alloc) return 0;
+		idx_t n = 0;
+		n += node_alloc->EvictCleanBuffers();
+		n += vector_alloc->EvictCleanBuffers();
+		n += upper_alloc->EvictCleanBuffers();
+		return n;
+	}
+
 	// ============================================================
 	// Node access helpers
 	// ============================================================
 
-	//! Get node header (read-write)
+	//! Get node header (read-write) — raw pointer, caller must ensure buffer stays pinned
 	inline vex::HNSWNodeHeader *GetNode(IndexPointer ptr) {
 		if (node_cache_.IsActive()) {
 			return reinterpret_cast<vex::HNSWNodeHeader *>(node_cache_.Get(ptr));
@@ -289,7 +300,7 @@ struct GraphIndexCore {
 		return reinterpret_cast<vex::HNSWNodeHeader *>(node_alloc->Get(ptr));
 	}
 
-	//! Get vector data for a node
+	//! Get vector data for a node — raw pointer
 	inline float *GetVector(IndexPointer vec_ptr) {
 		if (vec_cache_.IsActive()) {
 			return reinterpret_cast<float *>(vec_cache_.Get(vec_ptr));
@@ -297,12 +308,23 @@ struct GraphIndexCore {
 		return reinterpret_cast<float *>(vector_alloc->Get(vec_ptr));
 	}
 
-	//! Get upper-level data for a node
+	//! Get upper-level data for a node — raw pointer
 	inline vex::HNSWUpperLevel *GetUpper(IndexPointer upper_ptr) {
 		if (upper_cache_.IsActive()) {
 			return reinterpret_cast<vex::HNSWUpperLevel *>(upper_cache_.Get(upper_ptr));
 		}
 		return reinterpret_cast<vex::HNSWUpperLevel *>(upper_alloc->Get(upper_ptr));
+	}
+
+	//! RAII handle versions — buffer is unpinned when handle is destroyed (if clean + on-disk)
+	inline SegmentHandle GetNodeHandle(IndexPointer ptr) {
+		return node_alloc->GetHandle(ptr);
+	}
+	inline SegmentHandle GetVectorHandle(IndexPointer vec_ptr) {
+		return vector_alloc->GetHandle(vec_ptr);
+	}
+	inline SegmentHandle GetUpperHandle(IndexPointer upper_ptr) {
+		return upper_alloc->GetHandle(upper_ptr);
 	}
 
 	//! Get neighbor pointers and count for a given level

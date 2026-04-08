@@ -116,6 +116,16 @@ public:
 
 	//! Returns the in-memory size in bytes
 	idx_t GetInMemorySize() const;
+	//! Evict clean, on-disk buffers with zero readers. Returns count of evicted buffers.
+	idx_t EvictCleanBuffers() {
+		idx_t evicted = 0;
+		for (auto &pair : buffers) {
+			if (pair.second->TryEvict()) {
+				evicted++;
+			}
+		}
+		return evicted;
+	}
 	//! Returns the segment size.
 	inline idx_t GetSegmentSize() const {
 		return segment_size;

@@ -13,6 +13,7 @@
 #include "duckdb/parser/expression_util.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/main/config.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -107,10 +108,24 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 		metric = vex::ParseMetric(metric_it->second.GetValue<string>());
 	}
 
+	string memory_mode = "full";
+	auto mm_it = input.options.find("memory_mode");
+	if (mm_it != input.options.end()) {
+		memory_mode = mm_it->second.GetValue<string>();
+		if (memory_mode != "full" && memory_mode != "compact") {
+			throw InvalidInputException(
+			    "GRAPH_INDEX: 'memory_mode' must be 'full' or 'compact', got '%s'", memory_mode);
+		}
+	}
+	if (memory_mode == "compact" && !use_pq) {
+		use_pq = true;
+	}
+
 	auto graph_index = make_uniq<GraphIndex>(
 		input.name, input.constraint_type, input.column_ids, input.table_io_manager,
 		input.unbound_expressions, input.db, m, ef_construction, metric, use_pq, pq_m);
 	graph_index->graph_.max_dedup = max_dedup;
+	graph_index->memory_mode_ = memory_mode;
 
 	// Deserialize from storage if available (allocator-based)
 	// Only deserialize if we have actual data (dimension stored means there was data)
@@ -600,6 +615,25 @@ void GraphIndex::BuildParallel(const std::vector<float> &all_vectors, const std:
 // ============================================================
 
 ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
+	// Check memory budget before inserting
+	{
+		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
+		Value budget_val;
+		if (db_config.TryGetCurrentSetting("vex_memory_budget", budget_val)) {
+			int64_t budget = budget_val.GetValue<int64_t>();
+			if (budget > 0) {
+				idx_t current = GetInMemorySize(l);
+				if (current > static_cast<idx_t>(budget)) {
+					throw InvalidInputException(
+					    "VEX memory budget exceeded: current %llu bytes > budget %lld bytes. "
+					    "Increase with SET vex_memory_budget, or use memory_mode='compact'.",
+					    static_cast<unsigned long long>(current),
+					    static_cast<long long>(budget));
+				}
+			}
+		}
+	}
+
 	if (chunk.ColumnCount() != logical_types.size()) {
 		DataChunk key_chunk;
 		key_chunk.InitializeEmpty(logical_types);
@@ -846,6 +880,7 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
 	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
 	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
 	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
+	info.options["memory_mode"] = Value(memory_mode_);
 
 	// Store root as entry_point data
 	info.root = graph_.entry_point.Get();
@@ -929,6 +964,7 @@ IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> 
 	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
 	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
 	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
+	info.options["memory_mode"] = Value(memory_mode_);
 
 	info.root = graph_.entry_point.Get();
 
@@ -1034,6 +1070,10 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 	auto dedup_opt = info.options.find("max_dedup");
 	if (dedup_opt != info.options.end()) {
 		graph_.max_dedup = dedup_opt->second.GetValue<uint16_t>();
+	}
+	auto mm_opt = info.options.find("memory_mode");
+	if (mm_opt != info.options.end()) {
+		memory_mode_ = mm_opt->second.GetValue<string>();
 	}
 
 	// Create allocators WITHOUT slot-0 reservation.
@@ -1334,6 +1374,18 @@ void GraphIndex::Search(const float *query_vec, idx_t k, int ef,
 		graph_.SearchWithPQ(search_vec, k, ef, out_row_ids, out_distances, distance_func_, brute_force_threshold);
 	} else {
 		graph_.Search(search_vec, k, ef, out_row_ids, out_distances, distance_func_, brute_force_threshold);
+	}
+
+	// Evict clean, persisted buffers to reduce memory footprint.
+	// Controlled by SET vex_enable_eviction = true (default off for desktop performance).
+	{
+		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
+		Value evict_val;
+		if (db_config.TryGetCurrentSetting("vex_enable_eviction", evict_val)) {
+			if (evict_val.GetValue<bool>()) {
+				graph_.EvictCleanBuffers();
+			}
+		}
 	}
 }
 

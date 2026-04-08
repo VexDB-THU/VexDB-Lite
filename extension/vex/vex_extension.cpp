@@ -61,6 +61,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vex_brute_force_threshold",
 	                          "Node count threshold below which brute-force search is used instead of graph traversal",
 	                          LogicalType::UBIGINT, Value::UBIGINT(GraphIndexCore::BRUTE_FORCE_THRESHOLD));
+	config.AddExtensionOption("vex_memory_budget",
+	                          "Memory budget in bytes for VEX indexes (0 = unlimited)",
+	                          LogicalType::BIGINT, Value::BIGINT(0));
+	config.AddExtensionOption("vex_enable_eviction",
+	                          "Evict clean index buffers after search to reduce memory (default: false)",
+	                          LogicalType::BOOLEAN, Value::BOOLEAN(false));
 }
 
 void VexExtension::Load(ExtensionLoader &loader) {

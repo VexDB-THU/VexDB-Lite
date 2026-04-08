@@ -116,6 +116,9 @@ public:
 	uint32_t GetPQM() const {
 		return pq_m_;
 	}
+	const string &GetMemoryMode() const {
+		return memory_mode_;
+	}
 
 private:
 	int GetRandomLevel();
@@ -131,6 +134,7 @@ private:
 	uint32_t dimension_;
 	bool use_pq_;
 	uint32_t pq_m_;
+	string memory_mode_ = "full";
 
 	//! Graph index core with allocator-based storage
 	GraphIndexCore graph_;

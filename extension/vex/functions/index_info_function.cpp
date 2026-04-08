@@ -12,6 +12,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 #include <set>
 
 namespace duckdb {
@@ -48,6 +49,8 @@ struct VexIndexInfoGlobalState : public GlobalTableFunctionState {
 		string metric;
 		bool use_pq;
 		int32_t pq_m;
+		int64_t memory_bytes;
+		string memory_mode;
 	};
 
 	std::vector<IndexEntry> entries;
@@ -97,6 +100,12 @@ static unique_ptr<FunctionData> VexIndexInfoBind(ClientContext &context, TableFu
 
 	names.push_back("pq_m");
 	return_types.push_back(LogicalType::INTEGER);
+
+	names.push_back("memory_bytes");
+	return_types.push_back(LogicalType::BIGINT);
+
+	names.push_back("memory_mode");
+	return_types.push_back(LogicalType::VARCHAR);
 
 	return make_uniq<VexIndexInfoBindData>();
 }
@@ -178,6 +187,12 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.metric = vex::MetricName(graph_idx.GetMetric());
 				e.use_pq = graph_idx.GetUsePQ();
 				e.pq_m = static_cast<int32_t>(graph_idx.GetPQM());
+				{
+					IndexLock mem_lock;
+					graph_idx.InitializeLock(mem_lock);
+					e.memory_bytes = static_cast<int64_t>(graph_idx.GetInMemorySize(mem_lock));
+				}
+				e.memory_mode = graph_idx.GetMemoryMode();
 				state->entries.push_back(std::move(e));
 			}
 #ifdef VEX_ENABLE_HYBRID_INDEX
@@ -208,6 +223,8 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
 				e.metric = vex::MetricName(hybrid_idx.GetMetric());
 				e.use_pq = false;
 				e.pq_m = 0;
+				e.memory_bytes = 0;
+				e.memory_mode = "full";
 				state->entries.push_back(std::move(e));
 			}
 #endif
@@ -244,6 +261,9 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
 	auto metric_data = FlatVector::GetData<string_t>(metric_vec);
 	auto pq_data = FlatVector::GetData<bool>(output.data[11]);
 	auto pqm_data = FlatVector::GetData<int32_t>(output.data[12]);
+	auto mem_bytes_data = FlatVector::GetData<int64_t>(output.data[13]);
+	auto &mm_vec = output.data[14];
+	auto mm_data = FlatVector::GetData<string_t>(mm_vec);
 
 	while (state.current_offset < state.entries.size() && count < max_count) {
 		auto &e = state.entries[state.current_offset];
@@ -260,6 +280,8 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
 		metric_data[count] = StringVector::AddString(metric_vec, e.metric);
 		pq_data[count] = e.use_pq;
 		pqm_data[count] = e.pq_m;
+		mem_bytes_data[count] = e.memory_bytes;
+		mm_data[count] = StringVector::AddString(mm_vec, e.memory_mode);
 		count++;
 		state.current_offset++;
 	}
