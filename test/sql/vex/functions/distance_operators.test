@@ -75,3 +75,31 @@ query R
 SELECT array_negative_inner_product([1.0, 2.0]::FLOAT[2], [3.0, 4.0]::FLOAT[2]);
 ----
 -11.0
+
+# ============================================================
+# Operators with VARCHAR input (implicit conversion)
+# ============================================================
+
+# <-> with VARCHAR
+query R
+SELECT [1.0, 0.0, 0.0]::FLOAT[3] <-> '[0.0, 1.0, 0.0]';
+----
+1.4142135
+
+# <=> with VARCHAR
+query R
+SELECT [1.0, 0.0]::FLOAT[2] <=> '[0.0, 1.0]';
+----
+1.0
+
+# <~> with VARCHAR
+query R
+SELECT [1.0, 2.0]::FLOAT[2] <~> '[3.0, 4.0]';
+----
+-11.0
+
+# Both sides VARCHAR
+query R
+SELECT '[1.0, 0.0]' <-> '[0.0, 1.0]';
+----
+1.4142135
