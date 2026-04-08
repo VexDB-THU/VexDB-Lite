@@ -40,16 +40,25 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
 	auto m_it = input.options.find("m");
 	if (m_it != input.options.end()) {
-		m = m_it->second.GetValue<int>();
+		try {
+			m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("GRAPH_INDEX: 'm' must be a valid integer, got '%s'", m_it->second.ToString());
+		}
 		if (m < 2 || m > 128) {
 			throw InvalidInputException("GRAPH_INDEX: 'm' must be between 2 and 128, got %d", m);
 		}
 	}
 	auto ef_it = input.options.find("ef_construction");
 	if (ef_it != input.options.end()) {
-		ef_construction = ef_it->second.GetValue<int>();
-		if (ef_construction < 1 || ef_construction > 4096) {
-			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be between 1 and 4096, got %d", ef_construction);
+		try {
+			ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be a valid integer, got '%s'",
+			                            ef_it->second.ToString());
+		}
+		if (ef_construction < 1 || ef_construction > 10000) {
+			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be between 1 and 10000, got %d", ef_construction);
 		}
 	}
 	auto q_it = input.options.find("quantizer");
@@ -63,17 +72,30 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 	}
 	auto pqm_it = input.options.find("pq_m");
 	if (pqm_it != input.options.end()) {
-		pq_m = static_cast<uint32_t>(pqm_it->second.GetValue<int>());
-		if (pq_m < 1 || pq_m > 256) {
-			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %u", pq_m);
+		int pq_m_int;
+		try {
+			pq_m_int = pqm_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be a valid integer, got '%s'",
+			                            pqm_it->second.ToString());
 		}
+		if (pq_m_int < 1 || pq_m_int > 256) {
+			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %d", pq_m_int);
+		}
+		pq_m = static_cast<uint32_t>(pq_m_int);
 	}
 	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
 	auto dedup_it = input.options.find("max_dedup");
 	if (dedup_it != input.options.end()) {
-		int val = dedup_it->second.GetValue<int>();
+		int val;
+		try {
+			val = dedup_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("GRAPH_INDEX: 'max_dedup' must be a valid integer, got '%s'",
+			                            dedup_it->second.ToString());
+		}
 		if (val < 1 || val > 65535) {
-			throw InvalidInputException("max_dedup must be between 1 and 65535, got %d", val);
+			throw InvalidInputException("GRAPH_INDEX: 'max_dedup' must be between 1 and 65535, got %d", val);
 		}
 		max_dedup = static_cast<uint16_t>(val);
 	}

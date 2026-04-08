@@ -97,9 +97,9 @@ CREATE INDEX idx_efn ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = -1);
 ----
 ef_construction
 
-# ef_construction = 5000 should fail
+# ef_construction = 50000 should fail
 statement error
-CREATE INDEX idx_ef5k ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 5000);
+CREATE INDEX idx_ef50k ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 50000);
 ----
 ef_construction
 
@@ -109,6 +109,34 @@ CREATE INDEX idx_ef200 ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 20
 
 statement ok
 DROP INDEX idx_ef200;
+
+# ============================================================
+# String input validation (unified error messages)
+# ============================================================
+
+# m = 'aaa' should fail with our error message
+statement error
+CREATE INDEX idx_m_str ON t_val USING GRAPH_INDEX (v) WITH (m = 'aaa');
+----
+must be a valid integer
+
+# ef_construction = 'aaa' should fail
+statement error
+CREATE INDEX idx_ef_str ON t_val USING GRAPH_INDEX (v) WITH (ef_construction = 'aaa');
+----
+must be a valid integer
+
+# pq_m = 'aaa' should fail
+statement error
+CREATE INDEX idx_pq_str ON t_val USING GRAPH_INDEX (v) WITH (quantizer = 'pq', pq_m = 'aaa');
+----
+must be a valid integer
+
+# pq_m = -1 should show correct negative value (not uint32 overflow)
+statement error
+CREATE INDEX idx_pq_neg ON t_val USING GRAPH_INDEX (v) WITH (quantizer = 'pq', pq_m = -1);
+----
+got -1
 
 # ============================================================
 # HYBRID_INDEX parameter validation

@@ -40,16 +40,25 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 
 	auto m_it = input.options.find("m");
 	if (m_it != input.options.end()) {
-		m = m_it->second.GetValue<int>();
+		try {
+			m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("HYBRID_INDEX: 'm' must be a valid integer, got '%s'", m_it->second.ToString());
+		}
 		if (m < 2 || m > 128) {
 			throw InvalidInputException("HYBRID_INDEX: 'm' must be between 2 and 128, got %d", m);
 		}
 	}
 	auto ef_it = input.options.find("ef_construction");
 	if (ef_it != input.options.end()) {
-		ef_construction = ef_it->second.GetValue<int>();
-		if (ef_construction < 1 || ef_construction > 4096) {
-			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be between 1 and 4096, got %d", ef_construction);
+		try {
+			ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be a valid integer, got '%s'",
+			                            ef_it->second.ToString());
+		}
+		if (ef_construction < 1 || ef_construction > 10000) {
+			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be between 1 and 10000, got %d", ef_construction);
 		}
 	}
 	vex::VexMetric metric = vex::VexMetric::L2;
