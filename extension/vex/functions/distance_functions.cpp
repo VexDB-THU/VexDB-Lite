@@ -116,6 +116,12 @@ ScalarFunctionSet VexFunctions::GetL2DistanceFunction() {
 	return set;
 }
 
+ScalarFunctionSet VexFunctions::GetL2DistanceOperator() {
+	ScalarFunctionSet set("<->");
+	AddDistanceOverloads(set, L2DistanceFunction);
+	return set;
+}
+
 ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
 	ScalarFunctionSet set("inner_product");
 	AddDistanceOverloads(set, InnerProductFunction);
@@ -130,6 +136,12 @@ ScalarFunctionSet VexFunctions::GetNegativeInnerProductFunction() {
 
 ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
 	ScalarFunctionSet set("cosine_distance");
+	AddDistanceOverloads(set, CosineDistanceFunction);
+	return set;
+}
+
+ScalarFunctionSet VexFunctions::GetCosineDistanceOperator() {
+	ScalarFunctionSet set("<=>");
 	AddDistanceOverloads(set, CosineDistanceFunction);
 	return set;
 }

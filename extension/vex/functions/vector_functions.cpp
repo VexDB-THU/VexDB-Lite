@@ -319,9 +319,11 @@ ScalarFunction VexFunctions::GetVectorSubFunction() {
 void VexFunctions::Register(ExtensionLoader &loader) {
 	// Distance functions
 	loader.RegisterFunction(GetL2DistanceFunction());
+	loader.RegisterFunction(GetL2DistanceOperator());         // <->
 	loader.RegisterFunction(GetInnerProductFunction());
-	loader.RegisterFunction(GetNegativeInnerProductFunction());
+	loader.RegisterFunction(GetNegativeInnerProductFunction()); // <~>
 	loader.RegisterFunction(GetCosineDistanceFunction());
+	loader.RegisterFunction(GetCosineDistanceOperator());     // <=>
 
 	// Vector utility functions
 	loader.RegisterFunction(GetVectorDimsFunction());
