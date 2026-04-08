@@ -70,9 +70,15 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
 	auto dedup_it = input.options.find("max_dedup");
 	if (dedup_it != input.options.end()) {
-		int val = dedup_it->second.GetValue<int>();
+		int val;
+		try {
+			val = dedup_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+		} catch (const std::exception &) {
+			throw InvalidInputException("HYBRID_INDEX: 'max_dedup' must be a valid integer, got '%s'",
+			                            dedup_it->second.ToString());
+		}
 		if (val < 1 || val > 65535) {
-			throw InvalidInputException("max_dedup must be between 1 and 65535, got %d", val);
+			throw InvalidInputException("HYBRID_INDEX: 'max_dedup' must be between 1 and 65535, got %d", val);
 		}
 		max_dedup = static_cast<uint16_t>(val);
 	}
