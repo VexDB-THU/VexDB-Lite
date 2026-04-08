@@ -61,14 +61,6 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("vex_brute_force_threshold",
 	                          "Node count threshold below which brute-force search is used instead of graph traversal",
 	                          LogicalType::UBIGINT, Value::UBIGINT(GraphIndexCore::BRUTE_FORCE_THRESHOLD));
-	config.AddExtensionOption("vex_parallel_threshold",
-	                          "Row count threshold for parallel index construction (lower on mobile)",
-	                          LogicalType::UBIGINT,
-#ifdef VEX_MOBILE_MODE
-	                          Value::UBIGINT(1000));   // Lower threshold for mobile
-#else
-	                          Value::UBIGINT(10000));  // Default for desktop
-#endif
 }
 
 void VexExtension::Load(ExtensionLoader &loader) {
