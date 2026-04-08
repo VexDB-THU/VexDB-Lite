@@ -44,8 +44,9 @@ static int GetEfSearch(ClientContext &context, idx_t k) {
 	int ef = GraphIndexConfig::DEFAULT_EF_SEARCH;
 	if (context.TryGetCurrentSetting("vex_ef_search", val)) {
 		ef = val.GetValue<int>();
-		if (ef < 1 || ef > 10000) {
-			throw InvalidInputException("vex_ef_search must be between 1 and 10000, got %d", ef);
+		if (ef < GraphIndexConfig::MIN_EF_SEARCH || ef > GraphIndexConfig::MAX_EF_SEARCH) {
+			throw InvalidInputException("vex_ef_search must be between %d and %d, got %d",
+			                            GraphIndexConfig::MIN_EF_SEARCH, GraphIndexConfig::MAX_EF_SEARCH, ef);
 		}
 	}
 	if (static_cast<int>(k) > ef) {

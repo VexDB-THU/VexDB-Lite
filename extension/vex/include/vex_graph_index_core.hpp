@@ -156,13 +156,13 @@ public:
 struct GraphIndexConfig {
 	static constexpr int DEFAULT_M = 16;
 	static constexpr int MIN_M = 2;
-	static constexpr int MAX_M = 100;
+	static constexpr int MAX_M = 128;
 	static constexpr int DEFAULT_EF_CONSTRUCTION = 64;
-	static constexpr int MIN_EF_CONSTRUCTION = 4;
-	static constexpr int MAX_EF_CONSTRUCTION = 1000;
+	static constexpr int MIN_EF_CONSTRUCTION = 1;
+	static constexpr int MAX_EF_CONSTRUCTION = 10000;
 	static constexpr int DEFAULT_EF_SEARCH = 40;
 	static constexpr int MIN_EF_SEARCH = 1;
-	static constexpr int MAX_EF_SEARCH = 1000;
+	static constexpr int MAX_EF_SEARCH = 10000;
 
 	int m = DEFAULT_M;
 	int ef_construction = DEFAULT_EF_CONSTRUCTION;

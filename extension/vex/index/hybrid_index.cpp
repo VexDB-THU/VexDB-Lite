@@ -45,8 +45,9 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 		} catch (const std::exception &) {
 			throw InvalidInputException("HYBRID_INDEX: 'm' must be a valid integer, got '%s'", m_it->second.ToString());
 		}
-		if (m < 2 || m > 128) {
-			throw InvalidInputException("HYBRID_INDEX: 'm' must be between 2 and 128, got %d", m);
+		if (m < GraphIndexConfig::MIN_M || m > GraphIndexConfig::MAX_M) {
+			throw InvalidInputException("HYBRID_INDEX: 'm' must be between %d and %d, got %d",
+			                            GraphIndexConfig::MIN_M, GraphIndexConfig::MAX_M, m);
 		}
 	}
 	auto ef_it = input.options.find("ef_construction");
@@ -57,8 +58,9 @@ unique_ptr<BoundIndex> HybridIndex::Create(CreateIndexInput &input) {
 			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be a valid integer, got '%s'",
 			                            ef_it->second.ToString());
 		}
-		if (ef_construction < 1 || ef_construction > 10000) {
-			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be between 1 and 10000, got %d", ef_construction);
+		if (ef_construction < GraphIndexConfig::MIN_EF_CONSTRUCTION || ef_construction > GraphIndexConfig::MAX_EF_CONSTRUCTION) {
+			throw InvalidInputException("HYBRID_INDEX: 'ef_construction' must be between %d and %d, got %d",
+			                            GraphIndexConfig::MIN_EF_CONSTRUCTION, GraphIndexConfig::MAX_EF_CONSTRUCTION, ef_construction);
 		}
 	}
 	vex::VexMetric metric = vex::VexMetric::L2;
