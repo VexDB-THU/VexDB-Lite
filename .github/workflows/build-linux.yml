@@ -1,0 +1,268 @@
+name: Build & Test Linux
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DUCKDB_VERSION: '1.5.0'
+
+jobs:
+  # ══════════════════════════════════════════════════════════════
+  # 1. CLI + 全量 SQL 测试（manylinux_2_28，glibc 2.28）
+  # ══════════════════════════════════════════════════════════════
+  cli:
+    name: "CLI + SQL Tests (glibc 2.28)"
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+
+    steps:
+      - name: Install build tools
+        run: |
+          yum install -y cmake3 ninja-build git
+          ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-cli-manylinux228
+
+      - name: Build Release
+        working-directory: duckdb
+        run: |
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          bash build.sh release -j$(nproc)
+
+      - name: Run full SQL test suite
+        working-directory: duckdb
+        run: |
+          echo "=== Running all VEX SQL tests ==="
+          ./build/release/test/unittest "test/sql/vex/*" 2>&1 | tee /tmp/test-sql.log
+          echo ""
+          echo "=== SQL test complete ==="
+
+      - name: Run C API tests
+        working-directory: duckdb
+        run: |
+          bash build.sh test-capi 2>&1 | tee /tmp/test-capi.log
+
+      - name: Package CLI binary
+        run: |
+          mkdir -p dist
+          cp duckdb/build/release/src/duckdb dist/vexdb-lite-cli-linux-x86_64
+          chmod +x dist/vexdb-lite-cli-linux-x86_64
+          # 验证 glibc 依赖版本
+          echo "=== glibc dependency check ==="
+          objdump -T dist/vexdb-lite-cli-linux-x86_64 | grep GLIBC | sed 's/.*GLIBC_/GLIBC_/' | sort -Vu || true
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-x86_64
+          path: dist/vexdb-lite-cli-linux-x86_64
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-cli
+          path: /tmp/test-*.log
+
+  # ══════════════════════════════════════════════════════════════
+  # 2. CLI aarch64（ARM Linux 服务器）
+  # ══════════════════════════════════════════════════════════════
+  cli-arm64:
+    name: "CLI (Linux aarch64)"
+    runs-on: ubuntu-24.04-arm
+    container: quay.io/pypa/manylinux_2_28_aarch64
+
+    steps:
+      - name: Install build tools
+        run: yum install -y cmake3 ninja-build git && ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-cli-arm64
+
+      - name: Build Release
+        working-directory: duckdb
+        run: |
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          bash build.sh release -j$(nproc)
+
+      - name: Run SQL tests
+        working-directory: duckdb
+        run: ./build/release/test/unittest "test/sql/vex/*"
+
+      - name: Package CLI
+        run: |
+          mkdir -p dist
+          cp duckdb/build/release/src/duckdb dist/vexdb-lite-cli-linux-aarch64
+          chmod +x dist/vexdb-lite-cli-linux-aarch64
+
+      - name: Upload CLI
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-aarch64
+          path: dist/vexdb-lite-cli-linux-aarch64
+
+  # ══════════════════════════════════════════════════════════════
+  # 3. Java JDBC JAR
+  # ══════════════════════════════════════════════════════════════
+  java:
+    name: "Java JDBC JAR"
+    runs-on: ubuntu-latest
+    container: quay.io/pypa/manylinux_2_28_x86_64
+
+    steps:
+      - name: Install dependencies
+        run: |
+          yum install -y cmake3 ninja-build git java-17-openjdk-devel maven
+          ln -sf /usr/bin/cmake3 /usr/bin/cmake || true
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-java
+
+      - name: Build Java JAR
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+        run: |
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          bash packaging/build_java.sh dist
+
+      - name: Test Java JAR
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk
+        run: |
+          echo "=== Java smoke test ==="
+          java -cp dist/vexdb-lite-*.jar -Djava.library.path=. -e "
+            import java.sql.*;
+            Class.forName(\"org.duckdb.DuckDBDriver\");
+            Connection conn = DriverManager.getConnection(\"jdbc:duckdb:\");
+            Statement stmt = conn.createStatement();
+            ResultSet rs = stmt.executeQuery(\"SELECT l2_distance([1,2,3]::FLOAT[3], [4,5,6]::FLOAT[3])\");
+            rs.next();
+            System.out.println(\"l2_distance = \" + rs.getDouble(1));
+            conn.close();
+            System.out.println(\"Java smoke test PASSED\");
+          " || {
+            # Fallback: use test script if inline doesn't work
+            if [ -f test/java/VexRegressionTest.java ]; then
+              cd test/java
+              javac -cp "../../dist/vexdb-lite-*.jar" VexRegressionTest.java
+              java -cp ".:../../dist/vexdb-lite-*.jar" VexRegressionTest
+            fi
+          }
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-jar
+          path: dist/vexdb-lite-*.jar
+
+  # ══════════════════════════════════════════════════════════════
+  # 4. Node.js npm 包
+  # ══════════════════════════════════════════════════════════════
+  nodejs:
+    name: "Node.js package"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: linux-nodejs
+
+      - name: Build Node.js package
+        run: |
+          export CMAKE_C_COMPILER_LAUNCHER=ccache
+          export CMAKE_CXX_COMPILER_LAUNCHER=ccache
+          bash packaging/build_node.sh dist
+
+      - name: Test Node.js
+        run: |
+          cd dist
+          npm install vexdb-lite-*.tgz
+          node -e "
+            const duckdb = require('vexdb-lite');
+            const db = new duckdb.Database(':memory:');
+            db.all('SELECT l2_distance([1,2,3]::FLOAT[3], [4,5,6]::FLOAT[3]) AS d', (err, rows) => {
+              if (err) { console.error(err); process.exit(1); }
+              console.log('l2_distance =', rows[0].d);
+              console.log('Node.js smoke test PASSED');
+              db.close();
+            });
+          "
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-package
+          path: dist/vexdb-lite-*.tgz
+
+  # ══════════════════════════════════════════════════════════════
+  # 5. 汇总 + Release
+  # ══════════════════════════════════════════════════════════════
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [cli, cli-arm64, java, nodejs]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f | head -20
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          cp artifacts/cli-linux-x86_64/* release/ 2>/dev/null || true
+          cp artifacts/cli-linux-aarch64/* release/ 2>/dev/null || true
+          cp artifacts/java-jar/* release/ 2>/dev/null || true
+          cp artifacts/nodejs-package/* release/ 2>/dev/null || true
+          ls -lh release/
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

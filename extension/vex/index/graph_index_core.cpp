@@ -176,7 +176,7 @@ void GraphIndexCore::EnsureRowIdMap() {
 // ============================================================
 
 void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, int layer_num,
-                                  std::vector<GraphCandidate> &candidates, unordered_set<row_t> &visited,
+                                  std::vector<GraphCandidate> &candidates, VisitedSet &visited,
                                   vex::distance_func_t distance_func) {
 	std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::greater<GraphCandidate>> candidate_queue;
 	std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::less<GraphCandidate>> visited_queue;
@@ -184,23 +184,34 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 	// Use RAII handles when buffer cache is not active (non-parallel path)
 	bool use_handles = !node_cache_.IsActive();
 
-	if (use_handles) {
-		auto ep_node_h = GetNodeHandle(ep);
-		auto *ep_header = ep_node_h.GetPtr<vex::HNSWNodeHeader>();
-		if (ep_header->deleted) return;
-		auto ep_vec_h = GetVectorHandle(ep_header->vector_ptr);
-		float dist = distance_func(query, ep_vec_h.GetPtr<float>(), dimension);
+	// P0: Use IndexPointer.Get() as visited key (avoids GetNode to read row_id)
+	auto visit_check = [&](IndexPointer ptr) -> bool {
+		return !visited.Insert(ptr.Get()); // returns false if newly inserted
+	};
+
+	// Entry point
+	{
+		bool ep_deleted;
+		float dist;
+		if (use_handles) {
+			auto ep_node_h = GetNodeHandle(ep);
+			auto *ep_header = ep_node_h.GetPtr<vex::HNSWNodeHeader>();
+			ep_deleted = ep_header->deleted;
+			if (!ep_deleted) {
+				auto ep_vec_h = GetVectorHandle(ep_header->vector_ptr);
+				dist = distance_func(query, ep_vec_h.GetPtr<float>(), dimension);
+			}
+		} else {
+			auto *ep_header = GetNode(ep);
+			ep_deleted = ep_header->deleted;
+			if (!ep_deleted) {
+				dist = distance_func(query, GetVector(ep_header->vector_ptr), dimension);
+			}
+		}
+		if (ep_deleted) return;
+		visited.Insert(ep.Get());
 		candidate_queue.push({ep, dist});
 		visited_queue.push({ep, dist});
-		visited.insert(ep_header->row_id);
-	} else {
-		auto *ep_header = GetNode(ep);
-		if (ep_header->deleted) return;
-		auto *ep_vec = GetVector(ep_header->vector_ptr);
-		float dist = distance_func(query, ep_vec, dimension);
-		candidate_queue.push({ep, dist});
-		visited_queue.push({ep, dist});
-		visited.insert(ep_header->row_id);
 	}
 
 	while (!candidate_queue.empty()) {
@@ -211,16 +222,15 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 			break;
 		}
 
+		// P3: Get node header once, read neighbors from it directly
+		IndexPointer *neighbors;
+		uint16_t neighbor_count;
+
 		if (use_handles) {
 			auto cur_node_h = GetNodeHandle(current.node_ptr);
 			auto *cur_header = cur_node_h.GetPtr<vex::HNSWNodeHeader>();
-			if (layer_num > static_cast<int>(cur_header->level)) {
-				continue;
-			}
+			if (layer_num > static_cast<int>(cur_header->level)) continue;
 
-			// Inline neighbor retrieval — cur_node_h keeps buffer alive
-			IndexPointer *neighbors;
-			uint16_t neighbor_count;
 			if (layer_num == 0) {
 				neighbors = cur_header->GetLevel0Neighbors();
 				neighbor_count = cur_header->level0_count;
@@ -232,80 +242,81 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 				if (upper_idx >= vex::HNSW_MAX_UPPER_LEVELS) continue;
 				neighbors = upper->GetNeighbors(upper_idx, m);
 				neighbor_count = upper->counts[upper_idx];
-				// Copy neighbors before upper_h goes out of scope
-				// Actually upper_h is still alive here — we use neighbors within this block
+
 				for (uint16_t i = 0; i < neighbor_count; i++) {
 					IndexPointer neighbor_ptr = neighbors[i];
-					if (!neighbor_ptr.Get()) continue;
+					if (!neighbor_ptr.Get() || visit_check(neighbor_ptr)) continue;
 					auto nb_node_h = GetNodeHandle(neighbor_ptr);
 					auto *nb_header = nb_node_h.GetPtr<vex::HNSWNodeHeader>();
-					if (nb_header->deleted || visited.find(nb_header->row_id) != visited.end()) {
-						continue;
-					}
-					visited.insert(nb_header->row_id);
+					if (nb_header->deleted) continue;
 					auto nb_vec_h = GetVectorHandle(nb_header->vector_ptr);
-					float neighbor_dist = distance_func(query, nb_vec_h.GetPtr<float>(), dimension);
-					if (static_cast<int>(visited_queue.size()) < ef ||
-					    neighbor_dist < visited_queue.top().distance) {
-						candidate_queue.push({neighbor_ptr, neighbor_dist});
-						visited_queue.push({neighbor_ptr, neighbor_dist});
-						if (static_cast<int>(visited_queue.size()) > ef) {
-							visited_queue.pop();
-						}
+					float nd = distance_func(query, nb_vec_h.GetPtr<float>(), dimension);
+					if (static_cast<int>(visited_queue.size()) < ef || nd < visited_queue.top().distance) {
+						candidate_queue.push({neighbor_ptr, nd});
+						visited_queue.push({neighbor_ptr, nd});
+						if (static_cast<int>(visited_queue.size()) > ef) visited_queue.pop();
 					}
 				}
-				continue; // Already processed neighbors in upper branch
+				continue;
 			}
 
-			// Level 0 neighbors (cur_node_h still alive)
+			// Level 0 neighbors with prefetch (P1)
 			for (uint16_t i = 0; i < neighbor_count; i++) {
 				IndexPointer neighbor_ptr = neighbors[i];
-				if (!neighbor_ptr.Get()) continue;
+				if (!neighbor_ptr.Get() || visit_check(neighbor_ptr)) continue;
 				auto nb_node_h = GetNodeHandle(neighbor_ptr);
 				auto *nb_header = nb_node_h.GetPtr<vex::HNSWNodeHeader>();
-				if (nb_header->deleted || visited.find(nb_header->row_id) != visited.end()) {
-					continue;
-				}
-				visited.insert(nb_header->row_id);
-				auto nb_vec_h = GetVectorHandle(nb_header->vector_ptr);
-				float neighbor_dist = distance_func(query, nb_vec_h.GetPtr<float>(), dimension);
-				if (static_cast<int>(visited_queue.size()) < ef ||
-				    neighbor_dist < visited_queue.top().distance) {
-					candidate_queue.push({neighbor_ptr, neighbor_dist});
-					visited_queue.push({neighbor_ptr, neighbor_dist});
-					if (static_cast<int>(visited_queue.size()) > ef) {
-						visited_queue.pop();
+				if (nb_header->deleted) continue;
+				// P1: prefetch next neighbor's vector while computing current distance
+				if (i + 1 < neighbor_count && neighbors[i + 1].Get()) {
+					auto *next_h = GetNode(neighbors[i + 1]);
+					if (next_h->vector_ptr.Get()) {
+						__builtin_prefetch(GetVector(next_h->vector_ptr), 0, 0);
 					}
+				}
+				auto nb_vec_h = GetVectorHandle(nb_header->vector_ptr);
+				float nd = distance_func(query, nb_vec_h.GetPtr<float>(), dimension);
+				if (static_cast<int>(visited_queue.size()) < ef || nd < visited_queue.top().distance) {
+					candidate_queue.push({neighbor_ptr, nd});
+					visited_queue.push({neighbor_ptr, nd});
+					if (static_cast<int>(visited_queue.size()) > ef) visited_queue.pop();
 				}
 			}
 		} else {
-			// Original raw pointer path (buffer cache active)
+			// Raw pointer path (buffer cache active) — parallel build
 			auto *cur_header = GetNode(current.node_ptr);
-			if (layer_num > static_cast<int>(cur_header->level)) {
-				continue;
+			if (layer_num > static_cast<int>(cur_header->level)) continue;
+
+			if (layer_num == 0) {
+				neighbors = cur_header->GetLevel0Neighbors();
+				neighbor_count = cur_header->level0_count;
+			} else {
+				if (!cur_header->upper_ptr.Get()) continue;
+				auto *upper = GetUpper(cur_header->upper_ptr);
+				int upper_idx = layer_num - 1;
+				if (upper_idx >= vex::HNSW_MAX_UPPER_LEVELS) continue;
+				neighbors = upper->GetNeighbors(upper_idx, m);
+				neighbor_count = upper->counts[upper_idx];
 			}
-			IndexPointer *neighbors;
-			uint16_t neighbor_count;
-			GetNeighbors(current.node_ptr, layer_num, neighbors, neighbor_count);
-			if (!neighbors) continue;
 
 			for (uint16_t i = 0; i < neighbor_count; i++) {
 				IndexPointer neighbor_ptr = neighbors[i];
-				if (!neighbor_ptr.Get()) continue;
+				if (!neighbor_ptr.Get() || visit_check(neighbor_ptr)) continue;
 				auto *nb_header = GetNode(neighbor_ptr);
-				if (nb_header->deleted || visited.find(nb_header->row_id) != visited.end()) {
-					continue;
-				}
-				visited.insert(nb_header->row_id);
-				auto *nb_vec = GetVector(nb_header->vector_ptr);
-				float neighbor_dist = distance_func(query, nb_vec, dimension);
-				if (static_cast<int>(visited_queue.size()) < ef ||
-				    neighbor_dist < visited_queue.top().distance) {
-					candidate_queue.push({neighbor_ptr, neighbor_dist});
-					visited_queue.push({neighbor_ptr, neighbor_dist});
-					if (static_cast<int>(visited_queue.size()) > ef) {
-						visited_queue.pop();
+				if (nb_header->deleted) continue;
+				// P1: prefetch next neighbor's vector
+				if (i + 1 < neighbor_count && neighbors[i + 1].Get()) {
+					auto *next_h = GetNode(neighbors[i + 1]);
+					if (next_h->vector_ptr.Get()) {
+						__builtin_prefetch(GetVector(next_h->vector_ptr), 0, 0);
 					}
+				}
+				auto *nb_vec = GetVector(nb_header->vector_ptr);
+				float nd = distance_func(query, nb_vec, dimension);
+				if (static_cast<int>(visited_queue.size()) < ef || nd < visited_queue.top().distance) {
+					candidate_queue.push({neighbor_ptr, nd});
+					visited_queue.push({neighbor_ptr, nd});
+					if (static_cast<int>(visited_queue.size()) > ef) visited_queue.pop();
 				}
 			}
 		}
@@ -320,8 +331,7 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 				candidates.push_back(c);
 			}
 		} else {
-			auto *h = GetNode(c.node_ptr);
-			if (!h->deleted) {
+			if (!GetNode(c.node_ptr)->deleted) {
 				candidates.push_back(c);
 			}
 		}
@@ -404,14 +414,14 @@ void GraphIndexCore::InsertNode(IndexPointer new_node_ptr, int m_param, int ef_c
 	}
 
 	IndexPointer ep = entry_point;
-	unordered_set<row_t> visited;
+	VisitedSet visited(std::max(node_count, idx_t(128)));
 	std::vector<GraphCandidate> candidates;
 
 	// Traverse from top level down to node's level + 1
 	for (int level = max_level; level > node_level; level--) {
 		if (!ep.Get()) break;
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(new_header->vector_ptr.Get() ? GetVector(new_header->vector_ptr) : nullptr,
 		            ep, 1, level, candidates, visited, distance_func);
 		if (!candidates.empty()) {
@@ -428,7 +438,7 @@ void GraphIndexCore::InsertNode(IndexPointer new_node_ptr, int m_param, int ef_c
 	// Insert at each level from node's level down to 0
 	for (int level = std::min(node_level, max_level); level >= 0; level--) {
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(new_vec, ep, ef_construction, level, candidates, visited, distance_func);
 
 		int layer_m = GraphIndexConfig::GetLayerM(m_param, level);
@@ -557,7 +567,7 @@ void GraphIndexCore::InsertNodeConcurrent(IndexPointer new_node_ptr, int m_param
 	}
 
 	auto *new_vec = GetVector(new_header->vector_ptr);
-	unordered_set<row_t> visited;
+	VisitedSet visited(std::max(node_count, idx_t(128)));
 	std::vector<GraphCandidate> candidates;
 
 	// Step 3: Search upper levels (shared lock - multiple threads can search concurrently)
@@ -566,7 +576,7 @@ void GraphIndexCore::InsertNodeConcurrent(IndexPointer new_node_ptr, int m_param
 		for (int level = current_max_level; level > node_level; level--) {
 			if (!ep.Get()) break;
 			candidates.clear();
-			visited.clear();
+			visited.Clear();
 			SearchLayer(new_vec, ep, 1, level, candidates, visited, distance_func);
 			if (!candidates.empty()) {
 				std::sort(candidates.begin(), candidates.end(),
@@ -584,7 +594,7 @@ void GraphIndexCore::InsertNodeConcurrent(IndexPointer new_node_ptr, int m_param
 		{
 			SharedLockGuard lock(*graph_mutex_);
 			candidates.clear();
-			visited.clear();
+			visited.Clear();
 			SearchLayer(new_vec, ep, ef_construction, level, candidates, visited, distance_func);
 		}
 
@@ -686,8 +696,8 @@ bool GraphIndexCore::InsertNodeParallel(IndexPointer new_node_ptr, int m_param, 
 	IndexPointer ep = entry_point;
 	int current_max_level = max_level;
 
-	unordered_set<row_t> visited;
-	visited.reserve(ef_construction * 4);  // Pre-allocate to reduce heap allocation contention
+	VisitedSet visited(std::max(node_count, idx_t(128)));
+	visited.Reserve(static_cast<idx_t>(ef_construction) * 4);
 	std::vector<GraphCandidate> candidates;
 	candidates.reserve(ef_construction * 2);
 
@@ -699,7 +709,7 @@ bool GraphIndexCore::InsertNodeParallel(IndexPointer new_node_ptr, int m_param, 
 	for (int level = current_max_level; level > node_level; level--) {
 		if (!ep.Get()) break;
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(new_vec, ep, 1, level, candidates, visited, distance_func);
 		if (!candidates.empty()) {
 			std::sort(candidates.begin(), candidates.end(),
@@ -721,7 +731,7 @@ bool GraphIndexCore::InsertNodeParallel(IndexPointer new_node_ptr, int m_param, 
 
 	for (int level = start_level; level >= 0; level--) {
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(new_vec, ep, ef_construction, level, candidates, visited, distance_func);
 
 		int layer_m = GraphIndexConfig::GetLayerM(m_param, level);
@@ -909,13 +919,13 @@ void GraphIndexCore::Search(const float *query_vec, idx_t k, int ef,
 		}
 	}
 
-	unordered_set<row_t> visited;
+	VisitedSet visited(std::max(node_count, idx_t(128)));
 	std::vector<GraphCandidate> candidates;
 
 	// Traverse from top level down to level 1
 	for (int level = max_level; level > 0; level--) {
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(query_vec, ep, 1, level, candidates, visited, distance_func);
 		if (!candidates.empty()) {
 			std::sort(candidates.begin(), candidates.end(),
@@ -928,7 +938,7 @@ void GraphIndexCore::Search(const float *query_vec, idx_t k, int ef,
 
 	// Search at level 0 with ef
 	candidates.clear();
-	visited.clear();
+	visited.Clear();
 	SearchLayer(query_vec, ep, std::max(actual_ef, static_cast<int>(k)), 0,
 	            candidates, visited, distance_func);
 
@@ -1162,13 +1172,13 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 		}
 	}
 
-	unordered_set<row_t> visited;
+	VisitedSet visited(std::max(node_count, idx_t(128)));
 	std::vector<GraphCandidate> candidates;
 
 	// Upper levels: use exact distance (SearchLayer already uses handles)
 	for (int level = max_level; level > 0; level--) {
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(query_vec, ep, 1, level, candidates, visited, distance_func);
 		if (!candidates.empty()) {
 			std::sort(candidates.begin(), candidates.end(),
@@ -1181,7 +1191,7 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 	{
 		std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::greater<GraphCandidate>> cand_q;
 		std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::less<GraphCandidate>> visit_q;
-		unordered_set<row_t> vis;
+		VisitedSet vis(std::max(node_count, idx_t(128)));
 
 		auto pq_dist = [&](IndexPointer ptr) -> float {
 			if (use_handles) {
@@ -1211,16 +1221,7 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 		float d = pq_dist(ep);
 		cand_q.push({ep, d});
 		visit_q.push({ep, d});
-		{
-			row_t ep_row_id;
-			if (use_handles) {
-				auto h = GetNodeHandle(ep);
-				ep_row_id = h.GetPtr<vex::HNSWNodeHeader>()->row_id;
-			} else {
-				ep_row_id = GetNode(ep)->row_id;
-			}
-			vis.insert(ep_row_id);
-		}
+		vis.Insert(ep.Get());
 
 		while (!cand_q.empty()) {
 			auto current = cand_q.top();
@@ -1234,11 +1235,10 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 				uint16_t nb_count = cur_hdr->level0_count;
 				for (uint16_t i = 0; i < nb_count; i++) {
 					IndexPointer nb_ptr = neighbors[i];
-					if (!nb_ptr.Get()) continue;
+					if (!nb_ptr.Get() || !vis.Insert(nb_ptr.Get())) continue;
 					auto nb_h = GetNodeHandle(nb_ptr);
 					auto *nb_hdr = nb_h.GetPtr<vex::HNSWNodeHeader>();
-					if (nb_hdr->deleted || vis.find(nb_hdr->row_id) != vis.end()) continue;
-					vis.insert(nb_hdr->row_id);
+					if (nb_hdr->deleted) continue;
 					float nd = pq_dist(nb_ptr);
 					if (static_cast<int>(visit_q.size()) < search_ef || nd < visit_q.top().distance) {
 						cand_q.push({nb_ptr, nd});
@@ -1253,10 +1253,9 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 				if (!neighbors) continue;
 				for (uint16_t i = 0; i < nb_count; i++) {
 					IndexPointer nb_ptr = neighbors[i];
-					if (!nb_ptr.Get()) continue;
+					if (!nb_ptr.Get() || !vis.Insert(nb_ptr.Get())) continue;
 					auto *nb_h = GetNode(nb_ptr);
-					if (nb_h->deleted || vis.find(nb_h->row_id) != vis.end()) continue;
-					vis.insert(nb_h->row_id);
+					if (nb_h->deleted) continue;
 					float nd = pq_dist(nb_ptr);
 					if (static_cast<int>(visit_q.size()) < search_ef || nd < visit_q.top().distance) {
 						cand_q.push({nb_ptr, nd});
@@ -1365,13 +1364,13 @@ bool GraphIndexCore::TryDedup(row_t row_id, const float *vec, uint32_t dim,
 		if (!found) return false;
 	}
 
-	unordered_set<row_t> visited;
+	VisitedSet visited(std::max(node_count, idx_t(128)));
 	std::vector<GraphCandidate> candidates;
 
 	// Traverse upper levels
 	for (int level = max_level; level > 0; level--) {
 		candidates.clear();
-		visited.clear();
+		visited.Clear();
 		SearchLayer(vec, ep, 1, level, candidates, visited, distance_func);
 		if (!candidates.empty()) {
 			std::sort(candidates.begin(), candidates.end(),
@@ -1382,7 +1381,7 @@ bool GraphIndexCore::TryDedup(row_t row_id, const float *vec, uint32_t dim,
 
 	// Search level 0 with small ef (we only need 1-NN)
 	candidates.clear();
-	visited.clear();
+	visited.Clear();
 	SearchLayer(vec, ep, 4, 0, candidates, visited, distance_func);
 
 	if (candidates.empty()) return false;

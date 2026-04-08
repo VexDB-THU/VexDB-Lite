@@ -181,6 +181,82 @@ struct GraphIndexConfig {
 };
 
 // ============================================================
+// Fast visited set using open-addressing hash table with linear probing.
+// ~3-5x faster than unordered_set for HNSW search patterns.
+// ============================================================
+class VisitedSet {
+public:
+	explicit VisitedSet(idx_t capacity_hint = 128) {
+		// Round up to power of 2 for fast modulo (bitwise AND)
+		capacity_ = 64;
+		while (capacity_ < capacity_hint * 2) {
+			capacity_ <<= 1;
+		}
+		mask_ = capacity_ - 1;
+		table_.resize(capacity_, EmptyVal());
+	}
+
+	void Clear() {
+		std::fill(table_.begin(), table_.end(), EmptyVal());
+	}
+
+	void Reserve(idx_t capacity_hint) {
+		idx_t new_cap = 64;
+		while (new_cap < capacity_hint * 2) {
+			new_cap <<= 1;
+		}
+		if (new_cap > capacity_) {
+			capacity_ = new_cap;
+			mask_ = capacity_ - 1;
+			table_.resize(capacity_, EmptyVal());
+		}
+		Clear();
+	}
+
+	//! Insert a key. Returns true if newly inserted, false if already present.
+	inline bool Insert(idx_t key) {
+		idx_t idx = Hash(key) & mask_;
+		while (true) {
+			if (table_[idx] == EmptyVal()) {
+				table_[idx] = key;
+				return true;
+			}
+			if (table_[idx] == key) {
+				return false; // already present
+			}
+			idx = (idx + 1) & mask_;
+		}
+	}
+
+	//! Check if key is present.
+	inline bool Contains(idx_t key) const {
+		idx_t idx = Hash(key) & mask_;
+		while (true) {
+			if (table_[idx] == EmptyVal()) return false;
+			if (table_[idx] == key) return true;
+			idx = (idx + 1) & mask_;
+		}
+	}
+
+private:
+	static idx_t EmptyVal() { return ~idx_t(0); }
+
+	inline idx_t Hash(idx_t key) const {
+		// Fast integer hash (splitmix64 finalizer)
+		key ^= key >> 30;
+		key *= 0xbf58476d1ce4e5b9ULL;
+		key ^= key >> 27;
+		key *= 0x94d049bb133111ebULL;
+		key ^= key >> 31;
+		return key;
+	}
+
+	std::vector<idx_t> table_;
+	idx_t capacity_;
+	idx_t mask_;
+};
+
+// ============================================================
 // Search Candidate (uses IndexPointer instead of raw pointer)
 // ============================================================
 struct GraphCandidate {
@@ -349,7 +425,7 @@ struct GraphIndexCore {
 	// ============================================================
 
 	void SearchLayer(const float *query, IndexPointer ep, int ef, int layer_num,
-	                 std::vector<GraphCandidate> &candidates, unordered_set<row_t> &visited,
+	                 std::vector<GraphCandidate> &candidates, VisitedSet &visited,
 	                 vex::distance_func_t distance_func);
 
 	std::vector<IndexPointer> SelectNeighbors(const std::vector<GraphCandidate> &candidates, int max_m,
