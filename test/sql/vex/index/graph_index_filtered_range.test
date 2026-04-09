@@ -1,0 +1,167 @@
+# name: test/sql/vex/index/graph_index_filtered_range.test
+# description: Test GRAPH_INDEX with range predicates on metadata columns (>, <, BETWEEN)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: table with vector + FLOAT price metadata
+# ============================================================
+statement ok
+CREATE TABLE products (id INTEGER, vec FLOAT[4], price FLOAT);
+
+statement ok
+INSERT INTO products VALUES
+    (1,  [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 10.0),
+    (2,  [0.9, 0.1, 0.0, 0.0]::FLOAT[4], 20.0),
+    (3,  [0.8, 0.2, 0.0, 0.0]::FLOAT[4], 30.0),
+    (4,  [0.7, 0.3, 0.0, 0.0]::FLOAT[4], 40.0),
+    (5,  [0.6, 0.4, 0.0, 0.0]::FLOAT[4], 50.0),
+    (6,  [0.0, 1.0, 0.0, 0.0]::FLOAT[4], 60.0),
+    (7,  [0.0, 0.9, 0.1, 0.0]::FLOAT[4], 70.0),
+    (8,  [0.0, 0.8, 0.2, 0.0]::FLOAT[4], 80.0),
+    (9,  [0.0, 0.0, 1.0, 0.0]::FLOAT[4], 90.0),
+    (10, [0.0, 0.0, 0.0, 1.0]::FLOAT[4], 100.0),
+    (11, [0.5, 0.5, 0.0, 0.0]::FLOAT[4], 25.0),
+    (12, [0.0, 0.5, 0.5, 0.0]::FLOAT[4], 55.0),
+    (13, [0.0, 0.0, 0.5, 0.5]::FLOAT[4], 75.0),
+    (14, [0.3, 0.3, 0.3, 0.0]::FLOAT[4], 35.0),
+    (15, [0.0, 0.3, 0.3, 0.3]::FLOAT[4], 65.0);
+
+statement ok
+CREATE INDEX idx ON products USING GRAPH_INDEX (vec, price);
+
+# ============================================================
+# Test 1: Equality filter on FLOAT metadata
+# ============================================================
+query I
+SELECT id FROM products
+WHERE price = 10.0
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 1;
+----
+1
+
+# ============================================================
+# Test 2: Greater-than filter — price > 50
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM products
+WHERE price > 50
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 2;
+----
+6	60
+7	70
+
+# ============================================================
+# Test 3: Less-than filter — price < 30
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM products
+WHERE price < 30
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1	10
+2	20
+11	25
+
+# ============================================================
+# Test 4: BETWEEN filter — price BETWEEN 30 AND 70
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM products
+WHERE price BETWEEN 30 AND 70
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+5	50
+4	40
+14	35
+
+# ============================================================
+# Test 5: Greater-than-or-equal — price >= 90
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM products
+WHERE price >= 90
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOAT[4])
+LIMIT 2;
+----
+10	100
+9	90
+
+# ============================================================
+# Test 6: INTEGER metadata with range filter
+# ============================================================
+statement ok
+CREATE TABLE items_int (id INTEGER, vec FLOAT[3], rating INTEGER);
+
+statement ok
+INSERT INTO items_int VALUES
+    (1, [1.0, 0.0, 0.0]::FLOAT[3], 1),
+    (2, [0.9, 0.1, 0.0]::FLOAT[3], 2),
+    (3, [0.8, 0.2, 0.0]::FLOAT[3], 3),
+    (4, [0.0, 1.0, 0.0]::FLOAT[3], 4),
+    (5, [0.0, 0.9, 0.1]::FLOAT[3], 5),
+    (6, [0.0, 0.0, 1.0]::FLOAT[3], 3),
+    (7, [0.5, 0.5, 0.0]::FLOAT[3], 4),
+    (8, [0.0, 0.5, 0.5]::FLOAT[3], 2);
+
+statement ok
+CREATE INDEX idx_int ON items_int USING GRAPH_INDEX (vec, rating);
+
+# rating > 3
+query II
+SELECT id, rating FROM items_int
+WHERE rating > 3
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3])
+LIMIT 2;
+----
+4	4
+5	5
+
+# rating BETWEEN 2 AND 4
+query II
+SELECT id, rating FROM items_int
+WHERE rating BETWEEN 2 AND 4
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 3;
+----
+2	2
+3	3
+7	4
+
+# ============================================================
+# Test 7: Combined — range filter results are correct vs brute force
+# Verify that filtered ANN returns same top-1 as brute-force scan
+# ============================================================
+query I
+SELECT id FROM products
+WHERE price > 50
+ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4])
+LIMIT 1;
+----
+9
+
+# Brute force verification (no index)
+query I
+SELECT id FROM (
+    SELECT id, l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4]) AS dist
+    FROM products
+    WHERE price > 50
+) sub
+ORDER BY dist
+LIMIT 1;
+----
+9
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE items_int;

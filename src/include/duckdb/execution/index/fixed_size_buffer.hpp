@@ -80,6 +80,22 @@ private:
 
 	//! Load a buffer from disk, if not in memory.
 	void LoadFromDisk();
+
+public:
+	//! Evict this buffer from memory if safe (clean, on-disk, no readers).
+	//! Re-registers block_handle so LoadFromDisk() can reload later.
+	//! Mirrors the release pattern in Serialize().
+	bool TryEvict() {
+		lock_guard<mutex> l(lock);
+		if (readers == 0 && OnDisk() && !dirty && InMemory()) {
+			buffer_handle.Destroy();
+			block_handle = block_manager.RegisterBlock(block_pointer.block_id);
+			loaded = false;
+			return true;
+		}
+		return false;
+	}
+private:
 	//! Returns the first free offset in a bitmask
 	uint32_t GetOffset(const idx_t bitmask_count, const idx_t available_segments);
 	//! Sets the allocation size, if dirty
@@ -118,29 +134,33 @@ class SegmentHandle {
 public:
 	SegmentHandle() = delete;
 	SegmentHandle(FixedSizeBuffer &buffer_p, const idx_t offset) : buffer_ptr(buffer_p) {
+		// Fast path: buffer already in memory — skip mutex, use atomic readers only.
+		// Safe because TryEvict (the only eviction path) is never called concurrently
+		// with search — it runs explicitly after GraphIndex::Search() completes.
+		if (buffer_ptr->InMemory()) {
+			ptr = buffer_ptr->buffer_handle.Ptr() + offset;
+			buffer_ptr->readers.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		// Slow path: buffer not in memory, load from disk under mutex
 		lock_guard<mutex> l(buffer_ptr->lock);
-
 		if (!buffer_ptr->InMemory() && !buffer_ptr->loaded) {
 			buffer_ptr->LoadFromDisk();
 		}
 		if (!buffer_ptr->InMemory() && buffer_ptr->loaded) {
 			buffer_ptr->block_manager.buffer_manager.Pin(buffer_ptr->block_handle);
 		}
-
 		ptr = buffer_ptr->buffer_handle.Ptr() + offset;
-		buffer_ptr->readers++;
+		buffer_ptr->readers.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	~SegmentHandle() {
 		if (!buffer_ptr) {
 			return;
 		}
-		buffer_ptr->readers--;
+		buffer_ptr->readers.fetch_sub(1, std::memory_order_relaxed);
 		buffer_ptr = nullptr;
 		ptr = nullptr;
-
-		// FIXME: Enable unpinning buffers with zero readers while preventing oscillation.
-		// FIXME: loaded must be set to true.
 	}
 
 	SegmentHandle(const SegmentHandle &) = delete;

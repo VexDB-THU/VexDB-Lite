@@ -65,41 +65,17 @@ INSERT INTO t2 SELECT i, list_transform(range(8), x -> (x + i)::FLOAT / 100.0)::
 statement ok
 CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
 
-statement ok
-CREATE TABLE t3 (id INTEGER, vec FLOAT[3], cat VARCHAR);
-
-statement ok
-INSERT INTO t3 VALUES
-  (1, [1.0, 0.0, 0.0]::FLOAT[3], 'A'),
-  (2, [0.0, 1.0, 0.0]::FLOAT[3], 'A'),
-  (3, [0.0, 0.0, 1.0]::FLOAT[3], 'B');
-
-statement ok
-CREATE INDEX idx3 ON t3 USING HYBRID_INDEX (vec, cat);
-
-# Should have 3 entries (idx1, idx2, and idx3 — one row per index)
+# Should have 2 entries (idx1 and idx2)
 query I
 SELECT count(*) FROM vex_index_info();
 ----
-3
+2
 
 # Verify idx2 details
 query ITII
 SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE index_name = 'idx2';
 ----
 idx2	GRAPH_INDEX	50	8
-
-# Verify hybrid index shows one row with partition count
-query ITI
-SELECT index_name, index_type, partition_count FROM vex_index_info() WHERE index_name = 'idx3';
-----
-idx3	HYBRID_INDEX	2
-
-# Verify build parameters for HYBRID_INDEX
-query IITII
-SELECT m, ef_construction, metric, use_pq::INTEGER, pq_m FROM vex_index_info() WHERE index_name = 'idx3';
-----
-16	64	l2	0	0
 
 # ============================================================
 # Test 4: Drop an index, verify it disappears
@@ -112,7 +88,7 @@ SELECT count(*) FROM vex_index_info() WHERE index_name = 'idx2';
 ----
 0
 
-# idx1 and idx3 should still be present
+# idx1 should still be present
 query I
 SELECT count(*) FROM vex_index_info() WHERE index_name = 'idx1';
 ----
@@ -126,9 +102,6 @@ DROP TABLE t1;
 
 statement ok
 DROP TABLE t2;
-
-statement ok
-DROP TABLE t3;
 
 query I
 SELECT count(*) FROM vex_index_info();

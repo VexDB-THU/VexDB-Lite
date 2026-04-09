@@ -1,0 +1,138 @@
+# name: test/sql/vex/index/graph_index_memory.test
+# description: Test memory_mode and vex_memory_budget features
+# group: [vex]
+
+require vex
+
+# Create test table
+statement ok
+CREATE TABLE vecs (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO vecs SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(200) t(i);
+
+# ============================================================
+# Test memory_mode='full' (default)
+# ============================================================
+statement ok
+CREATE INDEX idx_full ON vecs USING GRAPH_INDEX(vec);
+
+query I
+SELECT memory_mode FROM vex_index_info() WHERE index_name = 'idx_full';
+----
+full
+
+query I
+SELECT (memory_bytes > 0)::INTEGER FROM vex_index_info() WHERE index_name = 'idx_full';
+----
+1
+
+query I
+SELECT use_pq::INTEGER FROM vex_index_info() WHERE index_name = 'idx_full';
+----
+0
+
+statement ok
+DROP INDEX idx_full;
+
+# ============================================================
+# Test memory_mode='compact' (auto-enable PQ)
+# ============================================================
+statement ok
+CREATE INDEX idx_compact ON vecs USING GRAPH_INDEX(vec) WITH (memory_mode='compact');
+
+query I
+SELECT memory_mode FROM vex_index_info() WHERE index_name = 'idx_compact';
+----
+compact
+
+query I
+SELECT use_pq::INTEGER FROM vex_index_info() WHERE index_name = 'idx_compact';
+----
+1
+
+query I
+SELECT (memory_bytes > 0)::INTEGER FROM vex_index_info() WHERE index_name = 'idx_compact';
+----
+1
+
+statement ok
+DROP INDEX idx_compact;
+
+# ============================================================
+# Test invalid memory_mode
+# ============================================================
+statement error
+CREATE INDEX idx_bad ON vecs USING GRAPH_INDEX(vec) WITH (memory_mode='invalid');
+----
+must be 'full' or 'compact'
+
+# ============================================================
+# Test vex_memory_budget
+# ============================================================
+
+# Budget of 1 byte should reject inserts on an existing index
+statement ok
+CREATE INDEX idx_budget ON vecs USING GRAPH_INDEX(vec);
+
+statement ok
+SET GLOBAL vex_memory_budget = 1;
+
+statement error
+INSERT INTO vecs VALUES (9999, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]);
+----
+VEX memory budget exceeded
+
+# Reset budget
+statement ok
+SET GLOBAL vex_memory_budget = 0;
+
+# With unlimited budget, insert should succeed
+statement ok
+INSERT INTO vecs VALUES (9999, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]);
+
+statement ok
+DROP INDEX idx_budget;
+
+# ============================================================
+# Test memory_mode with explicit quantizer override
+# ============================================================
+statement ok
+CREATE INDEX idx_pq_explicit ON vecs USING GRAPH_INDEX(vec) WITH (memory_mode='compact', quantizer='pq');
+
+query I
+SELECT use_pq::INTEGER FROM vex_index_info() WHERE index_name = 'idx_pq_explicit';
+----
+1
+
+statement ok
+DROP INDEX idx_pq_explicit;
+
+# ============================================================
+# Test vex_enable_eviction (default off, search still works when on)
+# ============================================================
+statement ok
+CREATE INDEX idx_evict ON vecs USING GRAPH_INDEX(vec);
+
+# Default: eviction off, search works
+query I
+SELECT count(*) > 0 FROM (SELECT * FROM vecs ORDER BY array_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5);
+----
+1
+
+# Enable eviction
+statement ok
+SET GLOBAL vex_enable_eviction = true;
+
+# Search still works with eviction enabled
+query I
+SELECT count(*) > 0 FROM (SELECT * FROM vecs ORDER BY array_distance(vec, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]) LIMIT 5);
+----
+1
+
+# Disable eviction
+statement ok
+SET GLOBAL vex_enable_eviction = false;
+
+statement ok
+DROP INDEX idx_evict;

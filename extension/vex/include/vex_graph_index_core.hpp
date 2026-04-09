@@ -7,6 +7,7 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 #include "vex_distance.hpp"
+#include "vex_filter_predicate.hpp"
 #include "vex_hnsw_node.hpp"
 #include "vex_quantizer.hpp"
 
@@ -181,6 +182,90 @@ struct GraphIndexConfig {
 };
 
 // ============================================================
+// Fast visited set using open-addressing hash table with linear probing.
+// ~3-5x faster than unordered_set for HNSW search patterns.
+// ============================================================
+class VisitedSet {
+public:
+	explicit VisitedSet(idx_t capacity_hint = 128) {
+		capacity_ = 64;
+		while (capacity_ < capacity_hint * 2) {
+			capacity_ <<= 1;
+		}
+		mask_ = capacity_ - 1;
+		generation_ = 1;
+		table_.resize(capacity_);
+		gen_table_.resize(capacity_, 0);
+	}
+
+	//! Reset for a new search — O(1) instead of O(N) memset.
+	void Clear() {
+		++generation_;
+		if (generation_ == 0) {
+			// Overflow (extremely rare): reset all generation stamps
+			std::fill(gen_table_.begin(), gen_table_.end(), 0);
+			generation_ = 1;
+		}
+	}
+
+	void Reserve(idx_t capacity_hint) {
+		idx_t new_cap = 64;
+		while (new_cap < capacity_hint * 2) {
+			new_cap <<= 1;
+		}
+		if (new_cap > capacity_) {
+			capacity_ = new_cap;
+			mask_ = capacity_ - 1;
+			table_.resize(capacity_);
+			gen_table_.resize(capacity_, 0);
+		}
+		Clear();
+	}
+
+	//! Insert a key. Returns true if newly inserted, false if already present.
+	inline bool Insert(idx_t key) {
+		idx_t idx = Hash(key) & mask_;
+		while (true) {
+			if (gen_table_[idx] != generation_) {
+				table_[idx] = key;
+				gen_table_[idx] = generation_;
+				return true;
+			}
+			if (table_[idx] == key) {
+				return false;
+			}
+			idx = (idx + 1) & mask_;
+		}
+	}
+
+	//! Check if key is present.
+	inline bool Contains(idx_t key) const {
+		idx_t idx = Hash(key) & mask_;
+		while (true) {
+			if (gen_table_[idx] != generation_) return false;
+			if (table_[idx] == key) return true;
+			idx = (idx + 1) & mask_;
+		}
+	}
+
+private:
+	inline idx_t Hash(idx_t key) const {
+		key ^= key >> 30;
+		key *= 0xbf58476d1ce4e5b9ULL;
+		key ^= key >> 27;
+		key *= 0x94d049bb133111ebULL;
+		key ^= key >> 31;
+		return key;
+	}
+
+	std::vector<idx_t> table_;
+	std::vector<idx_t> gen_table_;  // generation stamp per slot
+	idx_t capacity_;
+	idx_t mask_;
+	idx_t generation_;
+};
+
+// ============================================================
 // Search Candidate (uses IndexPointer instead of raw pointer)
 // ============================================================
 struct GraphCandidate {
@@ -217,6 +302,13 @@ struct GraphIndexCore {
 	unique_ptr<FixedSizeAllocator> node_alloc;    // Allocator 0: Node headers
 	unique_ptr<FixedSizeAllocator> vector_alloc;   // Allocator 1: Vector data
 	unique_ptr<FixedSizeAllocator> upper_alloc;    // Allocator 2: Upper-level neighbors
+	unique_ptr<FixedSizeAllocator> meta_alloc;     // Allocator 3: Per-node metadata (filter columns)
+
+	//! Metadata segment size (0 = no metadata columns)
+	uint32_t meta_segment_size = 0;
+
+	//! Metadata column schema (describes layout within each meta segment)
+	std::vector<vex::MetaColumnDesc> meta_columns;
 
 	//! Row ID → IndexPointer mapping for O(1) node lookup (needed by Delete)
 	//! With dedup, multiple row_ids (primary + extras) map to the same node_ptr.
@@ -271,17 +363,34 @@ struct GraphIndexCore {
 	BufferPtrCache node_cache_;
 	BufferPtrCache vec_cache_;
 	BufferPtrCache upper_cache_;
+	BufferPtrCache meta_cache_;
 
 	//! Build buffer caches for all allocated nodes (call single-threaded before parallel ops)
 	void BuildBufferCaches();
 	//! Clear buffer caches (call after parallel ops complete)
 	void ClearBufferCaches();
 
+	//! Evict clean, on-disk buffers from memory to reduce footprint.
+	//! Call only when no SegmentHandles or raw pointers reference index data.
+	//! Requires VEX_HAS_BUFFER_EVICTION (forked DuckDB with TryEvict/EvictCleanBuffers).
+	idx_t EvictCleanBuffers() {
+#ifdef VEX_HAS_BUFFER_EVICTION
+		if (!node_alloc || !vector_alloc || !upper_alloc) return 0;
+		idx_t n = 0;
+		n += node_alloc->EvictCleanBuffers();
+		n += vector_alloc->EvictCleanBuffers();
+		n += upper_alloc->EvictCleanBuffers();
+		return n;
+#else
+		return 0;
+#endif
+	}
+
 	// ============================================================
 	// Node access helpers
 	// ============================================================
 
-	//! Get node header (read-write)
+	//! Get node header (read-write) — raw pointer, caller must ensure buffer stays pinned
 	inline vex::HNSWNodeHeader *GetNode(IndexPointer ptr) {
 		if (node_cache_.IsActive()) {
 			return reinterpret_cast<vex::HNSWNodeHeader *>(node_cache_.Get(ptr));
@@ -289,7 +398,7 @@ struct GraphIndexCore {
 		return reinterpret_cast<vex::HNSWNodeHeader *>(node_alloc->Get(ptr));
 	}
 
-	//! Get vector data for a node
+	//! Get vector data for a node — raw pointer
 	inline float *GetVector(IndexPointer vec_ptr) {
 		if (vec_cache_.IsActive()) {
 			return reinterpret_cast<float *>(vec_cache_.Get(vec_ptr));
@@ -297,12 +406,32 @@ struct GraphIndexCore {
 		return reinterpret_cast<float *>(vector_alloc->Get(vec_ptr));
 	}
 
-	//! Get upper-level data for a node
+	//! Get upper-level data for a node — raw pointer
 	inline vex::HNSWUpperLevel *GetUpper(IndexPointer upper_ptr) {
 		if (upper_cache_.IsActive()) {
 			return reinterpret_cast<vex::HNSWUpperLevel *>(upper_cache_.Get(upper_ptr));
 		}
 		return reinterpret_cast<vex::HNSWUpperLevel *>(upper_alloc->Get(upper_ptr));
+	}
+
+	//! Get metadata for a node (returns nullptr if no metadata)
+	inline uint8_t *GetMeta(IndexPointer meta_ptr) {
+		if (!meta_ptr.Get()) return nullptr;
+		if (meta_cache_.IsActive()) {
+			return meta_cache_.Get(meta_ptr);
+		}
+		return meta_alloc->Get(meta_ptr);
+	}
+
+	//! RAII handle versions — buffer is unpinned when handle is destroyed (if clean + on-disk)
+	inline SegmentHandle GetNodeHandle(IndexPointer ptr) {
+		return node_alloc->GetHandle(ptr);
+	}
+	inline SegmentHandle GetVectorHandle(IndexPointer vec_ptr) {
+		return vector_alloc->GetHandle(vec_ptr);
+	}
+	inline SegmentHandle GetUpperHandle(IndexPointer upper_ptr) {
+		return upper_alloc->GetHandle(upper_ptr);
 	}
 
 	//! Get neighbor pointers and count for a given level
@@ -315,7 +444,11 @@ struct GraphIndexCore {
 	//! Allocate a new node with vector data, returns IndexPointer to node header
 	IndexPointer AllocateNode(row_t row_id, const float *vec, uint32_t dim, uint8_t level);
 
-	//! Free a node's allocator segments (vector, upper, node header).
+	//! Allocate a new node with vector data and metadata
+	IndexPointer AllocateNode(row_t row_id, const float *vec, uint32_t dim, uint8_t level,
+	                          const uint8_t *metadata);
+
+	//! Free a node's allocator segments (vector, upper, metadata, node header).
 	//! Does NOT update row_id_map or node_count — caller must handle those.
 	void FreeNode(IndexPointer node_ptr);
 
@@ -327,7 +460,7 @@ struct GraphIndexCore {
 	// ============================================================
 
 	void SearchLayer(const float *query, IndexPointer ep, int ef, int layer_num,
-	                 std::vector<GraphCandidate> &candidates, unordered_set<row_t> &visited,
+	                 std::vector<GraphCandidate> &candidates, VisitedSet &visited,
 	                 vex::distance_func_t distance_func);
 
 	std::vector<IndexPointer> SelectNeighbors(const std::vector<GraphCandidate> &candidates, int max_m,
@@ -361,6 +494,26 @@ struct GraphIndexCore {
 	void BruteForceSearch(const float *query_vec, idx_t k,
 	                      std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
 	                      vex::distance_func_t distance_func);
+
+	// ============================================================
+	// Filtered search (ACORN-style in-graph filtering)
+	// ============================================================
+
+	//! Filtered search with selectivity-based routing
+	void FilteredSearch(const float *query_vec, idx_t k, int ef,
+	                    std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                    vex::distance_func_t distance_func, const vex::FilterPredicate &filter,
+	                    idx_t brute_force_threshold = BRUTE_FORCE_THRESHOLD);
+
+	//! SearchLayer with optional filter predicate (ACORN-style)
+	void SearchLayerFiltered(const float *query, IndexPointer ep, int ef, int layer_num,
+	                         std::vector<GraphCandidate> &candidates, VisitedSet &visited,
+	                         vex::distance_func_t distance_func, const vex::FilterPredicate &filter);
+
+	//! Brute-force filtered search (for pre-filter strategy or small graphs)
+	void BruteForceFilteredSearch(const float *query_vec, idx_t k,
+	                              std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                              vex::distance_func_t distance_func, const vex::FilterPredicate &filter);
 
 	//! PQ-accelerated search
 	void SearchWithPQ(const float *query_vec, idx_t k, int ef,

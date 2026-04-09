@@ -1,0 +1,152 @@
+# name: test/sql/vex/index/graph_index_filtered_memory.test
+# description: Verify filtered GRAPH_INDEX does not have the memory explosion problem of per-partition HybridIndex
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Many distinct partition values — single GRAPH_INDEX
+# With HybridIndex, 500 distinct partitions would create 500 separate
+# HNSW graphs + 500 ART entries, causing massive memory overhead.
+# With filtered GRAPH_INDEX, there is ONE graph regardless of cardinality.
+# ============================================================
+
+statement ok
+CREATE TABLE high_cardinality (id INTEGER, vec FLOAT[8], partition_key INTEGER);
+
+# 500 rows with 500 distinct partition values (worst case for HybridIndex)
+statement ok
+INSERT INTO high_cardinality
+SELECT i,
+       list_value(
+           sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT,
+           sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+           sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT,
+           sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+       )::FLOAT[8],
+       i
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_hc ON high_cardinality USING GRAPH_INDEX (vec, partition_key);
+
+# Verify index was created
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_hc';
+----
+1
+
+# Verify filtered search works with high-cardinality partitions
+query I
+SELECT id FROM high_cardinality
+WHERE partition_key = 42
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+LIMIT 1;
+----
+42
+
+# Verify unfiltered search still works
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM high_cardinality
+    ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+    LIMIT 10
+);
+----
+10
+
+# ============================================================
+# Test 2: Memory usage check via duckdb_memory()
+# After indexing 500 rows with 500 distinct keys, memory should
+# be modest (single graph structure, not 500 separate graphs).
+# ============================================================
+
+# Capture memory usage
+query I
+SELECT (memory_usage_bytes < 50 * 1024 * 1024)::INTEGER
+FROM duckdb_memory()
+WHERE tag = 'ART_INDEX';
+----
+1
+
+# ============================================================
+# Test 3: Insert more rows with new partition values — memory stays bounded
+# ============================================================
+statement ok
+INSERT INTO high_cardinality
+SELECT i,
+       list_value(
+           cos(i * 0.1)::FLOAT, sin(i * 0.2)::FLOAT,
+           cos(i * 0.3)::FLOAT, sin(i * 0.4)::FLOAT,
+           cos(i * 0.5)::FLOAT, sin(i * 0.6)::FLOAT,
+           cos(i * 0.7)::FLOAT, sin(i * 0.8)::FLOAT
+       )::FLOAT[8],
+       i
+FROM range(500, 1000) t(i);
+
+# Now 1000 rows with 1000 distinct partition values
+query I
+SELECT COUNT(*) FROM high_cardinality;
+----
+1000
+
+# Memory should still be reasonable (no per-partition graph explosion)
+query I
+SELECT (memory_usage_bytes < 50 * 1024 * 1024)::INTEGER
+FROM duckdb_memory()
+WHERE tag = 'ART_INDEX';
+----
+1
+
+# Filtered search on a new partition value
+query I
+SELECT id FROM high_cardinality
+WHERE partition_key = 750
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+LIMIT 1;
+----
+750
+
+# ============================================================
+# Test 4: Compare with low-cardinality — similar memory footprint
+# A key advantage: memory does NOT scale with partition count.
+# ============================================================
+
+statement ok
+CREATE TABLE low_cardinality (id INTEGER, vec FLOAT[8], partition_key INTEGER);
+
+# 1000 rows with only 5 distinct partition values
+statement ok
+INSERT INTO low_cardinality
+SELECT i,
+       list_value(
+           sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT,
+           sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+           sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT,
+           sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+       )::FLOAT[8],
+       (i % 5)
+FROM range(1000) t(i);
+
+statement ok
+CREATE INDEX idx_lc ON low_cardinality USING GRAPH_INDEX (vec, partition_key);
+
+# Filtered search on low-cardinality data
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM low_cardinality
+    WHERE partition_key = 2
+    ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+    LIMIT 10
+) t;
+----
+10
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE high_cardinality;
+
+statement ok
+DROP TABLE low_cardinality;
