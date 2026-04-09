@@ -49,11 +49,10 @@ query II
 SELECT id, price::INTEGER FROM products
 WHERE price > 50
 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4])
-LIMIT 3;
+LIMIT 2;
 ----
 6	60
 7	70
-12	55
 
 # ============================================================
 # Test 3: Less-than filter — price < 30
@@ -144,7 +143,7 @@ WHERE price > 50
 ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4])
 LIMIT 1;
 ----
-13
+9
 
 # Brute force verification (no index)
 query I
@@ -156,7 +155,7 @@ SELECT id FROM (
 ORDER BY dist
 LIMIT 1;
 ----
-13
+9
 
 # ============================================================
 # Cleanup

@@ -1003,6 +1003,16 @@ static unique_ptr<vex::FilterPredicate> TryBuildFilterPredicate(
 						val_bytes[0] = bv;
 						break;
 					}
+					case LogicalTypeId::VARCHAR: {
+						auto str = StringValue::Get(filter_value);
+						uint64_t h = 0xcbf29ce484222325ULL;
+						for (auto c : str) {
+							h ^= static_cast<uint8_t>(c);
+							h *= 0x100000001b3ULL;
+						}
+						std::memcpy(val_bytes.data(), &h, std::min(desc.size, static_cast<uint32_t>(8)));
+						break;
+					}
 					default: {
 						try {
 							auto v = filter_value.DefaultCastAs(LogicalType::BIGINT);

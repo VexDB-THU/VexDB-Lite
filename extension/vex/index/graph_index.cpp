@@ -193,12 +193,20 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
 		vector<unique_ptr<Expression>> filter_select_list;
 		auto not_null_type = ExpressionType::OPERATOR_IS_NOT_NULL;
 
+		// Only filter NULL on the vector column (index 0).
+		// Metadata columns (index 1+) are allowed to be NULL.
 		for (idx_t i = 0; i < new_column_types.size() - 1; i++) {
 			filter_types.push_back(new_column_types[i]);
-			auto is_not_null_expr = make_uniq<BoundOperatorExpression>(not_null_type, LogicalType::BOOLEAN);
-			auto bound_ref = make_uniq<BoundReferenceExpression>(new_column_types[i], i);
-			is_not_null_expr->children.push_back(std::move(bound_ref));
-			filter_select_list.push_back(std::move(is_not_null_expr));
+			if (i == 0) {
+				// Vector column: NOT NULL filter
+				auto is_not_null_expr = make_uniq<BoundOperatorExpression>(not_null_type, LogicalType::BOOLEAN);
+				auto bound_ref = make_uniq<BoundReferenceExpression>(new_column_types[i], i);
+				is_not_null_expr->children.push_back(std::move(bound_ref));
+				filter_select_list.push_back(std::move(is_not_null_expr));
+			} else {
+				// Metadata columns: pass through (constant TRUE)
+				filter_select_list.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
+			}
 		}
 
 		prev_op = planner.Make<PhysicalFilter>(std::move(filter_types), std::move(filter_select_list),
@@ -1677,8 +1685,18 @@ void GraphIndex::SerializeMetaValue(const Value &val, LogicalTypeId type_id, uin
 		std::memcpy(dest, &v, 8);
 		break;
 	}
+	case LogicalTypeId::VARCHAR: {
+		// Store hash of string (8 bytes) — enables equality filtering on variable-length strings
+		auto str = StringValue::Get(val);
+		uint64_t h = 0xcbf29ce484222325ULL; // FNV-1a
+		for (auto c : str) {
+			h ^= static_cast<uint8_t>(c);
+			h *= 0x100000001b3ULL;
+		}
+		std::memcpy(dest, &h, std::min(size, static_cast<uint32_t>(8)));
+		break;
+	}
 	default: {
-		// For other types, try to cast to BIGINT and store as 8 bytes
 		try {
 			auto v = val.DefaultCastAs(LogicalType::BIGINT);
 			auto iv = BigIntValue::Get(v);
