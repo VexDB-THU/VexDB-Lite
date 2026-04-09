@@ -19,10 +19,11 @@ enum class HNSWAllocType : uint8_t {
 	NODE = 0,    // Node header + level-0 neighbors
 	VECTOR = 1,  // Vector float data
 	UPPER = 2,   // Upper-level neighbors (level 1+)
-	COUNT = 3
+	META = 3,    // Per-node metadata (filter columns)
+	COUNT = 4
 };
 
-static constexpr idx_t HNSW_ALLOCATOR_COUNT = 3;
+static constexpr idx_t HNSW_ALLOCATOR_COUNT = 4;
 
 // ============================================================
 // Allocator 0: Node header segment
@@ -37,7 +38,8 @@ struct HNSWNodeHeader {
 	uint16_t reserved;         // 2B - alignment padding
 	IndexPointer vector_ptr;   // 8B - points to VectorSegment
 	IndexPointer upper_ptr;    // 8B - points to UpperLevelSegment (null if level==0)
-	// Total fixed part: 32B
+	IndexPointer metadata_ptr; // 8B - points to MetadataSegment (null if no metadata)
+	// Total fixed part: 40B
 	// Followed by: IndexPointer level0_neighbors[M*2]
 
 	IndexPointer *GetLevel0Neighbors() {
@@ -52,7 +54,7 @@ struct HNSWNodeHeader {
 	}
 };
 
-static_assert(sizeof(HNSWNodeHeader) == 32, "HNSWNodeHeader must be 32 bytes");
+static_assert(sizeof(HNSWNodeHeader) == 40, "HNSWNodeHeader must be 40 bytes");
 
 // ============================================================
 // Allocator 1: Vector data segment

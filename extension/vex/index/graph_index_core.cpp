@@ -30,6 +30,13 @@ void GraphIndexCore::InitAllocators(BlockManager &block_manager) {
 	node_alloc->Get(p0);
 	vector_alloc->Get(p1);
 	upper_alloc->Get(p2);
+
+	// Initialize metadata allocator if metadata columns are defined
+	if (meta_segment_size > 0) {
+		meta_alloc = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(meta_segment_size), block_manager);
+		auto p3 = meta_alloc->New();
+		meta_alloc->Get(p3);
+	}
 }
 
 // ============================================================
@@ -40,6 +47,9 @@ void GraphIndexCore::BuildBufferCaches() {
 	node_cache_.Init(*node_alloc);
 	vec_cache_.Init(*vector_alloc);
 	upper_cache_.Init(*upper_alloc);
+	if (meta_alloc) {
+		meta_cache_.Init(*meta_alloc);
+	}
 
 	// Iterate all allocated nodes and pin their buffers
 	for (auto &pair : row_id_map) {
@@ -54,6 +64,9 @@ void GraphIndexCore::BuildBufferCaches() {
 		if (header->level > 0 && header->upper_ptr.Get()) {
 			upper_cache_.Pin(*upper_alloc, header->upper_ptr);
 		}
+		if (header->metadata_ptr.Get() && meta_alloc) {
+			meta_cache_.Pin(*meta_alloc, header->metadata_ptr);
+		}
 	}
 }
 
@@ -61,6 +74,7 @@ void GraphIndexCore::ClearBufferCaches() {
 	node_cache_.Clear();
 	vec_cache_.Clear();
 	upper_cache_.Clear();
+	meta_cache_.Clear();
 }
 
 // ============================================================
@@ -125,6 +139,7 @@ IndexPointer GraphIndexCore::AllocateNode(row_t row_id, const float *vec, uint32
 	header->reserved = 0;
 	header->vector_ptr = vec_ptr;
 	header->upper_ptr = IndexPointer(); // null
+	header->metadata_ptr = IndexPointer(); // null
 
 	// Allocate upper-level segment if needed
 	if (level > 0) {
@@ -132,6 +147,52 @@ IndexPointer GraphIndexCore::AllocateNode(row_t row_id, const float *vec, uint32
 		auto *upper = GetUpper(upper_ptr);
 		std::memset(upper, 0, vex::HNSWUpperLevel::SegmentSize(m));
 		header->upper_ptr = upper_ptr;
+	}
+
+	// Register in row_id_map
+	row_id_map[row_id] = node_ptr;
+
+	node_count++;
+	return node_ptr;
+}
+
+IndexPointer GraphIndexCore::AllocateNode(row_t row_id, const float *vec, uint32_t dim, uint8_t level,
+                                           const uint8_t *metadata) {
+	// Allocate node header
+	IndexPointer node_ptr = node_alloc->New();
+	auto *header = GetNode(node_ptr);
+	std::memset(header, 0, vex::HNSWNodeHeader::SegmentSize(m));
+
+	// Allocate vector data
+	IndexPointer vec_ptr = vector_alloc->New();
+	auto *vec_data = GetVector(vec_ptr);
+	std::memcpy(vec_data, vec, dim * sizeof(float));
+
+	// Fill header
+	header->row_id = row_id;
+	header->level = level;
+	header->deleted = 0;
+	header->level0_count = 0;
+	header->extra_row_count = 0;
+	header->reserved = 0;
+	header->vector_ptr = vec_ptr;
+	header->upper_ptr = IndexPointer(); // null
+	header->metadata_ptr = IndexPointer(); // null
+
+	// Allocate upper-level segment if needed
+	if (level > 0) {
+		IndexPointer upper_ptr = upper_alloc->New();
+		auto *upper = GetUpper(upper_ptr);
+		std::memset(upper, 0, vex::HNSWUpperLevel::SegmentSize(m));
+		header->upper_ptr = upper_ptr;
+	}
+
+	// Allocate metadata segment if metadata is provided and meta_alloc exists
+	if (metadata && meta_alloc && meta_segment_size > 0) {
+		IndexPointer meta_ptr = meta_alloc->New();
+		auto *meta_data = GetMeta(meta_ptr);
+		std::memcpy(meta_data, metadata, meta_segment_size);
+		header->metadata_ptr = meta_ptr;
 	}
 
 	// Register in row_id_map
@@ -152,6 +213,11 @@ void GraphIndexCore::FreeNode(IndexPointer node_ptr) {
 	// Free upper-level data
 	if (header->upper_ptr.Get()) {
 		upper_alloc->Free(header->upper_ptr);
+	}
+
+	// Free metadata
+	if (header->metadata_ptr.Get() && meta_alloc) {
+		meta_alloc->Free(header->metadata_ptr);
 	}
 
 	// Free node header
@@ -1441,6 +1507,7 @@ void GraphIndexCore::Clear() {
 	if (node_alloc) node_alloc->Reset();
 	if (vector_alloc) vector_alloc->Reset();
 	if (upper_alloc) upper_alloc->Reset();
+	if (meta_alloc) meta_alloc->Reset();
 	// Re-reserve slot 0 after reset, and mark buffers dirty (see InitAllocators comment)
 	if (node_alloc) {
 		auto p0 = node_alloc->New();
@@ -1449,6 +1516,10 @@ void GraphIndexCore::Clear() {
 		node_alloc->Get(p0);
 		vector_alloc->Get(p1);
 		upper_alloc->Get(p2);
+		if (meta_alloc) {
+			auto p3 = meta_alloc->New();
+			meta_alloc->Get(p3);
+		}
 	}
 	entry_point.Clear();
 	has_entry_point = false;
@@ -1462,6 +1533,293 @@ void GraphIndexCore::Clear() {
 }
 
 // C++11/14 out-of-line definitions for static constexpr members (required for ODR-use)
+// ============================================================
+// Filtered Search (ACORN-style in-graph filtering)
+// ============================================================
+
+void GraphIndexCore::SearchLayerFiltered(const float *query, IndexPointer ep, int ef, int layer_num,
+                                         std::vector<GraphCandidate> &candidates, VisitedSet &visited,
+                                         vex::distance_func_t distance_func, const vex::FilterPredicate &filter) {
+	std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::greater<GraphCandidate>> candidate_queue;
+	std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::less<GraphCandidate>> visited_queue;
+
+	auto *ep_header = GetNode(ep);
+	if (ep_header->deleted) return;
+
+	auto *ep_vec = GetVector(ep_header->vector_ptr);
+	float dist = distance_func(query, ep_vec, dimension);
+	candidate_queue.push({ep, dist});
+	visited.Insert(ep.Get());
+
+	// ACORN: entry point goes to visited_queue only if it matches the filter
+	auto *ep_meta = GetMeta(ep_header->metadata_ptr);
+	if (!ep_meta || filter.Matches(ep_meta)) {
+		visited_queue.push({ep, dist});
+	}
+
+	// Adaptively increase ef based on selectivity to ensure enough matching results
+	double selectivity = filter.Selectivity();
+	int adaptive_ef = ef;
+	if (selectivity > 0.0 && selectivity < 1.0) {
+		adaptive_ef = std::min(static_cast<int>(ef / selectivity), ef * 10);
+	}
+
+	while (!candidate_queue.empty()) {
+		auto current = candidate_queue.top();
+		candidate_queue.pop();
+
+		// Stop condition: use adaptive_ef for candidate expansion
+		if (static_cast<int>(visited_queue.size()) >= adaptive_ef &&
+		    !visited_queue.empty() && current.distance > visited_queue.top().distance) {
+			break;
+		}
+
+		auto *cur_header = GetNode(current.node_ptr);
+		if (layer_num > static_cast<int>(cur_header->level)) {
+			continue;
+		}
+
+		IndexPointer *neighbors;
+		uint16_t neighbor_count;
+		GetNeighbors(current.node_ptr, layer_num, neighbors, neighbor_count);
+		if (!neighbors) continue;
+
+		for (uint16_t i = 0; i < neighbor_count; i++) {
+			IndexPointer neighbor_ptr = neighbors[i];
+			if (!neighbor_ptr.Get()) continue;
+
+			auto *nb_header = GetNode(neighbor_ptr);
+			if (nb_header->deleted || !visited.Insert(neighbor_ptr.Get())) {
+				continue;
+			}
+
+			auto *nb_vec = GetVector(nb_header->vector_ptr);
+			float neighbor_dist = distance_func(query, nb_vec, dimension);
+
+			// ACORN: always add to candidate_queue for graph connectivity
+			candidate_queue.push({neighbor_ptr, neighbor_dist});
+
+			// Only add matching nodes to the result set (visited_queue)
+			auto *nb_meta = GetMeta(nb_header->metadata_ptr);
+			if (nb_meta && !filter.Matches(nb_meta)) {
+				continue; // skip non-matching nodes for results
+			}
+
+			if (static_cast<int>(visited_queue.size()) < adaptive_ef ||
+			    neighbor_dist < visited_queue.top().distance) {
+				visited_queue.push({neighbor_ptr, neighbor_dist});
+				if (static_cast<int>(visited_queue.size()) > adaptive_ef) {
+					visited_queue.pop();
+				}
+			}
+		}
+	}
+
+	candidates.clear();
+	while (!visited_queue.empty()) {
+		auto &c = visited_queue.top();
+		auto *h = GetNode(c.node_ptr);
+		if (!h->deleted) {
+			candidates.push_back(c);
+		}
+		visited_queue.pop();
+	}
+}
+
+void GraphIndexCore::BruteForceFilteredSearch(const float *query_vec, idx_t k,
+                                               std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+                                               vex::distance_func_t distance_func, const vex::FilterPredicate &filter) {
+	std::vector<GraphCandidate> all;
+	all.reserve(node_count);
+
+	unordered_set<idx_t> seen_nodes;
+	for (auto &pair : row_id_map) {
+		if (seen_nodes.find(pair.second.Get()) != seen_nodes.end()) continue;
+		seen_nodes.insert(pair.second.Get());
+		auto *header = GetNode(pair.second);
+		if (header->deleted) continue;
+
+		// Apply filter
+		auto *meta = GetMeta(header->metadata_ptr);
+		if (meta && !filter.Matches(meta)) continue;
+
+		auto *vec = GetVector(header->vector_ptr);
+		float dist = distance_func(query_vec, vec, dimension);
+		all.push_back({pair.second, dist});
+	}
+
+	std::sort(all.begin(), all.end(),
+	          [this](const GraphCandidate &a, const GraphCandidate &b) {
+		          if (a.distance != b.distance) return a.distance < b.distance;
+		          return GetNode(a.node_ptr)->row_id < GetNode(b.node_ptr)->row_id;
+	          });
+
+	idx_t count = std::min(k, static_cast<idx_t>(all.size()));
+	for (idx_t i = 0; i < count && out_row_ids.size() < k; i++) {
+		auto *h = GetNode(all[i].node_ptr);
+		out_row_ids.push_back(h->row_id);
+		out_distances.push_back(all[i].distance);
+		if (h->extra_row_count > 0 && out_row_ids.size() < k) {
+			auto dit = dedup_map_.find(all[i].node_ptr.Get());
+			if (dit != dedup_map_.end()) {
+				for (auto &extra_rid : dit->second) {
+					if (out_row_ids.size() >= k) break;
+					out_row_ids.push_back(extra_rid);
+					out_distances.push_back(all[i].distance);
+				}
+			}
+		}
+	}
+}
+
+void GraphIndexCore::FilteredSearch(const float *query_vec, idx_t k, int ef,
+                                     std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+                                     vex::distance_func_t distance_func, const vex::FilterPredicate &filter,
+                                     idx_t brute_force_threshold) {
+	if (!has_entry_point || node_count == 0) return;
+
+	double selectivity = filter.Selectivity();
+
+	// Strategy routing based on selectivity
+	// PRE_FILTER: very selective queries on large graphs -> brute-force scan matching nodes
+	if (selectivity < 0.01 && node_count > 10000) {
+		BruteForceFilteredSearch(query_vec, k, out_row_ids, out_distances, distance_func, filter);
+		return;
+	}
+
+	// Small graph: always brute force
+	if (node_count <= brute_force_threshold) {
+		BruteForceFilteredSearch(query_vec, k, out_row_ids, out_distances, distance_func, filter);
+		return;
+	}
+
+	// POST_FILTER: nearly unselective -> standard ANN + post-filter
+	if (selectivity > 0.90) {
+		// Over-fetch to account for post-filter losses
+		idx_t fetch_k = std::min(static_cast<idx_t>(k / selectivity) + k, node_count);
+		int post_ef = std::max(ef, static_cast<int>(fetch_k));
+
+		IndexPointer ep = entry_point;
+		auto *ep_header = GetNode(ep);
+		if (ep_header->deleted) {
+			int best_level = -1;
+			for (auto &pair : row_id_map) {
+				auto *h = GetNode(pair.second);
+				if (!h->deleted && static_cast<int>(h->level) > best_level) {
+					ep = pair.second;
+					best_level = h->level;
+				}
+			}
+			if (best_level < 0) return;
+		}
+
+		VisitedSet visited(std::max(node_count, idx_t(128)));
+		std::vector<GraphCandidate> candidates;
+
+		for (int level = max_level; level > 0; level--) {
+			candidates.clear();
+			visited.Clear();
+			SearchLayer(query_vec, ep, 1, level, candidates, visited, distance_func);
+			if (!candidates.empty()) {
+				std::sort(candidates.begin(), candidates.end(),
+				          [](const GraphCandidate &a, const GraphCandidate &b) { return a.distance < b.distance; });
+				ep = candidates[0].node_ptr;
+			}
+		}
+
+		candidates.clear();
+		visited.Clear();
+		SearchLayer(query_vec, ep, post_ef, 0, candidates, visited, distance_func);
+
+		// Post-filter
+		std::sort(candidates.begin(), candidates.end(),
+		          [this](const GraphCandidate &a, const GraphCandidate &b) {
+			          if (a.distance != b.distance) return a.distance < b.distance;
+			          return GetNode(a.node_ptr)->row_id < GetNode(b.node_ptr)->row_id;
+		          });
+
+		for (auto &c : candidates) {
+			if (out_row_ids.size() >= k) break;
+			auto *h = GetNode(c.node_ptr);
+			auto *meta = GetMeta(h->metadata_ptr);
+			if (meta && !filter.Matches(meta)) continue;
+			out_row_ids.push_back(h->row_id);
+			out_distances.push_back(c.distance);
+			if (h->extra_row_count > 0 && out_row_ids.size() < k) {
+				auto dit = dedup_map_.find(c.node_ptr.Get());
+				if (dit != dedup_map_.end()) {
+					for (auto &extra_rid : dit->second) {
+						if (out_row_ids.size() >= k) break;
+						out_row_ids.push_back(extra_rid);
+						out_distances.push_back(c.distance);
+					}
+				}
+			}
+		}
+		return;
+	}
+
+	// IN_GRAPH_FILTER: ACORN-style filtered graph traversal
+	int actual_ef = (ef > 0) ? ef : GraphIndexConfig::DEFAULT_EF_SEARCH;
+
+	IndexPointer ep = entry_point;
+	auto *ep_header = GetNode(ep);
+	if (ep_header->deleted) {
+		int best_level = -1;
+		for (auto &pair : row_id_map) {
+			auto *h = GetNode(pair.second);
+			if (!h->deleted && static_cast<int>(h->level) > best_level) {
+				ep = pair.second;
+				best_level = h->level;
+			}
+		}
+		if (best_level < 0) return;
+	}
+
+	VisitedSet visited(std::max(node_count, idx_t(128)));
+	std::vector<GraphCandidate> candidates;
+
+	// Upper levels: unfiltered greedy descent
+	for (int level = max_level; level > 0; level--) {
+		candidates.clear();
+		visited.Clear();
+		SearchLayer(query_vec, ep, 1, level, candidates, visited, distance_func);
+		if (!candidates.empty()) {
+			std::sort(candidates.begin(), candidates.end(),
+			          [](const GraphCandidate &a, const GraphCandidate &b) { return a.distance < b.distance; });
+			ep = candidates[0].node_ptr;
+		}
+	}
+
+	// Level 0: filtered search
+	candidates.clear();
+	visited.Clear();
+	SearchLayerFiltered(query_vec, ep, std::max(actual_ef, static_cast<int>(k)), 0,
+	                    candidates, visited, distance_func, filter);
+
+	std::sort(candidates.begin(), candidates.end(),
+	          [this](const GraphCandidate &a, const GraphCandidate &b) {
+		          if (a.distance != b.distance) return a.distance < b.distance;
+		          return GetNode(a.node_ptr)->row_id < GetNode(b.node_ptr)->row_id;
+	          });
+
+	for (idx_t i = 0; i < candidates.size() && out_row_ids.size() < k; i++) {
+		auto *h = GetNode(candidates[i].node_ptr);
+		out_row_ids.push_back(h->row_id);
+		out_distances.push_back(candidates[i].distance);
+		if (h->extra_row_count > 0 && out_row_ids.size() < k) {
+			auto dit = dedup_map_.find(candidates[i].node_ptr.Get());
+			if (dit != dedup_map_.end()) {
+				for (auto &extra_rid : dit->second) {
+					if (out_row_ids.size() >= k) break;
+					out_row_ids.push_back(extra_rid);
+					out_distances.push_back(candidates[i].distance);
+				}
+			}
+		}
+	}
+}
+
 constexpr int GraphIndexConfig::DEFAULT_M;
 constexpr int GraphIndexConfig::MIN_M;
 constexpr int GraphIndexConfig::MAX_M;

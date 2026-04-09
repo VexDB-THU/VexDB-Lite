@@ -233,39 +233,3 @@ WHERE sub.id = sub.found_id;
 
 statement ok
 DROP TABLE t_self;
-
-# ============================================================
-# Test 6: HybridIndex invariant — per-partition consistency
-# ============================================================
-
-statement ok
-CREATE TABLE t_hybrid_inv (id INTEGER, cat VARCHAR, vec FLOAT[4]);
-
-statement ok
-CREATE INDEX idx_hybrid_inv ON t_hybrid_inv USING HYBRID_INDEX (vec, cat);
-
-statement ok
-INSERT INTO t_hybrid_inv SELECT i, 'x', list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
-FROM range(1, 101) t(i);
-
-statement ok
-INSERT INTO t_hybrid_inv SELECT i, 'y', list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
-FROM range(101, 201) t(i);
-
-# Every partition must satisfy the invariant
-query I
-SELECT bool_and(node_count <= row_id_map_size) FROM vex_index_info() WHERE index_name = 'idx_hybrid_inv';
-----
-true
-
-# DELETE from one partition
-statement ok
-DELETE FROM t_hybrid_inv WHERE cat = 'x' AND id <= 50;
-
-query I
-SELECT bool_and(node_count <= row_id_map_size) FROM vex_index_info() WHERE index_name = 'idx_hybrid_inv';
-----
-true
-
-statement ok
-DROP TABLE t_hybrid_inv;

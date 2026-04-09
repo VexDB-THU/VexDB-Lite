@@ -1,8 +1,6 @@
 #include "vex_optimizer.hpp"
 #include "vex_graph_index.hpp"
-#ifdef VEX_ENABLE_HYBRID_INDEX
-#include "vex_hybrid_index.hpp"
-#endif
+#include "vex_filter_predicate.hpp"
 #include "vex_distance.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -387,9 +385,6 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 
 struct IndexMatch {
 	GraphIndex *graph_idx = nullptr;
-#ifdef VEX_ENABLE_HYBRID_INDEX
-	HybridIndex *hybrid_idx = nullptr;
-#endif
 };
 
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
@@ -411,11 +406,7 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 	for (auto &index : storage.GetDataTableInfo()->GetIndexes().Indexes()) {
 		if (!index.IsBound()) {
 			auto &idx_type = index.GetIndexType();
-			if (idx_type == GraphIndex::TYPE_NAME
-#ifdef VEX_ENABLE_HYBRID_INDEX
-			    || idx_type == HybridIndex::TYPE_NAME
-#endif
-			    ) {
+			if (idx_type == GraphIndex::TYPE_NAME) {
 				for (auto &idx_col : index.GetColumnIds()) {
 					if (idx_col == physical_col_id) {
 						needs_bind = true;
@@ -443,36 +434,19 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 			if (index.Cast<GraphIndex>().GetMetric() != query_metric) {
 				continue; // metric mismatch, continue scanning
 			}
-			for (auto &idx_col : index.GetColumnIds()) {
-				if (idx_col == physical_col_id) {
-					match.graph_idx = &index.Cast<GraphIndex>();
-					found_match = true;
-					break;
-				}
-			}
-		}
-#ifdef VEX_ENABLE_HYBRID_INDEX
-		else if (index.GetIndexType() == HybridIndex::TYPE_NAME) {
-			if (index.Cast<HybridIndex>().GetMetric() != query_metric) {
-				continue; // metric mismatch, continue scanning
-			}
+			// Match on vector column (first column of the index)
 			auto &idx_col_ids = index.GetColumnIds();
 			if (!idx_col_ids.empty() && idx_col_ids[0] == physical_col_id) {
-				match.hybrid_idx = &index.Cast<HybridIndex>();
+				match.graph_idx = &index.Cast<GraphIndex>();
 				found_match = true;
 			}
 		}
-#endif
 		if (found_match) {
 			break;
 		}
 	}
 
-	return match.graph_idx
-#ifdef VEX_ENABLE_HYBRID_INDEX
-	       || match.hybrid_idx
-#endif
-	       ;
+	return match.graph_idx != nullptr;
 }
 
 //===--------------------------------------------------------------------===//
@@ -481,77 +455,20 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 
 static bool ExecuteANNSearch(ClientContext &context, const IndexMatch &match, LogicalGet *get,
                              const float *query_vec, idx_t k,
-                             vector<row_t> &result_row_ids, vector<float> &result_distances) {
+                             vector<row_t> &result_row_ids, vector<float> &result_distances,
+                             const vex::FilterPredicate *filter = nullptr) {
 	int ef = GetEfSearch(context, k);
 	idx_t bf_threshold = GetBruteForceThreshold(context);
 
-	if (match.graph_idx) {
-		match.graph_idx->ANNSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
-	}
-#ifdef VEX_ENABLE_HYBRID_INDEX
-	else if (match.hybrid_idx) {
-		bool filtered = false;
-		auto &idx_col_ids = match.hybrid_idx->GetColumnIds();
-		if (idx_col_ids.size() >= 2) {
-			column_t filter_physical_col = idx_col_ids[1];
-			auto &column_ids = get->GetColumnIds();
-			idx_t filter_logical_col = DConstants::INVALID_INDEX;
-			for (idx_t i = 0; i < column_ids.size(); i++) {
-				if (column_ids[i].GetPrimaryIndex() == filter_physical_col) {
-					filter_logical_col = i;
-					break;
-				}
-			}
-
-			if (filter_logical_col != DConstants::INVALID_INDEX) {
-				auto &table_filters = get->table_filters;
-				auto filter_it = table_filters.filters.find(filter_logical_col);
-				if (filter_it != table_filters.filters.end()) {
-					auto &tf = *filter_it->second;
-					if (tf.filter_type == TableFilterType::CONSTANT_COMPARISON) {
-						auto &const_filter = tf.Cast<ConstantFilter>();
-						if (const_filter.comparison_type == ExpressionType::COMPARE_EQUAL) {
-							string partition_key = HybridIndex::ValueToPartitionKey(const_filter.constant);
-							match.hybrid_idx->FilteredSearch(partition_key, query_vec, k, ef,
-							                                 result_row_ids, result_distances, bf_threshold);
-							filtered = true;
-						}
-					} else if (tf.filter_type == TableFilterType::IN_FILTER) {
-						auto &in_filter = tf.Cast<InFilter>();
-						// Search each partition in the IN list, then merge top-k
-						std::vector<std::pair<row_t, float>> all_results;
-						for (auto &val : in_filter.values) {
-							string partition_key = HybridIndex::ValueToPartitionKey(val);
-							std::vector<row_t> part_ids;
-							std::vector<float> part_dists;
-							match.hybrid_idx->FilteredSearch(partition_key, query_vec, k, ef,
-							                                 part_ids, part_dists, bf_threshold);
-							for (idx_t i = 0; i < part_ids.size(); i++) {
-								all_results.push_back(std::make_pair(part_ids[i], part_dists[i]));
-							}
-						}
-						std::sort(all_results.begin(), all_results.end(),
-						          [](const std::pair<row_t, float> &a, const std::pair<row_t, float> &b) {
-							          return a.second < b.second;
-						          });
-						idx_t count = std::min(k, static_cast<idx_t>(all_results.size()));
-						for (idx_t i = 0; i < count; i++) {
-							result_row_ids.push_back(all_results[i].first);
-							result_distances.push_back(all_results[i].second);
-						}
-						filtered = true;
-					}
-				}
-			}
-		}
-
-		if (!filtered) {
-			match.hybrid_idx->GlobalSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
-		}
-	}
-#endif
-	else {
+	if (!match.graph_idx) {
 		return false;
+	}
+
+	if (filter) {
+		match.graph_idx->FilteredSearch(query_vec, k, ef, result_row_ids, result_distances,
+		                                *filter, bf_threshold);
+	} else {
+		match.graph_idx->ANNSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
 	}
 
 	return !result_row_ids.empty();
@@ -648,9 +565,12 @@ static void ReplacePlanWithResults(unique_ptr<LogicalOperator> &node, unique_ptr
 	}
 }
 
-// Forward declaration
+// Forward declarations
 static bool TryExtractEqualityFilter(const Expression &expr, idx_t table_index,
                                      idx_t &out_col_index, Value &out_value);
+static unique_ptr<vex::FilterPredicate> TryBuildFilterPredicate(
+    const Expression &filter_expr, idx_t table_index, GraphIndex &graph_idx,
+    const vector<ColumnIndex> &column_ids);
 
 //===--------------------------------------------------------------------===//
 // Shared: core ANN optimization logic
@@ -692,20 +612,6 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 
 	IndexMatch match;
 	if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index, dist_info.func_expr->function.name, match)) {
-		return false;
-	}
-
-	// If there's a FILTER node but the index is a plain GRAPH_INDEX (not hybrid),
-	// we cannot apply the filter through ANN search — skip optimization to let
-	// the regular plan handle it (full scan + filter).
-	if (get_info.filter
-#ifdef VEX_ENABLE_HYBRID_INDEX
-	    && !match.hybrid_idx
-#endif
-	    ) {
-#ifdef VEX_OPTIMIZER_DEBUG
-		std::cerr << "[VEX] TryOptimizeANN: skipping — FILTER present but index is not hybrid" << std::endl;
-#endif
 		return false;
 	}
 
@@ -769,38 +675,33 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 	idx_t k = limit + offset;
 	vector<row_t> result_row_ids;
 	vector<float> result_distances;
-	int ef = GetEfSearch(context, k);
-	idx_t bf_threshold = GetBruteForceThreshold(context);
 
-	// For hybrid index with a FILTER node (pre-optimize: filter not yet pushed to GET)
-	bool did_filtered_search = false;
-#ifdef VEX_ENABLE_HYBRID_INDEX
 #ifdef VEX_OPTIMIZER_DEBUG
-	std::cerr << "[VEX] TryOptimizeANN: hybrid_idx=" << (match.hybrid_idx != nullptr)
-	          << " filter=" << (get_info.filter != nullptr)
-	          << " filter_exprs=" << (get_info.filter ? get_info.filter->expressions.size() : 0) << std::endl;
+	std::cerr << "[VEX] TryOptimizeANN: filter=" << (get_info.filter != nullptr)
+	          << " graph_idx=" << (match.graph_idx != nullptr)
+	          << " has_meta=" << (match.graph_idx ? match.graph_idx->HasMetadataColumns() : false)
+	          << std::endl;
 #endif
-	if (match.hybrid_idx && get_info.filter && get_info.filter->expressions.size() == 1) {
-		auto &idx_col_ids = match.hybrid_idx->GetColumnIds();
-		if (idx_col_ids.size() >= 2) {
-			column_t filter_physical_col = idx_col_ids[1];
+	// Try to extract filter predicate from FILTER node for filtered HNSW search
+	unique_ptr<vex::FilterPredicate> filter_pred;
+	bool did_filtered_search = false;
 
-			idx_t filter_col_index = 0;
-			Value filter_value;
-			if (TryExtractEqualityFilter(*get_info.filter->expressions[0], get->table_index,
-			                             filter_col_index, filter_value)) {
-				// Verify the filter column matches the hybrid index partition column
-				if (filter_col_index < column_ids.size() &&
-				    column_ids[filter_col_index].GetPrimaryIndex() == filter_physical_col) {
-					string partition_key = HybridIndex::ValueToPartitionKey(filter_value);
-					match.hybrid_idx->FilteredSearch(partition_key, dist_info.query_vec.data(), k, ef,
-					                                 result_row_ids, result_distances, bf_threshold);
-					did_filtered_search = true;
-				}
-			}
+	if (get_info.filter && match.graph_idx && match.graph_idx->HasMetadataColumns() &&
+	    get_info.filter->expressions.size() == 1) {
+		filter_pred = TryBuildFilterPredicate(*get_info.filter->expressions[0],
+		                                     get->table_index, *match.graph_idx, column_ids);
+#ifdef VEX_OPTIMIZER_DEBUG
+		std::cerr << "[VEX] TryOptimizeANN: filter_pred=" << (filter_pred != nullptr) << std::endl;
+#endif
+		if (filter_pred) {
+			int ef = GetEfSearch(context, k);
+			idx_t bf_threshold = GetBruteForceThreshold(context);
+			match.graph_idx->FilteredSearch(dist_info.query_vec.data(), k, ef,
+			                               result_row_ids, result_distances,
+			                               *filter_pred, bf_threshold);
+			did_filtered_search = true;
 		}
 	}
-#endif
 
 	// If there's a FILTER node but we couldn't apply it through the index,
 	// we MUST bail out. Otherwise ReplacePlanWithResults will drop the FILTER
@@ -813,8 +714,6 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 	}
 
 	// If filtered search returned empty, fall back to regular plan.
-	// Empty could mean the partition has no items OR HNSW search missed remaining items after delete.
-	// Either way, the regular plan (full scan + filter) will produce correct results.
 	if (did_filtered_search && result_row_ids.empty()) {
 #ifdef VEX_OPTIMIZER_DEBUG
 		std::cerr << "[VEX] TryOptimizeANN: filtered search returned empty, falling back to regular plan" << std::endl;
@@ -822,7 +721,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 		return false;
 	}
 
-	// Fallback: use ExecuteANNSearch (handles table_filters for post-optimize, or global search)
+	// Fallback: use ExecuteANNSearch (unfiltered)
 	if (!did_filtered_search && result_row_ids.empty()) {
 		if (!ExecuteANNSearch(context, match, get, dist_info.query_vec.data(), k, result_row_ids, result_distances)) {
 			return false;
@@ -990,7 +889,7 @@ bool VexOptimizerExtension::TryOptimizeLimitOrderBy(ClientContext &context, uniq
 }
 
 //===--------------------------------------------------------------------===//
-// Pattern: TOP_N -> FILTER -> GET  (hybrid filtered search)
+// Filter predicate extraction from FILTER expressions
 //===--------------------------------------------------------------------===//
 
 static bool TryExtractEqualityFilter(const Expression &expr, idx_t table_index,
@@ -1037,5 +936,92 @@ static bool TryExtractEqualityFilter(const Expression &expr, idx_t table_index,
 	return false;
 }
 
+static unique_ptr<vex::FilterPredicate> TryBuildFilterPredicate(
+    const Expression &filter_expr, idx_t table_index, GraphIndex &graph_idx,
+    const vector<ColumnIndex> &column_ids) {
+#ifdef VEX_OPTIMIZER_DEBUG
+	std::cerr << "[VEX] TryBuildFilterPredicate: HasMetadataColumns=" << graph_idx.HasMetadataColumns()
+	          << " meta_col_ids.size=" << graph_idx.GetMetadataColumnIds().size()
+	          << " column_ids.size=" << column_ids.size() << std::endl;
+#endif
+	if (!graph_idx.HasMetadataColumns()) return nullptr;
+
+	auto &meta_col_ids = graph_idx.GetMetadataColumnIds();
+	auto &meta_cols = graph_idx.GetMetaColumns();
+	auto &meta_col_types = graph_idx.GetMetadataColumnTypes();
+
+	// Try equality filter: col = constant
+	idx_t col_index;
+	Value filter_value;
+	if (TryExtractEqualityFilter(filter_expr, table_index, col_index, filter_value)) {
+#ifdef VEX_OPTIMIZER_DEBUG
+		std::cerr << "[VEX] TryBuildFilterPredicate: equality filter found col_index=" << col_index
+		          << " value=" << filter_value.ToString() << std::endl;
+#endif
+		if (col_index < column_ids.size()) {
+			column_t physical_col = column_ids[col_index].GetPrimaryIndex();
+#ifdef VEX_OPTIMIZER_DEBUG
+			std::cerr << "[VEX] TryBuildFilterPredicate: physical_col=" << physical_col << std::endl;
+			for (idx_t m = 0; m < meta_col_ids.size(); m++) {
+				std::cerr << "[VEX]   meta_col_ids[" << m << "]=" << meta_col_ids[m] << std::endl;
+			}
+#endif
+			for (idx_t m = 0; m < meta_col_ids.size(); m++) {
+				if (meta_col_ids[m] == physical_col) {
+					auto &desc = meta_cols[m];
+					// Serialize the filter value to raw bytes
+					std::vector<uint8_t> val_bytes(desc.size, 0);
+					auto type_id = meta_col_types[m].id();
+					switch (type_id) {
+					case LogicalTypeId::INTEGER: {
+						auto v = filter_value.DefaultCastAs(LogicalType::INTEGER);
+						auto iv = IntegerValue::Get(v);
+						std::memcpy(val_bytes.data(), &iv, 4);
+						break;
+					}
+					case LogicalTypeId::BIGINT: {
+						auto v = filter_value.DefaultCastAs(LogicalType::BIGINT);
+						auto iv = BigIntValue::Get(v);
+						std::memcpy(val_bytes.data(), &iv, 8);
+						break;
+					}
+					case LogicalTypeId::FLOAT: {
+						auto v = filter_value.DefaultCastAs(LogicalType::FLOAT);
+						auto fv = FloatValue::Get(v);
+						std::memcpy(val_bytes.data(), &fv, 4);
+						break;
+					}
+					case LogicalTypeId::DOUBLE: {
+						auto v = filter_value.DefaultCastAs(LogicalType::DOUBLE);
+						auto dv = DoubleValue::Get(v);
+						std::memcpy(val_bytes.data(), &dv, 8);
+						break;
+					}
+					case LogicalTypeId::BOOLEAN: {
+						auto v = filter_value.DefaultCastAs(LogicalType::BOOLEAN);
+						uint8_t bv = BooleanValue::Get(v) ? 1 : 0;
+						val_bytes[0] = bv;
+						break;
+					}
+					default: {
+						try {
+							auto v = filter_value.DefaultCastAs(LogicalType::BIGINT);
+							auto iv = BigIntValue::Get(v);
+							std::memcpy(val_bytes.data(), &iv, std::min(desc.size, static_cast<uint32_t>(8)));
+						} catch (...) {
+							return nullptr;
+						}
+						break;
+					}
+					}
+					return make_uniq<vex::EqualityFilter>(desc.offset, desc.size,
+					                                     val_bytes.data(), 0.1);
+				}
+			}
+		}
+	}
+
+	return nullptr;
+}
 
 } // namespace duckdb

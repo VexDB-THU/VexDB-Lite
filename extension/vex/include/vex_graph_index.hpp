@@ -5,6 +5,7 @@
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/common/types/vector.hpp"
 #include "vex_graph_index_core.hpp"
+#include "vex_filter_predicate.hpp"
 
 #include <random>
 #include <mutex>
@@ -49,8 +50,10 @@ public:
 	void BuildConcurrent(DataChunk &chunk, Vector &row_ids);
 	//! Parallel bulk build: allocate all nodes first, then insert in parallel using std::thread.
 	//! Called from Finalize with all accumulated vectors.
+	//! all_metadata: optional flat byte array with meta_segment_size bytes per row.
 	void BuildParallel(const std::vector<float> &all_vectors, const std::vector<row_t> &all_row_ids,
-	                   idx_t total_count, uint32_t dim, int num_threads);
+	                   idx_t total_count, uint32_t dim, int num_threads,
+	                   const std::vector<uint8_t> &all_metadata = {});
 
 	// BoundIndex interface
 	ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -81,6 +84,27 @@ public:
 	               std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
 	               idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
 
+	//! Filtered ANN search with a predicate applied to metadata columns
+	void FilteredSearch(const float *query_vec, idx_t k, int ef,
+	                    std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                    const vex::FilterPredicate &filter,
+	                    idx_t brute_force_threshold = GraphIndexCore::BRUTE_FORCE_THRESHOLD);
+
+	//! Check if this index has metadata columns
+	bool HasMetadataColumns() const { return !meta_col_types_.empty(); }
+
+	//! Get metadata column types (for optimizer to verify filter columns)
+	const std::vector<LogicalType> &GetMetadataColumnTypes() const { return meta_col_types_; }
+
+	//! Get metadata column IDs (physical column IDs in the table)
+	const std::vector<column_t> &GetMetadataColumnIds() const { return meta_col_ids_; }
+
+	//! Get metadata column schema descriptors
+	const std::vector<vex::MetaColumnDesc> &GetMetaColumns() const { return graph_.meta_columns; }
+
+	//! Extract metadata bytes from a DataChunk row into a buffer
+	void ExtractMetadata(DataChunk &chunk, idx_t row_idx, uint8_t *meta_buf);
+
 	// Index Scan Interface
 	static unique_ptr<IndexScanState> TryInitializeScan(const Expression &expr, const Expression &filter_expr);
 	bool Scan(IndexScanState &state, idx_t max_count, set<row_t> &row_ids);
@@ -93,7 +117,7 @@ public:
 		return graph_.max_level;
 	}
 
-	//! Access to graph core (for HybridIndex and testing)
+	//! Access to graph core (for testing and index info)
 	GraphIndexCore &GetGraphCore() {
 		return graph_;
 	}
@@ -146,6 +170,14 @@ private:
 
 	std::mutex rng_mutex_;              //! Mutex for thread-safe random level generation
 	std::once_flag dimension_init_flag_; //! For one-time dimension initialization
+
+	//! Metadata column types (extra columns after the vector column in CREATE INDEX)
+	std::vector<LogicalType> meta_col_types_;
+	//! Metadata column IDs (physical column IDs in the table)
+	std::vector<column_t> meta_col_ids_;
+
+	//! Serialize metadata value to raw bytes for storage in meta_alloc
+	void SerializeMetaValue(const Value &val, LogicalTypeId type_id, uint8_t *dest, uint32_t size);
 };
 
 } // namespace duckdb

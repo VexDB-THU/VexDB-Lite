@@ -7,6 +7,7 @@
 #include "duckdb/execution/index/fixed_size_allocator.hpp"
 #include "duckdb/execution/index/index_pointer.hpp"
 #include "vex_distance.hpp"
+#include "vex_filter_predicate.hpp"
 #include "vex_hnsw_node.hpp"
 #include "vex_quantizer.hpp"
 
@@ -301,6 +302,13 @@ struct GraphIndexCore {
 	unique_ptr<FixedSizeAllocator> node_alloc;    // Allocator 0: Node headers
 	unique_ptr<FixedSizeAllocator> vector_alloc;   // Allocator 1: Vector data
 	unique_ptr<FixedSizeAllocator> upper_alloc;    // Allocator 2: Upper-level neighbors
+	unique_ptr<FixedSizeAllocator> meta_alloc;     // Allocator 3: Per-node metadata (filter columns)
+
+	//! Metadata segment size (0 = no metadata columns)
+	uint32_t meta_segment_size = 0;
+
+	//! Metadata column schema (describes layout within each meta segment)
+	std::vector<vex::MetaColumnDesc> meta_columns;
 
 	//! Row ID → IndexPointer mapping for O(1) node lookup (needed by Delete)
 	//! With dedup, multiple row_ids (primary + extras) map to the same node_ptr.
@@ -355,6 +363,7 @@ struct GraphIndexCore {
 	BufferPtrCache node_cache_;
 	BufferPtrCache vec_cache_;
 	BufferPtrCache upper_cache_;
+	BufferPtrCache meta_cache_;
 
 	//! Build buffer caches for all allocated nodes (call single-threaded before parallel ops)
 	void BuildBufferCaches();
@@ -405,6 +414,15 @@ struct GraphIndexCore {
 		return reinterpret_cast<vex::HNSWUpperLevel *>(upper_alloc->Get(upper_ptr));
 	}
 
+	//! Get metadata for a node (returns nullptr if no metadata)
+	inline uint8_t *GetMeta(IndexPointer meta_ptr) {
+		if (!meta_ptr.Get()) return nullptr;
+		if (meta_cache_.IsActive()) {
+			return meta_cache_.Get(meta_ptr);
+		}
+		return meta_alloc->Get(meta_ptr);
+	}
+
 	//! RAII handle versions — buffer is unpinned when handle is destroyed (if clean + on-disk)
 	inline SegmentHandle GetNodeHandle(IndexPointer ptr) {
 		return node_alloc->GetHandle(ptr);
@@ -426,7 +444,11 @@ struct GraphIndexCore {
 	//! Allocate a new node with vector data, returns IndexPointer to node header
 	IndexPointer AllocateNode(row_t row_id, const float *vec, uint32_t dim, uint8_t level);
 
-	//! Free a node's allocator segments (vector, upper, node header).
+	//! Allocate a new node with vector data and metadata
+	IndexPointer AllocateNode(row_t row_id, const float *vec, uint32_t dim, uint8_t level,
+	                          const uint8_t *metadata);
+
+	//! Free a node's allocator segments (vector, upper, metadata, node header).
 	//! Does NOT update row_id_map or node_count — caller must handle those.
 	void FreeNode(IndexPointer node_ptr);
 
@@ -472,6 +494,26 @@ struct GraphIndexCore {
 	void BruteForceSearch(const float *query_vec, idx_t k,
 	                      std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
 	                      vex::distance_func_t distance_func);
+
+	// ============================================================
+	// Filtered search (ACORN-style in-graph filtering)
+	// ============================================================
+
+	//! Filtered search with selectivity-based routing
+	void FilteredSearch(const float *query_vec, idx_t k, int ef,
+	                    std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                    vex::distance_func_t distance_func, const vex::FilterPredicate &filter,
+	                    idx_t brute_force_threshold = BRUTE_FORCE_THRESHOLD);
+
+	//! SearchLayer with optional filter predicate (ACORN-style)
+	void SearchLayerFiltered(const float *query, IndexPointer ep, int ef, int layer_num,
+	                         std::vector<GraphCandidate> &candidates, VisitedSet &visited,
+	                         vex::distance_func_t distance_func, const vex::FilterPredicate &filter);
+
+	//! Brute-force filtered search (for pre-filter strategy or small graphs)
+	void BruteForceFilteredSearch(const float *query_vec, idx_t k,
+	                              std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
+	                              vex::distance_func_t distance_func, const vex::FilterPredicate &filter);
 
 	//! PQ-accelerated search
 	void SearchWithPQ(const float *query_vec, idx_t k, int ef,

@@ -7,7 +7,6 @@ include_directories(include)
 # ============================================================
 # VEX Mobile/Embedded Feature Switches
 # ============================================================
-option(VEX_ENABLE_HYBRID_INDEX "Enable HybridIndex (partitioned index)" ON)
 option(VEX_ENABLE_OPTIMIZER "Enable query optimizer rewrite" ON)
 option(VEX_MOBILE_MODE "Enable mobile-friendly defaults (mutex locks, lower thresholds)" OFF)
 # Note: PQ (Product Quantization) is always compiled because it is deeply integrated
@@ -51,11 +50,6 @@ set(VEX_EXTENSION_FILES
     quantizer/product_quantizer.cpp
     index/graph_index_core.cpp
     index/graph_index.cpp)
-
-if(VEX_ENABLE_HYBRID_INDEX)
-    list(APPEND VEX_EXTENSION_FILES index/hybrid_index.cpp)
-    add_definitions(-DVEX_ENABLE_HYBRID_INDEX)
-endif()
 
 if(VEX_ENABLE_OPTIMIZER)
     list(APPEND VEX_EXTENSION_FILES
