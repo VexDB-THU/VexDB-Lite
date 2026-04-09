@@ -182,7 +182,7 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 	std::priority_queue<GraphCandidate, std::vector<GraphCandidate>, std::less<GraphCandidate>> visited_queue;
 
 	// Use RAII handles when buffer cache is not active (non-parallel path)
-	bool use_handles = eviction_enabled && !node_cache_.IsActive();
+	bool use_handles = !node_cache_.IsActive();
 
 	// P0: Use IndexPointer.Get() as visited key (avoids GetNode to read row_id)
 	auto visit_check = [&](IndexPointer ptr) -> bool {
@@ -886,7 +886,7 @@ void GraphIndexCore::Search(const float *query_vec, idx_t k, int ef,
 	}
 
 	int actual_ef = (ef > 0) ? ef : GraphIndexConfig::DEFAULT_EF_SEARCH;
-	bool use_handles = eviction_enabled && !node_cache_.IsActive();
+	bool use_handles = !node_cache_.IsActive();
 
 	IndexPointer ep = entry_point;
 	{
@@ -997,7 +997,7 @@ void GraphIndexCore::BruteForceSearch(const float *query_vec, idx_t k,
                                        vex::distance_func_t distance_func) {
 	std::vector<GraphCandidate> all;
 	all.reserve(node_count);
-	bool use_handles = eviction_enabled && !node_cache_.IsActive();
+	bool use_handles = !node_cache_.IsActive();
 
 	unordered_set<idx_t> seen_nodes;
 	for (auto &pair : row_id_map) {
@@ -1147,7 +1147,7 @@ void GraphIndexCore::SearchWithPQ(const float *query_vec, idx_t k, int ef,
 
 	int actual_ef = (ef > 0) ? ef : GraphIndexConfig::DEFAULT_EF_SEARCH;
 
-	bool use_handles = eviction_enabled && !node_cache_.IsActive();
+	bool use_handles = !node_cache_.IsActive();
 	IndexPointer ep = entry_point;
 	{
 		bool ep_deleted;

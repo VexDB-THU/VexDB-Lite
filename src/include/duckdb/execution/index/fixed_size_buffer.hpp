@@ -134,24 +134,31 @@ class SegmentHandle {
 public:
 	SegmentHandle() = delete;
 	SegmentHandle(FixedSizeBuffer &buffer_p, const idx_t offset) : buffer_ptr(buffer_p) {
+		// Fast path: buffer already in memory — skip mutex, use atomic readers only.
+		// Safe because TryEvict (the only eviction path) is never called concurrently
+		// with search — it runs explicitly after GraphIndex::Search() completes.
+		if (buffer_ptr->InMemory()) {
+			ptr = buffer_ptr->buffer_handle.Ptr() + offset;
+			buffer_ptr->readers.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		// Slow path: buffer not in memory, load from disk under mutex
 		lock_guard<mutex> l(buffer_ptr->lock);
-
 		if (!buffer_ptr->InMemory() && !buffer_ptr->loaded) {
 			buffer_ptr->LoadFromDisk();
 		}
 		if (!buffer_ptr->InMemory() && buffer_ptr->loaded) {
 			buffer_ptr->block_manager.buffer_manager.Pin(buffer_ptr->block_handle);
 		}
-
 		ptr = buffer_ptr->buffer_handle.Ptr() + offset;
-		buffer_ptr->readers++;
+		buffer_ptr->readers.fetch_add(1, std::memory_order_relaxed);
 	}
 
 	~SegmentHandle() {
 		if (!buffer_ptr) {
 			return;
 		}
-		buffer_ptr->readers--;
+		buffer_ptr->readers.fetch_sub(1, std::memory_order_relaxed);
 		buffer_ptr = nullptr;
 		ptr = nullptr;
 	}
