@@ -11,6 +11,21 @@ namespace duckdb {
 namespace vex {
 
 // ============================================================
+// FNV-1a hash for VARCHAR metadata (deterministic, stable across builds)
+// Used by both SerializeMetaValue and TryBuildFilterPredicate —
+// both MUST use the same function to ensure stored hashes match query hashes.
+// Collision probability ~n²/2^65, acceptable for ANN pre-filtering.
+// ============================================================
+inline uint64_t FNV1aHash(const char *data, size_t len) {
+	uint64_t h = 0xcbf29ce484222325ULL;
+	for (size_t i = 0; i < len; i++) {
+		h ^= static_cast<uint8_t>(data[i]);
+		h *= 0x100000001b3ULL;
+	}
+	return h;
+}
+
+// ============================================================
 // Metadata Column Descriptor
 // ============================================================
 struct MetaColumnDesc {

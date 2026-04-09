@@ -1686,13 +1686,8 @@ void GraphIndex::SerializeMetaValue(const Value &val, LogicalTypeId type_id, uin
 		break;
 	}
 	case LogicalTypeId::VARCHAR: {
-		// Store hash of string (8 bytes) — enables equality filtering on variable-length strings
 		auto str = StringValue::Get(val);
-		uint64_t h = 0xcbf29ce484222325ULL; // FNV-1a
-		for (auto c : str) {
-			h ^= static_cast<uint8_t>(c);
-			h *= 0x100000001b3ULL;
-		}
+		uint64_t h = vex::FNV1aHash(str.data(), str.size());
 		std::memcpy(dest, &h, std::min(size, static_cast<uint32_t>(8)));
 		break;
 	}
