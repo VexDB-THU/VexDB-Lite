@@ -187,17 +187,24 @@ struct GraphIndexConfig {
 class VisitedSet {
 public:
 	explicit VisitedSet(idx_t capacity_hint = 128) {
-		// Round up to power of 2 for fast modulo (bitwise AND)
 		capacity_ = 64;
 		while (capacity_ < capacity_hint * 2) {
 			capacity_ <<= 1;
 		}
 		mask_ = capacity_ - 1;
-		table_.resize(capacity_, EmptyVal());
+		generation_ = 1;
+		table_.resize(capacity_);
+		gen_table_.resize(capacity_, 0);
 	}
 
+	//! Reset for a new search — O(1) instead of O(N) memset.
 	void Clear() {
-		std::fill(table_.begin(), table_.end(), EmptyVal());
+		++generation_;
+		if (generation_ == 0) {
+			// Overflow (extremely rare): reset all generation stamps
+			std::fill(gen_table_.begin(), gen_table_.end(), 0);
+			generation_ = 1;
+		}
 	}
 
 	void Reserve(idx_t capacity_hint) {
@@ -208,7 +215,8 @@ public:
 		if (new_cap > capacity_) {
 			capacity_ = new_cap;
 			mask_ = capacity_ - 1;
-			table_.resize(capacity_, EmptyVal());
+			table_.resize(capacity_);
+			gen_table_.resize(capacity_, 0);
 		}
 		Clear();
 	}
@@ -217,12 +225,13 @@ public:
 	inline bool Insert(idx_t key) {
 		idx_t idx = Hash(key) & mask_;
 		while (true) {
-			if (table_[idx] == EmptyVal()) {
+			if (gen_table_[idx] != generation_) {
 				table_[idx] = key;
+				gen_table_[idx] = generation_;
 				return true;
 			}
 			if (table_[idx] == key) {
-				return false; // already present
+				return false;
 			}
 			idx = (idx + 1) & mask_;
 		}
@@ -232,17 +241,14 @@ public:
 	inline bool Contains(idx_t key) const {
 		idx_t idx = Hash(key) & mask_;
 		while (true) {
-			if (table_[idx] == EmptyVal()) return false;
+			if (gen_table_[idx] != generation_) return false;
 			if (table_[idx] == key) return true;
 			idx = (idx + 1) & mask_;
 		}
 	}
 
 private:
-	static idx_t EmptyVal() { return ~idx_t(0); }
-
 	inline idx_t Hash(idx_t key) const {
-		// Fast integer hash (splitmix64 finalizer)
 		key ^= key >> 30;
 		key *= 0xbf58476d1ce4e5b9ULL;
 		key ^= key >> 27;
@@ -252,8 +258,10 @@ private:
 	}
 
 	std::vector<idx_t> table_;
+	std::vector<idx_t> gen_table_;  // generation stamp per slot
 	idx_t capacity_;
 	idx_t mask_;
+	idx_t generation_;
 };
 
 // ============================================================
@@ -284,10 +292,6 @@ struct GraphIndexCore {
 
 	//! Below this threshold, use brute force instead of graph traversal
 	static constexpr idx_t BRUTE_FORCE_THRESHOLD = 64;
-
-	//! When true, search uses SegmentHandle (RAII) so buffers can be evicted after search.
-	//! When false (default), search uses raw pointers for zero overhead.
-	bool eviction_enabled = false;
 
 	//! Index parameters (needed for segment size calculation)
 	int m = GraphIndexConfig::DEFAULT_M;

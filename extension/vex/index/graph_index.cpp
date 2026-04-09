@@ -1367,18 +1367,6 @@ void GraphIndex::Search(const float *query_vec, idx_t k, int ef,
 		search_vec = norm_query.data();
 	}
 
-	// Check eviction setting once before search — controls whether search uses
-	// SegmentHandle (RAII, enables eviction) or raw pointers (zero overhead).
-	bool eviction = false;
-	{
-		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
-		Value evict_val;
-		if (db_config.TryGetCurrentSetting("vex_enable_eviction", evict_val)) {
-			eviction = evict_val.GetValue<bool>();
-		}
-	}
-	graph_.eviction_enabled = eviction;
-
 	if (use_pq_ && metric_ == vex::VexMetric::L2) {
 		if (!graph_.pq.trained && graph_.node_count > 0) {
 			graph_.TrainPQ(pq_m_);
@@ -1388,9 +1376,13 @@ void GraphIndex::Search(const float *query_vec, idx_t k, int ef,
 		graph_.Search(search_vec, k, ef, out_row_ids, out_distances, distance_func_, brute_force_threshold);
 	}
 
-	// Evict after search when enabled
-	if (eviction) {
-		graph_.EvictCleanBuffers();
+	// Evict clean buffers after search to reduce memory (controlled by vex_enable_eviction)
+	{
+		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
+		Value evict_val;
+		if (db_config.TryGetCurrentSetting("vex_enable_eviction", evict_val) && evict_val.GetValue<bool>()) {
+			graph_.EvictCleanBuffers();
+		}
 	}
 }
 

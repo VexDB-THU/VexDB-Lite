@@ -184,9 +184,8 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 	// Use RAII handles when buffer cache is not active (non-parallel path)
 	bool use_handles = !node_cache_.IsActive();
 
-	// P0: Use IndexPointer.Get() as visited key (avoids GetNode to read row_id)
 	auto visit_check = [&](IndexPointer ptr) -> bool {
-		return !visited.Insert(ptr.Get()); // returns false if newly inserted
+		return !visited.Insert(ptr.Get());
 	};
 
 	// Entry point
@@ -222,7 +221,7 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 			break;
 		}
 
-		// P3: Get node header once, read neighbors from it directly
+		// Read header once, get neighbors directly from it
 		IndexPointer *neighbors;
 		uint16_t neighbor_count;
 
@@ -267,13 +266,6 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 				auto nb_node_h = GetNodeHandle(neighbor_ptr);
 				auto *nb_header = nb_node_h.GetPtr<vex::HNSWNodeHeader>();
 				if (nb_header->deleted) continue;
-				// P1: prefetch next neighbor's vector while computing current distance
-				if (i + 1 < neighbor_count && neighbors[i + 1].Get()) {
-					auto *next_h = GetNode(neighbors[i + 1]);
-					if (next_h->vector_ptr.Get()) {
-						__builtin_prefetch(GetVector(next_h->vector_ptr), 0, 0);
-					}
-				}
 				auto nb_vec_h = GetVectorHandle(nb_header->vector_ptr);
 				float nd = distance_func(query, nb_vec_h.GetPtr<float>(), dimension);
 				if (static_cast<int>(visited_queue.size()) < ef || nd < visited_queue.top().distance) {
@@ -304,7 +296,7 @@ void GraphIndexCore::SearchLayer(const float *query, IndexPointer ep, int ef, in
 				if (!neighbor_ptr.Get() || visit_check(neighbor_ptr)) continue;
 				auto *nb_header = GetNode(neighbor_ptr);
 				if (nb_header->deleted) continue;
-				// P1: prefetch next neighbor's vector
+				// Prefetch next neighbor's vector to hide cache miss latency
 				if (i + 1 < neighbor_count && neighbors[i + 1].Get()) {
 					auto *next_h = GetNode(neighbors[i + 1]);
 					if (next_h->vector_ptr.Get()) {
