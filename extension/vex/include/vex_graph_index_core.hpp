@@ -355,13 +355,18 @@ struct GraphIndexCore {
 
 	//! Evict clean, on-disk buffers from memory to reduce footprint.
 	//! Call only when no SegmentHandles or raw pointers reference index data.
+	//! Requires VEX_HAS_BUFFER_EVICTION (forked DuckDB with TryEvict/EvictCleanBuffers).
 	idx_t EvictCleanBuffers() {
+#ifdef VEX_HAS_BUFFER_EVICTION
 		if (!node_alloc || !vector_alloc || !upper_alloc) return 0;
 		idx_t n = 0;
 		n += node_alloc->EvictCleanBuffers();
 		n += vector_alloc->EvictCleanBuffers();
 		n += upper_alloc->EvictCleanBuffers();
 		return n;
+#else
+		return 0;
+#endif
 	}
 
 	// ============================================================

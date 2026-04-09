@@ -29,6 +29,17 @@ else()
     message(STATUS "VEX: index_type_set.hpp not found, using fallback")
 endif()
 
+# Detect buffer eviction support (forked DuckDB with TryEvict/EvictCleanBuffers)
+set(FIXED_SIZE_BUFFER_HEADER "${CMAKE_SOURCE_DIR}/src/include/duckdb/execution/index/fixed_size_buffer.hpp")
+if(EXISTS "${FIXED_SIZE_BUFFER_HEADER}")
+    file(READ "${FIXED_SIZE_BUFFER_HEADER}" FSB_CONTENT)
+    string(FIND "${FSB_CONTENT}" "TryEvict" HAS_TRY_EVICT_POS)
+    if(NOT HAS_TRY_EVICT_POS EQUAL -1)
+        add_definitions(-DVEX_HAS_BUFFER_EVICTION)
+        message(STATUS "VEX: Buffer eviction support detected")
+    endif()
+endif()
+
 # Conditionally include source files
 set(VEX_EXTENSION_FILES
     vex_extension.cpp
