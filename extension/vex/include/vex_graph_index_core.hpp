@@ -285,6 +285,10 @@ struct GraphIndexCore {
 	//! Below this threshold, use brute force instead of graph traversal
 	static constexpr idx_t BRUTE_FORCE_THRESHOLD = 64;
 
+	//! When true, search uses SegmentHandle (RAII) so buffers can be evicted after search.
+	//! When false (default), search uses raw pointers for zero overhead.
+	bool eviction_enabled = false;
+
 	//! Index parameters (needed for segment size calculation)
 	int m = GraphIndexConfig::DEFAULT_M;
 	uint32_t dimension = 0;
