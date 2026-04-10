@@ -67,6 +67,10 @@ string LogicalVexIndexScan::GetExtensionName() const {
 	return "vex_index_scan";
 }
 
+string PhysicalVexIndexScan::GetName() const {
+	return "VEX_INDEX_SCAN [" + graph_index.GetIndexName() + "]";
+}
+
 vector<ColumnBinding> LogicalVexIndexScan::GetColumnBindings() {
 	// Expose bindings from the main table (same as the original GET)
 	vector<ColumnBinding> result;

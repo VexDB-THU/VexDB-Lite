@@ -66,9 +66,7 @@ public:
 	                     unique_ptr<Expression> query_vec_expr, idx_t k,
 	                     vector<ColumnIndex> column_ids, vector<LogicalType> returned_types);
 
-	string GetName() const override {
-		return "VEX_INDEX_SCAN";
-	}
+	string GetName() const override;
 
 	// Operator interface
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
