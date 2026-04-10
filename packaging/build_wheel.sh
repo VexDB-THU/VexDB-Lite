@@ -41,28 +41,12 @@ BUILD_DIR="$DUCKDB_PY_SRC/duckdb-$DUCKDB_VERSION"
 echo ">>> Copying VEX extension..."
 cp -r "$DUCKDB_DIR/extension/vex" "$BUILD_DIR/external/duckdb/extension/vex"
 
-# Step 3: Copy physical_create_graph_index
-cp "$DUCKDB_DIR/src/execution/operator/schema/physical_create_graph_index.cpp" \
-   "$BUILD_DIR/external/duckdb/src/execution/operator/schema/"
-cp "$DUCKDB_DIR/src/include/duckdb/execution/operator/schema/physical_create_graph_index.hpp" \
-   "$BUILD_DIR/external/duckdb/src/include/duckdb/execution/operator/schema/"
-
-# Add to CMakeLists if not already there (cross-platform sed)
-SCHEMA_CMAKE="$BUILD_DIR/external/duckdb/src/execution/operator/schema/CMakeLists.txt"
-if ! grep -q "physical_create_graph_index" "$SCHEMA_CMAKE"; then
-    if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' 's/physical_create_index\.cpp/physical_create_index.cpp\n  physical_create_graph_index.cpp/' "$SCHEMA_CMAKE"
-    else
-        sed -i 's/physical_create_index\.cpp/physical_create_index.cpp\n  physical_create_graph_index.cpp/' "$SCHEMA_CMAKE"
-    fi
-fi
-
-# Step 4: Add VEX to extension config
+# Step 3: Add VEX to extension config
 if ! grep -q "duckdb_extension_load(vex)" "$BUILD_DIR/external/duckdb/extension/extension_config.cmake"; then
     echo 'duckdb_extension_load(vex)' >> "$BUILD_DIR/external/duckdb/extension/extension_config.cmake"
 fi
 
-# Step 5: Platform-specific build settings
+# Step 4: Platform-specific build settings
 CMAKE_EXTRA=""
 if [[ "$(uname)" == "Darwin" ]]; then
     ARCH=$(python3 -c "import platform; print(platform.machine())")

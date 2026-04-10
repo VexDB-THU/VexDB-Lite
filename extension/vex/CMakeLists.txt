@@ -65,7 +65,8 @@ set(VEX_EXTENSION_FILES
     distance/distance.cpp
     quantizer/product_quantizer.cpp
     index/graph_index_core.cpp
-    index/graph_index.cpp)
+    index/graph_index.cpp
+    optimizer/vex_physical_create_index.cpp)
 
 if(VEX_ENABLE_OPTIMIZER)
     list(APPEND VEX_EXTENSION_FILES

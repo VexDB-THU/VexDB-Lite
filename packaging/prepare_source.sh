@@ -24,17 +24,6 @@ BUILD_DIR="$WORK_DIR/duckdb-$DUCKDB_VERSION"
 # Inject VEX extension
 cp -r "$DUCKDB_DIR/extension/vex" "$BUILD_DIR/external/duckdb/extension/vex"
 
-# Inject physical_create_graph_index
-cp "$DUCKDB_DIR/src/execution/operator/schema/physical_create_graph_index.cpp" \
-   "$BUILD_DIR/external/duckdb/src/execution/operator/schema/"
-cp "$DUCKDB_DIR/src/include/duckdb/execution/operator/schema/physical_create_graph_index.hpp" \
-   "$BUILD_DIR/external/duckdb/src/include/duckdb/execution/operator/schema/"
-
-SCHEMA_CMAKE="$BUILD_DIR/external/duckdb/src/execution/operator/schema/CMakeLists.txt"
-if ! grep -q "physical_create_graph_index" "$SCHEMA_CMAKE"; then
-    sed -i 's/physical_create_index\.cpp/physical_create_index.cpp\n  physical_create_graph_index.cpp/' "$SCHEMA_CMAKE"
-fi
-
 # Add VEX to extension config
 if ! grep -q "duckdb_extension_load(vex)" "$BUILD_DIR/external/duckdb/extension/extension_config.cmake"; then
     echo 'duckdb_extension_load(vex)' >> "$BUILD_DIR/external/duckdb/extension/extension_config.cmake"

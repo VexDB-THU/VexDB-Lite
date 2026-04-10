@@ -5,11 +5,11 @@
 #include "duckdb/planner/operator/logical_create_index.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/execution/operator/filter/physical_filter.hpp"
-#include "duckdb/execution/operator/schema/physical_create_graph_index.hpp"
 #include "duckdb/planner/expression/bound_operator_expression.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "vex_physical_create_index.hpp"
 #include "duckdb/parser/expression_util.hpp"
 #include "duckdb/common/allocator.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -129,6 +129,8 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 		input.unbound_expressions, input.db, m, ef_construction, metric, use_pq, pq_m);
 	graph_index->graph_.max_dedup = max_dedup;
 	graph_index->memory_mode_ = memory_mode;
+	graph_index->dimension_ = ArrayType::GetSize(vec_type);
+	graph_index->graph_.dimension = graph_index->dimension_;
 
 	// Setup metadata columns (columns after the first vector column)
 	if (input.unbound_expressions.size() > 1) {
@@ -166,6 +168,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 			}
 		}
 	}
+	graph_index->EnsureSerializableState();
 
 	return std::move(graph_index);
 }
@@ -215,9 +218,9 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
 		prev_op.get().children.push_back(proj);
 	}
 
-	auto &create_idx = planner.Make<PhysicalCreateGraphIndex>(op, op.table, op.info->column_ids, std::move(op.info),
-	                                                            std::move(op.unbound_expressions), op.estimated_cardinality,
-	                                                            std::move(op.alter_table_info));
+	auto &create_idx = planner.Make<PhysicalVexCreateIndex>(op, op.table, op.info->column_ids, std::move(op.info),
+	                                                        std::move(op.unbound_expressions), op.estimated_cardinality,
+	                                                        std::move(op.alter_table_info));
 	create_idx.children.push_back(prev_op);
 	return create_idx;
 }
@@ -268,6 +271,20 @@ void GraphIndex::EnsureAllocators() {
 		auto &block_manager = table_io_manager.GetIndexBlockManager();
 		graph_.dimension = dimension_;
 		graph_.InitAllocators(block_manager);
+	}
+}
+
+void GraphIndex::EnsureSerializableState() {
+	EnsureAllocators();
+}
+
+void GraphIndex::EnsurePQCodesUpToDate() {
+	if (!use_pq_ || !graph_.pq.trained) {
+		return;
+	}
+	auto expected_size = graph_.row_id_map.size() * graph_.pq.CodeSize();
+	if (graph_.pq_codes.size() != expected_size) {
+		graph_.EncodeAllPQ();
 	}
 }
 
@@ -914,8 +931,9 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
                                               const case_insensitive_map_t<Value> &options) {
 	IndexStorageInfo info;
 	info.name = name;
-
-	if (!graph_.node_alloc || graph_.node_count == 0) {
+	EnsureSerializableState();
+	EnsurePQCodesUpToDate();
+	if (!graph_.node_alloc) {
 		return info;
 	}
 
@@ -927,6 +945,7 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
 	info.options["max_level"] = Value::INTEGER(graph_.max_level);
 	info.options["entry_point"] = Value::UBIGINT(graph_.entry_point.Get());
 	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
+	info.options["pq_m"] = Value::UINTEGER(pq_m_);
 	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
 	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
 	info.options["memory_mode"] = Value(memory_mode_);
@@ -1040,8 +1059,9 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
 IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
 	IndexStorageInfo info;
 	info.name = name;
-
-	if (!graph_.node_alloc || graph_.node_count == 0) {
+	EnsureSerializableState();
+	EnsurePQCodesUpToDate();
+	if (!graph_.node_alloc) {
 		return info;
 	}
 
@@ -1053,6 +1073,7 @@ IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> 
 	info.options["max_level"] = Value::INTEGER(graph_.max_level);
 	info.options["entry_point"] = Value::UBIGINT(graph_.entry_point.Get());
 	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
+	info.options["pq_m"] = Value::UINTEGER(pq_m_);
 	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
 	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
 	info.options["memory_mode"] = Value(memory_mode_);
@@ -1191,6 +1212,10 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 	auto pq_it = info.options.find("use_pq");
 	if (pq_it != info.options.end()) {
 		use_pq_ = pq_it->second.GetValue<bool>();
+	}
+	auto pqm_it = info.options.find("pq_m");
+	if (pqm_it != info.options.end()) {
+		pq_m_ = pqm_it->second.GetValue<uint32_t>();
 	}
 	auto metric_opt = info.options.find("metric");
 	if (metric_opt != info.options.end()) {
@@ -1573,6 +1598,8 @@ void GraphIndex::Search(const float *query_vec, idx_t k, int ef,
 	if (use_pq_ && metric_ == vex::VexMetric::L2) {
 		if (!graph_.pq.trained && graph_.node_count > 0) {
 			graph_.TrainPQ(pq_m_);
+		} else {
+			EnsurePQCodesUpToDate();
 		}
 		graph_.SearchWithPQ(search_vec, k, ef, out_row_ids, out_distances, distance_func_, brute_force_threshold);
 	} else {

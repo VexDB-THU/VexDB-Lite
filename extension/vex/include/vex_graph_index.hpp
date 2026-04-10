@@ -147,6 +147,8 @@ public:
 private:
 	int GetRandomLevel();
 	void EnsureAllocators();
+	void EnsureSerializableState();
+	void EnsurePQCodesUpToDate();
 	void DeserializeFromStorage(const IndexStorageInfo &info);
 	bool DeserializeFromBlob(const string &blob);
 	void RebuildRowIdMap();
