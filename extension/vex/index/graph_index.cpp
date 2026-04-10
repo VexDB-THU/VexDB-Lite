@@ -682,17 +682,18 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
 		}
 	}
 
-	if (chunk.ColumnCount() != logical_types.size()) {
-		DataChunk key_chunk;
-		key_chunk.InitializeEmpty(logical_types);
-		for (idx_t i = 0; i < column_ids.size() && i < logical_types.size(); i++) {
+	// Remap columns: chunk contains all table columns in physical order,
+	// but Build() expects columns in index order (vec first, then metadata).
+	// Always remap via column_ids to ensure correct ordering.
+	DataChunk key_chunk;
+	key_chunk.InitializeEmpty(logical_types);
+	for (idx_t i = 0; i < column_ids.size() && i < logical_types.size(); i++) {
+		if (column_ids[i] < chunk.ColumnCount()) {
 			key_chunk.data[i].Reference(chunk.data[column_ids[i]]);
 		}
-		key_chunk.SetCardinality(chunk.size());
-		Build(key_chunk, row_ids);
-	} else {
-		Build(chunk, row_ids);
 	}
+	key_chunk.SetCardinality(chunk.size());
+	Build(key_chunk, row_ids);
 	return ErrorData();
 }
 
