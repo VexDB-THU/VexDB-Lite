@@ -39,6 +39,22 @@ if(EXISTS "${FIXED_SIZE_BUFFER_HEADER}")
     endif()
 endif()
 
+# Get git commit hash at configure time
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    OUTPUT_VARIABLE VEX_GIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(NOT VEX_GIT_HASH)
+    set(VEX_GIT_HASH "unknown")
+endif()
+# Get build timestamp
+string(TIMESTAMP VEX_BUILD_TIME "%Y-%m-%d %H:%M")
+add_definitions(-DVEX_GIT_HASH="${VEX_GIT_HASH}")
+add_definitions(-DVEX_BUILD_TIME="${VEX_BUILD_TIME}")
+message(STATUS "VEX: version ${VEX_GIT_HASH} built at ${VEX_BUILD_TIME}")
+
 # Conditionally include source files
 set(VEX_EXTENSION_FILES
     vex_extension.cpp

@@ -8,8 +8,22 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
+#include "duckdb/function/scalar_function.hpp"
+
+#ifndef VEX_GIT_HASH
+#define VEX_GIT_HASH "unknown"
+#endif
+#ifndef VEX_BUILD_TIME
+#define VEX_BUILD_TIME "unknown"
+#endif
 
 namespace duckdb {
+
+static void VexVersionFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+	result.SetValue(0, StringVector::AddString(result,
+	    "VexDB-Lite " VEX_GIT_HASH " (built " VEX_BUILD_TIME ")"));
+	result.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
 
 static void RegisterIndexTypes(DBConfig &config) {
 	IndexType graph_index_type;
@@ -28,6 +42,9 @@ static void RegisterIndexTypes(DBConfig &config) {
 
 static void LoadInternal(ExtensionLoader &loader) {
 	VexFunctions::Register(loader);
+
+	// Register vex_version() scalar function
+	loader.RegisterFunction(ScalarFunction("vex_version", {}, LogicalType::VARCHAR, VexVersionFunction));
 
 	auto &db = loader.GetDatabaseInstance();
 	auto &config = DBConfig::GetConfig(db);
