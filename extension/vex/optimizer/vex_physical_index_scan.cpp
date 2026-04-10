@@ -68,7 +68,14 @@ string LogicalVexIndexScan::GetExtensionName() const {
 }
 
 string PhysicalVexIndexScan::GetName() const {
-	return "VEX_INDEX_SCAN [" + graph_index.GetIndexName() + "]";
+	return "VEX_INDEX_SCAN";
+}
+
+InsertionOrderPreservingMap<string> PhysicalVexIndexScan::ParamsToString() const {
+	InsertionOrderPreservingMap<string> result;
+	result["Index"] = graph_index.GetIndexName();
+	result["Top"] = to_string(k);
+	return result;
 }
 
 vector<ColumnBinding> LogicalVexIndexScan::GetColumnBindings() {

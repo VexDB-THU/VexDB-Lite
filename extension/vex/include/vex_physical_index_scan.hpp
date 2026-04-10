@@ -67,6 +67,7 @@ public:
 	                     vector<ColumnIndex> column_ids, vector<LogicalType> returned_types);
 
 	string GetName() const override;
+	InsertionOrderPreservingMap<string> ParamsToString() const override;
 
 	// Operator interface
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
