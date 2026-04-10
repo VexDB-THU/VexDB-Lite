@@ -37,7 +37,7 @@ query II
 EXPLAIN WITH tmp AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS vec)
 SELECT id FROM t ORDER BY l2_distance(v, (SELECT vec FROM tmp)) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 2: CTE as query vector - result correctness
@@ -60,7 +60,7 @@ SELECT id FROM t ORDER BY l2_distance(v, (SELECT vec FROM tmp)) LIMIT 5;
 query II
 EXPLAIN SELECT id FROM t ORDER BY l2_distance(v, (SELECT qvec FROM queries WHERE qid = 1)) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 4: Cross-table subquery - result correctness
@@ -91,7 +91,7 @@ query II
 EXPLAIN WITH q AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS v)
 SELECT id FROM t ORDER BY v <-> (SELECT v FROM q) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 7: <-> operator with subquery - result correctness
@@ -112,7 +112,7 @@ SELECT id FROM t ORDER BY v <-> (SELECT v FROM q) LIMIT 5;
 query II
 EXPLAIN SELECT id FROM t ORDER BY l2_distance(v, (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4])) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 9: Subquery with inline CAST - result correctness
@@ -171,7 +171,7 @@ query II
 EXPLAIN WITH tmp AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS vec)
 SELECT id FROM t ORDER BY cosine_distance(v, (SELECT vec FROM tmp)) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 13: Cosine - CTE subquery result count
@@ -191,7 +191,7 @@ query II
 EXPLAIN WITH q AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS v)
 SELECT id FROM t ORDER BY v <=> (SELECT v FROM q) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 15: <=> operator with subquery - result count
@@ -226,7 +226,7 @@ query II
 EXPLAIN WITH tmp AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS vec)
 SELECT id FROM t ORDER BY inner_product(v, (SELECT vec FROM tmp)) DESC LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 18: Inner Product - CTE subquery result (DESC)
@@ -258,7 +258,7 @@ query II
 EXPLAIN WITH q AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS v)
 SELECT id FROM t ORDER BY v <~> (SELECT v FROM q) ASC LIMIT 5;
 ----
-physical_plan	<REGEX>:.*EXTENSION.*
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 # ============================================================
 # Test 21: Inner Product - cross-table subquery
