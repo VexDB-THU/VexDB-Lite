@@ -63,6 +63,8 @@ class FilterPredicate {
 public:
 	virtual ~FilterPredicate() = default;
 
+	virtual unique_ptr<FilterPredicate> Clone() const = 0;
+
 	//! Check if the metadata at the given pointer matches this predicate
 	virtual bool Matches(const uint8_t *meta_data) const = 0;
 
@@ -84,6 +86,10 @@ public:
 	    : offset(offset), size(size), selectivity_(sel) {
 		value.resize(size);
 		std::memcpy(value.data(), val, size);
+	}
+
+	unique_ptr<FilterPredicate> Clone() const override {
+		return make_uniq<EqualityFilter>(*this);
 	}
 
 	bool Matches(const uint8_t *meta_data) const override {
@@ -109,6 +115,10 @@ public:
 
 	RangeFilter(uint32_t offset, uint32_t size, LogicalTypeId type_id, double sel = 0.3)
 	    : offset(offset), size(size), type_id(type_id), has_min(false), has_max(false), selectivity_(sel) {}
+
+	unique_ptr<FilterPredicate> Clone() const override {
+		return make_uniq<RangeFilter>(*this);
+	}
 
 	void SetMin(const void *val) {
 		min_val.resize(size);
@@ -177,6 +187,10 @@ public:
 	InListFilter(uint32_t offset, uint32_t size, double sel = 0.1)
 	    : offset(offset), size(size), selectivity_(sel) {}
 
+	unique_ptr<FilterPredicate> Clone() const override {
+		return make_uniq<InListFilter>(*this);
+	}
+
 	void AddValue(const void *val) {
 		std::vector<uint8_t> v(size);
 		std::memcpy(v.data(), val, size);
@@ -203,6 +217,14 @@ public:
 
 	void AddChild(unique_ptr<FilterPredicate> child) {
 		children.push_back(std::move(child));
+	}
+
+	unique_ptr<FilterPredicate> Clone() const override {
+		auto result = make_uniq<ConjunctionFilter>();
+		for (auto &child : children) {
+			result->AddChild(child->Clone());
+		}
+		return result;
 	}
 
 	bool Matches(const uint8_t *meta_data) const override {

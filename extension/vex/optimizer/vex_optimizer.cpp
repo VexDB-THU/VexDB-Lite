@@ -33,39 +33,6 @@
 
 namespace duckdb {
 
-//===--------------------------------------------------------------------===//
-// Helper utilities
-//===--------------------------------------------------------------------===//
-
-static int GetEfSearch(ClientContext &context, idx_t k) {
-	Value val;
-	int ef = GraphIndexConfig::DEFAULT_EF_SEARCH;
-	if (context.TryGetCurrentSetting("vex_ef_search", val)) {
-		ef = val.GetValue<int>();
-		if (ef < GraphIndexConfig::MIN_EF_SEARCH || ef > GraphIndexConfig::MAX_EF_SEARCH) {
-			throw InvalidInputException("vex_ef_search must be between %d and %d, got %d",
-			                            GraphIndexConfig::MIN_EF_SEARCH, GraphIndexConfig::MAX_EF_SEARCH, ef);
-		}
-	}
-	if (static_cast<int>(k) > ef) {
-		ef = static_cast<int>(k) * 2;
-	}
-	return ef;
-}
-
-static idx_t GetBruteForceThreshold(ClientContext &context) {
-	Value val;
-	if (context.TryGetCurrentSetting("vex_brute_force_threshold", val)) {
-		auto v = val.GetValue<idx_t>();
-		if (v > 1000000) {
-			throw InvalidInputException("vex_brute_force_threshold must be <= 1000000, got %llu",
-			                            static_cast<unsigned long long>(v));
-		}
-		return v;
-	}
-	return GraphIndexCore::BRUTE_FORCE_THRESHOLD;
-}
-
 // Table-driven distance function registry — single source of truth for
 // function recognition, metric mapping, and sort direction requirement
 struct DistanceFuncEntry {
@@ -256,11 +223,10 @@ static bool TryExtractConstantVector(const Expression &expr, vector<float> &out_
 
 struct DistanceOrderInfo {
 	BoundFunctionExpression *func_expr = nullptr;
-	vector<float> query_vec;           // constant path: extracted at optimize time
+	vector<float> query_vec;
 	Expression *query_vec_expr = nullptr; // deferred path: expression to evaluate at runtime
 	idx_t col_index = 0;
 	bool needs_desc = false;
-	bool deferred = false;             // true = query_vec_expr needs runtime evaluation
 };
 
 static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, LogicalProjection *proj,
@@ -348,10 +314,12 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 	// Try direct constant extraction first (fastest path)
 	if (IsColumnRefFromTable(*info.func_expr->children[0], get->table_index, info.col_index) &&
 	    TryExtractConstantVector(*info.func_expr->children[1], info.query_vec)) {
+		info.query_vec_expr = info.func_expr->children[1].get();
 		return true;
 	}
 	if (IsColumnRefFromTable(*info.func_expr->children[1], get->table_index, info.col_index) &&
 	    TryExtractConstantVector(*info.func_expr->children[0], info.query_vec)) {
+		info.query_vec_expr = info.func_expr->children[0].get();
 		return true;
 	}
 
@@ -368,7 +336,6 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
 				continue; // both sides are columns from the same table — not an ANN pattern
 			}
 			info.query_vec_expr = info.func_expr->children[vec_side].get();
-			info.deferred = true;
 #ifdef VEX_OPTIMIZER_DEBUG
 			std::cerr << "[VEX] TryResolveDistanceOrder: deferred mode — query vector expression at runtime" << std::endl;
 #endif
@@ -449,35 +416,6 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage,
 	return match.graph_idx != nullptr;
 }
 
-//===--------------------------------------------------------------------===//
-// Shared: execute ANN search
-//===--------------------------------------------------------------------===//
-
-static bool ExecuteANNSearch(ClientContext &context, const IndexMatch &match, LogicalGet *get,
-                             const float *query_vec, idx_t k,
-                             vector<row_t> &result_row_ids, vector<float> &result_distances,
-                             const vex::FilterPredicate *filter = nullptr) {
-	int ef = GetEfSearch(context, k);
-	idx_t bf_threshold = GetBruteForceThreshold(context);
-
-	if (!match.graph_idx) {
-		return false;
-	}
-
-	if (filter) {
-		match.graph_idx->FilteredSearch(query_vec, k, ef, result_row_ids, result_distances,
-		                                *filter, bf_threshold);
-	} else {
-		match.graph_idx->ANNSearch(query_vec, k, ef, result_row_ids, result_distances, bf_threshold);
-	}
-
-	return !result_row_ids.empty();
-}
-
-//===--------------------------------------------------------------------===//
-// Shared: fetch rows by row_ids
-//===--------------------------------------------------------------------===//
-
 // Get the output types for a LogicalGet node.
 // In pre-optimize stage, get->types may be empty. returned_types is indexed by
 // physical column position, but column_ids may be in arbitrary order.
@@ -486,14 +424,6 @@ static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
 		return get->types;
 	}
 	return BuildOutputTypes(get->GetColumnIds(), get->returned_types);
-}
-
-static unique_ptr<ColumnDataCollection> FetchRowsByIds(ClientContext &context, DuckTableEntry &duck_table,
-                                                       LogicalGet *get, const vector<row_t> &result_row_ids,
-                                                       idx_t limit, idx_t offset) {
-	auto output_types = GetOutputTypes(get);
-	return FetchRowsByRowIds(context, duck_table, get->GetColumnIds(), output_types,
-	                         result_row_ids, limit, offset);
 }
 
 //===--------------------------------------------------------------------===//
@@ -553,15 +483,14 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 	return false;
 }
 
-static void ReplacePlanWithResults(unique_ptr<LogicalOperator> &node, unique_ptr<LogicalOperator> &child_owner,
-                                   const GetChildInfo &info, unique_ptr<LogicalColumnDataGet> column_data_get) {
-	auto cardinality = column_data_get->estimated_cardinality;
+static void ReplaceGetWithVexScan(unique_ptr<LogicalOperator> &get_owner, const GetChildInfo &info,
+                                  unique_ptr<LogicalOperator> vex_scan) {
 	if (info.proj) {
-		child_owner->children[0] = std::move(column_data_get);
-		child_owner->SetEstimatedCardinality(cardinality);
-		node = std::move(child_owner);
+		info.proj->children[0] = std::move(vex_scan);
+	} else if (info.filter) {
+		info.filter->children[0] = std::move(vex_scan);
 	} else {
-		node = std::move(column_data_get);
+		get_owner = std::move(vex_scan);
 	}
 }
 
@@ -615,66 +544,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 		return false;
 	}
 
-	//--- Deferred path: query vector not known at optimize time ---
-	// Generate a LogicalVexIndexScan that will be converted to PhysicalVexIndexScan
-	// during physical planning. The physical operator evaluates the query vector
-	// expression and executes the ANN search at runtime.
-	//
-	// For subqueries, DuckDB flattens `ORDER BY dist(col, (SELECT ...))` into:
-	//   LIMIT -> ORDER_BY -> PROJECTION -> CROSS_PRODUCT -> [GET, subquery]
-	// We replace CROSS_PRODUCT with LogicalVexIndexScan, keeping the subquery
-	// as a child. The PROJECTION, ORDER_BY and LIMIT stay in place (ORDER_BY and
-	// LIMIT become no-ops since the index returns pre-sorted top-k results).
-	if (dist_info.deferred) {
-		if (!match.graph_idx) {
-#ifdef VEX_OPTIMIZER_DEBUG
-			std::cerr << "[VEX] TryOptimizeANN: deferred mode only supports GraphIndex" << std::endl;
-#endif
-			return false;
-		}
-		if (!get_info.cross_product) {
-#ifdef VEX_OPTIMIZER_DEBUG
-			std::cerr << "[VEX] TryOptimizeANN: deferred mode requires CROSS_PRODUCT (subquery)" << std::endl;
-#endif
-			return false;
-		}
-#ifdef VEX_OPTIMIZER_DEBUG
-		std::cerr << "[VEX] TryOptimizeANN: deferred mode — emitting LogicalVexIndexScan" << std::endl;
-#endif
-		idx_t k = limit + offset;
-
-		auto output_types = GetOutputTypes(get);
-		auto &column_ids = get->GetColumnIds();
-
-		auto scan = make_uniq<LogicalVexIndexScan>(
-		    get->table_index, output_types,
-		    duck_table, *match.graph_idx,
-		    dist_info.query_vec_expr->Copy(),
-		    k,
-		    column_ids, get->returned_types);
-		scan->SetEstimatedCardinality(k);
-
-		// Keep the subquery pipeline as a child so its column bindings are
-		// available for the inner PROJECTION's distance expression.
-		scan->children.push_back(
-		    std::move(get_info.cross_product->children[get_info.subquery_child_idx]));
-
-		// Replace CROSS_PRODUCT with LogicalVexIndexScan in the plan.
-		// The PROJECTION, ORDER_BY and LIMIT stay intact above.
-		if (get_info.proj) {
-			// PROJECTION -> CROSS_PRODUCT  =>  PROJECTION -> LogicalVexIndexScan
-			get_info.proj->children[0] = std::move(scan);
-		} else if (get_info.filter) {
-			// FILTER -> CROSS_PRODUCT  =>  FILTER -> LogicalVexIndexScan
-			get_info.filter->children[0] = std::move(scan);
-		}
-		// Don't replace `node` — the LIMIT/ORDER_BY stay in the plan.
-		return true;
-	}
-
 	idx_t k = limit + offset;
-	vector<row_t> result_row_ids;
-	vector<float> result_distances;
 
 #ifdef VEX_OPTIMIZER_DEBUG
 	std::cerr << "[VEX] TryOptimizeANN: filter=" << (get_info.filter != nullptr)
@@ -684,80 +554,34 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 #endif
 	// Try to extract filter predicate from FILTER node for filtered HNSW search
 	unique_ptr<vex::FilterPredicate> filter_pred;
-	bool did_filtered_search = false;
-
-	if (get_info.filter && match.graph_idx && match.graph_idx->HasMetadataColumns() &&
-	    get_info.filter->expressions.size() == 1) {
+	if (get_info.filter) {
+		if (!match.graph_idx || !match.graph_idx->HasMetadataColumns() || get_info.filter->expressions.size() != 1) {
+			return false;
+		}
 		filter_pred = TryBuildFilterPredicate(*get_info.filter->expressions[0],
 		                                     get->table_index, *match.graph_idx, column_ids);
 #ifdef VEX_OPTIMIZER_DEBUG
 		std::cerr << "[VEX] TryOptimizeANN: filter_pred=" << (filter_pred != nullptr) << std::endl;
 #endif
-		if (filter_pred) {
-			int ef = GetEfSearch(context, k);
-			idx_t bf_threshold = GetBruteForceThreshold(context);
-			match.graph_idx->FilteredSearch(dist_info.query_vec.data(), k, ef,
-			                               result_row_ids, result_distances,
-			                               *filter_pred, bf_threshold);
-			did_filtered_search = true;
-		}
-	}
-
-	// If there's a FILTER node but we couldn't apply it through the index,
-	// we MUST bail out. Otherwise ReplacePlanWithResults will drop the FILTER
-	// node and we'd return unfiltered results — a correctness bug.
-	if (get_info.filter && !did_filtered_search) {
-#ifdef VEX_OPTIMIZER_DEBUG
-		std::cerr << "[VEX] TryOptimizeANN: skipping — FILTER present but filter extraction failed" << std::endl;
-#endif
-		return false;
-	}
-
-	// If filtered search returned empty, fall back to regular plan.
-	if (did_filtered_search && result_row_ids.empty()) {
-#ifdef VEX_OPTIMIZER_DEBUG
-		std::cerr << "[VEX] TryOptimizeANN: filtered search returned empty, falling back to regular plan" << std::endl;
-#endif
-		return false;
-	}
-
-	// Fallback: use ExecuteANNSearch (unfiltered)
-	if (!did_filtered_search && result_row_ids.empty()) {
-		if (!ExecuteANNSearch(context, match, get, dist_info.query_vec.data(), k, result_row_ids, result_distances)) {
+		if (!filter_pred) {
 			return false;
 		}
 	}
 
-#ifdef VEX_OPTIMIZER_DEBUG
-	std::cerr << "[VEX] ANN search returned " << result_row_ids.size() << " results, k=" << k << std::endl;
-	for (idx_t i = 0; i < result_row_ids.size() && i < 5; i++) {
-		std::cerr << "[VEX]   row_id=" << result_row_ids[i] << " dist=" << result_distances[i] << std::endl;
-	}
-	std::cerr << "[VEX] get->types.size()=" << get->types.size()
-	          << " column_ids.size()=" << column_ids.size()
-	          << " projection_ids.size()=" << get->projection_ids.size() << std::endl;
-	for (idx_t i = 0; i < get->types.size(); i++) {
-		std::cerr << "[VEX]   type[" << i << "]=" << get->types[i].ToString() << std::endl;
-	}
-	for (idx_t i = 0; i < column_ids.size(); i++) {
-		std::cerr << "[VEX]   col_id[" << i << "]=" << column_ids[i].GetPrimaryIndex() << std::endl;
-	}
-	if (get_info.proj) {
-		std::cerr << "[VEX] proj->types.size()=" << get_info.proj->types.size() << std::endl;
-		for (idx_t i = 0; i < get_info.proj->types.size(); i++) {
-			std::cerr << "[VEX]   proj_type[" << i << "]=" << get_info.proj->types[i].ToString() << std::endl;
-		}
-	}
-	// Also check returned_types
-	std::cerr << "[VEX] get->returned_types.size()=" << get->returned_types.size() << std::endl;
-#endif
+	auto scan = make_uniq<LogicalVexIndexScan>(
+	    get->table_index, GetOutputTypes(get),
+	    duck_table, *match.graph_idx,
+	    dist_info.query_vec_expr->Copy(),
+	    k,
+	    column_ids, get->returned_types,
+	    std::move(filter_pred));
+	scan->SetEstimatedCardinality(k);
 
-	auto collection = FetchRowsByIds(context, duck_table, get, result_row_ids, limit, offset);
-	auto actual_count = collection->Count();
-	auto column_data_get = make_uniq<LogicalColumnDataGet>(get->table_index, GetOutputTypes(get), std::move(collection));
-	column_data_get->SetEstimatedCardinality(actual_count);
-
-	ReplacePlanWithResults(node, get_owner, get_info, std::move(column_data_get));
+	if (get_info.cross_product) {
+		scan->children.push_back(
+		    std::move(get_info.cross_product->children[get_info.subquery_child_idx]));
+	}
+	ReplaceGetWithVexScan(get_owner, get_info, std::move(scan));
 	return true;
 }
 

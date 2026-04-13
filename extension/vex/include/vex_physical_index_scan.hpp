@@ -5,6 +5,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/storage/storage_index.hpp"
 #include "duckdb/common/column_index.hpp"
+#include "vex_filter_predicate.hpp"
 
 namespace duckdb {
 
@@ -20,7 +21,8 @@ public:
 	LogicalVexIndexScan(idx_t table_index, vector<LogicalType> output_types,
 	                    DuckTableEntry &table, GraphIndex &graph_index,
 	                    unique_ptr<Expression> query_vec_expr, idx_t k,
-	                    vector<ColumnIndex> column_ids, vector<LogicalType> returned_types);
+	                    vector<ColumnIndex> column_ids, vector<LogicalType> returned_types,
+	                    unique_ptr<vex::FilterPredicate> filter_predicate = nullptr);
 
 	// LogicalExtensionOperator interface
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
@@ -47,6 +49,8 @@ public:
 	unique_ptr<Expression> query_vec_expr;
 	//! Number of nearest neighbors to return
 	idx_t k;
+	//! Optional metadata filter to apply inside the graph index
+	unique_ptr<vex::FilterPredicate> filter_predicate;
 	//! Column IDs to fetch from the table (logical column indices from LogicalGet)
 	vector<ColumnIndex> column_ids;
 	//! The returned types of the underlying table columns (indexed by physical column position)
@@ -64,7 +68,8 @@ public:
 	PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
 	                     DuckTableEntry &table, GraphIndex &graph_index,
 	                     unique_ptr<Expression> query_vec_expr, idx_t k,
-	                     vector<ColumnIndex> column_ids, vector<LogicalType> returned_types);
+	                     vector<ColumnIndex> column_ids, vector<LogicalType> returned_types,
+	                     unique_ptr<vex::FilterPredicate> filter_predicate = nullptr);
 
 	string GetName() const override;
 	InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -89,6 +94,8 @@ public:
 	unique_ptr<Expression> query_vec_expr;
 	//! Number of nearest neighbors to return
 	idx_t k;
+	//! Optional metadata filter to apply inside the graph index
+	unique_ptr<vex::FilterPredicate> filter_predicate;
 	//! Column IDs from LogicalGet (logical column indices)
 	vector<ColumnIndex> column_ids;
 	//! The returned types of the underlying table columns

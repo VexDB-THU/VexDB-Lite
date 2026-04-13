@@ -5,6 +5,7 @@
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
+#include "duckdb/execution/operator/scan/physical_dummy_scan.hpp"
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -24,10 +25,12 @@ namespace duckdb {
 LogicalVexIndexScan::LogicalVexIndexScan(idx_t table_index_p, vector<LogicalType> output_types_p,
                                          DuckTableEntry &table_p, GraphIndex &graph_index_p,
                                          unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
-                                         vector<ColumnIndex> column_ids_p, vector<LogicalType> returned_types_p)
+                                         vector<ColumnIndex> column_ids_p, vector<LogicalType> returned_types_p,
+                                         unique_ptr<vex::FilterPredicate> filter_predicate_p)
     : LogicalExtensionOperator(), table_index(table_index_p), output_types(std::move(output_types_p)),
       table(table_p), graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
-      column_ids(std::move(column_ids_p)), returned_types(std::move(returned_types_p)) {
+      filter_predicate(std::move(filter_predicate_p)), column_ids(std::move(column_ids_p)),
+      returned_types(std::move(returned_types_p)) {
 }
 
 PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
@@ -42,11 +45,17 @@ PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, Physic
 	    types, estimated_cardinality,
 	    table, graph_index,
 	    query_vec_expr->Copy(), k,
-	    column_ids, returned_types);
+	    column_ids, returned_types,
+	    filter_predicate ? filter_predicate->Clone() : nullptr);
 
 	// Attach child physical plans
-	for (auto &child_plan : child_plans) {
-		scan.children.push_back(child_plan.get());
+	if (child_plans.empty()) {
+		auto &dummy_scan = planner.Make<PhysicalDummyScan>(vector<LogicalType> {LogicalType::INTEGER}, 1);
+		scan.children.push_back(dummy_scan);
+	} else {
+		for (auto &child_plan : child_plans) {
+			scan.children.push_back(child_plan.get());
+		}
 	}
 
 	return scan;
@@ -118,10 +127,12 @@ PhysicalVexIndexScan::PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<L
                                            idx_t estimated_cardinality, DuckTableEntry &table_p,
                                            GraphIndex &graph_index_p, unique_ptr<Expression> query_vec_expr_p,
                                            idx_t k_p, vector<ColumnIndex> column_ids_p,
-                                           vector<LogicalType> returned_types_p)
+                                           vector<LogicalType> returned_types_p,
+                                           unique_ptr<vex::FilterPredicate> filter_predicate_p)
     : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types), estimated_cardinality),
       table(table_p), graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
-      column_ids(std::move(column_ids_p)), returned_types(std::move(returned_types_p)) {
+      filter_predicate(std::move(filter_predicate_p)), column_ids(std::move(column_ids_p)),
+      returned_types(std::move(returned_types_p)) {
 }
 
 //===--------------------------------------------------------------------===//
@@ -188,6 +199,7 @@ static bool ExtractFloatVector(const Value &val, vector<float> &out_vec) {
 static unique_ptr<ColumnDataCollection> PerformSearchAndFetch(
     ClientContext &client_context, DuckTableEntry &table, GraphIndex &graph_index,
     const vector<float> &query_vec, idx_t k,
+    const optional_ptr<const vex::FilterPredicate> filter_predicate,
     const vector<ColumnIndex> &column_ids, const vector<LogicalType> &returned_types,
     const vector<LogicalType> &output_types) {
 
@@ -218,7 +230,12 @@ static unique_ptr<ColumnDataCollection> PerformSearchAndFetch(
 	// Execute ANN search
 	vector<row_t> result_row_ids;
 	vector<float> result_distances;
-	graph_index.ANNSearch(query_vec.data(), k, ef, result_row_ids, result_distances, bf_threshold);
+	if (filter_predicate) {
+		graph_index.FilteredSearch(query_vec.data(), k, ef, result_row_ids, result_distances,
+		                           *filter_predicate, bf_threshold);
+	} else {
+		graph_index.ANNSearch(query_vec.data(), k, ef, result_row_ids, result_distances, bf_threshold);
+	}
 
 #ifdef VEX_PHYSICAL_SCAN_DEBUG
 	std::cerr << "[VEX PhysicalScan] ANNSearch returned " << result_row_ids.size()
@@ -280,6 +297,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
 
 		auto fetch_collection = PerformSearchAndFetch(
 		    client_context, table, graph_index, query_vec, k,
+		    filter_predicate ? optional_ptr<const vex::FilterPredicate>(*filter_predicate) : nullptr,
 		    column_ids, returned_types, get_types);
 
 		// Now build the final collection that includes the subquery columns too.
