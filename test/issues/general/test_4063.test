@@ -1,8 +1,0 @@
-# name: test/issues/general/test_4063.test
-# description: Issue 4063: First_value window function sanitizer issue
-# group: [general]
-
-query T
-SELECT first_value(1) OVER ()
-----
-1

@@ -7,7 +7,6 @@
 
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/config.hpp"
-#include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
 #ifndef VEX_GIT_HASH
@@ -33,11 +32,6 @@ static void RegisterIndexTypes(DBConfig &config) {
 
 	// Always register directly to config (works in all contexts including unittest)
 	try { config.GetIndexTypes().RegisterIndexType(graph_index_type); } catch (...) {}
-
-#ifdef VEX_HAS_GLOBAL_INDEX_REGISTRY
-	// Also register to global registry for FinalizeLoad() reload path
-	GlobalIndexTypeRegistry::GetInstance().RegisterIndexType(graph_index_type);
-#endif
 }
 
 static void LoadInternal(ExtensionLoader &loader) {

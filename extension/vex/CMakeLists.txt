@@ -13,36 +13,10 @@ option(VEX_MOBILE_MODE "Enable mobile-friendly defaults (mutex locks, lower thre
 # into GraphIndexCore (member variables, serialization, search paths). The binary size
 # overhead is minimal (~300 lines). Use CREATE INDEX ... WITH (pq_m=0) to disable at runtime.
 
-# Detect GlobalIndexTypeRegistry availability (present in our fork, absent in upstream DuckDB)
-set(INDEX_TYPE_SET_HEADER "${CMAKE_SOURCE_DIR}/src/include/duckdb/execution/index/index_type_set.hpp")
-if(EXISTS "${INDEX_TYPE_SET_HEADER}")
-    file(READ "${INDEX_TYPE_SET_HEADER}" INDEX_TYPE_SET_CONTENT)
-    string(FIND "${INDEX_TYPE_SET_CONTENT}" "GlobalIndexTypeRegistry" HAS_GLOBAL_REGISTRY_POS)
-    if(NOT HAS_GLOBAL_REGISTRY_POS EQUAL -1)
-        add_definitions(-DVEX_HAS_GLOBAL_INDEX_REGISTRY)
-        message(STATUS "VEX: GlobalIndexTypeRegistry detected")
-    else()
-        message(STATUS "VEX: Using DBConfig::GetIndexTypes() fallback")
-    endif()
-else()
-    message(STATUS "VEX: index_type_set.hpp not found, using fallback")
-endif()
-
-# Detect buffer eviction support (forked DuckDB with TryEvict/EvictCleanBuffers)
-set(FIXED_SIZE_BUFFER_HEADER "${CMAKE_SOURCE_DIR}/src/include/duckdb/execution/index/fixed_size_buffer.hpp")
-if(EXISTS "${FIXED_SIZE_BUFFER_HEADER}")
-    file(READ "${FIXED_SIZE_BUFFER_HEADER}" FSB_CONTENT)
-    string(FIND "${FSB_CONTENT}" "TryEvict" HAS_TRY_EVICT_POS)
-    if(NOT HAS_TRY_EVICT_POS EQUAL -1)
-        add_definitions(-DVEX_HAS_BUFFER_EVICTION)
-        message(STATUS "VEX: Buffer eviction support detected")
-    endif()
-endif()
-
 # Get git commit hash at configure time
 execute_process(
     COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     OUTPUT_VARIABLE VEX_GIT_HASH
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET)

@@ -168,12 +168,24 @@ VexDB-Lite consistently occupies the upper-right corner of the Recall-QPS curve.
 ## Build
 
 ```bash
-bash build.sh release           # Release build
-bash build.sh test               # Build and run tests
-bash build.sh test-capi          # Cross-platform C API tests
-bash build.sh ios                # iOS cross-compilation
-bash build.sh android            # Android cross-compilation
-bash build.sh wasm               # WebAssembly build
+# 1) Point to a separate DuckDB source checkout
+export DUCKDB_SOURCE_DIR=/path/to/duckdb
+
+# 2) (Optional) pin extension version tag to target DuckDB runtime
+# export DUCKDB_VERSION_TAG=v1.4.4
+
+# 3) Build loadable vex extension
+./build.sh all Release
+
+# 4) Output artifact (example)
+# build/standalone/_duckdb/extension/vex/vex.duckdb_extension
+```
+
+Load in DuckDB:
+
+```sql
+LOAD '/absolute/path/to/vex.duckdb_extension';
+SELECT vex_version();
 ```
 
 ---

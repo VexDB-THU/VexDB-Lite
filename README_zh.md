@@ -168,12 +168,24 @@ VexDB-Lite 在 Recall-QPS 曲线上始终占据右上角——同等召回率下
 ## 构建
 
 ```bash
-bash build.sh release           # Release 构建
-bash build.sh test               # 编译并运行测试
-bash build.sh test-capi          # C API 跨平台测试
-bash build.sh ios                # iOS 交叉编译
-bash build.sh android            # Android 交叉编译
-bash build.sh wasm               # WebAssembly 编译
+# 1) 指向一个独立的 DuckDB 源码目录
+export DUCKDB_SOURCE_DIR=/path/to/duckdb
+
+# 2)（可选）指定与运行时 DuckDB 匹配的版本标签
+# export DUCKDB_VERSION_TAG=v1.4.4
+
+# 3) 构建可加载的 vex 扩展
+./build.sh all Release
+
+# 4) 产物示例
+# build/standalone/_duckdb/extension/vex/vex.duckdb_extension
+```
+
+在 DuckDB 中加载：
+
+```sql
+LOAD '/absolute/path/to/vex.duckdb_extension';
+SELECT vex_version();
 ```
 
 ---

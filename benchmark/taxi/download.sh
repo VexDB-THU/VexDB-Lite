@@ -1,1 +1,0 @@
-wget -i files.txt -P data/
