@@ -74,6 +74,8 @@ m4/lt~obsolete.m4
 #==============================================================================#
 #m4/
 build/
+build-release/
+build-release-vex/
 duckdb_benchmark_data/
 #*.m4
 *.o
