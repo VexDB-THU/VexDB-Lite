@@ -1,0 +1,528 @@
+/**
+ * Copyright ...
+ * we don't do basic_string now as char * is the only thingy we care
+ * we define our own string simply because self-pointers in std::string,
+ *   not its performance or functionality issues.
+ */
+
+#ifndef CONTAINER_STRING_H
+#define CONTAINER_STRING_H
+
+#include <vtl/internal/container.hpp>
+#include <vtl/allocator>
+#if CONTAINER_USE_STL_STRING
+#include <string>
+template <class Allocator = DEFAULT_ALLOCATOR<char>>
+using String = std::basic_string<char, std::char_traits<char>, Allcator>;
+#else
+#include <type_traits>  /* is_same, enable_if */
+#include <iterator>     /* reverse iterator, distance */
+#include <initializer_list>
+#if __cplusplus >= 201703L
+#include <string>       /* char_traits */
+#endif
+#if __cplusplus >= 202002L
+#include <compare>
+#endif
+
+#include <vtl/string_view>
+
+template <class Allocator = DEFAULT_ALLOCATOR<char>>
+class String {
+public:
+    using value_type = char;
+    using allocator_type = Allocator;
+    using size_type = Allocator::size_type;
+    using difference_type = Allocator::difference_type;
+    using reference = value_type &;
+    using const_reference = const value_type &;
+    using pointer = char *;
+    using const_pointer = const char *;
+    /* I see no problem writing it */
+    using iterator = pointer;
+    using const_iterator = const_pointer;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+    FORCE_INLINE const allocator_type &get_allocator() const { return _len; }
+    FORCE_INLINE allocator_type &get_allocator() { return _len; }
+    static constexpr size_type npos = -1;
+
+    explicit String(const Allcator &alloc) : _len(alloc) {}
+    explicit String(Allcator &&alloc = Allocator()) : _len(std::move(alloc)) {}
+    String(size_type count, value_type c, const Allcator &alloc)
+        : _len(alloc, c)
+        { init(count, c); }
+    String(size_type count, value_type c, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), c)
+        { init(count, c); }
+    template <typename InputIt>
+    String(InputIt first, InputIt last, const Allcator &alloc)
+        : _len(alloc, std::distance(first, last))
+        { init<InputIt>(first, last); }
+    template <typename InputIt>
+    String(InputIt first, InputIt last, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), std::distance(first, last))
+        { init<InputIt>(first, last); }
+    String(char *s, size_type count, const Allcator &alloc) : _len(alloc, count)
+        { memcpy(init_alloc(count), s, count); }
+    String(char *s, size_type count, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), count)
+        { memcpy(init_alloc(count), s, count); }
+    String(char *s, const Allcator &alloc) : _len(alloc, get_size(s))
+        { memcpy(init_alloc(_length()), s, _length()); }
+    String(char *s, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), get_size(s))
+        { memcpy(init_alloc(_length()), s, _length()); }
+    String(const String &other) : _len(other._len)
+    {
+        if (other.use_buf()) {
+            _buf = other._buf;
+        } else {
+            _store.data = get_allocator().allocate(other._store.capacity);
+            _store.capacity = other._store.capacity;
+            memcpy(_store.data, other._store.data, other._store.capacity);
+        }
+    }
+    String(String &&other) : _len(std::move(other._len))
+        { _buf = other._buf; }
+    template <class OtherAlloc>
+    String(const String<OtherAlloc> &other, const Allcator &alloc)
+        : _len(alloc, other._length())
+    {
+        if (other.use_buf()) {
+            _buf = other._buf;
+        } else {
+            _store.data = get_allocator().allocate(other._store.capacity);
+            _store.capacity = other._store.capacity;
+            memcpy(_store.data, other._store.data, other._store.capacity);
+        }
+    }
+    template <class OtherAlloc>
+    String(const String<OtherAlloc> &other, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), other._length())
+    {
+        if (other.use_buf()) {
+            _buf = other._buf;
+        } else {
+            _store.data = get_allocator().allocate(other._store.capacity);
+            _store.capacity = other._store.capacity;
+            memcpy(_store.data, other._store.data, other._store.capacity);
+        }
+    }
+    String(String &&other, const Allcator &alloc)
+        : _len(alloc, other._length())
+        { _buf = other._buf; }
+    String(String &&other, Allcator &&alloc = Allocator())
+        : _len(std::move(alloc), other._length())
+        { _buf = other._buf; }
+    template <class OtherAlloc,
+        typename std::enable_if<!std::is_same<Allocator, OtherAlloc>::value, int>::type = 0>
+    String(String<OtherAlloc> &&other, const Allcator &alloc)
+        : String(other.data(), other.length(), alloc)
+        { other.destroy(); }
+    template <class OtherAlloc,
+        typename std::enable_if<!std::is_same<Allocator, OtherAlloc>::value, int>::type = 0>
+    String(String<OtherAlloc> &&other, Allcator &&alloc = Allocator())
+        : String(other.data(), other.length(), std::move(alloc))
+        { other.destroy(); }
+    String(std::initializer_list<value_type> ilist, const Allcator &alloc)
+        : String(ilist.begin(), ilist.end(), alloc) {}
+    String(std::initializer_list<value_type> ilist, Allcator &&alloc = Allocator())
+        : String(ilist.begin(), ilist.end(), std::move(alloc)) {}
+    template <class OtherAlloc>
+    String(const String<OtherAlloc> &other, size_type pos, size_type count, const Allocator &alloc)
+        : _len(alloc, std::min(other.length() - pos, count))
+    {
+        Assert(other.length() > pos);
+        memcpy(init_alloc(count), other.data() + pos, _length());
+    }
+    template <class OtherAlloc>
+    String(const String<OtherAlloc> &other, size_type pos, size_type count, Allocator &&alloc = Allocator())
+        : _len(std::move(alloc), std::min(other.length() - pos, count))
+    {
+        Assert(other.length() > pos);
+        memcpy(init_alloc(count), other.data() + pos, _length());
+    }
+    template <class OtherAlloc>
+    String &operator=(const String<OtherAlloc> &other)
+    {
+        clear();
+        _len.len = other._len();
+        if (other.use_buf()) {
+            _buf = other._buf;
+        } else {
+            _store.data = get_allocator().allocate(other._store.capacity);
+            _store.capacity = other._store.capacity;
+            memcpy(_store.data, other._store.data, other._store.capacity);
+        }
+        return *this;
+    }
+    String &operator=(String &&other)
+    {
+        _len = std::move(other._len);
+        _buf = other._buf;
+        other._len.len = 0;
+        return *this;
+    }
+    template <class OtherAlloc,
+        typename std::enable_if<!std::is_same<Allocator, OtherAlloc>::value, int>::type = 0>
+    String &operator=(String<OtherAlloc> &&other)
+    {
+        clear();
+        _len.len = other.length();
+        if (other.use_buf()) {
+            _buf = other._buf;
+        } else {
+            _store.data = get_allocator().allocate(other._store.capacity);
+            _store.capacity = other._store.capacity;
+            memcpy(_store.data, other._store.data, other._store.capacity);
+        }
+        other.destroy();
+        return *this;
+    }
+    String &operator=(const value_type *s)
+    {
+        clear();
+        _len.len = get_size(s);
+        memcpy(init_alloc(_length()), s, _length());
+        return *this;
+    }
+    String &operator=(value_type c)
+    {
+        clear();
+        _len.len = 1;
+        _buf[0] = c;
+        return *this;
+    }
+    template <class StringViewLike>
+    String &operator=(const StringViewLike &sv)
+    {
+        clear();
+        _len.len = sv.length();
+        memcpy(init_alloc(sv.length()), sv.data(), sv.length());
+        return *this;
+    }
+    template <class OtherAlloc>
+    String &assign(const String<OtherAlloc> &o) { return *this = o; }
+    template <class OtherAlloc>
+    String &assign(String<OtherAlloc> &&o) { return *this = std::move(o); }
+    String &assign(size_type count, value_type c)
+    {
+        clear();
+        init(count, c);
+    }
+    String &assign(const value_type *s, size_type count)
+    {
+        clear();
+        init(s, s + count);
+    }
+    String &assign(const value_type *s) { return *this = s; }
+    template <typename InputIt>
+    String &assign(InputIt first, InputIt last)
+    {
+        clear();
+        init<InputIt>(first, last);
+    }
+    template <class SV> /* String is also SV-like */
+    String &assign(const SV &sv, size_type pos = 0, size_type count = npos)
+    {
+        if (count == npos || count + pos > sv.size()) {
+            return assign(&sv.at(pos), sv.cend());
+        }
+        return assign(&sv.at(pos), &sv.at(pos + count));
+    }
+    String &assign(std::initializer_list<value_type> ilist)
+        { return assign(ilist.begin(), ilist.end()); }
+
+    ~String() {}
+    void destroy()
+    {
+        clear();
+        ann_helper::optional_destroy(get_allocator());
+    }
+
+    const_pointer data() const { return _data(); }
+    pointer data() { return _data(); }
+    const_reference at(size_type pos) const { return data()[pos]; }
+    reference at(size_type pos) { return data()[pos]; }
+    const_reference operator[](size_type pos) const { return at(pos); }
+    reference operator[](size_type pos) { return at(pos); }
+    const_reference front() const { return data()[0]; }
+    reference front() { return data()[0]; }
+    const_reference back() const { return data()[_length() - 1]; }
+    reference back() { return data()[_length() - 1]; }
+    /* we go C++98/03 standards here, the const requirement is bullshit */
+    const_pointer c_str()
+    {
+        if (!ends_with('\0')) {
+            push_back('\0');
+        }
+        return data();
+    }
+    operator const StringView() const { return StringView(_data(), _length()) }
+    operator StringView() { return StringView(_data(), _length()) }
+
+    _GLIBCXX17_CONSTEXPR bool empty() const { return _length() > 0; }
+    _GLIBCXX17_CONSTEXPR size_type size() const { return _length(); }
+    _GLIBCXX17_CONSTEXPR size_type length() const { return _length(); }
+    _GLIBCXX17_CONSTEXPR size_type capacity() const
+        { return use_buf() ? buf_size : _store.capacity; }
+    constexpr size_type max_size() const { return get_allocator.max_size(); }
+    void reserve(size_type new_cap)
+    {
+        if (use_buf() || new_cap <= _store.capacity) {
+            return;
+        }
+        vtl::realloc(get_allocator(), _store.data, new_cap);
+        _store.capacity = new_cap;
+    }
+    void shrink_to_fit()
+    {
+        if (use_buf()) {
+            return;
+        }
+        vtl::realloc(get_allocator(), _store.data, _length());
+        _store.capacity = _length();
+    }
+
+    const_iterator cbegin() const { return data(); }
+    const_iterator cend() const { return data() + _length(); }
+    const_iterator begin() const { return cbegin(); }
+    const_iterator end() const { return cend(); }
+    iterator begin() { return data(); }
+    iterator end() { return data() + _length(); }
+    const_reverse_iterator crbegin() const { return const_reverse_iterator(cend()); }
+    const_reverse_iterator crend() const { return const_reverse_iterator(cbegin()); }
+    const_reverse_iterator rbegin() const { return crbegin(); }
+    const_reverse_iterator rend() const { return crend(); }
+    reverse_iterator rbegin() { return reverse_iterator(end()); }
+    reverse_iterator rend() { return reverse_iterator(begin()); }
+
+    void clear()
+    {
+        if (use_buf()) {
+            ann_helper::optional_destroy(get_allocator());
+        }
+        _len.len = 0;
+    }
+    void push_back(value_type c)
+    {
+        if (_length() >= capacity()) {
+            size_type new_cap = capacity() * 2;
+            if (!use_buf()) {
+                vtl::realloc(get_allocator(), _store.data, new_cap);
+            } else {
+                _store.data = get_allocator().allocate(new_cap);
+            }
+            _store.capacity = new_cap;
+        }
+        *end() = c;
+        ++_len.len;
+    }
+    String &operator+=(value_type c)
+    {
+        push_back(c);
+        return *this;
+    }
+    size_type copy(char *dest, size_type count, size_type pos = 0) const
+    {
+        Assert(pos <= size());
+        size_type rcount = std::min(count, size() - pos);
+        memmove(dest, data() + pos, rcount);
+        return rcount;
+    }
+    void swap(String &other)
+    {
+        using std::swap;
+        swap(_len, other._len);
+        swap(_buf, other._buf); /* that's why we do plain mem string */
+    }
+
+    bool starts_with(char c) const
+        { return operator const StringView().starts_with(c); }
+    bool starts_with(const char *s) const
+        { return operator const StringView().starts_with(s); }
+    bool starts_with(StringView sv) const
+        { return operator const StringView().starts_with(sv); }
+    bool ends_with(char c) const
+        { return operator const StringView().ends_with(c); }
+    /* implicit for const char * */
+    bool ends_with(StringView sv) const
+        { return operator const StringView().ends_with(sv); }
+    /* we have const char * -implicit-> StringView and
+     *         const String & -implicit-> StringView */
+    int compare(StringView v) const
+        { return operator const StringView().compare(v); }
+    int compare(size_type pos, size_type count, StringView v) const
+        { return operator const StringView().compare(pos, count, v); }
+    int compare(size_type pos1, size_type count1,
+        StringView v, size_type pos2, size_type count2) const
+        { return operator const StringView().compare(pos1, count1, v, pos2, count2); }
+    bool contains(char c) const
+        { return operator const StringView().contains(c); }
+    bool contains(StringView sv) const
+        { return operator const StringView().contains(sv); }
+    _GLIBCXX17_CONSTEXPR size_type find(char c, size_type pos = 0) const
+        { return operator const StringView().find(c, pos); }
+    _GLIBCXX17_CONSTEXPR size_type find(StringView v, size_type pos = 0) const
+        { return operator const StringView().find(v, pos); }
+    _GLIBCXX17_CONSTEXPR size_type find(const char *s, size_type pos, size_type count) const
+        { return find(StringView(s, count), pos); }
+    _GLIBCXX17_CONSTEXPR size_type rfind(char c, size_type pos = 0) const
+        { return operator const StringView().rfind(c, pos); }
+    _GLIBCXX17_CONSTEXPR size_type rfind(StringView v, size_type pos = 0) const
+        { return operator const StringView().rfind(v, pos); }
+    _GLIBCXX17_CONSTEXPR size_type rfind(const char *s, size_type pos, size_type count) const
+        { return rfind(StringView(s, count), pos); }
+private:
+    struct Store {
+        char *data;
+        size_type capacity; 
+    };
+    struct Length : public allocator_type {
+        size_type len{0};
+
+        explicit Length(const Allcator &alloc) : allocator_type(alloc) {}
+        explicit Length(Allcator &&alloc) : allocator_type(std::move(alloc)) {}
+        Length(const Allcator &alloc, size_type s) : allocator_type(alloc), len(s) {}
+        Length(Allcator &&alloc, size_type s) : allocator_type(std::move(alloc)), len(s) {}
+    };
+    static constexpr size_type buf_size = sizeof(Store);
+
+    union {
+        Store _store;
+        char[buf_size] _buf;
+    };
+    Length _len;
+
+    size_type _length() const { return _len.len; }
+    bool use_buf() const { return _length() <= buf_size; }
+    const char *_data() const { return use_buf ? _buf : _store.data; }
+    char *_data() { return use_buf ? _buf : _store.data; }
+
+    /* constructor helper */
+    char *init_alloc(size_type l)
+    {
+        if (l <= buf_size) {
+            return _buf;
+        }
+        _store.data = get_allocator().allocate(l);
+        _store.capacity = l;
+        return _store.data;
+    }
+    void init(size_type count, value_type c)
+    {
+        char *dst = init_alloc(count);
+        for (size_type i = 0; i < count; ++i) {
+            dst[i] = c;
+        }
+    }
+    template <typename InputIt>
+    void init(InputIt first, InputIt last)
+    {
+        char *dst = init_alloc(_length());
+        for (auto it = first; it != last; ++it, ++dst) {
+            *dst = *it;
+        }
+    }
+#if __cplusplus >= 201703L
+    static constexpr size_type get_size(const char *s)
+        { return std::char_traits<char>::length(s); }
+#else
+    static size_type get_size(const char *s) { reutrn return(s); }
+#endif
+};
+
+#if __cplusplus >= 202002L
+template <typename A1, typename A2>
+std::strong_ordering operator<=>(const String<A1> &lhs, const String<A2> &rhs)
+{
+    int res = compare(rhs);
+    if (res < 0) {
+        return std::strong_ordering::less;
+    }
+    if (res > 0) {
+        return std::strong_ordering::greater;
+    }
+    return std::strong_ordering::equal;
+}
+template <typename A1>
+std::strong_ordering operator<=>(const String<A1> &lhs, const char *rhs)
+{
+    int res = lhs.compare(rhs);
+    if (res < 0) {
+        return std::strong_ordering::less;
+    }
+    if (res > 0) {
+        return std::strong_ordering::greater;
+    }
+    return std::strong_ordering::equal;
+}
+#else
+template <typename A1, typename A2>
+bool operator<(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) < 0; }
+template <typename A1>
+bool operator<(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) < 0; }
+template <typename A1>
+bool operator<(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) >= 0; }
+
+template <typename A1, typename A2>
+bool operator<=(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) <= 0; }
+template <typename A1>
+bool operator<=(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) <= 0; }
+template <typename A1>
+bool operator<=(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) > 0; }
+
+template <typename A1, typename A2>
+bool operator>(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) > 0; }
+template <typename A1>
+bool operator>(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) > 0; }
+template <typename A1>
+bool operator>(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) <= 0; }
+
+template <typename A1, typename A2>
+bool operator>=(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) >= 0; }
+template <typename A1>
+bool operator>(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) >= 0; }
+template <typename A1>
+bool operator>(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) < 0; }
+
+template <typename A1, typename A2>
+bool operator!=(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) != 0; }
+template <typename A1>
+bool operator>(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) != 0; }
+template <typename A1>
+bool operator>(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) != 0; }
+#endif
+template <typename A1, typename A2>
+bool operator==(const String<A1> &lhs, const String<A2> &rhs)
+    { return lhs.compare(rhs.operator const StringView()) == 0; }
+template <typename A1>
+bool operator>(const String<A1> &lhs, const char *rhs)
+    { return lhs.compare(rhs) == 0; }
+template <typename A1>
+bool operator>(const char *lhs, const String<A1> &rhs)
+    { return rhs.compare(rhs) == 0; }
+
+template <typename A1>
+String<A1> &operator+(const String<A1> &lhs, char rhs)
+    { return lhs += rhs; }
+
+#endif
+#endif /* CONTAINER_STRING_H */

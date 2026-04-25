@@ -1,0 +1,36 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_HOLDER_H
+#define CONTAINER_HOLDER_H
+
+#include <utility>
+#include <type_traits>
+
+template <typename T>
+class Holder {
+private:
+    union {
+        char unused;
+        T value;
+    };
+public:
+    Holder() {}
+    ~Holder() {}
+    template <typename... Args,
+              typename = std::enable_if_t<!std::disjunction_v<std::is_same<std::decay_t<Args>, Holder>...>>>
+    explicit Holder(Args &&...args) : value(std::forward<Args>(args)...) {}
+    template <typename... Args>
+    void emplace(Args &&...args) { new (&value) T(std::forward<Args>(args)...); }
+    constexpr operator const T &() const & { return value; }
+    constexpr operator T &&() && { return value; }
+    constexpr operator T &() & { return value; }
+    constexpr const T &operator*() const & { return value; }
+    constexpr T &&operator*() && { return value; }
+    constexpr T &operator*() & { return value; }
+    constexpr const T *operator->() const { return &value; }
+    constexpr T *operator->() { return &value; }
+};
+
+#endif /* CONTAINER_HOLDER_H */

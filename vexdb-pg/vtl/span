@@ -1,0 +1,218 @@
+/**
+ * Copyright ...
+ * expect to be identical to std::span,
+ *   we wrote this only because we don't have c++20
+ */
+
+#ifndef CONTAINER_SPAN_H
+#define CONTAINER_SPAN_H
+
+#include <vtl/internal/container.hpp>
+#if CONTAINER_USE_STL_SPAN
+#include <span>
+template <class T, std::size_t Extent = std::dynamic_extent>
+using Span = std::span<T, Extent>;
+#else
+#include <type_traits>  /* is_pointer, remove_cv, enable_if */
+#include <iterator>     /* reverse iterator */
+#include <vtl/internal/expr.hpp>
+#include <vtl/array>
+
+namespace vtl {
+_GLIBCXX17_INLINE constexpr size_t dynamic_extent = -1;
+namespace span_detail {
+template <typename pointer, typename size_type, size_t _Extent>
+struct Store {
+    pointer _data;
+    static constexpr size_type size() { return _Extent; }
+
+    constexpr Store() : _data(NULL) {};
+    _GLIBCXX17_CONSTEXPR Store(pointer data) : _data(data) {}
+    _GLIBCXX17_CONSTEXPR Store(pointer data, size_type) : Store(data) {}
+    _GLIBCXX17_CONSTEXPR Store(const Store &) = default;
+    _GLIBCXX17_CONSTEXPR Store &operator=(const Store &) = default;
+    void swap(Store &other) { std::swap(_data, other._data); }
+};
+template <typename pointer, typename size_type>
+struct Store<pointer, size_type, ::vtl::dynamic_extent> {
+    pointer _data;
+    size_type _size;
+    size_type size() const { return _size; }
+
+    constexpr Store() : _data(NULL), _size(0) {};
+    _GLIBCXX17_CONSTEXPR Store(pointer data, size_type size) : _data(data), _size(size) {}
+    template <typename It,
+        typename std::enable_if<std::is_pointer<It>::value, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Store(It first, size_type size) : _data(first), _size(size) {}
+    template <typename It,
+        typename std::enable_if<!std::is_pointer<It>::value, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Store(It first, size_type size) : _data(first.operator->()), _size(size) {}
+    _GLIBCXX17_CONSTEXPR Store(const Store &) = default;
+    _GLIBCXX17_CONSTEXPR Store& operator=(const Store &) = default;
+    void swap(Store &other)
+    {
+        std::swap(_data, other._data);
+        std::swap(_size, other._size);
+    }
+};
+} /* namespace span_detail */
+} /* namespace vtl */
+
+template <class T, size_t Extent = ::vtl::dynamic_extent>
+class Span {
+public:
+    using element_type = T;
+    using value_type = typename std::remove_cv<T>::type;
+    using size_type = size_t;
+    using difference_type = std::ptrdiff_t;
+    using pointer = T *;
+    using const_pointer = const T *;
+    using reference = T &;
+    using const_reference = const T &;
+    using iterator = T *;
+    using const_iterator = const T *;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+    static constexpr size_t extent = Extent;
+    static constexpr bool is_dynamic = Extent == ::vtl::dynamic_extent;
+private:
+    template <size_t Offset, size_t Count>
+    static constexpr size_t subspan_count =
+        Count != ::vtl::dynamic_extent
+            ? Count
+            : (is_dynamic
+                ? extent - Offset
+                : ::vtl::dynamic_extent);
+
+    template <typename...> using holder = void;
+
+    template <typename R, typename = void>
+    struct has_data : std::false_type {};
+    template <typename R>
+    struct has_data<R, holder<decltype(std::declval<R &>().data())>>
+        : std::is_convertible<decltype(std::declval<R &>().data()), T *> {};
+
+    template <typename R, typename = void>
+    struct has_size : std::false_type {};
+    template <typename R>
+    struct has_size<R, holder<decltype(std::declval<R&>().size())>>
+        : std::is_convertible<decltype(std::declval<R&>().size()), size_type> {};
+
+    template <typename R>
+    using enable_if_container_like = typename std::enable_if<
+        has_data<R>::value && has_size<R>::value
+    >::type;
+public:
+    constexpr Span() = default;
+    template <typename It>
+    _GLIBCXX17_CONSTEXPR Span(It first, size_type count) : _store(first, count) {}
+    template <typename It, typename End,
+        typename std::enable_if<!std::is_convertible<End, size_t>::value, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Span(It first, End last) : _store(first, last - first) {}
+    template <size_t N, typename std::enable_if<N == Extent, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Span(element_type(&arr)[N]) : _store(arr) {}
+    template <class U, size_t N,
+        typename std::enable_if<N == Extent, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Span(Array<U, N> &arr) : _store(arr.data()) {}
+    template <class U, size_t N,
+        typename std::enable_if<N == Extent, int>::type = 0>
+    _GLIBCXX17_CONSTEXPR Span(const Array<U, N> &arr) : _store(arr.data()) {}
+    template <typename R, typename = enable_if_container_like<R>>
+    _GLIBCXX17_CONSTEXPR Span(R &&r) : _store(r.data(), r.size()) {}
+    /* additional constructor to std::span, it should be useful */
+    _GLIBCXX17_CONSTEXPR Span(T &v) : _store(&v, 1) {}
+    /* initializer constructor is not implemented as I see no use case yet */
+    _GLIBCXX17_CONSTEXPR Span(const Span &source) : _store(source._store) {}
+    _GLIBCXX17_CONSTEXPR Span &operator=(const Span &other) = default;
+    void swap(Span &other) { _store.swap(other._store); }
+
+    /* size() is not optionally static because
+     *  1. we have to put Store outsize and it's tons of work,
+     *  2. std::span behaves the same */
+    constexpr size_type size() const { return _store.size(); }
+    constexpr size_type size_bytes() const { return size() * sizeof(element_type); }
+    constexpr bool empty() const { return size() == 0; }
+
+    _GLIBCXX17_CONSTEXPR const_iterator cbegin() const { return _store._data; }
+    _GLIBCXX17_CONSTEXPR const_iterator cend() const { return _store._data + size(); }
+    _GLIBCXX17_CONSTEXPR const_iterator begin() const { return cbegin(); }
+    _GLIBCXX17_CONSTEXPR const_iterator end() const { return cend(); }
+    _GLIBCXX17_CONSTEXPR iterator begin() { return _store._data; }
+    _GLIBCXX17_CONSTEXPR iterator end() { return _store._data + size(); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crbegin() const
+        { return const_reverse_iterator(cend()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crend() const
+        { return const_reverse_iterator(cbegin()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rbegin() const { return crbegin(); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rend() const { return crend(); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rbegin() { return reverse_iterator(end()); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rend() { return reverse_iterator(begin()); }
+
+    _GLIBCXX17_CONSTEXPR const_pointer data() const { return _store._data; }
+    _GLIBCXX17_CONSTEXPR pointer data() { return _store._data; }
+    _GLIBCXX17_CONSTEXPR const_reference front() const { return data()[0]; }
+    _GLIBCXX17_CONSTEXPR reference front() { return data()[0]; }
+    _GLIBCXX17_CONSTEXPR const_reference back() const { return data()[size() - 1]; }
+    _GLIBCXX17_CONSTEXPR reference back() { return data()[size() - 1]; }
+    _GLIBCXX17_CONSTEXPR const_reference at(size_type pos) const { return data()[pos]; }
+    _GLIBCXX17_CONSTEXPR reference at(size_type pos) { return data()[pos]; }
+    _GLIBCXX17_CONSTEXPR const_reference operator[](size_type pos) const { return at(pos); }
+    _GLIBCXX17_CONSTEXPR reference operator[](size_type pos) { return at(pos); }
+
+    template <size_t Count>
+    _GLIBCXX17_CONSTEXPR Span<element_type, Count> first() const
+    {
+        static_assert(Count <= extent || is_dynamic, "Count exceeds");
+        CONSTEXPR_IF(is_dynamic) {
+            Assert(size() >= Count);
+        }
+        return Span<element_type, Count>{data(), Count};
+    }
+
+    _GLIBCXX17_CONSTEXPR Span<element_type, ::vtl::dynamic_extent> first(size_type count) const
+    {
+        Assert(size() >= count);
+        return Span<element_type, ::vtl::dynamic_extent>{data(), count};
+    }
+
+    template <size_t Count>
+    _GLIBCXX17_CONSTEXPR Span<element_type, Count> last() const
+    {
+        static_assert(Count <= extent || is_dynamic, "Count exceeds");
+        CONSTEXPR_IF(is_dynamic) {
+            Assert(size() >= Count);
+        }
+        return Span<element_type, Count>{data() + (size() - Count), Count};
+    }
+
+    _GLIBCXX17_CONSTEXPR Span<element_type, ::vtl::dynamic_extent> last(size_type count) const
+    {
+        Assert(size() >= count);
+        return Span<element_type, ::vtl::dynamic_extent>{data() + (size() - count), count};
+    }
+
+    template <size_t Offset, size_t Count = ::vtl::dynamic_extent>
+    _GLIBCXX17_CONSTEXPR Span<element_type, subspan_count<Offset, Count>> subspan() const
+    {
+        static_assert(Count + Offset <= extent || is_dynamic, "Count exceeds");
+        CONSTEXPR_IF(is_dynamic) {
+            Assert(size() >= Count + Offset);
+        }
+        return Span<element_type, subspan_count<Offset, Count>>
+            (data() + Offset, Count != ::vtl::dynamic_extent ? Count : size() - Offset);
+    }
+
+    _GLIBCXX17_CONSTEXPR Span<element_type, ::vtl::dynamic_extent> subspan(size_type offset,
+        size_type count = ::vtl::dynamic_extent) const
+    {
+        Assert(size() >= offset + (count == ::vtl::dynamic_extent ? 0 : count));
+        return Span<element_type, ::vtl::dynamic_extent>
+            (data() + offset, count != ::vtl::dynamic_extent ? count : size() - offset);
+    }
+private:
+    ::vtl::span_detail::Store<pointer, size_type, Extent> _store;
+};
+
+#endif
+#endif /* CONTAINER_SPAN_H */

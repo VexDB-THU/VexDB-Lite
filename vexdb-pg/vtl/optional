@@ -1,0 +1,163 @@
+/**
+ * Copyright ...
+ * std::Optional equivalent
+ */
+
+#ifndef CONTAINER_OPTIONAL_H
+#define CONTAINER_OPTIONAL_H
+
+#include <vtl/internal/container.hpp>
+#if !CONTAINER_USE_STL_OPTIONAL
+#include <utility>
+#include <vtl/internal/expr.hpp>
+
+template <typename T>
+class Optional {
+public:
+    constexpr Optional() : _empty(), _has_value(false) {}
+    constexpr Optional(const T &value) : _has_value(true) { new (&_value_storage) T(value); }
+    constexpr Optional(T &&value) : _has_value(true) { new (&_value_storage) T(std::move(value)); }
+    Optional(const Optional &other) : _has_value(other._has_value)
+    {
+        if (_has_value) {
+            new (&_value_storage) T(other.get_value());
+        }
+    }
+    Optional(Optional &&other) : _has_value(other._has_value)
+    {
+        if (_has_value) {
+            new (&_value_storage) T(std::move(other.get_value()));
+            other._has_value = false;
+        }
+    }
+    Optional &operator=(const Optional &other)
+    {
+        if (this != &other) {
+            reset();
+            _has_value = other._has_value;
+            if (_has_value) {
+                new (&_value_storage) T(other.get_value());
+            }
+        }
+        return *this;
+    }
+    Optional &operator=(Optional &&other)
+    {
+        if (this != &other) {
+            reset();
+            _has_value = other._has_value;
+            if (_has_value) {
+                new (&_value_storage) T(std::move(other.get_value()));
+                other._has_value = false;
+            }
+        }
+        return *this;
+    }
+    void destroy() { reset(); }
+    ~Optional() {}
+
+    void swap(Optional &other)
+    {
+        if (_has_value) {
+            if (other) {
+                using std::swap;
+                swap(_value_storage, other._value_storage);
+            } else {
+                other.emplace(std::move(_value_storage));
+                _has_value = false;
+            }
+        } else {
+            if (other) {
+                new (&_value_storage) T(std::move(other._value_storage));
+                _has_value = true;
+                other._has_value = false;
+            }
+        }
+    }
+
+    constexpr explicit operator bool() const { return _has_value; }
+    constexpr bool has_value() const { return _has_value; }
+    constexpr const T &value() const & { return get_value(); }
+    constexpr T &value() & { return get_value(); }
+    /* no idea what to set _has_value here */
+    // constexpr const T &&value() const && { return get_value(); }
+    constexpr T &&value() &&
+    {
+        _has_value = false;
+        return std::move(get_value());
+    }
+    template <class U = PureType(T)>
+    constexpr T value_or(U &&default_value) const &
+    {
+        static_assert(std::is_copy_constructible<T>::value && std::is_convertible<U &&, T>::value,
+                      "call value_or with U is invalid");
+        return _has_value ? _value_storage : static_cast<T>(std::forward<U>(default_value));
+    }
+    template <class U = PureType(T)>
+    constexpr T &&value_or(U &&default_value) &&
+    {
+        static_assert(std::is_move_constructible<T>::value && std::is_convertible<U &&, T>::value,
+                      "call value_or with U is invalid");
+        if (_has_value) {
+            _has_value = false;
+            return std::move(_value_storage);
+        }
+        return static_cast<T &&>(std::forward<U>(default_value));
+    }
+    constexpr const T &operator*() const & { return get_value(); }
+    constexpr T &&operator*() && { return get_value(); }
+    constexpr T &operator*() & { return get_value(); }
+    constexpr const T *operator->() const { return &get_value(); }
+    constexpr T *operator->() { return &get_value(); }
+
+    void reset()
+    {
+        if (_has_value) {
+            ann_helper::optional_destroy_destruct(get_value());
+            _has_value = false;
+        }
+    }
+    void emplace(T &&value)
+    {
+        reset();
+        new (&_value_storage) T(std::move(value));
+        _has_value = true;
+    }
+    void emplace(const T &value)
+    {
+        reset();
+        new (&_value_storage) T(value);
+        _has_value = true;
+    }
+    template <typename... Args>
+    void emplace(Args &&... args)
+    {
+        reset();
+        new (&_value_storage) T(std::forward<Args>(args)...);
+        _has_value = true;
+    }
+
+    /* monadic operations can be implemented if needed */
+private:
+    union {
+        NO_UNIQUE_ADDRESS EmptyObject _empty;
+        T _value_storage;
+    };
+    bool _has_value;
+
+    constexpr const T &get_value() const & { return _value_storage; }
+    constexpr T &get_value() & { return _value_storage; }
+    constexpr const T &&get_value() const && { return _value_storage; }
+    constexpr T &&get_value() && { return _value_storage; }
+};
+
+template <typename ...Args>
+constexpr Optional<Args...> make_optional(Args &&...args)
+    { return Optional<Args...>(std::forward<Args>(args)...); }
+
+#else
+#include <optional>
+template <typename T>
+using Optional = std::optional<T>;
+#endif
+#endif /* CONTAINER_OPTIONAL_H */

@@ -1,0 +1,252 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_VARIANT_H
+#define CONTAINER_VARIANT_H
+
+#include <vtl/internal/container.hpp>
+
+#if CONTAINER_USE_STL_VARIANT
+#include <variant>
+template <typename... Types>
+using Variant = std::variant<Types...>;
+using std::visit;
+#else
+#include <type_traits>
+#include <utility>
+#include <algorithm>
+#include <vtl/optional>
+
+#if __cplusplus < 201402L
+namespace vtl::internal {
+template <typename T>
+constexpr size_t max_sizeof() {
+    return sizeof(T);
+}
+
+template <typename T, typename U, typename... Rest>
+constexpr size_t max_sizeof() {
+    size_t current = sizeof(T);
+    size_t next = max_sizeof<U, Rest...>();
+    return current > next ? current : next;
+}
+
+template <typename T>
+constexpr size_t max_alignof() {
+    return alignof(T);
+}
+
+template <typename T, typename U, typename... Rest>
+constexpr size_t max_alignof() {
+    size_t current = alignof(T);
+    size_t next = max_alignof<U, Rest...>();
+    return current > next ? current : next;
+}
+} /* namespace vtl::internal */
+#endif
+
+template <typename... Types>
+class Variant {
+    static_assert(sizeof...(Types) > 0, "Variant should be applied with at least one type");
+private:
+#if __cplusplus >= 201402L
+    static constexpr size_t size = std::max({sizeof(Types)...});;
+    static constexpr size_t align = std::max({alignof(Types)...});
+#else
+    static constexpr size_t size = vtl::internal::max_sizeof<Types...>();
+    static constexpr size_t align = vtl::internal::max_alignof<Types...>();
+#endif
+    static constexpr size_t invalid_index = static_cast<size_t>(-1);
+
+    alignas(align) unsigned char storage[size];
+    size_t current_index{invalid_index};
+
+    template <size_t I, typename T, typename... Rest>
+    struct TypeAt {
+        using type = typename TypeAt<I - 1, Rest...>::type;
+    };
+    template <typename T, typename... Rest>
+    struct TypeAt<0, T, Rest...> {
+        using type = T;
+    };
+
+    template <typename T, size_t I = 0, typename... Ts>
+    struct IndexOf;
+    template <typename T, size_t I, typename U, typename... Ts>
+    struct IndexOf<T, I, U, Ts...> {
+        static constexpr size_t value = std::is_same_v<T, U> ? I : IndexOf<T, I + 1, Ts...>::value;
+    };
+    template <typename T, size_t I>
+    struct IndexOf<T, I> {
+        static constexpr size_t value = invalid_index;
+    };
+
+public:
+    Variant() = default;
+    template <typename T, typename = std::enable_if_t<(std::is_same_v<T, Types> || ...)>>
+    Variant(T &&value) { emplace<std::decay_t<T>>(std::forward<T>(value)); }
+    Variant(const Variant &other)
+    {
+        if (other.current_index != invalid_index) {
+            copy_construct_from(other);
+        }
+    }
+    Variant(Variant &&other) noexcept
+    {
+        if (other.current_index != invalid_index) {
+            move_construct_from(std::move(other));
+        }
+    }
+    Variant &operator=(const Variant &other)
+    {
+        if (this != &other) {
+            destroy();
+            if (other.current_index != invalid_index) {
+                copy_construct_from(other);
+            }
+        }
+        return *this;
+    }
+
+    Variant &operator=(Variant &&other) noexcept
+    {
+        if (this != &other) {
+            destroy();
+            if (other.current_index != invalid_index) {
+                move_construct_from(std::move(other));
+            }
+        }
+        return *this;
+    }
+
+    template <typename T, typename... Args>
+    void emplace(Args &&...args)
+    {
+        static_assert((std::is_same_v<T, Types> || ...), "Type not in variant");
+        destroy();
+        new (storage) T(std::forward<Args>(args)...);
+        current_index = IndexOf<T, 0, Types...>::value;
+    }
+
+    template <typename T>
+    bool holds_alternative() const { return current_index == IndexOf<T, 0, Types...>::value; }
+
+    size_t index() const { return current_index; }
+
+    template <typename T>
+    const T &get() const &
+    {
+        Assert(holds_alternative<T>());
+        return *reinterpret_cast<const T *>(storage);
+    }
+
+    template <typename T>
+    T &get() &
+    {
+        Assert(holds_alternative<T>());
+        return *reinterpret_cast<T *>(storage);
+    }
+
+    template <typename T>
+    T &&get() &&
+    {
+        Assert(holds_alternative<T>());
+        return std::move(*reinterpret_cast<T *>(storage));
+    }
+
+    template <size_t I>
+    const auto &get() const &
+    {
+        using T = typename TypeAt<I, Types...>::type;
+        return get<T>();
+    }
+
+    template <size_t I>
+    auto &get() &
+    {
+        using T = typename TypeAt<I, Types...>::type;
+        return get<T>();
+    }
+
+    template <size_t I>
+    auto &&get() &&
+    {
+        using T = typename TypeAt<I, Types...>::type;
+        return std::move(get<T>());
+    }
+
+    void destroy()
+    {
+        if (current_index != invalid_index) {
+            destroy_impl(std::index_sequence_for<Types...>{});
+            current_index = invalid_index;
+        }
+    }
+
+private:
+    template <size_t... Is>
+    void destroy_impl(std::index_sequence<Is...>)
+    {
+        ((current_index == Is ?
+            (ann_helper::optional_destroy_destruct(get<Is>()), 0) :
+            0), ...);
+    }
+
+    void copy_construct_from(const Variant &other)
+        { copy_construct_impl(other, std::index_sequence_for<Types...>{}); }
+
+    template <size_t... Is>
+    void copy_construct_impl(const Variant &other, std::index_sequence<Is...>) {
+        ((other.current_index == Is ? 
+            (emplace<typename TypeAt<Is, Types...>::type>(other.get<typename TypeAt<Is, Types...>::type>()), 0) 
+            : 0), ...);
+    }
+
+    void move_construct_from(Variant &&other)
+        { move_construct_impl(std::move(other), std::index_sequence_for<Types...>{}); }
+
+    template <size_t... Is>
+    void move_construct_impl(Variant &&other, std::index_sequence<Is...>) {
+        ((other.current_index == Is ? 
+            (emplace<typename TypeAt<Is, Types...>::type>(std::move(other.get<typename TypeAt<Is, Types...>::type>())), 0) 
+            : 0), ...);
+    }
+};
+
+template <typename... Fs>
+struct Visitor : Fs... {
+    using Fs::operator()...;
+};
+
+// template <typename... Fs>
+// Visitor(Fs...) -> Visitor<Fs...>;
+
+template <size_t I, typename Visitor, typename... Variants>
+constexpr auto visit_impl(Visitor &&vis, Variant<Variants...> &var) -> decltype(auto)
+{
+    using First = PureType(decltype(var.template get<0>()));
+    using ReturnType = PureType(decltype(vis(std::declval<First&>())));
+    CONSTEXPR_IF (I + 1 < sizeof...(Variants)) {
+        if (var.index() == I) {
+            return std::forward<Visitor>(vis)(var.template get<I>());
+        }
+        static_assert(
+            std::is_same<ReturnType, PureType(decltype(vis(var.template get<I + 1>())))>::value,
+            "visit requires the same return type for all alternatives");
+        return visit_impl<I + 1>(std::forward<Visitor>(vis), var);
+    } else CONSTEXPR_IF (I + 1 == sizeof...(Variants)) {
+        Assert(var.index() == I);
+        return std::forward<Visitor>(vis)(var.template get<I>());
+    }
+}
+
+template <typename Visitor, typename... Variants>
+constexpr auto visit(Visitor &&vis, Variant<Variants...> &var) -> decltype(auto)
+{
+    Assert(var.index() != static_cast<size_t>(-1));
+    return visit_impl<0>(std::forward<Visitor>(vis), var);
+}
+
+#endif /* CONTAINER_USE_STL_VARIANT */
+#endif /* CONTAINER_VARIANT_H */

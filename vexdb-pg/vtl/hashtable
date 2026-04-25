@@ -1,0 +1,10 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_HASH_TABLE_H
+#define CONTAINER_HASH_TABLE_H
+
+#include <vtl/internal/hashtable/common.hpp>
+
+#endif /* CONTAINER_HASH_TABLE_H */

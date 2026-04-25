@@ -1,0 +1,6 @@
+# pg_vexdb - Vector Similarity Search Extension for PostgreSQL
+
+comment = 'HNSW graph index for vector similarity search'
+default_version = 1.0
+module_pathname = '/opt/vexdb-lite-build/VexDB-Lite/vexdb-pg/pg_vexdb'
+relocatable = false

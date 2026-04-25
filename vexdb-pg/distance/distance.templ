@@ -1,0 +1,133 @@
+#ifndef CUR_ARCH
+static_assert(false, "Please specify arch");
+#endif
+#define METRIC_ENUM_SEQ (Metric::L2)(Metric::INNER_PRODUCT)(Metric::COSINE)(Metric::SPHERICAL)(Metric::L2_SQRT)(Metric::L2_NORM)     // (Metric::FAST_COSINE)
+#define STRIP_AND_GLUE(s, state, elem) state(DistPrecisionType::BOOST_PP_TUPLE_ELEM(0, elem))
+#define DIST_PRECISION_TYPE_ENUM_SEQ \
+    BOOST_PP_SEQ_FOLD_LEFT( \
+        STRIP_AND_GLUE, \
+        (DistPrecisionType::BOOST_PP_TUPLE_ELEM(2, 0, BOOST_PP_SEQ_HEAD(DIST_PRECISION_TYPE_SEQ))), \
+        BOOST_PP_SEQ_TAIL(DIST_PRECISION_TYPE_SEQ) \
+    )
+#ifndef REMAINDER_SITUATION_ENUM_SEQ
+#define GLUE(s, state, elem) state(RemainderSituation::elem)
+#define REMAINDER_SITUATION_ENUM_SEQ \
+    BOOST_PP_SEQ_FOLD_LEFT( \
+        GLUE, \
+        (RemainderSituation::BOOST_PP_SEQ_HEAD(REMAINDER_SITUATION_SEQ)), \
+        BOOST_PP_SEQ_TAIL(REMAINDER_SITUATION_SEQ) \
+    )
+#endif
+#define ALIGNED_SEQ (true)(false)
+#define PRODUCT_SETS \
+    (METRIC_ENUM_SEQ) \
+    (DIST_PRECISION_TYPE_ENUM_SEQ) \
+    (REMAINDER_SITUATION_ENUM_SEQ) \
+    (ALIGNED_SEQ)
+#define TEMPLATE_EXPAND(r, product) \
+    BOOST_PP_SEQ_ELEM(0, product), \
+    BOOST_PP_SEQ_ELEM(1, product), \
+    BOOST_PP_SEQ_ELEM(2, product), \
+    BOOST_PP_SEQ_ELEM(3, product)
+#define DISTANCER_TEMPLATE(r, product) \
+    Distancer<CUR_ARCH, TEMPLATE_EXPAND(r, product)>
+#define DECLARE_DISTANCER(r, product) \
+    template <> \
+    struct DISTANCER_TEMPLATE(r, product) { \
+        static float get_distance_single(const void *x, const void *y, uint16 dim); \
+        static void get_distance_batch2(const void *x, void *const *y, uint16 dim, uint16 y_size, float *out); \
+    };
+#define DECLARE_IMPL1(r, product) \
+    float DISTANCER_TEMPLATE(r, product)::get_distance_single(const void *x, const void *y, uint16 dim) \
+    { return PatcherName::Distancer<TEMPLATE_EXPAND(r, product)>::get_distance_single(x, y, dim); }
+#define DECLARE_IMPL2(r, product) \
+    void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
+        const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) \
+    { PatcherName::Distancer<TEMPLATE_EXPAND(r, product)>::get_distance_batch2(x, y, dim, y_size, out); }
+#define DECLARE_END(r, product) \
+    template struct DISTANCER_TEMPLATE(r, product);
+#define RENDER_PRODUCTS(r, product) \
+    DECLARE_DISTANCER(r, product) \
+    DECLARE_IMPL1(r, product) \
+    DECLARE_IMPL2(r, product) \
+    DECLARE_END(r, product)
+
+BOOST_PP_SEQ_FOR_EACH_PRODUCT(RENDER_PRODUCTS, PRODUCT_SETS)
+
+#define DECLARE_RS(r, data, elem) \
+    template <> \
+    RemainderSituation RemainderPatcher<CUR_ARCH, elem>::get_remainder_situation(uint16 dim) \
+        { return PatcherName::get_remainder_situation<elem>(dim); }
+BOOST_PP_SEQ_FOR_EACH(DECLARE_RS, _, DIST_PRECISION_TYPE_ENUM_SEQ)
+
+#define TRANSFORM_OP_ENUM_SEQ \
+    (TransformOp::ADD) \
+    (TransformOp::SUB) \
+    (TransformOp::MUL_SCALAR) \
+    (TransformOp::NORMALIZE)
+#define T_ALIGNED_SEQ (true)(false)
+#define T_PRODUCT_SETS \
+    (TRANSFORM_OP_SEQ) \
+    (DIST_PRECISION_TYPE_ENUM_SEQ) \
+    (REMAINDER_SITUATION_ENUM_SEQ) \
+    (T_ALIGNED_SEQ)
+#define T_TEMPLATE_EXPAND(r, product) \
+    TransformOp::BOOST_PP_SEQ_ELEM(0, product), \
+    BOOST_PP_SEQ_ELEM(1, product), \
+    BOOST_PP_SEQ_ELEM(2, product), \
+    BOOST_PP_SEQ_ELEM(3, product)
+#define TRANSFORMER_TEMPLATE(r, product) \
+    Transformer<CUR_ARCH, T_TEMPLATE_EXPAND(r, product)>
+#define DECLARE_TRANSFORMER(r, product) \
+    template <> \
+    struct TRANSFORMER_TEMPLATE(r, product) { \
+        static void transform_single(const void *x, const void *y, void *out, uint16 dim); \
+    };
+#define DECLARE_TRANSFORM_IMPL(r, product) \
+    void TRANSFORMER_TEMPLATE(r, product)::transform_single(const void *x, const void *y, void *out, uint16 dim) \
+    { PatcherName::Transformer<T_TEMPLATE_EXPAND(r, product)>::transform_single(x, y, out, dim); }
+#define DECLARE_TRANSFORM_END(r, product) \
+    template struct TRANSFORMER_TEMPLATE(r, product);
+#define RENDER_TRANSFORM_PRODUCTS(r, product) \
+    DECLARE_TRANSFORMER(r, product) \
+    DECLARE_TRANSFORM_IMPL(r, product) \
+    DECLARE_TRANSFORM_END(r, product)
+BOOST_PP_SEQ_FOR_EACH_PRODUCT(RENDER_TRANSFORM_PRODUCTS, T_PRODUCT_SETS)
+
+#undef T_ALIGNED_SEQ
+#undef T_PRODUCT_SETS
+#undef T_TEMPLATE_EXPAND
+#undef TRANSFORMER_TEMPLATE
+#undef DECLARE_TRANSFORMER
+#undef DECLARE_TRANSFORM_IMPL
+#undef DECLARE_TRANSFORM_END
+#undef RENDER_TRANSFORM_PRODUCTS
+
+#undef METRIC_ENUM_SEQ
+#undef REMAINDER_SITUATION_ENUM_SEQ
+#undef ALIGNED_SEQ
+#undef PRODUCT_SETS
+
+/**
+#define METRIC_ENUM_SEQ (Metric::SPHERICAL)(Metric::L2_SQRT)(Metric::L2_NORM)
+#define REMAINDER_SITUATION_ENUM_SEQ (RemainderSituation::Unknown)
+#define ALIGNED_SEQ (false)
+#define PRODUCT_SETS \
+    (METRIC_ENUM_SEQ) \
+    (DIST_PRECISION_TYPE_ENUM_SEQ) \
+    (REMAINDER_SITUATION_ENUM_SEQ) \
+    (ALIGNED_SEQ)
+
+#undef DECLARE_IMPL2
+#undef RENDER_PRODUCTS
+#define DECLARE_IMPL2(r, product) \
+    void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
+        const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) const \
+    { Assert(false); }
+#define RENDER_PRODUCTS(r, product) \
+    DECLARE_DISTANCER(r, product) \
+    DECLARE_IMPL1(r, product) \
+    DECLARE_IMPL2(r, product) \
+    DECLARE_END(r, product)
+BOOST_PP_SEQ_FOR_EACH_PRODUCT(RENDER_PRODUCTS, PRODUCT_SETS)
+*/

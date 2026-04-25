@@ -1,0 +1,510 @@
+/**
+ * Copyright ...
+ * Two layer roaring bitmap.
+ */
+
+#ifndef CONTAINER_ROARING_BITMAP_H
+#define CONTAINER_ROARING_BITMAP_H
+
+#include <algorithm>    /* swap, lower_bound, upper_bound, binary_search */
+
+#include <vtl/hashtable>
+#include <vtl/vector>
+#include <vtl/bitvector>
+
+template <typename Allocator = DEFAULT_ALLOCATOR<char>>
+class RoaringBitMap {
+    enum class ContainerType : uint8 { Array, Bit, RLE, Dummy };
+    class ArrayContainer {
+        using data_type = Vector<uint16>;
+    public:
+        data_type _data;
+        ArrayContainer() = default;
+        size_t size() const { return _data.size(); }
+        void destroy() { _data.destroy(); }
+        bool operator[](uint16 idx) const { return std::binary_search(_data.cbegin(), _data.cend(), idx); }
+        void set(uint16 idx)
+        {
+            auto it = std::lower_bound(_data.cbegin(), _data.cend(), idx);
+            if (it != _data.cend() && *it == idx) {
+                return;
+            }
+            _data.insert(it, idx);
+        }
+        bool try_set(uint16 idx)
+        {
+            auto it = std::lower_bound(_data.cbegin(), _data.cend(), idx);
+            if (it != _data.cend() && *it == idx) {
+                return false;
+            }
+            _data.insert(it, idx);
+            return true;
+        }
+        void unset(uint16 idx)
+        {
+            auto it = std::lower_bound(_data.begin(), _data.end(), idx);
+            if (it != _data.end() && *it == idx) {
+                _data.erase(it);
+            }
+        }
+        void unset(data_type::const_iterator &it)
+        {
+            it = _data.erase(const_cast<data_type::iterator>(it));
+        }
+        ContainerType type() const { return ContainerType::Array; }
+
+        class ArrayContainerIterator {
+        public:
+            ArrayContainer &container;
+            data_type::const_iterator it;
+
+            ArrayContainerIterator(ArrayContainer &cont) : container(cont), it(cont._data.cbegin()) {}
+            ArrayContainerIterator(ArrayContainer &cont, data_type::const_iterator it)
+                : container(cont), it(it) {}
+            bool at_end() const { return it == container._data.cend(); }
+            void reset_to_next() { container.unset(it); }
+            void operator++() { ++it; }
+            uint16 operator*() const { return *it; }
+        };
+        ArrayContainerIterator get_it_after(uint16 pos, bool inclusive = true)
+        {
+            if (pos == 0 && inclusive) {
+                return ArrayContainerIterator(*this);
+            }
+            auto it = std::upper_bound(_data.cbegin(), _data.cend(), pos - (inclusive ? 1u : 0));
+            return ArrayContainerIterator(*this, it);
+        }
+    };
+
+    class BitmapContainer : public BaseObject {
+    public:
+        BitSet<0xfffful> _bits;
+        BitmapContainer() = default;
+        BitmapContainer(const ArrayContainer &arr) : _bits()
+        {
+            for (uint16 i : arr._data) {
+                _bits.set(i);
+            }
+        }
+        size_t size() const { return _bits.count(); }
+        void destroy() {}
+        bool operator[](uint16 idx) const { return _bits[idx]; }
+        void set(uint16 idx) { _bits.set(idx); }
+        bool try_set(uint16 idx) { return _bits.try_set(idx); }
+        void unset(uint16 idx) { _bits.reset(idx); }
+        ContainerType type() const { return ContainerType::Bit; }
+
+        class BitmapContainerIterator {
+        public:
+            BitmapContainer &container;
+            uint32 current_pos;
+
+            BitmapContainerIterator(BitmapContainer &cont) : container(cont), current_pos(0)
+                { to_next(); }
+            BitmapContainerIterator(BitmapContainer &cont, uint32 pos)
+                : container(cont), current_pos(pos) { to_next(); }
+            bool at_end() const { return current_pos > 0xffffu; }
+            void reset_to_next() { container.unset(current_pos); to_next(); }
+            void operator++() { ++current_pos; to_next(); }
+            uint16 operator*() const { return static_cast<uint16>(current_pos); }
+        private:
+            void to_next()
+            {
+                while (current_pos <= 0xffffu && !container[static_cast<uint16>(current_pos)]) {
+                    ++current_pos;
+                }
+            }
+        };
+        BitmapContainerIterator get_it_after(uint16 pos, bool inclusive = true)
+        {
+            uint32 start = inclusive ? static_cast<uint32>(pos) : static_cast<uint32>(pos) + 1u;
+            return BitmapContainerIterator(*this, start);
+        }
+    };
+
+    class Container : public BaseObject {
+    public:
+        ContainerType type;
+        union {
+            BitmapContainer *bitmap;
+            ArrayContainer arr;
+        };
+
+        Container(ContainerType type) : type(type)
+        {
+            if (type == ContainerType::Array) {
+                new (&arr) ArrayContainer();
+            } else {
+                bitmap = NEW BitmapContainer();
+            }
+        }
+
+        Container(const Container& other) : type(other.type) {
+            if (other.type == ContainerType::Array) {
+                new (&arr) ArrayContainer(other.arr);
+            } else if (other.type == ContainerType::Bit) {
+                bitmap = NEW BitmapContainer(*other.bitmap);
+            }
+        }
+        ~Container() {}
+
+        void upgrade()
+        {
+            Assert(type == ContainerType::Array);
+            BitmapContainer temp(arr);
+            arr.destroy();
+            bitmap = NEW BitmapContainer(std::move(temp));
+            type = ContainerType::Bit;
+        }
+        void downgrade()
+        {
+            Assert(type == ContainerType::Bit);
+            ArrayContainer temp_arr;
+            typename BitmapContainer::BitmapContainerIterator it(*bitmap);
+            while (!it.at_end()) {
+                temp_arr.set(*it);
+                ++it;
+            }
+            bitmap->destroy();
+            delete bitmap;
+            new (&arr) ArrayContainer(std::move(temp_arr));
+            type = ContainerType::Array;
+        }
+        void destroy()
+        {
+            if (type == ContainerType::Array) {
+                arr.destroy();
+            } else {
+                bitmap->destroy();
+                delete bitmap;
+            }
+        }
+        bool operator[](uint16 idx) const
+        {
+            if (type == ContainerType::Array) {
+                return arr[idx];
+            }
+            return (*bitmap)[idx];
+        }
+        void set(uint16 idx)
+        {
+            if (type == ContainerType::Array) {
+                arr.set(idx);
+            } else {
+                bitmap->set(idx);
+            }
+        }
+        bool try_set(uint16 idx)
+        {
+            if (type == ContainerType::Array) {
+                return arr.try_set(idx);
+            }
+            return bitmap->try_set(idx);
+        }
+        size_t size() const
+        {
+            if (type == ContainerType::Array) {
+                return arr.size();
+            }
+            return bitmap->size();
+        }
+    };
+    class Iterator {
+    public:
+        ContainerType type{ContainerType::Dummy};
+        using ait = typename ArrayContainer::ArrayContainerIterator;
+        using bit = typename BitmapContainer::BitmapContainerIterator;
+        union {
+            ait arr_it;
+            bit bitmap_it;
+        };
+
+        Iterator() {}
+        explicit Iterator(const Container &c)
+        {
+            if (c.type == ContainerType::Array) {
+                type = ContainerType::Array;
+                new (&arr_it) ait(const_cast<ArrayContainer &>(c.arr));
+            } else {
+                type = ContainerType::Bit;
+                new (&bitmap_it) bit(*c.bitmap);
+            }
+        }
+        Iterator(const Iterator &it) : type(it.type)
+        {
+            if (type == ContainerType::Array) {
+                new (&arr_it) ait(it.arr_it);
+            } else {
+                new (&bitmap_it) bit(it.bitmap_it);
+            }
+        }
+        static Iterator get_it_after(Container &c, uint16 pos, bool inclusive = true)
+        {
+            Iterator res;
+            if (c.type == ContainerType::Array) {
+                res.type = ContainerType::Array;
+                new (&res.arr_it) ait(std::move(c.arr.get_it_after(pos, inclusive)));
+            } else {
+                res.type = ContainerType::Bit;
+                new (&res.bitmap_it) bit(std::move(c.bitmap->get_it_after(pos, inclusive)));
+            }
+            return res;
+        }
+
+        /* please refer to ArrayContainer::unset() for potential bugs */
+        void reset_to_next()
+        {
+            if (type == ContainerType::Array) {
+                arr_it.reset_to_next();
+            } else {
+                bitmap_it.reset_to_next();
+            }
+        }
+        bool at_end() const
+        {
+            if (type == ContainerType::Dummy) {
+                return true;
+            }
+            if (type == ContainerType::Array) {
+                return arr_it.at_end();
+            }
+            return bitmap_it.at_end();
+        }
+        void operator++()
+        {
+            if (type == ContainerType::Array) {
+                ++arr_it;
+            } else {
+                ++bitmap_it;
+            }
+        }
+        uint16 operator*() const
+        {
+            if (type == ContainerType::Array) {
+                return *arr_it;
+            }
+            return *bitmap_it;
+        }
+    };
+
+    using map_type = UnorderedMap<uint16, Container>;
+    struct conatiner_pair { uint32 header; map_type maps; };
+    using allocator_type = typename Allocator::rebind<conatiner_pair>::other;
+    using vec_pair_type = Vector<conatiner_pair, allocator_type>;
+
+    static bool PAIR_CMP(const conatiner_pair &a, uint32 header)
+        { return a.header < header; }
+    static bool PAIR_CMP_UP(uint32 header, const conatiner_pair &a)
+        { return header < a.header; }
+    static constexpr size_t max_arr_length = 64ul;
+public:
+    struct iterator {
+        iterator(vec_pair_type &in_p, bool is_end)
+            : cit(), pit(in_p.cbegin()), p(in_p)
+        {
+            if (p.empty() || is_end) {
+                return;
+            }
+            mit = pit->maps.cbegin();
+            new (&cit) Iterator(mit->second);
+        }
+        iterator(Iterator in_cit, typename map_type::const_iterator in_mit,
+                 typename vec_pair_type::const_iterator in_pit, vec_pair_type &in_p)
+            : cit(in_cit), mit(in_mit), pit(in_pit), p(in_p) {}
+        uint64 operator*()
+        {
+            uint32 header = pit->header;
+            uint16 k = mit->first;
+            uint16 v = *cit;
+            uint64 res = uint64(header) << 32;
+            res |= uint64(k) << 16;
+            res |= uint64(v);
+            return res;
+        }
+        void reset_to_next()
+        {
+            cit.reset_to_next();
+            if (cit.at_end()) {
+                bool need_erase = false;
+                if (cit.type == ContainerType::Array && cit.arr_it.container.size() == 0) {
+                    need_erase = true;
+                } else if (cit.type == ContainerType::Bit &&
+                           cit.bitmap_it.container.size() <= max_arr_length) {
+                    const_cast<Container &>(mit->second).downgrade();
+                }
+                if (need_erase) {
+                    mit = const_cast<map_type &>(pit->maps).erase(mit);
+                } else {
+                    ++mit;
+                }
+                if (mit != pit->maps.cend()) {
+                    new (&cit) Iterator(mit->second);
+                    return;
+                }
+                ++pit;
+                if (pit == p.cend()) {
+                    cit.type = ContainerType::Dummy;
+                    p.clear();
+                    return;
+                }
+                mit = pit->maps.cbegin();
+                new (&cit) Iterator(mit->second);
+            }
+        }
+        bool at_end() const { return cit.at_end(); }
+        iterator &operator++()
+        {
+            ++cit;
+            if (!cit.at_end()) {
+                return *this;
+            }
+            ++mit;
+            if (mit != pit->maps.cend()) {
+                new (&cit) Iterator(mit->second);
+                return *this;
+            }
+            if (pit->maps.empty()) {
+                pit = p.erase(pit);
+            } else {
+                ++pit;
+            }
+            if (pit == p.cend()) {
+                cit.type = ContainerType::Dummy;
+                return *this;
+            }
+            mit = pit->maps.cbegin();
+            new (&cit) Iterator(mit->second);
+            return *this;
+        }
+        bool operator==(const iterator &other) const
+        {
+            if (!cit.at_end() && !other.cit.at_end()) {
+                return *cit == *other.cit;
+            }
+            return cit.at_end() && other.cit.at_end();
+        }
+        bool operator!=(const iterator &other) const { return !operator==(other); }
+    private:
+        Iterator cit;
+        typename map_type::const_iterator mit;
+        typename vec_pair_type::const_iterator pit;
+        vec_pair_type &p;
+    };
+    explicit RoaringBitMap(const Allocator &alloc) : _pairs(alloc) {}
+    explicit RoaringBitMap(Allocator &&alloc = Allocator()) : _pairs(std::move(alloc)) {}
+    bool get(uint64 idx)
+    {
+        uint32 header = uint32(idx >> 32);
+        auto pit = std::lower_bound(_pairs.cbegin(), _pairs.cend(), header, PAIR_CMP);
+        if (pit == _pairs.cend() || pit->header != header) {
+            return false;
+        }
+        uint16 key = uint16(idx >> 16);
+        auto mit = pit->maps.cfind(key);
+        if (mit == pit->maps.cend()) {
+            return false;
+        }
+        return mit->second[uint16(idx)];
+    }
+    bool operator[](uint64 idx) { return get(idx); }
+    void set(uint64 idx)
+    {
+        const uint32 header = uint32(idx >> 32);
+        const uint16 key = uint16(idx >> 16);
+        const uint16 pos = uint16(idx);
+        auto pit = std::lower_bound(_pairs.begin(), _pairs.end(), header, PAIR_CMP);
+        if (pit == _pairs.end() || pit->header != header) {
+            _pairs.insert(pit, {header, map_type(2048ul)});
+            pit = std::lower_bound(_pairs.begin(), _pairs.end(), header, PAIR_CMP);
+        }
+        auto res = pit->maps.try_emplace(key, ContainerType::Array);
+        if (res.second) {
+            res.first->second.set(pos);
+        } else {
+            Container &c = res.first->second;
+            c.set(pos);
+            if (c.type == ContainerType::Array && c.size() > max_arr_length) {
+                c.upgrade();
+            }
+        }
+    }
+    bool try_set(uint64 idx)
+    {
+        const uint32 header = uint32(idx >> 32);
+        const uint16 key = uint16(idx >> 16);
+        const uint16 pos = uint16(idx);
+        auto pit = std::lower_bound(_pairs.begin(), _pairs.end(), header, PAIR_CMP);
+        if (pit == _pairs.end() || pit->header != header) {
+            _pairs.insert(pit, {header, map_type(2048ul)});
+            pit = std::lower_bound(_pairs.begin(), _pairs.end(), header, PAIR_CMP);
+        }
+        auto it_inserted = pit->maps.try_emplace(key, ContainerType::Array);
+        if (it_inserted.second) {
+            it_inserted.first->second.set(pos);
+            return true;
+        }
+        Container &c = it_inserted.first->second;
+        bool res = c.try_set(pos);
+        if (res && c.type == ContainerType::Array && c.size() > max_arr_length) {
+            c.upgrade();
+        }
+        return res;
+    }
+    void clear() { _pairs.clear(); }
+    void desreoy() { ann_helper::optional_destroy(_pairs); }
+    iterator begin() const { return iterator(_pairs, false); }
+    iterator end() const { return iterator(_pairs, true); }
+    iterator after(uint64 pos, bool inclusive = true) const
+    {
+        const uint32 header = uint32(pos >> 32);
+        uint16 key = uint16(pos >> 16);
+        uint16 cpos = uint16(pos);
+        auto pit = header == 0 ? _pairs.cbegin() :
+                                 std::upper_bound(_pairs.cbegin(), _pairs.cend(), header - 1u, PAIR_CMP_UP);
+retry_1:
+        if (pit == _pairs.cend()) {
+            return end();
+        }
+retry_2:
+        uint16 min_diff = __UINT16_MAX__;
+        auto mit = pit->maps.cend();
+        for (auto mit_temp = pit->maps.cbegin(); mit_temp != pit->maps.cend(); ++mit_temp) {
+            if (key > mit_temp->first) {
+                continue;
+            }
+            uint16 diff = mit_temp->first - key;
+            if (diff < min_diff) {
+                mit = mit_temp;
+                min_diff = diff;
+            }
+        }
+        if (mit == pit->maps.cend()) {
+go_retry1:
+            key = 0;
+            cpos = 0;
+            inclusive = true;
+            ++pit;
+            goto retry_1;
+        }
+        if (min_diff > 0) {
+            cpos = 0;
+            inclusive = true;
+        }
+        auto cit = Iterator::get_it_after(const_cast<Container &>(mit->second), cpos, inclusive);
+        if (cit.at_end()) {
+            Assert(min_diff == 0);
+            if (key == __UINT16_MAX__) {    /* check overflow */
+                goto go_retry1;
+            }
+            ++key;
+            cpos = 0;
+            inclusive = true;
+            goto retry_2;
+        }
+        return iterator(cit, mit, pit, _pairs);
+    }
+private:
+    mutable vec_pair_type _pairs;
+};
+
+#endif /* CONTAINER_ROARING_BITMAP_H */

@@ -1,0 +1,415 @@
+/**
+ * Copyright ...
+ * we don't do basic_string_view now as char * is the only thingy we care
+ * it differs from std::string_view with a transfer func to cstr
+ */
+
+#ifndef CONTAINER_STRINGVIEW_H
+#define CONTAINER_STRINGVIEW_H
+
+#include <vtl/internal/container.hpp>
+#if CONTAINER_USE_STL_STRINGVIEW
+#include <string_view>
+using StringView = std::string_view;
+#else
+#if __cplusplus >= 202002L
+#include <compare>
+#endif
+#include <type_traits>  /* conditional */
+#include <iterator>     /* reverse iterator */
+#include <functional>   /* hash */
+#if __cplusplus >= 201703L
+#include <string>       /* char_traits */
+#endif
+
+#include <vtl/internal/expr.hpp>
+#include <vtl/allocator>
+
+class CStringView {
+public:
+    using value_type = char;
+    using pointer = char *;
+    using const_pointer = const char *;
+    using reference = char &;
+    using const_reference = const char &;
+    using size_type = typename std::conditional<(sizeof(pointer) > sizeof(uint32)),
+                                                size_t, uint32>::type;
+    static constexpr size_type npos = -1;
+    char *_str{NULL};
+
+    _GLIBCXX17_CONSTEXPR CStringView() {}
+    _GLIBCXX17_CONSTEXPR CStringView(const char *s) : _str(const_cast<char *>(s)) {}
+    _GLIBCXX17_CONSTEXPR CStringView(const CStringView &) = default;
+    _GLIBCXX17_CONSTEXPR CStringView(CStringView &&) = default;
+    _GLIBCXX17_CONSTEXPR CStringView &operator=(const CStringView &) = default;
+    _GLIBCXX17_CONSTEXPR CStringView &operator=(CStringView &&) = default;
+    _GLIBCXX17_CONSTEXPR void swap(CStringView &other)
+    {
+        char *temp = _str;
+        _str = other._str;
+        other._str = temp;
+    }
+    _GLIBCXX17_CONSTEXPR operator char *() const { return _str; }
+
+    _GLIBCXX17_CONSTEXPR const_reference at(size_type pos) const { return _str[pos]; }
+    _GLIBCXX17_CONSTEXPR reference at(size_type pos) { return _str[pos]; }
+    _GLIBCXX17_CONSTEXPR const_reference operator[](size_type pos) const { return at(pos); }
+    _GLIBCXX17_CONSTEXPR reference operator[](size_type pos) { return at(pos); }
+
+    _GLIBCXX17_CONSTEXPR const_pointer data() const { return _str; }
+    _GLIBCXX17_CONSTEXPR pointer data() { return _str; }
+    _GLIBCXX17_CONSTEXPR bool empty() const { return _str[0] == '\0'; }
+};
+
+class StringView : public CStringView {
+public:
+    using iterator = char *;
+    using const_iterator = const char *;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+    constexpr StringView() {}
+#if __cplusplus >= 201703L
+    _GLIBCXX17_CONSTEXPR StringView(const char *s) : CStringView(s), _len(std::char_traits<char>::length(s)) {}
+#else
+    _GLIBCXX17_CONSTEXPR StringView(const char *s) : CStringView(s), _len(strlen(s)) {}
+#endif
+    _GLIBCXX17_CONSTEXPR StringView(const char *s, size_type len) : CStringView(s), _len(len) {}
+    _GLIBCXX17_CONSTEXPR StringView(const StringView &) = default;
+    _GLIBCXX17_CONSTEXPR StringView(StringView &&) = default;
+    _GLIBCXX17_CONSTEXPR StringView &operator=(const StringView &) = default;
+    _GLIBCXX17_CONSTEXPR StringView &operator=(StringView &&) = default;
+
+    _GLIBCXX17_CONSTEXPR void remove_prefix(size_type n)
+    {
+        Assert(n <= size());
+        this->_str += n;
+        _len -= n;
+    }
+    _GLIBCXX17_CONSTEXPR void remove_suffix(size_type n)
+    {
+        Assert(n <= size());
+        _len -= n;
+    }
+    void swap(StringView &other)
+    {
+        CStringView::swap(other);
+        std::swap(_len, other._len);
+    }
+
+    _GLIBCXX17_CONSTEXPR const_iterator cbegin() const { return data(); }
+    _GLIBCXX17_CONSTEXPR const_iterator cend() const { return data() + _len; }
+    _GLIBCXX17_CONSTEXPR const_iterator begin() const { return cbegin(); }
+    _GLIBCXX17_CONSTEXPR const_iterator end() const { return cend(); }
+    _GLIBCXX17_CONSTEXPR iterator begin() { return data(); }
+    _GLIBCXX17_CONSTEXPR iterator end() { return data() + _len; }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crbegin() const
+        { return const_reverse_iterator(cend()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crend() const
+        { return const_reverse_iterator(cbegin()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rbegin() const { return crbegin(); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rend() const { return crend(); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rbegin() { return reverse_iterator(end()); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rend() { return reverse_iterator(begin()); }
+
+    _GLIBCXX17_CONSTEXPR const_reference front() const { return data()[0]; }
+    _GLIBCXX17_CONSTEXPR reference front() { return data()[0]; }
+    _GLIBCXX17_CONSTEXPR const_reference back() const { return data()[_len - 1]; }
+    _GLIBCXX17_CONSTEXPR reference back() { return data()[_len - 1]; }
+
+    _GLIBCXX17_CONSTEXPR size_type size() const { return _len; }
+    _GLIBCXX17_CONSTEXPR size_t ssize() const { return _len; }
+    _GLIBCXX17_CONSTEXPR size_type length() const { return _len; }
+    _GLIBCXX17_CONSTEXPR bool empty() const { return _len == 0; }
+
+    template <template <typename> class Allocator = DEFAULT_ALLOCATOR, typename... Args>
+    char *cstr(Args &&...args) const
+    {
+        Allocator<char> alloc(std::forward<Args>(args)...);
+        char *res = alloc.allocate(_len + 1);
+        ann_helper::optional_destroy(alloc);
+        memcpy(res, data(), _len);
+        res[_len] = '\0';
+        return res;
+    }
+
+    _GLIBCXX17_CONSTEXPR bool starts_with(char c) const
+        { return !empty() && front() == c; }
+    _GLIBCXX17_CONSTEXPR bool starts_with(const char *s) const
+    {
+        for (const char *a = cbegin(); a != cend(); ++a, ++s) {
+            if (*a != *s) {
+                return false;
+            }
+        }
+        return true;
+    }
+    _GLIBCXX17_CONSTEXPR bool starts_with(StringView sv) const
+    {
+        if (sv.length() > length()) {
+            return false;
+        }
+        for (const char *a = sv.cbegin(), *b = cbegin(); a != sv.cend(); ++a, ++b) {
+            if (*a != *b) {
+                return false;
+            }
+        }
+        return true;
+    }
+    _GLIBCXX17_CONSTEXPR bool ends_with(char c) const
+        { return !empty() && back() == c; }
+    /* implicit for const char * */
+    _GLIBCXX17_CONSTEXPR bool ends_with(StringView sv) const
+    {
+        if (sv.length() > length()) {
+            return false;
+        }
+        for (auto a = sv.crbegin(), b = crbegin(); a != sv.crend(); ++a, ++b) {
+            if (*a != *b) {
+                return false;
+            }
+        }
+        return true;
+    }
+    _GLIBCXX17_CONSTEXPR StringView substr(size_type pos, size_type count = npos) const
+    {
+        Assert(pos <= size());
+        Assert(count == npos || pos + count <= size());
+        return StringView{
+            const_cast<char *>(data()) + pos,
+            count == npos ? size() - pos : count
+        };
+    }
+    _GLIBCXX17_CONSTEXPR int compare(StringView v) const
+    {
+        if (_len != v._len) {
+            return _len > v._len ? 1 : -1;
+        }
+        return strncmp(data(), v.data(), _len);
+    }
+    _GLIBCXX17_CONSTEXPR int compare(size_type pos, size_type count,
+                                     StringView v) const
+        { return substr(pos, count).compare(v); }
+    _GLIBCXX17_CONSTEXPR int compare(size_type pos1, size_type count1,
+        StringView v, size_type pos2, size_type count2) const
+        { return substr(pos1, count1).compare(v.substr(pos2, count2)); }
+    _GLIBCXX17_CONSTEXPR bool contains(char c) const
+    {
+        for (const char s : *this) {
+            if (s == c) {
+                return true;
+            }
+        }
+        return false;
+    }
+    _GLIBCXX17_CONSTEXPR bool contains(StringView sv) const
+    {
+        // static_assert(false, "not implemented");
+        return false;
+    }
+    _GLIBCXX17_CONSTEXPR size_type find(char c, size_type pos = 0) const
+    {
+        for (size_type i = 0; i < length(); ++i) {
+            if (at(i) == c) {
+                return i;
+            }
+        }
+        return npos;
+    }
+    _GLIBCXX17_CONSTEXPR size_type find(StringView v, size_type pos = 0) const
+    {
+        // static_assert(false, "not implemented");
+        return npos;
+    }
+    _GLIBCXX17_CONSTEXPR size_type find(const char *s, size_type pos, size_type count) const
+        { return find(StringView(s, count), pos); }
+    _GLIBCXX17_CONSTEXPR size_type rfind(char c, size_type pos = 0) const
+    {
+        for (int64 i = (int64)length() - 1; i >= 0; --i) {
+            if (at(i) == c) {
+                return i;
+            }
+        }
+        return npos;
+    }
+    _GLIBCXX17_CONSTEXPR size_type rfind(StringView v, size_type pos = 0) const
+    {
+        // static_assert(false, "not implemented");
+        return npos;
+    }
+    _GLIBCXX17_CONSTEXPR size_type rfind(const char *s, size_type pos, size_type count) const
+        { return rfind(StringView(s, count), pos); }
+
+private:
+    size_type _len{0};
+};
+
+class StringViewSplitIterator {
+public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = StringView;
+    using difference_type = ptrdiff_t;
+    using pointer = StringView *;
+    using reference = StringView;
+
+    _GLIBCXX17_CONSTEXPR StringViewSplitIterator() {}
+    _GLIBCXX17_CONSTEXPR StringViewSplitIterator(StringView source, char delim, bool keep_empty, bool is_end)
+        : _source(source), _delim(delim), _keep_empty(keep_empty), _is_end(is_end)
+    {
+        if (!_is_end) {
+            _next_pos = 0;
+            advance_to_next();
+        }
+    }
+
+    _GLIBCXX17_CONSTEXPR StringView operator*() const
+    {
+        Assert(!_is_end);
+        return _source.substr(_token_begin, _token_end - _token_begin);
+    }
+
+    _GLIBCXX17_CONSTEXPR StringViewSplitIterator &operator++()
+    {
+        if (!_is_end) {
+            advance_to_next();
+        }
+        return *this;
+    }
+
+    _GLIBCXX17_CONSTEXPR bool operator==(const StringViewSplitIterator &other) const
+    {
+        if (_is_end || other._is_end) {
+            return _is_end == other._is_end;
+        }
+        return _source.data() == other._source.data() && _source.size() == other._source.size() &&
+            _token_begin == other._token_begin && _token_end == other._token_end;
+    }
+
+    _GLIBCXX17_CONSTEXPR bool operator!=(const StringViewSplitIterator &other) const
+        { return !(*this == other); }
+
+private:
+    _GLIBCXX17_CONSTEXPR void advance_to_next()
+    {
+        const StringView::size_type n = _source.size();
+        while (true) {
+            if (_next_pos > n) {
+                _is_end = true;
+                return;
+            }
+
+            const StringView::size_type start = _next_pos;
+            StringView::size_type pos = start;
+            while (pos < n && _source[pos] != _delim) {
+                ++pos;
+            }
+
+            _token_begin = start;
+            _token_end = pos;
+            _next_pos = (pos < n) ? (pos + 1) : (n + 1);
+
+            if (_keep_empty || _token_begin != _token_end) {
+                _is_end = false;
+                return;
+            }
+        }
+    }
+
+private:
+    StringView _source;
+    StringView::size_type _next_pos{0};
+    StringView::size_type _token_begin{0};
+    StringView::size_type _token_end{0};
+    char _delim{0};
+    bool _keep_empty{false};
+    bool _is_end{true};
+};
+
+class StringViewSplitRange {
+public:
+    _GLIBCXX17_CONSTEXPR StringViewSplitRange(StringView source, char delim, bool keep_empty)
+        : _source(source), _delim(delim), _keep_empty(keep_empty)
+    {
+    }
+
+    _GLIBCXX17_CONSTEXPR StringViewSplitIterator begin() const
+        { return StringViewSplitIterator(_source, _delim, _keep_empty, false); }
+    _GLIBCXX17_CONSTEXPR StringViewSplitIterator end() const
+        { return StringViewSplitIterator(_source, _delim, _keep_empty, true); }
+
+private:
+    StringView _source;
+    char _delim;
+    bool _keep_empty;
+};
+
+inline _GLIBCXX17_CONSTEXPR StringViewSplitRange split(StringView sv, char delim, bool keep_empty = false)
+{
+    return StringViewSplitRange(sv, delim, keep_empty);
+}
+
+template <>
+struct std::hash<CStringView> {
+    size_t operator()(const CStringView &csv) const noexcept
+    {
+        size_t hash = 5381ul;
+        const char *ptr = csv.data();
+        while (*ptr) {
+            hash = ((hash << 5) + hash) + *ptr++;
+        }
+        return hash;
+    }
+};
+template <>
+struct std::hash<StringView> {
+    size_t operator()(const StringView &sv) const noexcept
+    {
+        size_t hash = 5381ul;
+        const char *ptr = sv.data();
+        for (StringView::size_type i = 0; i < sv.length(); ++i, ++ptr) {
+            hash = ((hash << 5) + hash) + *ptr;
+        }
+        return hash;
+    }
+};
+
+#if __cplusplus >= 202002L
+inline std::strong_ordering operator<=>(CStringView lhs, CStringView rhs)
+{
+    int res = strcmp(lhs._str, rhs._str);
+    if (res < 0) {
+        return std::strong_ordering::less;
+    }
+    if (res > 0) {
+        return std::strong_ordering::greater;
+    }
+    return std::strong_ordering::equal;
+}
+inline std::strong_ordering operator<=>(StringView lhs, StringView rhs)
+{
+    int res = lhs.compare(rhs);
+    if (res < 0) {
+        return std::strong_ordering::less;
+    }
+    if (res > 0) {
+        return std::strong_ordering::greater;
+    }
+    return std::strong_ordering::equal;
+}
+#else
+inline bool operator<(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) < 0; }
+inline bool operator<=(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) <= 0; }
+inline bool operator>(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) > 0; }
+inline bool operator>=(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) >= 0; }
+inline bool operator!=(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) != 0; }
+inline bool operator<(StringView lhs, StringView rhs) { return lhs.compare(rhs) < 0; }
+inline bool operator<=(StringView lhs, StringView rhs) { return lhs.compare(rhs) <= 0; }
+inline bool operator>(StringView lhs, StringView rhs) { return lhs.compare(rhs) > 0; }
+inline bool operator>=(StringView lhs, StringView rhs) { return lhs.compare(rhs) >= 0; }
+inline bool operator!=(StringView lhs, StringView rhs) { return lhs.compare(rhs) != 0; }
+#endif
+inline bool operator==(CStringView lhs, CStringView rhs) { return strcmp(lhs, rhs) == 0; }
+inline bool operator==(StringView lhs, StringView rhs) { return lhs.compare(rhs) == 0; }
+
+#endif
+#endif /* CONTAINER_STRINGVIEW_H */

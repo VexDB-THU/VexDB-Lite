@@ -1,0 +1,116 @@
+/**
+ * Shared allocator for VTL containers
+ * Uses SharedAllocSet for memory that is shared across processes
+ */
+
+#ifndef VTL_SHARED_ALLOCATOR_H
+#define VTL_SHARED_ALLOCATOR_H
+
+#include <type_traits>
+#include <utility>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+
+extern "C" {
+#include "utils/palloc.h"
+#include "utils/memutils.h"
+#include "utils/elog.h"
+#include "storage/shmem.h"
+}
+
+/* Global shared context - set during shmem initialization */
+extern MemoryContext vecbuf_shared_ctx;
+
+namespace vtl {
+
+template <class T>
+class SharedCtxAllocator {
+public:
+    using value_type = T;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using size_type = size_t;
+    using difference_type = std::ptrdiff_t;
+    using propagate_on_container_copy_assignment = std::true_type;
+    using propagate_on_container_move_assignment = std::true_type;
+    using propagate_on_container_swap = std::true_type;
+    
+    template <class U> struct rebind { using other = SharedCtxAllocator<U>; };
+
+    SharedCtxAllocator() noexcept : _ctx(vecbuf_shared_ctx) {}
+    SharedCtxAllocator(MemoryContext ctx) noexcept : _ctx(ctx) {}
+    SharedCtxAllocator(const SharedCtxAllocator &other) noexcept : _ctx(other._ctx) {}
+    template <typename U> SharedCtxAllocator(const SharedCtxAllocator<U> &other) noexcept 
+        : _ctx(other._ctx) {}
+    
+    SharedCtxAllocator& operator=(const SharedCtxAllocator &other) noexcept {
+        _ctx = other._ctx;
+        return *this;
+    }
+
+    pointer allocate(size_type n, const void* = 0) {
+        if (n == 0)
+            return nullptr;
+        pointer p = (pointer)ShmemAlloc(n * sizeof(T));
+        
+        if (!p)
+            ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("SharedCtxAllocator: out of shared memory")));
+        return p;
+    }
+
+    pointer allocate_zero(size_type n, const void* = 0) {
+        if (n == 0)
+            return nullptr;
+        pointer p = (pointer)ShmemAlloc(n * sizeof(T));
+        
+        if (!p)
+            ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("SharedCtxAllocator: out of shared memory")));
+        memset(p, 0, n * sizeof(T));
+        return p;
+    }
+
+    pointer reallocate(pointer p, size_type n) {
+        (void)p;
+        (void)n;
+        ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                        errmsg("SharedCtxAllocator: reallocate is not supported")));
+        return nullptr;
+    }
+
+    void deallocate(pointer p, size_type = 0) noexcept {
+        (void)p;
+    }
+
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) {
+        new ((void*)p) U(std::forward<Args>(args)...);
+    }
+
+    template <class U> void destroy(U* p) {
+        p->~U();
+    }
+    
+    MemoryContext get_context() const noexcept { return _ctx; }
+    
+    void swap(SharedCtxAllocator &other) noexcept {
+        std::swap(_ctx, other._ctx);
+    }
+
+    MemoryContext _ctx;
+};
+
+template <class T, class U>
+bool operator==(const SharedCtxAllocator<T> &a, const SharedCtxAllocator<U> &b) noexcept {
+    return a._ctx == b._ctx;
+}
+
+template <class T, class U>
+bool operator!=(const SharedCtxAllocator<T> &a, const SharedCtxAllocator<U> &b) noexcept {
+    return a._ctx != b._ctx;
+}
+
+} /* namespace vtl */
+
+#endif /* VTL_SHARED_ALLOCATOR_H */

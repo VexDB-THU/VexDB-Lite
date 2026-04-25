@@ -154,14 +154,14 @@ VexDB-Lite 在 Recall-QPS 曲线上始终占据右上角——同等召回率下
 
 | 平台 | 使用指南 |
 |------|---------|
-| CLI | [usage_cli.md](extension/vex/docs/usage_cli.md) |
-| Python | [usage_python.md](extension/vex/docs/usage_python.md) |
-| Java | [usage_java.md](extension/vex/docs/usage_java.md) |
-| iOS | [usage_ios.md](extension/vex/docs/usage_ios.md) |
-| Android | [usage_android.md](extension/vex/docs/usage_android.md) |
-| WASM | [usage_wasm.md](extension/vex/docs/usage_wasm.md) |
-| Rust | [usage_rust.md](extension/vex/docs/usage_rust.md) |
-| Node.js | [usage_nodejs.md](extension/vex/docs/usage_nodejs.md) |
+| CLI | [usage_cli.md](vexdb-duck/docs/usage_cli.md) |
+| Python | [usage_python.md](vexdb-duck/docs/usage_python.md) |
+| Java | [usage_java.md](vexdb-duck/docs/usage_java.md) |
+| iOS | [usage_ios.md](vexdb-duck/docs/usage_ios.md) |
+| Android | [usage_android.md](vexdb-duck/docs/usage_android.md) |
+| WASM | [usage_wasm.md](vexdb-duck/docs/usage_wasm.md) |
+| Rust | [usage_rust.md](vexdb-duck/docs/usage_rust.md) |
+| Node.js | [usage_nodejs.md](vexdb-duck/docs/usage_nodejs.md) |
 
 ---
 

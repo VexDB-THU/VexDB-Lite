@@ -1,0 +1,74 @@
+/**
+ * Original code is from https://github.com/paweldac/source_location.
+ */
+
+#ifndef CONTAINER_SOURCE_LOCATION_H
+#define CONTAINER_SOURCE_LOCATION_H
+
+#include "c.h"
+
+/* Clang */
+#if defined(__clang__) && !defined(__apple_build_version__) && (__clang_major__ >= 9)
+#define SOURCE_LOCATION_BUILTIN_FILE __builtin_FILE()
+#define SOURCE_LOCATION_BUILTIN_FUNCTION __builtin_FUNCTION()
+#define SOURCE_LOCATION_BUILTIN_LINE __builtin_LINE()
+#define SOURCE_LOCATION_BUILTIN_COLUMN __builtin_COLUMN()
+/* AppleClang https://en.wikipedia.org/wiki/Xcode#Toolchain_versions */
+#elif defined(__apple_build_version__) && defined(__clang__) && \
+      (__clang_major__ * 10000 + __clang_minor__ * 100 + __clang_patchlevel__ % 100) >= 110003
+#define SOURCE_LOCATION_BUILTIN_FILE __builtin_FILE()
+#define SOURCE_LOCATION_BUILTIN_FUNCTION __builtin_FUNCTION()
+#define SOURCE_LOCATION_BUILTIN_LINE __builtin_LINE()
+#define SOURCE_LOCATION_BUILTIN_COLUMN __builtin_COLUMN()
+/* GCC */
+#elif defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 8))
+#define SOURCE_LOCATION_BUILTIN_FILE __builtin_FILE()
+#define SOURCE_LOCATION_BUILTIN_FUNCTION __builtin_FUNCTION()
+#define SOURCE_LOCATION_BUILTIN_LINE __builtin_LINE()
+#define SOURCE_LOCATION_BUILTIN_COLUMN 0
+/* MSVC https://github.com/microsoft/STL/issues/54#issuecomment-616904069
+   https://learn.microsoft.com/en-us/cpp/overview/compiler-versions?view=msvc-170 */
+#elif defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER) && (_MSC_VER >= 1926)
+#define SOURCE_LOCATION_BUILTIN_FILE __builtin_FILE()
+#define SOURCE_LOCATION_BUILTIN_FUNCTION __builtin_FUNCTION()
+#define SOURCE_LOCATION_BUILTIN_LINE __builtin_LINE()
+#define SOURCE_LOCATION_BUILTIN_COLUMN 0
+else
+#define SOURCE_LOCATION_BUILTIN_FILE "Unsupported"
+#define SOURCE_LOCATION_BUILTIN_FUNCTION "Unsupported"
+#define SOURCE_LOCATION_BUILTIN_LINE 0
+#define SOURCE_LOCATION_BUILTIN_COLUMN 0
+#endif
+
+struct SourceLocation {
+public:
+    static constexpr SourceLocation current(
+        const char *file_name = SOURCE_LOCATION_BUILTIN_FILE,
+        const char *func_name = SOURCE_LOCATION_BUILTIN_FUNCTION,
+        const uint32 line_num = SOURCE_LOCATION_BUILTIN_LINE,
+        const uint32 column_num = SOURCE_LOCATION_BUILTIN_COLUMN) noexcept
+    { return SourceLocation(file_name, func_name, line_num, column_num); }
+
+    constexpr SourceLocation() noexcept = default;
+    constexpr const char *file() const noexcept { return _file_name; }
+    constexpr const char *function() const noexcept { return _func_name; }
+    constexpr uint32 line() const noexcept { return _line_num; }
+    constexpr uint32 column() const noexcept { return _column_num; }
+
+private:
+    constexpr SourceLocation(const char *file_name, const char *func_name,
+                             uint32 line_num, uint32 column_num) noexcept
+        : _file_name(file_name),
+          _func_name(func_name),
+          _line_num(line_num),
+          _column_num(column_num) {}
+
+    const char *_file_name = "";
+    const char *_func_name = "";
+    uint32 _line_num{0};
+    uint32 _column_num{0};
+};
+
+#define MAKE_SOURCE_LOCATION(loc) const SourceLocation &loc = SourceLocation::current()
+
+#endif /* CONTAINER_SOURCE_LOCATION_H */

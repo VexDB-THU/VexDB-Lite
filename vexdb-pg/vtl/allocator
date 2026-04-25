@@ -1,0 +1,112 @@
+#ifndef VTL_ALLOCATOR_H
+#define VTL_ALLOCATOR_H
+
+#include <type_traits>
+#include <utility>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <new>
+
+#include "utils/palloc.h"
+#include "utils/memutils.h"
+
+namespace vtl {
+
+class CtxAllocatorBase {
+public:
+    MemoryContext _ctx;
+    CtxAllocatorBase() : _ctx(CurrentMemoryContext) {}
+    CtxAllocatorBase(MemoryContext ctx) : _ctx(ctx) {}
+    CtxAllocatorBase(const CtxAllocatorBase &other) : _ctx(other._ctx) {}
+    CtxAllocatorBase &operator=(const CtxAllocatorBase &other) { _ctx = other._ctx; return *this; }
+    void swap(CtxAllocatorBase &other) { std::swap(_ctx, other._ctx); }
+    MemoryContext get_context() const { return _ctx; }
+    constexpr static size_t max_size() { return SIZE_MAX; }
+};
+
+template <class T>
+class CtxAllocator : public CtxAllocatorBase {
+public:
+    using value_type = T;
+    using pointer = T*;
+    using const_pointer = const T*;
+    using size_type = size_t;
+    using difference_type = std::ptrdiff_t;
+    template <class U> struct rebind { using other = CtxAllocator<U>; };
+
+    using CtxAllocatorBase::CtxAllocatorBase;
+    CtxAllocator(const CtxAllocator &other) : CtxAllocatorBase(other) {}
+    template <typename U> CtxAllocator(const CtxAllocator<U> &other) : CtxAllocatorBase(other) {}
+
+    pointer allocate(size_type num, const void* = 0) {
+        if (num == 0) return nullptr;
+        MemoryContext oldctx = MemoryContextSwitchTo(_ctx);
+        pointer p = (pointer)palloc(num * sizeof(T));
+        MemoryContextSwitchTo(oldctx);
+        return p;
+    }
+
+    pointer allocate_zero(size_type num, const void* = 0) {
+        if (num == 0) return nullptr;
+        MemoryContext oldctx = MemoryContextSwitchTo(_ctx);
+        pointer p = (pointer)palloc0(num * sizeof(T));
+        MemoryContextSwitchTo(oldctx);
+        return p;
+    }
+
+    pointer reallocate(pointer p, size_type num) {
+        if (num == 0) return nullptr;
+        MemoryContext oldctx = MemoryContextSwitchTo(_ctx);
+        pointer newp = (pointer)repalloc(p, num * sizeof(T));
+        MemoryContextSwitchTo(oldctx);
+        return newp;
+    }
+
+    void deallocate(pointer p, size_type = 0) { if (p) pfree(p); }
+
+    template <class U, class... Args>
+    void construct(U* p, Args&&... args) { new ((void*)p) U(std::forward<Args>(args)...); }
+
+    template <class U> void destroy(U* p) { p->~U(); }
+};
+
+template <class T, class U>
+bool operator==(const CtxAllocator<T> &, const CtxAllocator<U> &) { return true; }
+template <class T, class U>
+bool operator!=(const CtxAllocator<T> &, const CtxAllocator<U> &) { return false; }
+
+template <class T> using CurCtxAllocator = CtxAllocator<T>;
+template <class T> using HugeCtxAllocator = CtxAllocator<T>;
+template <size_t, class T> using AlignCurCtxAllocator = CtxAllocator<T>;
+
+namespace internal {
+template <typename Allocator>
+typename Allocator::pointer alloc0(Allocator &allocator, size_t s) {
+    return allocator.allocate_zero(s);
+}
+template <typename Allocator>
+typename Allocator::pointer realloc(Allocator &allocator, typename Allocator::pointer p, size_t s) {
+    return allocator.reallocate(p, s);
+}
+}
+
+template <typename Allocator>
+typename Allocator::pointer alloc0(Allocator &allocator, size_t s) {
+    return internal::alloc0(allocator, s);
+}
+template <typename Allocator>
+typename Allocator::pointer realloc(Allocator &allocator, typename Allocator::pointer p, size_t s) {
+    return internal::realloc(allocator, p, s);
+}
+
+template <typename Allocator>
+MemoryContext get_context(Allocator &allocator) { return allocator.get_context(); }
+
+} /* namespace vtl */
+
+template <typename T> using DEFAULT_ALLOCATOR = vtl::CurCtxAllocator<T>;
+template <typename T> using HUGE_ALLOCATOR = vtl::HugeCtxAllocator<T>;
+template <typename T> using CONTEXT_ALLOCATOR = vtl::CtxAllocator<T>;
+
+#endif

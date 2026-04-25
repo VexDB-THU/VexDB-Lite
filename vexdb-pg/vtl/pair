@@ -1,0 +1,180 @@
+/**
+ * Copyright ...
+ * std::Pair equivalent
+ */
+
+#ifndef CONTAINER_PAIR_H
+#define CONTAINER_PAIR_H
+
+#include <utility>
+#include <vtl/internal/container.hpp>
+
+#if !CONTAINER_USE_STL_PAIR
+#if __cplusplus >= 202002L
+#include <compare>
+#endif /* c++20 or greater */
+
+#include <vtl/internal/expr.hpp>
+
+template <typename A, typename B>
+struct Pair {
+    static constexpr bool construct_with_alloc =
+        ann_helper::constructor_with_alloc<A> ||
+        ann_helper::constructor_with_alloc<B>;
+
+    A first;
+    B second;
+
+    Pair() = default;
+    Pair(const A &a, const B &b) : first(a), second(b) {}
+    Pair(A &&a, const B &b) : first(std::move(a)), second(b) {}
+    Pair(const A &a, B &&b) : first(a), second(std::move(b)) {}
+    Pair(A &&a, B &&b) : first(std::move(a)), second(std::move(b)) {}
+
+    /* we does not support piecewise constructor */
+    template <typename ...Args>
+    Pair(const A &a, Args &&...args) : first(a), second(std::forward<Args>(args)...) {}
+    template <typename ...Args>
+    Pair(A &&a, Args &&...args) : first(std::move(a)), second(std::forward<Args>(args)...) {}
+    template <typename ...Args>
+    Pair(Args &&...args, const B &b) : first(std::forward<Args>(args)...), second(b) {}
+    template <typename ...Args>
+    Pair(Args &&...args, B &&b) : first(std::forward<Args>(args)...), second(std::move(b)) {}
+
+    Pair(const Pair &other) = default;
+    Pair(Pair &&other) = default;
+    Pair &operator=(const Pair &other) = default;
+    Pair &operator=(Pair &&other) = default;
+
+    void destroy()
+    {
+        ann_helper::optional_destroy(first);
+        ann_helper::optional_destroy(second);
+    }
+
+    void swap(Pair &other)
+    {
+        using std::swap;
+        swap(first, other.first);
+        swap(second, other.second);
+    }
+};
+
+/* thx ADL :) */
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator==(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+    { return lhs.first == rhs.first && lhs.second == rhs.second; }
+#if __cplusplus < 202002L
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator!=(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+    { return lhs.first != rhs.first || lhs.second != rhs.second; }
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator<(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+{
+    return lhs.first < rhs.first ||
+        (lhs.first == rhs.first && lhs.second < rhs.second);
+}
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator<=(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+{
+    return lhs.first < rhs.first ||
+        (lhs.first == rhs.first && lhs.second <= rhs.second);
+}
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator>(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+{
+    return lhs.first > rhs.first ||
+        (lhs.first == rhs.first && lhs.second > rhs.second);
+}
+template<class T1, class T2, class U1, class U2>
+constexpr bool operator>=(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+{
+    return lhs.first > rhs.first ||
+        (lhs.first == rhs.first && lhs.second >= rhs.second);
+}
+#else /* until c++20 */
+template<class T1, class T2, class U1, class U2>
+constexpr std::common_comparison_category_t<synth-three-way-result<T1, U1>,
+                                            synth-three-way-result<T2, U2>>
+    operator<=>(const Pair<T1, T2> &lhs, const Pair<U1, U2> &rhs)
+{
+    auto c1 = synth-three-way(lhs.first, rhs.first);
+    if (c1 == 0) {
+        return c1;
+    }
+    return synth-three-way(lhs.second, rhs.second);
+}
+#endif /* since c++20 */
+
+template<size_t I, class A, class B>
+constexpr const typename std::enable_if<I == 0, A>::type &get(const Pair<A, B> &p)
+    { return p.first; }
+template<size_t I, class A, class B>
+constexpr typename std::enable_if<I == 0, A>::type &get(Pair<A, B> &p)
+    { return p.first; }
+template<size_t I, class A, class B>
+constexpr const typename std::enable_if<I == 1ul, B>::type &get(const Pair<A, B> &p)
+    { return p.second; }
+template<size_t I, class A, class B>
+constexpr typename std::enable_if<I == 1ul, B>::type &get(Pair<A, B> &p)
+    { return p.second; }
+template<size_t I, class A, class B>
+constexpr typename std::enable_if<I == 0, A>::type &&get(Pair<A, B> &&p)
+{
+    ann_helper::optional_destroy(p.second);
+    return std::move(p.first);
+}
+template<size_t I, class A, class B>
+constexpr typename std::enable_if<I == 1ul, B>::type &&get(Pair<A, B> &&p)
+{
+    ann_helper::optional_destroy(p.first);
+    return std::move(p.second);
+}
+template<class A, class B>
+constexpr const typename std::enable_if<!std::is_same<A, B>::value, A>::type &
+get(const Pair<A, B> &p) { return p.first; }
+template<class A, class B>
+constexpr const typename std::enable_if<!std::is_same<A, B>::value, B>::type &
+get(const Pair<B, A> &p) { return p.second; }
+template<class A, class B>
+constexpr typename std::enable_if<!std::is_same<A, B>::value, A>::type &
+get(Pair<A, B> &p) { return p.first; }
+template<class A, class B>
+constexpr typename std::enable_if<!std::is_same<A, B>::value, B>::type &
+get(Pair<B, A> &p) { return p.second; }
+template<class A, class B>
+constexpr typename std::enable_if<!std::is_same<A, B>::value, A>::type &&
+get(Pair<A, B> &&p) { return p.first; }
+template<class A, class B>
+constexpr typename std::enable_if<!std::is_same<A, B>::value, B>::type &&
+get(Pair<B, A> &&p) { return p.second; }
+
+namespace vtl {
+namespace internal {
+    template <typename T>
+    using get_v = typename std::conditional<
+        std::is_same<
+            typename std::decay<T>::type,
+            std::reference_wrapper<T>
+        >::value,
+        T &,
+        typename std::decay<T>::type
+    >::type;
+} /* namespace internal */
+template<class A, class B>
+constexpr Pair<internal::get_v<A>, internal::get_v<B>> make_pair(A &&a, B &&b)
+{
+    using a_type = internal::get_v<A>;
+    using b_type = internal::get_v<B>;
+    return Pair<a_type, b_type>(std::forward<a_type>(a), std::forward<b_type>(b));
+}
+} /* namespace vtl */
+
+#else
+template <typename A, typename B>
+using Pair = std::pair<A, B>;
+namespace vtl {
+using std::make_pair;
+}
+#endif
+#endif /* CONTAINER_PAIR_H */

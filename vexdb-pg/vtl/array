@@ -1,0 +1,99 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_ARRAY_H
+#define CONTAINER_ARRAY_H
+
+#include <iterator>
+#include <vtl/internal/container.hpp>
+#include <vtl/internal/expr.hpp>
+
+template<typename T, size_t N>
+struct alignas(T) Array {
+private:
+    using Tp = T[N];
+public:
+    using value_type = T;
+    using size_type = size_t;
+    using difference_type = std::ptrdiff_t;
+    using reference = value_type &;
+    using const_reference = const value_type &;
+    using pointer = value_type *;
+    using const_pointer = const value_type *;
+    using iterator = pointer;
+    using const_iterator = const_pointer;
+    using reverse_iterator = std::reverse_iterator<iterator>;
+    using const_reverse_iterator = std::reverse_iterator<const_iterator>;
+
+    /* data needs to be public for implicitly constructor/copy */
+    Tp _M_data;
+
+    _GLIBCXX17_CONSTEXPR void destroy()
+    {
+        for (auto &d : _M_data) {
+            ann_helper::optional_destroy(d);
+        }
+    }
+
+    /* element access */
+    /* we cannot check idx as we need to make it constexpr */
+    _GLIBCXX17_CONSTEXPR const_reference at(size_t idx) const
+    {
+#if __cplusplus < 201703L
+        Assert(idx < N);
+#endif
+        return _M_data[idx];
+    }
+    _GLIBCXX17_CONSTEXPR reference at(size_t idx)
+    {
+#if __cplusplus < 201703L
+        Assert(idx < N);
+#endif
+        return _M_data[idx];
+    }
+    _GLIBCXX17_CONSTEXPR const_reference operator[](size_t idx) const { return at(idx); }
+    _GLIBCXX17_CONSTEXPR reference operator[](size_t idx) { return at(idx); }
+    _GLIBCXX17_CONSTEXPR const_reference front() const { return at(0); }
+    _GLIBCXX17_CONSTEXPR reference front() { return at(0); }
+    _GLIBCXX17_CONSTEXPR const_reference back() const { return at(N - 1ul); }
+    _GLIBCXX17_CONSTEXPR reference back() { return at(N - 1u); }
+    _GLIBCXX17_CONSTEXPR const T *data() const { return _M_data; }
+    _GLIBCXX17_CONSTEXPR T *data() { return _M_data; }
+
+    /* iterators */
+    _GLIBCXX17_CONSTEXPR const_iterator cbegin() const { return _M_data; }
+    _GLIBCXX17_CONSTEXPR const_iterator begin() const { return _M_data; }
+    _GLIBCXX17_CONSTEXPR iterator begin() { return _M_data; }
+    _GLIBCXX17_CONSTEXPR const_iterator cend() const { return _M_data + N; }
+    _GLIBCXX17_CONSTEXPR const_iterator end() const { return _M_data + N; }
+    _GLIBCXX17_CONSTEXPR iterator end() { return _M_data + N; }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crbegin() const
+        { return const_reverse_iterator(cend()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rbegin() const { return crbegin(); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rbegin() { return reverse_iterator(end()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator crend() const
+        { return const_reverse_iterator(cbegin()); }
+    _GLIBCXX17_CONSTEXPR const_reverse_iterator rend() const { return crend(); }
+    _GLIBCXX17_CONSTEXPR reverse_iterator rend() { return reverse_iterator(begin()); }
+
+    /* capacity */
+    static _GLIBCXX17_CONSTEXPR bool empty() { return N == 0; }
+    static _GLIBCXX17_CONSTEXPR size_type size() { return N; }
+    static _GLIBCXX17_CONSTEXPR size_type max_size() { return N; }
+
+    /* operation */
+    _GLIBCXX17_CONSTEXPR void fill(const T &value)
+    {
+        for (auto &d : _M_data) {
+            d = value;
+        }
+    }
+    _GLIBCXX17_CONSTEXPR void swap(Array &other)
+    {
+        using std::swap;
+        swap(_M_data, other._M_data);
+    }
+};
+
+#endif /* CONTAINER_ARRAY_H */

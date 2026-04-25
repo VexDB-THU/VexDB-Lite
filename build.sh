@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/build/standalone}"
+CORE_BUILD_DIR="${CORE_BUILD_DIR:-$ROOT_DIR/build/core}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 JOBS="${JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || echo 4)}"
 
@@ -12,17 +13,19 @@ DUCKDB_VERSION_TAG="${DUCKDB_VERSION_TAG:-}"
 usage() {
   cat <<USAGE
 Usage:
-  DUCKDB_SOURCE_DIR=/path/to/duckdb ./build.sh [configure|build|all|clean] [Debug|Release]
+  DUCKDB_SOURCE_DIR=/path/to/duckdb ./build.sh [configure|build|all|core|clean] [Debug|Release]
 
 Environment:
-  DUCKDB_SOURCE_DIR   Absolute path to DuckDB source checkout (required)
+  DUCKDB_SOURCE_DIR   Absolute path to DuckDB source checkout (required for duckdb targets)
   DUCKDB_VERSION_TAG  Override extension ABI version tag (e.g. v1.4.4)
-  BUILD_DIR           Build directory (default: $BUILD_DIR)
+  BUILD_DIR           DuckDB standalone build directory (default: $BUILD_DIR)
+  CORE_BUILD_DIR      libvex-core build directory (default: $CORE_BUILD_DIR)
   JOBS                Parallel build jobs (default: CPU count)
 
 Examples:
   DUCKDB_SOURCE_DIR=~/Work/duckdb ./build.sh all Release
   DUCKDB_SOURCE_DIR=~/Work/duckdb ./build.sh build
+  ./build.sh core Release
 USAGE
 }
 
@@ -32,18 +35,13 @@ if [[ "${2:-}" != "" ]]; then
 fi
 
 if [[ "$ACTION" == "clean" ]]; then
-  rm -rf "$BUILD_DIR"
+  rm -rf "$BUILD_DIR" "$CORE_BUILD_DIR"
   echo "Cleaned: $BUILD_DIR"
+  echo "Cleaned: $CORE_BUILD_DIR"
   exit 0
 fi
 
-if [[ -z "$DUCKDB_SOURCE_DIR" ]]; then
-  echo "Error: DUCKDB_SOURCE_DIR is required."
-  usage
-  exit 1
-fi
-
-configure() {
+configure_duckdb() {
   local cmake_args=(
     -S "$ROOT_DIR"
     -B "$BUILD_DIR"
@@ -56,7 +54,7 @@ configure() {
   cmake "${cmake_args[@]}"
 }
 
-build() {
+build_duckdb() {
   cmake --build "$BUILD_DIR" --target vex_loadable_extension -j "$JOBS"
   local ext
   ext="$(find "$BUILD_DIR" -name 'vex.duckdb_extension' | head -n 1 || true)"
@@ -67,17 +65,51 @@ build() {
   fi
 }
 
+configure_core() {
+  cmake -S "$ROOT_DIR/libvex-core" -B "$CORE_BUILD_DIR" -DCMAKE_BUILD_TYPE="$BUILD_TYPE"
+}
+
+build_core() {
+  cmake --build "$CORE_BUILD_DIR" -j "$JOBS"
+  local core_lib
+  core_lib="$(find "$CORE_BUILD_DIR" -name 'libvex_core.a' | head -n 1 || true)"
+  if [[ -n "$core_lib" ]]; then
+    echo "Built core library: $core_lib"
+  else
+    echo "Core build finished, but libvex_core.a path was not found automatically."
+  fi
+}
+
 case "$ACTION" in
   configure)
-    configure
+    if [[ -z "$DUCKDB_SOURCE_DIR" ]]; then
+      echo "Error: DUCKDB_SOURCE_DIR is required for 'configure'."
+      usage
+      exit 1
+    fi
+    configure_duckdb
     ;;
   build)
-    configure
-    build
+    if [[ -z "$DUCKDB_SOURCE_DIR" ]]; then
+      echo "Error: DUCKDB_SOURCE_DIR is required for 'build'."
+      usage
+      exit 1
+    fi
+    configure_duckdb
+    build_duckdb
     ;;
   all)
-    configure
-    build
+    if [[ -z "$DUCKDB_SOURCE_DIR" ]]; then
+      echo "Error: DUCKDB_SOURCE_DIR is required for 'all'."
+      usage
+      exit 1
+    fi
+    configure_duckdb
+    build_duckdb
+    ;;
+  core)
+    configure_core
+    build_core
     ;;
   *)
     usage

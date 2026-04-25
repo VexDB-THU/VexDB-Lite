@@ -1,0 +1,227 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef PRIORITY_QUEUE_H
+#define PRIORITY_QUEUE_H
+
+#include <vtl/vector>
+#include <vtl/internal/expr.hpp>
+#include <algorithm>
+#include <functional>
+
+template <typename T, class Compare = std::less<T>, class Allocator = DEFAULT_ALLOCATOR<T>>
+class PriorityQueue {
+    constexpr static size_t k = 4; /* 4-ary heap */
+
+public:
+    using value_type = T;
+    using container_type = Vector<T, Allocator>;
+    using reference = T &;
+    using const_reference = const T &;
+    using allocator_type = Allocator;
+
+    PriorityQueue() = default;
+    explicit PriorityQueue(size_t capacity) : _store(capacity) {}
+    explicit PriorityQueue(const Allocator &alloc) : _store(alloc) {}
+    explicit PriorityQueue(Allocator &&alloc) : _store(std::move(alloc)) {}
+
+    PriorityQueue(std::initializer_list<T> list, const Allocator &alloc = Allocator())
+        : _store(list, alloc) { heapify(); }
+
+    explicit PriorityQueue(Vector<T, Allocator> &&vec, bool sorted = false)
+        : _store(std::move(vec))
+    {
+        if (!sorted) {
+            heapify();
+        }
+    }
+
+    PriorityQueue(const PriorityQueue &other) = default;
+    PriorityQueue(PriorityQueue &&other) = default;
+    PriorityQueue &operator=(const PriorityQueue &other) = default;
+    PriorityQueue &operator=(PriorityQueue &&other) = default;
+
+    void heapify()
+    {
+        if (empty()) {
+            return;
+        }
+        /* Start from the last non-leaf node and sift down each node */
+        for (int i = (parent(data().size() - 1)); i >= 0; --i) {
+            sift_down(i);
+        }
+    }
+
+    bool empty() const { return data().empty(); }
+    size_t size() const { return data().size(); }
+    const_reference top() const { return data().front(); }
+    reference top() { return data().front(); }
+
+    void push(const T &value)
+    {
+        data().push_back(value);
+        sift_up(data().size() - 1);
+    }
+
+    void push(T &&value)
+    {
+        data().push_back(std::move(value));
+        sift_up(data().size() - 1);
+    }
+
+    template <typename... Args>
+    void emplace(Args &&...args)
+    {
+        data().emplace_back(std::forward<Args>(args)...);
+        sift_up(data().size() - 1);
+    }
+
+    void pop()
+    {
+        Assert(!empty());
+        if (data().size() == 1) {
+            data().pop_back();
+            return;
+        }
+        /* Move last element to root and sift down */
+        data().front() = std::move(data().back());
+        data().pop_back();
+        sift_down(0);
+    }
+
+    void clear() { data().clear(); }
+    void reserve(size_t cap) { data().reserve(cap); }
+    void swap(PriorityQueue &other) { data().swap(other.data()); }
+
+    void update(size_t idx, const T &value)
+    {
+        Assert(idx < data().size());
+        bool should_go_up = get_comp()(value, data()[idx]);
+        data()[idx] = value;
+        if (should_go_up) {
+            sift_up(idx);
+        } else {
+            sift_down(idx);
+        }
+    }
+
+    void erase(size_t idx)
+    {
+        Assert(idx < data().size());
+        if (idx == data().size() - 1) {
+            data().pop_back();
+            return;
+        }
+        /* Replace with last element */
+        data()[idx] = std::move(data().back());
+        data().pop_back();
+        /* Restore heap property */
+        if (idx > 0) {
+            size_t p = parent(idx);
+            if (get_comp()(data()[idx], data()[p])) {
+                sift_up(idx);
+            } else {
+                sift_down(idx);
+            }
+        } else {
+            sift_down(0);
+        }
+    }
+
+    void destroy() { ann_helper::optional_destroy(data()); }
+
+    const container_type &data() const & { return _store.d; }
+    container_type &data() & { return _store.d; }
+    container_type &&data() && { return std::move(_store.d); }
+    const T *cbegin() const { return data().cbegin(); }
+    const T *begin() const { return cbegin(); }
+    T *begin() { return data().begin(); }
+    const T *cend() { return data().cend(); }
+    const T *end() { return cend(); }
+    T *end() const { return data().end(); }
+    const T *data_ptr() const { return data().data(); }
+    T *data_ptr() { return data().data(); }
+
+    /* sort in ascending order, will destroy heap struct if this is a max heap! */
+    void sort()
+    {
+        const size_t n = data().size();
+        if (n <= 1) {
+            return;
+        }
+        for (size_t i = 0; i < n - 1; ++i) {
+            size_t last_unsorted = n - 1 - i;
+            std::swap(data()[0], data()[last_unsorted]);
+            sift_down_in_range(0, last_unsorted);
+        }
+    }
+
+private:
+    struct Store : public Compare {
+        container_type d;
+        Store() = default;
+        explicit Store(size_t capacity) : d(capacity) {}
+        explicit Store(const Allocator &alloc) : d(alloc) {}
+        explicit Store(Allocator &&alloc) : d(std::move(alloc)) {}
+        Store(std::initializer_list<T> list, const Allocator &alloc) : d(list, alloc) {}
+        explicit Store(Vector<T, Allocator> &&vec) : d(std::move(vec)) {}
+    } _store;
+    const Compare &get_comp() const { return _store; }
+    Compare &get_comp() { return _store; }
+
+    size_t parent(size_t idx) { return (idx - 1) / k; }
+    size_t first_child(size_t idx) { return k * idx + 1; }
+
+    void sift_up(size_t idx)
+    {
+        while (idx > 0) {
+            size_t p = parent(idx);
+            if (!get_comp()(data()[idx], data()[p])) {
+                break;
+            }
+            std::swap(data()[idx], data()[p]);
+            idx = p;
+        }
+    }
+
+    void sift_down(size_t idx)
+    {
+        const size_t n = data().size();
+        while (true) {
+            size_t best = idx;
+            size_t first = first_child(idx);
+            for (size_t i = 0; i < k && first + i < n; ++i) {
+                if (get_comp()(data()[first + i], data()[best])) {
+                    best = first + i;
+                }
+            }
+            if (best == idx) {
+                break;
+            }
+            std::swap(data()[idx], data()[best]);
+            idx = best;
+        }
+    }
+
+    void sift_down_in_range(size_t idx, size_t end)
+    {
+        for (;;) {
+            size_t best = idx;
+            size_t first = first_child(idx);
+            for (size_t i = 0; i < k && first + i < end; ++i) {
+                if (get_comp()(data()[first + i], data()[best])) {
+                    best = first + i;
+                }
+            }
+            if (best == idx) {
+                break;
+                
+            }
+            std::swap(data()[idx], data()[best]);
+            idx = best;
+        }
+    }
+};
+
+#endif /* PRIORITY_QUEUE_H */

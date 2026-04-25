@@ -1,0 +1,118 @@
+/**
+ * Copyright...
+ */
+
+#ifndef CONTAINER_TRIANGLE_MATRIX_H
+#define CONTAINER_TRIANGLE_MATRIX_H
+
+#include <vtl/allocator>
+
+#include <algorithm>
+
+template <typename T, class Allocator = DEFAULT_ALLOCATOR<T>>
+class TriangleMatrix : public Allocator {
+public:
+    using value_type = T;
+    using allocator_type = Allocator;
+
+    const allocator_type &get_allocator() const { return *this; }
+    allocator_type &get_allocator() { return *this; }
+
+    TriangleMatrix(size_t width, size_t height, const Allocator &alloc = Allocator())
+        : Allocator(alloc), _capacity(width)
+    {
+        Assert(width == height); /* we don't support that case */
+        _data = alloc0(get_allocator(), _capacity * (_capacity + 1ul) / 2ul);
+    }
+    TriangleMatrix(size_t width, size_t height, const T &init_v, const Allocator &alloc = Allocator())
+        : Allocator(alloc), _capacity(width)
+    {
+        Assert(width == height); /* we don't support that case */
+        const size_t size = _capacity * (_capacity + 1ul) / 2ul;
+        _data = get_allocator().allocate(size);
+        std::fill_n(_data, size, init_v);
+    }
+    TriangleMatrix(const TriangleMatrix &other, const Allocator &alloc = Allocator())
+        : Allocator(alloc), _capacity(other._capacity)
+    {
+        const size_t size = _capacity * (_capacity + 1ul) / 2ul;
+        _data = get_allocator().allocate(size);
+        for (size_t i = 0; i < size; ++i) {
+            get_allocator().construct(_data + i, other._data[i]);
+        }
+    }
+    TriangleMatrix(TriangleMatrix &&other, const Allocator &alloc = Allocator())
+        : Allocator(alloc), _capacity(other._capacity), _data(other._data) { other._data = NULL; }
+    TriangleMatrix &operator=(const TriangleMatrix &other)
+    {
+        if (this != &other) {
+            destroy();
+            get_allocator() = other.get_allocator();
+            _capacity = other._capacity;
+            const size_t size = _capacity * (_capacity + 1ul) / 2ul;
+            _data = get_allocator().allocate(size);
+            for (size_t i = 0; i < size; ++i) {
+                get_allocator().construct(_data + i, other._data[i]);
+            }
+        }
+        return *this;
+    }
+    TriangleMatrix &operator=(TriangleMatrix &&other)
+    {
+        if (this != &other) {
+            destroy();
+            std::swap(get_allocator(), other.get_allocator());
+            _capacity = other._capacity;
+            std::swap(_data, other._data);
+        }
+        return *this;
+    }
+    ~TriangleMatrix() = default;
+    void swap(TriangleMatrix &other)
+    {
+        std::swap(get_allocator(), other.get_allocator());
+        std::swap(_capacity, other._capacity);
+        std::swap(_data, other._data);
+    }
+
+    const T &get(size_t i, size_t j) const
+    {
+        Assert(i < _capacity && j < _capacity);
+        if (i > j) {
+            std::swap(i, j);
+        }
+        return _data[i * _capacity + j - i * (i + 1ul) / 2ul];
+    }
+    T &get(size_t i, size_t j)
+    {
+        Assert(i < _capacity && j < _capacity);
+        if (i > j) {
+            std::swap(i, j);
+        }
+        return _data[i * _capacity + j - i * (i + 1ul) / 2ul];
+    }
+
+    void set(size_t i, size_t j, T &&val) { get(i, j) = std::move(val); }
+    void set(size_t i, size_t j, const T &val) { get(i, j) = val; }
+
+    const T &operator()(size_t i, size_t j) const { return get(i, j); }
+    T &operator()(size_t i, size_t j) { return get(i, j); }
+
+    size_t size() const { return _capacity; }
+    void destroy()
+    {
+        if (_data) {
+            const size_t size = _capacity * (_capacity + 1ul) / 2ul;
+            for (size_t i = 0; i < size; ++i) {
+                get_allocator().destroy(_data + i);
+            }
+            get_allocator().deallocate(_data, size);
+            _data = NULL;
+        }
+    }
+private:
+    size_t _capacity;
+    T *_data;
+};
+
+#endif /* CONTAINER_TRIANGLE_MATRIX_H */
