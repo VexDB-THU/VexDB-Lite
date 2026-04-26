@@ -12,6 +12,7 @@ add_library(vex_core STATIC
   src/distance.cpp
   src/product_quantizer.cpp
   src/quant_distancer.cpp
+  src/rabitq.cpp
   src/node_store_memory.cpp
   src/graph_algo.cpp
   src/adapter_low_level_binding_mock.cpp

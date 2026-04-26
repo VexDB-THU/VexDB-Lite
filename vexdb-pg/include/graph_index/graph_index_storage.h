@@ -31,6 +31,8 @@
 #include "halfvec.h"
 #include "floatvector.h"
 #include "index_inspect.h"
+#include "pq.h"
+#include "rabitq/rabitq_distancer.h"
 
 PERF_DECLARE_CATS(MemPerfCats, true, read, write, calc, lock);
 PERF_DECLARE_CATS(DiskPerfCats, false, read_node, read_neighbor, read_vec, write_node, write_neighbor, write_vec, calc, lock, fetch);
@@ -338,6 +340,12 @@ public:
         DO_PERF(write);
         vector_pool.set(id, (void *)query);
         STOP_PERF(write);
+    }
+
+    template <typename Distancer>
+    void add_vector(T id, const char *query, Distancer &distancer)
+    {
+        add_vector(id, query);
     }
 
     template <bool is_base_layer>
@@ -838,6 +846,28 @@ public:
         STOP_PERF(write_vec);
     }
 
+    template <typename Distancer>
+    void add_vector(T id, const char *query, Distancer &distancer)
+    {
+        if (st != VecStorageType::PureCode) {
+            add_vector(id, query);
+            return;
+        }
+
+        DO_PERF(write_vec);
+        char *code = alloc_vector(elem_size);
+        distancer.compute_code((float *)query, code);
+        vec_write(index->rd_smgr, elem_size * id, elem_size, code, false, st);
+        CONSTEXPR_IF (WithBulkbuf) {
+            bulkbuf->update(id, code);
+        }
+        if (need_wal) {
+            xlog.add_vector(code, elem_size * id, elem_size, st);
+        }
+        free_vector(code);
+        STOP_PERF(write_vec);
+    }
+
     template <bool is_base_layer>
     void get_neighbors(Vector<GraphIndexCandidate<T>> &neighbors, const GraphIndexCandidate<T> &point)
     {
@@ -1084,13 +1114,15 @@ public:
         Assert(!is_null);
 
         Datum d;
-        char *func_name = get_func_name(func_oid);
-        if (strcmp(func_name, "array_to_floatvector") == 0 || strcmp(func_name, "array_to_halfvector") == 0) {
+        char *func_name = OidIsValid(func_oid) ? get_func_name(func_oid) : NULL;
+        if (func_name != NULL &&
+            (strcmp(func_name, "array_to_floatvector") == 0 || strcmp(func_name, "array_to_halfvector") == 0)) {
             PGFunction func = metap->precision_type == DistPrecisionType::FLOAT
                 ? array_to_floatvector
                 : array_to_halfvector;
             d = DirectFunctionCall2(func, value, Int32GetDatum(dim));
-        } else if (strcmp(func_name, "subfloatvector") == 0 || strcmp(func_name, "halfvector_subvector") == 0) {
+        } else if (func_name != NULL &&
+                   (strcmp(func_name, "subfloatvector") == 0 || strcmp(func_name, "halfvector_subvector") == 0)) {
             FuncExpr *func_expr = (FuncExpr *)linitial(index->rd_indexprs);
             Assert(list_length(func_expr->args) == 3);
             ListCell *lc = list_nth_cell(func_expr->args, 1);
@@ -1109,11 +1141,30 @@ public:
             d = value;
         }
 
-        FloatVector *data = DatumGetFloatVector(d);
-        memcpy(vec, data->x, vec_size);
+        if (metap->precision_type == DistPrecisionType::FLOAT) {
+            FloatVector *data = DatumGetFloatVector(d);
+            memcpy(vec, data->x, vec_size);
 
-        if (PointerGetDatum(data) != value) {
-            pfree(data);
+            if (PointerGetDatum(data) != d) {
+                pfree(data);
+            }
+        } else if (metap->precision_type == DistPrecisionType::HALF) {
+            HalfVector *data = DatumGetHalfVector(d);
+            half *src = data->x;
+            half *dst = (half *)vec;
+            memcpy(dst, src, vec_size);
+
+            if (PointerGetDatum(data) != d) {
+                pfree(data);
+            }
+        } else {
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("fetch_vec_via_slot only supports floatvector and halfvector")));
+        }
+
+        if (func_name != NULL) {
+            pfree(func_name);
         }
     }
 

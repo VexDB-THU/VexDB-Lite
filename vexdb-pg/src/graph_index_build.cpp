@@ -23,6 +23,7 @@
 #endif
 
 #include <chrono>
+#include <cstring>
 #include <memory>
 #include <type_traits>
 
@@ -386,8 +387,69 @@ private:
 
     bool init_quantizer(Relation heap, Relation index)
     {
-        /* For now, skip quantizer initialization - return false to disable */
-        return false;
+        if (qt_type == QuantizerType::NONE) {
+            elem_size = vector_size;
+            return false;
+        }
+
+        if (qt_type != QuantizerType::RABITQ) {
+            ereport(WARNING,
+                (errmsg("requested quantizer is not available in current PG build"),
+                 errdetail("quantizer_type=%d", static_cast<int>(qt_type))));
+            elem_size = vector_size;
+            return false;
+        }
+
+        const size_t sample_target = std::max<size_t>(GRAPH_INDEX_MIN_QT_SAMPLES_SIZE,
+                                                      GRAPH_INDEX_RABITQ_NUM_CLUSTERS * 32);
+        FloatVectorArray samples = graph_index_quantizer_sample_data(heap, index, dimension, need_norm,
+                                                                     precision_type, parallel_workers,
+                                                                     sample_target);
+        const int sample_count = samples ? samples->length : 0;
+        if (samples == nullptr || sample_count < GRAPH_INDEX_RABITQ_NUM_CLUSTERS) {
+            if (samples != nullptr) {
+                FloatVectorArrayFree(samples);
+            }
+            ereport(WARNING,
+                (errmsg("insufficient samples for RaBitQ training"),
+                 errdetail("sample_count=%d required=%d",
+                           sample_count,
+                           GRAPH_INDEX_RABITQ_NUM_CLUSTERS)));
+            elem_size = vector_size;
+            return false;
+        }
+
+        bool trained = DispatchRunner<true,
+            MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE>,
+            DistPrecisionTypeList<DistPrecisionType::FLOAT, DistPrecisionType::HALF>,
+            DispatcherMode::DEFAULT>::call(
+            metric, precision_type, dimension, qt_type,
+            [&](auto &distancer) {
+                using Distancer = std::decay_t<decltype(distancer)>;
+                if constexpr (std::is_same_v<Distancer, RabitqDistancer>) {
+                    distancer.train(index, samples, dimension, metric, need_norm,
+                                    parallel_workers, maintenance_work_mem_kb);
+                    elem_size = distancer.code_size();
+                    distancer.flush(index, qtcode_block, false);
+                    Variant<PQDistancer, RabitqDistancer> trained_quantizer;
+                    trained_quantizer.emplace<RabitqDistancer>(std::move(distancer));
+                    quantizer.emplace(std::move(trained_quantizer));
+                    metap->quantizer_metainfo.get_rabitq_meta().quant_size = static_cast<int>(elem_size);
+                    metap->quantizer_metainfo.get_rabitq_meta().query_rescaling_factor =
+                        quantizer->template get<RabitqDistancer>().get_query_rescaling_factor();
+                    metap->quantizer_metainfo.centroids_version = 1;
+                    metap->quantizer_metainfo.code_version = 1;
+                    metap->quantizer_metainfo.set_enable();
+                    return true;
+                } else {
+                    return false;
+                }
+            });
+        FloatVectorArrayFree(samples);
+        if (!trained) {
+            elem_size = vector_size;
+        }
+        return trained;
     }
 
     template <typename D>
@@ -771,15 +833,38 @@ private:
         auto &vec = vector_pool.vec;
         uint32 num_vectors = store.get_vector_num();
 
-        for (size_t i = 0; i < vec.size(); ++i) {
-            size_t batch_offset = i * vector_pool.one_chunk_elem_nums;
-            size_t actual_copy_num = Min(vector_pool.one_chunk_elem_nums, num_vectors - batch_offset);
-            if (actual_copy_num == 0) {
-                break;
+        const bool use_rabitq_codes =
+            qt_type == QuantizerType::RABITQ && quantizer.has_value() &&
+            metap->quantizer_metainfo.get_type() == QuantizerType::RABITQ;
+        if (!use_rabitq_codes) {
+            for (size_t i = 0; i < vec.size(); ++i) {
+                size_t batch_offset = i * vector_pool.one_chunk_elem_nums;
+                size_t actual_copy_num = Min(vector_pool.one_chunk_elem_nums, num_vectors - batch_offset);
+                if (actual_copy_num == 0) {
+                    break;
+                }
+                off_t offset = batch_offset * vector_size;
+                int nbytes = actual_copy_num * vector_size;
+                vec_write(index->rd_smgr, offset, nbytes, vec[i].buf, false, storage_type);
             }
-            off_t offset = batch_offset * vector_size;
-            int nbytes = actual_copy_num * vector_size;
-            vec_write(index->rd_smgr, offset, nbytes, vec[i].buf, false, storage_type);
+        } else {
+            auto &distancer = quantizer->template get<RabitqDistancer>();
+            std::unique_ptr<char[]> code_buf(new char[static_cast<size_t>(vector_pool.one_chunk_elem_nums) * elem_size]);
+            for (size_t i = 0; i < vec.size(); ++i) {
+                size_t batch_offset = i * vector_pool.one_chunk_elem_nums;
+                size_t actual_copy_num = Min(vector_pool.one_chunk_elem_nums, num_vectors - batch_offset);
+                if (actual_copy_num == 0) {
+                    break;
+                }
+                char *src = vec[i].buf;
+                for (size_t j = 0; j < actual_copy_num; ++j) {
+                    distancer.compute_code(reinterpret_cast<float *>(src + j * vector_size),
+                                           code_buf.get() + j * elem_size);
+                }
+                off_t offset = static_cast<off_t>(batch_offset) * elem_size;
+                int nbytes = static_cast<int>(actual_copy_num * elem_size);
+                vec_write(index->rd_smgr, offset, nbytes, code_buf.get(), false, VecStorageType::PureCode);
+            }
         }
 
         flush_timer.report("Flush Finished");

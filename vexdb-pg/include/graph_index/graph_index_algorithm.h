@@ -54,6 +54,25 @@ class GraphIndexAlgorithm {
     static constexpr bool distancer_supports_cluster_maint =
         has_cluster_maint_traits<Distancer>::value;
 
+    template <typename D, typename = void>
+    struct has_compute_code_traits : std::false_type {};
+
+    template <typename D>
+    struct has_compute_code_traits<D,
+        std::void_t<decltype(std::declval<D &>().compute_code((float *)nullptr, (char *)nullptr))>> : std::true_type {};
+
+    static constexpr bool distancer_supports_code_compute =
+        has_compute_code_traits<Distancer>::value;
+
+    void add_vector_for_store(T id, const char *query)
+    {
+        if constexpr (distancer_supports_code_compute) {
+            store.add_vector(id, query, distancer);
+        } else {
+            store.add_vector(id, query);
+        }
+    }
+
     struct ClosestCompare {
         bool operator()(const Cand &a, const Cand &b) const {
             return a.dist < b.dist; /* smallest distance has highest priority (min-heap) */
@@ -120,6 +139,9 @@ public:
         }
         ep = search_layer<true>(query, std::move(ep), ef_search, dummy_filter);
         refine(ctx, ep, query);
+        std::sort(ep.begin(), ep.end(), [](const Cand &a, const Cand &b) {
+            return a.dist < b.dist || (a.dist == b.dist && a.id < b.id);
+        });
 
         res.first.reserve(ep.size());
         res.second.reserve(ep.size());
@@ -283,7 +305,7 @@ public:
         T id = store.template assign_vector_id<true>();
         store.add_async_id(id);
         store.add_elem(ctx.ctx, id, ctx.tid);
-        store.add_vector(id, ctx.query);
+        add_vector_for_store(id, ctx.query);
     }
 
     template <bool try_bottom_first = clustered>
@@ -303,7 +325,7 @@ retry:
             store.template assign_vector_id<true>();
             store.add_elem(ctx.ctx, 0, ctx.tid);
             add_first_basepoint();
-            store.add_vector(0, ctx.query);
+            add_vector_for_store(0, ctx.query);
             store.set_entrypoint(0, 0, 0);
             store.release_entry_lock(shared_lock);
             return;
@@ -866,7 +888,7 @@ private:
         T lower_layer_idx = (T)INVALID_VECTOR_ID;
         Vector<Cand> base_neighbors{select_neighbors<true>(std::move(ep))};
         add_basepoint(id, base_neighbors);
-        store.add_vector(id, ctx.query);
+        add_vector_for_store(id, ctx.query);
         update_reverse_edges<true>(std::move(base_neighbors), ctx.query, id, cur_layer_idx);
         for (int_fast8_t l = 1; l <= search_level; ++l) {
             lower_layer_idx = cur_layer_idx;

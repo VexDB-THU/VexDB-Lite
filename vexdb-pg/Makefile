@@ -55,7 +55,8 @@ PG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE ?= 1
 SRCS += src/core_node_store_bridge.cpp \
         ../libvex-core/src/distance.cpp \
         ../libvex-core/src/graph_algo.cpp \
-        ../libvex-core/src/node_store_memory.cpp
+        ../libvex-core/src/node_store_memory.cpp \
+        ../libvex-core/src/rabitq.cpp
 ifeq ($(PG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE),1)
 PG_CPPFLAGS += -DPG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE
 endif
@@ -93,6 +94,7 @@ src/distance/avx512_dispatcher.bc: BITCODE_CXXFLAGS += -mavx512f -mavx512dq -mav
 ../libvex-core/src/distance.o: CXXFLAGS += -fexceptions
 ../libvex-core/src/graph_algo.o: CXXFLAGS += -fexceptions
 ../libvex-core/src/node_store_memory.o: CXXFLAGS += -fexceptions
+../libvex-core/src/rabitq.o: CXXFLAGS += -fexceptions
 
 include $(PGXS)
 

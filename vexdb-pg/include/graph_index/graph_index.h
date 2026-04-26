@@ -8,6 +8,7 @@
 #include "utils/relcache.h"
 
 #include "graph_index/graph_index_struct.h"
+#include "floatvector.h"
 
 /* Graph index functions */
 extern Datum graph_index_build(PG_FUNCTION_ARGS);
@@ -66,5 +67,9 @@ QuantizerType graph_index_get_quantizer_type(Relation index);
 FmgrInfo *graph_index_optional_proc_info(Relation index, uint16 procnum);
 void create_vec_data(Relation index, bool create);
 uint16_t graph_index_get_dim(Relation index);
+void graph_index_store_qt_centroids(Relation index, BlockNumber qtcode_block, const float *center,
+    size_t write_size, bool enabling);
+FloatVectorArray graph_index_quantizer_sample_data(Relation heap, Relation index, size_t dimension,
+    bool need_norm, DistPrecisionType precision_type, int parallel_workers, size_t sample_nums);
 
 #endif /* GRAPH_INDEX_H */

@@ -6,20 +6,17 @@
 #define RABITQ_DISTANCER_H
 
 #include "pg_compat.h"
-#include "rabitq/estimator.h"
-#include "rabitq/rabitq.h"
-#include "rabitq/rabitq_cache.h"
 #include "graph_index/graph_index_quantizer.h"
+#include "quantizer.h"
+#include "rabitq/utils.h"
+#include "vex/vex_rabitq.hpp"
 #include <vtl/optional>
 
 namespace rabitq {
 
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 struct RabitqDistancer {
-#pragma GCC diagnostic pop
     static constexpr bool has_estimation_func = true;
-    static constexpr bool need_refine = false;
+    static constexpr bool need_refine = true;
 
     RabitqDistancer() : cid_size(0), bin_size(0), prepared(false) {}
 
@@ -30,32 +27,12 @@ struct RabitqDistancer {
     void process(const char *query);
     void destroy();
     size_t code_size() { return code_len; }
-    void compute_code(float *vec, char *code)
-    {
-        char *bin_data = code + cid_size;
-        char *ext_data = bin_data + bin_size;
-        int cluster_id = quantizer->quantize(vec, bin_data, ext_data);
-        memcpy(code, &cluster_id, cid_size);
-    }
+    double get_query_rescaling_factor() const;
+    void compute_code(float *vec, char *code);
+    float get_distance_precise(const void *x, const void *y, uint16 dim) const;
 
-    float get_distance_est_single(const void *x, const void *y, uint16 dim) const
-    {
-        char *quant_data = (char *)y;
-        uint16 cluster_id = *((uint16 *)quant_data);
-        char *bin_data = quant_data + cid_size;
-        estimator.get_bin_dist(cluster_id, bin_data, rec);
-        return rec.low_dist;
-    }
-
-    float get_distance_single(const void *x, const void *y, uint16 dim) const
-    {
-        char *quant_data = (char *)y;
-        uint16 cluster_id = *((uint16 *)quant_data);
-        char *bin_data = quant_data + cid_size;
-        char *ext_data = bin_data + bin_size;
-        estimator.get_full_dist(cluster_id, bin_data, ext_data, rec);
-        return rec.est_dist;
-    }
+    float get_distance_est_single(const void *x, const void *y, uint16 dim) const;
+    float get_distance_single(const void *x, const void *y, uint16 dim) const;
 
     void get_distance_est_batch2(const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) const
     {
@@ -72,22 +49,27 @@ struct RabitqDistancer {
     }
 private:
     void load_rabitq(Relation index, void *metap);
-    void load_rabitq_quantizer(Relation index, RaBitQMeta &rabitq_meta, RaBitQCache &cache);
-    void load_rabitq_cache(Relation index, RaBitQMeta &rabitq_meta);
-    void read_rabitq_data(Relation index, size_t rabitq_data_size, char *rabitq_data);
-    void free_rabitq();
+    void read_rabitq_data(Relation index, size_t rabitq_data_size, char *rabitq_data) const;
+    static vex::Metric to_core_metric(Metric metric);
+    void init_code_layout();
+    static void train_centroids(FloatVectorArray samples, int dim, std::vector<float> &centroids);
+    static void encode_binary_bits(const float *rotated_vec, const float *rotated_centroid, int padded_dim, char *bin_data);
+    void encode_ext_bits(const float *rotated_vec, const float *rotated_centroid, int padded_dim, char *ext_data);
+    static float decode_binary_distance(const uint64 *query_bits, const uint64 *code_bits, int padded_dim);
+    static float decode_ext_distance(const char *query, const char *ext_data, int dim);
 
-    mutable RaBitQEstimator estimator;
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-    mutable EstimateRecord rec;
-#pragma GCC diagnostic pop
+    mutable EstimateRecord rec{};
     int dim;
     int padded_dim;
     Metric metric;
-    Optional<RaBitQuantizer> quantizer;
+    Optional<vex::RabitQQuantizer> quantizer;
+    Optional<vex::RabitQEstimator> estimator;
+    std::vector<float> rotated_query;
+    std::vector<uint16> query_scalar_code;
+    std::vector<uint64> query_binary_bits;
     uint32 cid_size;
     uint32 bin_size;
+    uint32 ext_size;
     size_t code_len;
     BlockNumber qtcode_block;
     bool prepared;

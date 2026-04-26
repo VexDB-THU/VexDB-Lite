@@ -258,6 +258,161 @@ PQ SIMD 特别说明:
   - `ItemPointer/TID` 展开
   - async merge
   - clustered / disk-store / mem-store 调度
+
+## 6. PG 侧未迁移算法清单
+
+这一节只盘点“仍留在 `vexdb-pg`，但本质上属于通用算法、理论上还应继续迁入 `libvex-core`”的部分。
+
+### 6.1 第一优先级：RabitQ 通用数学实现
+
+文件:
+- [rabitq.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/rabitq.h)
+- [utils.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/utils.h)
+- [query.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/query.h)
+- [estimator.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/estimator.h)
+- [rotator.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/rotator.h)
+
+判断:
+- 这批文件主要承载 RabitQ 的量化数学、query preprocess、旋转和估计逻辑
+- 与 DuckDB / PostgreSQL 的存储接口没有天然绑定
+- 是当前 PG 侧最明确、最值得继续迁入 core 的算法块
+
+迁移原则:
+- 先迁纯数学逻辑
+- PG 侧保留:
+  - [rabitq_cache.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/rabitq_cache.h)
+  - [rabitq_distancer.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/rabitq/rabitq_distancer.h)
+  - [rabitq_distancer.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/rabitq_distancer.cpp)
+  - PG metadata / cache / load / flush 胶水
+
+### 6.2 第一优先级：PQ 残留算法实现
+
+文件:
+- [pq.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/pq.cpp)
+- [pq.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/pq.h)
+- [horizontal_sum128.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/horizontal_sum128.h)
+- [horizontal_sum256.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/horizontal_sum256.h)
+- [horizontal_sum512.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/horizontal_sum512.h)
+- [pq_endecode.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/pq_endecode.h)
+- [transpose_avx2_inl.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/transpose_avx2_inl.h)
+- [transpose_avx512_inl.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/pq/transpose_avx512_inl.h)
+
+判断:
+- `libvex-core` 已经有:
+  - [product_quantizer.cpp](/Users/sunji/Work/VexDB-Lite/libvex-core/src/product_quantizer.cpp)
+  - [quant_distancer.cpp](/Users/sunji/Work/VexDB-Lite/libvex-core/src/quant_distancer.cpp)
+- 但 PG 侧仍残留一套 PQ 训练、编码、距离表和 distancer 适配
+- 说明 PQ 收敛尚未完成，PG 适配层仍偏厚
+
+迁移原则:
+- core 继续承接:
+  - 训练
+  - 编码/解码
+  - 距离表构建
+  - SIMD 查表累计
+- PG 保留:
+  - quantizer 元信息
+  - `qtcode_block` 持久化
+  - 构建/查询时的加载和 flush 胶水
+
+### 6.3 第一优先级：距离与 SIMD 内核
+
+文件:
+- [distance.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/distance.cpp)
+- [general.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/general.cpp)
+- [sse.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/sse.cpp)
+- [avx.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/avx.cpp)
+- [avx512.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/avx512.cpp)
+- [distance_template.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/distance_template.h)
+- [distance_template2.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/distance_template2.h)
+- [transform_template.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/distance/transform_template.h)
+- [distances_simd_template.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/distances_simd_template.cpp)
+- [code_distance_template.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/distance/code_distance_template.cpp)
+
+判断:
+- `libvex-core` 已有基础距离实现，但还没有完全覆盖 PG 侧这套 SIMD/模板内核
+- 这批内核本身不依赖 PG page / Relation / TID 语义
+- 应逐步收敛到 core，形成统一距离核和 ISA dispatch
+
+迁移原则:
+- core 承接:
+  - 标量实现
+  - SSE / AVX2 / AVX512 实现
+  - half / int8 / PQ / RabitQ 的通用距离核
+  - 统一 dispatch 接口
+- PG 保留:
+  - `distance_guc` 和运行时架构选择胶水
+  - 兼容 PG 编译环境的宏和封装
+
+### 6.4 第二优先级：训练辅助算法
+
+文件:
+- [annkmeans.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/annkmeans.h)
+- [ann_utils.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/ann_utils.h)
+- [ann_utils.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/ann_utils.cpp)
+
+判断:
+- 这批代码中如果包含纯采样、归一化、聚类、训练工具，应进入 core
+- 但若混有 `Relation` / heap scan / PG row 访问，则不能整块迁移
+
+迁移原则:
+- 拆出纯训练数学工具进入 core
+- heap sampling、Relation 访问留在 PG
+
+### 6.5 第二优先级：`GraphIndexAlgorithm` 中仍可抽离的通用骨架
+
+文件:
+- [graph_index_algorithm.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/graph_index/graph_index_algorithm.h)
+
+判断:
+- 文件整体不能迁
+- 但里面仍可能残留:
+  - 通用搜索骨架
+  - 候选集/visited/剪枝骨架
+  - 与 `NodeStore` 接口兼容的后端无关层
+
+迁移原则:
+- 只继续抽“真正后端无关”的部分
+- 不把以下内容带入 core:
+  - `ItemPointer/TID` 展开
+  - async merge
+  - clustered / disk-store / mem-store 调度
+
+## 7. PG 侧暂不迁移的算法相关文件
+
+这些文件虽然与构建/搜索相关，但本质仍属于 PG 适配层，不应直接迁到 core。
+
+文件:
+- [graph_index_build.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_build.cpp)
+- [graph_index_insert.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_insert.cpp)
+- [graph_index_scan.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_scan.cpp)
+- [graph_index_am.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_am.cpp)
+- [graph_index_vacuum.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_vacuum.cpp)
+- [graph_index_xlog.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_xlog.cpp)
+- [graph_index_storage.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/graph_index/graph_index_storage.h)
+- [vector_smgr.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/vector_smgr.cpp)
+- [vector_buffer_manager.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/vector_buffer_manager.h)
+- [quantizer.h](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/quantizer.h)
+- [quantizer_stubs.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/quantizer_stubs.cpp)
+
+原因:
+- 含 PG page / WAL / metapage / Relation / TID / cache 生命周期
+- 属于适配层对象模型和持久化实现
+- 后续可以瘦身，但不应整体迁入 core
+
+## 8. 后续批次建议顺序
+
+建议顺序:
+1. 先收 `rabitq/*` 的纯数学和 query preprocess
+2. 再收 `pq.cpp/pq.h` 中残留的通用 PQ 算法核
+3. 再收 `distance/*` 的通用 SIMD 距离内核
+4. 再拆 `ann_utils/annkmeans` 中纯训练工具
+5. 最后再继续从 `graph_index_algorithm.h` 抽纯 HNSW 骨架
+
+原因:
+- 前三批更纯、更容易验证
+- 风险小于直接硬拆 PG 的 build / scan / storage 混合层
+- 更符合“适配层只做调用，通用算法尽量进 core”的路线
   - relation / metapage / buffer / xlog 生命周期
   - quantizer metadata、后台任务、cache 生命周期
 

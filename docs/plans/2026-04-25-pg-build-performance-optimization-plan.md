@@ -151,6 +151,15 @@
 目标:
 - 对高频读节点访问进一步收缩分配和重复准备成本
 
+### 批次 P4
+
+PG 并行构建接入评估
+
+目标:
+- 明确当前 `vexdb-pg` 索引构建仍是单线程
+- 在适配层性能热点收敛后，再评估 PostgreSQL 并行 build 接入
+- 不把“并行化”误当成当前 `PinNode` 热点问题的替代修复
+
 ## 5. 批次 P1 方案
 
 ### 5.1 问题
@@ -218,6 +227,37 @@
 - 当前热点不是“小 vector 分配本身”
 - 而是“每次 pin 里反复做存储读取、layout decode 和中间搬运”
 - pin state 必须继续保持小对象
+
+## 8. 并行构建 TODO
+
+当前状态:
+- 当前 PG 索引构建主流程仍是单线程
+- `parallel_workers` reloption 已存在，但 build 路径未真正启用并行 worker
+- Index AM 当前也明确关闭了并行建索引能力
+
+代码依据:
+- [graph_index_am.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_am.cpp)
+  - `amcanparallel = false`
+  - `amcanbuildparallel = false`
+- [graph_index_build.cpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/src/graph_index_build.cpp)
+  - `parallel build not yet implemented, using single-threaded`
+
+结论:
+- 当前性能分析中的 `pin_read_ms / pin_vector_ms / build_ms`，都是单 backend 构建路径上的热点
+- 这意味着现阶段应先把单线程单位访问成本降下来，再讨论并行 build
+
+TODO:
+1. 在当前 bridge / vector read 热点收敛后，单独立项评估 PG 并行 build 接入
+2. 梳理哪些阶段可并行:
+   - heap 扫描 / 采样
+   - 训练前数据准备
+   - 建图本体是否允许分阶段并行
+3. 明确与现有 `graph_index` 算法设计边界
+4. 评估 PostgreSQL `CreateParallelContext()` / parallel scan / worker 生命周期接线成本
+5. 并行方案应单独验证:
+   - 正确性
+   - WAL / vacuum / entrypoint 一致性
+   - recall 是否回归
 
 ### 5.7 P1-rework
 
