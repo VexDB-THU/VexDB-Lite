@@ -956,12 +956,16 @@ SMGR_READ_STATUS vec_read(SMgrRelation reln, off_t offset, size_t nbytes,
                              WAIT_EVENT_DATA_FILE_READ);
         } else {
             /* Use aligned temporary buffer for unaligned I/O */
-            alignas(PG_IO_ALIGN_SIZE) char tmp[BLCKSZ * 16];
+            alignas(PG_IO_ALIGN_SIZE) char stack_tmp[BLCKSZ * 16];
             size_t aligned_offset = TYPEALIGN_DOWN(PG_IO_ALIGN_SIZE, seg_offset);
             size_t aligned_size = TYPEALIGN(PG_IO_ALIGN_SIZE, seg_offset + chunk) - aligned_offset;
-            
-            if (aligned_size > sizeof(tmp))
-                aligned_size = TYPEALIGN_DOWN(PG_IO_ALIGN_SIZE, chunk);
+            char *tmp = stack_tmp;
+            bool heap_tmp = false;
+
+            if (aligned_size > sizeof(stack_tmp)) {
+                tmp = alloc_vector(aligned_size);
+                heap_tmp = true;
+            }
             
             /* Read aligned chunk */
             nread = FileRead(seg->mdfd_vfd, tmp, aligned_size, aligned_offset,
@@ -970,11 +974,21 @@ SMGR_READ_STATUS vec_read(SMgrRelation reln, off_t offset, size_t nbytes,
             if (nread > 0) {
                 /* Copy the relevant portion */
                 size_t copy_offset = seg_offset - aligned_offset;
-                size_t copy_size = Min(chunk, (size_t)nread - copy_offset);
-                if (copy_size > 0 && copy_offset < (size_t)nread) {
-                    memcpy(buffer + read_bytes, tmp + copy_offset, copy_size);
-                    nread = copy_size;
+                if (copy_offset < (size_t)nread) {
+                    size_t copy_size = Min(chunk, (size_t)nread - copy_offset);
+                    if (copy_size > 0) {
+                        memcpy(buffer + read_bytes, tmp + copy_offset, copy_size);
+                        nread = copy_size;
+                    } else {
+                        nread = 0;
+                    }
+                } else {
+                    nread = 0;
                 }
+            }
+
+            if (heap_tmp) {
+                free_vector(tmp);
             }
         }
         
@@ -1039,13 +1053,15 @@ void vec_write(SMgrRelation reln, off_t offset, size_t nbytes,
                                   WAIT_EVENT_DATA_FILE_WRITE);
         } else {
             /* Use aligned temporary buffer for unaligned I/O */
-            alignas(PG_IO_ALIGN_SIZE) char tmp[BLCKSZ * 16];
+            alignas(PG_IO_ALIGN_SIZE) char stack_tmp[BLCKSZ * 16];
             size_t aligned_offset = TYPEALIGN_DOWN(PG_IO_ALIGN_SIZE, seg_offset);
             size_t aligned_size = TYPEALIGN(PG_IO_ALIGN_SIZE, seg_offset + chunk) - aligned_offset;
-            
-            if (aligned_size > sizeof(tmp)) {
-                aligned_size = TYPEALIGN_DOWN(PG_IO_ALIGN_SIZE, chunk);
-                aligned_offset = seg_offset;
+            char *tmp = stack_tmp;
+            bool heap_tmp = false;
+
+            if (aligned_size > sizeof(stack_tmp)) {
+                tmp = alloc_vector(aligned_size);
+                heap_tmp = true;
             }
             
             /* Read existing data if partial block */
@@ -1069,6 +1085,10 @@ void vec_write(SMgrRelation reln, off_t offset, size_t nbytes,
                                   WAIT_EVENT_DATA_FILE_WRITE);
             if (nwritten >= (ssize_t)copy_offset) {
                 nwritten = Min((ssize_t)chunk, nwritten - (ssize_t)copy_offset);
+            }
+
+            if (heap_tmp) {
+                free_vector(tmp);
             }
         }
         

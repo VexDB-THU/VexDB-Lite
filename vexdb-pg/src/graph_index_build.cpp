@@ -162,8 +162,11 @@ public:
         if (!quant_trained) {
             qt_type = QuantizerType::NONE;
         }
+        ereport(NOTICE, (errmsg("PG build stage"), errdetail("stage=build_graph_begin")));
         build_graph(heap, index, index_info);
+        ereport(NOTICE, (errmsg("PG build stage"), errdetail("stage=build_graph_done")));
         log_index(index);
+        ereport(NOTICE, (errmsg("PG build stage"), errdetail("stage=log_index_done")));
         return metablkno;
     }
 
@@ -651,6 +654,13 @@ private:
 
     bool try_build_single_thread_core(Relation heap, Relation index, IndexInfo *index_info)
     {
+        if (build_state == BuildState::MEMORY) {
+            ereport(NOTICE,
+                    (errmsg("PG core bridge build skipped for memory build"),
+                     errdetail("reason=true_memory_build_requires_mem_store_flush_path")));
+            return false;
+        }
+
         if (!pgvexdb::CanUseCoreBridgeBuild(id_type, precision_type, qt_type, metric)) {
             ereport(NOTICE,
                     (errmsg("PG core bridge build disabled: unsupported build config"),
@@ -662,9 +672,6 @@ private:
             return false;
         }
 
-        if (build_state == BuildState::MEMORY) {
-            create_vec_data(index, true);
-        }
         build_state = BuildState::DISK;
 
         ereport(NOTICE,
@@ -741,8 +748,11 @@ private:
         timer = NULL;
 
         if (build_state == BuildState::MEMORY) {
+            ereport(NOTICE, (errmsg("PG memory build flush start")));
             flush(index);
+            ereport(NOTICE, (errmsg("PG memory build flush done")));
             mem_store->destroy();
+            ereport(NOTICE, (errmsg("PG memory build mem_store destroy done")));
         } else if (!flush_warned) {
             mem_store->destroy();
         }
@@ -828,7 +838,11 @@ private:
 
         /* Flush vector data */
         flush_timer.report("Flushing Vector");
+        elog(LOG, "pg memory flush: create_vec_data begin");
+        ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=create_vec_data_begin")));
         create_vec_data(index, true);
+        elog(LOG, "pg memory flush: create_vec_data done");
+        ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=create_vec_data_done")));
         auto &vector_pool = store.vector_pool;
         auto &vec = vector_pool.vec;
         uint32 num_vectors = store.get_vector_num();
@@ -866,11 +880,17 @@ private:
                 vec_write(index->rd_smgr, offset, nbytes, code_buf.get(), false, VecStorageType::PureCode);
             }
         }
+        elog(LOG, "pg memory flush: vector flush done");
+        ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=vector_flush_done")));
 
         flush_timer.report("Flush Finished");
+        elog(LOG, "pg memory flush: mark metapage begin");
+        ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=mark_metapage_begin")));
         LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
         MarkBufferDirty(metabuf);
         LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+        elog(LOG, "pg memory flush: mark metapage done");
+        ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=mark_metapage_done")));
         flush_timer.destroy();
     }
 
