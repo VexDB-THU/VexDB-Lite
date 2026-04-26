@@ -45,7 +45,6 @@ struct PgCoreBindingConfig {
     std::function<bool(vex::node_id_t node_id)> on_free_node_cb;
     std::function<bool(vex::row_id_t row_id, vex::node_id_t &node_id)> resolve_node_id_by_row_id_cb;
     std::function<bool(vex::node_id_t node_id, uint64_t &storage_key)> resolve_storage_node_key_cb;
-    bool trust_live_header_cache_for_read = false;
 };
 
 // Skeleton for PG shared-buffer/page direct binding.

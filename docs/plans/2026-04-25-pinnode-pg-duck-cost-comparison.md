@@ -85,8 +85,8 @@ DuckDB 实现位置:
 - [core_node_store_bridge_live.hpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/graph_index/core_node_store_bridge_live.hpp:147)
 
 4. 组装 header
-- 查 `header_cache_`
 - 默认字段回填
+- 查 `node_to_row_id_` / `upper_chain_by_node_`
 - 通过 `get_itempointer(...)` 检查 deleted / empty
 - 可能走 `load_node_header_cb`
 - [core_node_store_bridge_live.hpp](/Users/sunji/Work/VexDB-Lite/vexdb-pg/include/graph_index/core_node_store_bridge_live.hpp:149)
@@ -258,4 +258,3 @@ DuckDB 当前 `PinNode` 更像:
   - `backlink_ms`
   - `prune_ms`
   - `build_ms`
-

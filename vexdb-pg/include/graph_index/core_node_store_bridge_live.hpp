@@ -100,18 +100,8 @@ public:
 
         upper_chain_by_node_[base_id] = upper_slots;
 
-        vex::NodeHeader header{};
-        header.row_id = row_id;
-        header.level = level;
-        header.deleted = 0;
-        header.level0_count = 0;
-        header.extra_row_count = 0;
-        header.reserved = 0;
-        header.upper_offset = 0;
-        header.metadata_offset = 0;
-        header_cache_[base_id] = header;
         row_to_node_id_[row_id] = base_id;
-        metadata_cache_[base_id].assign(cfg_.metadata_size, 0);
+        node_to_row_id_[base_id] = row_id;
 
         if (cfg_.on_allocate_node_cb && !cfg_.on_allocate_node_cb(base_id, row_id, level)) {
             ereport(ERROR, (errmsg("PG core live binding: node allocation hook failed")));
@@ -124,20 +114,33 @@ public:
 
     void FreeNode(vex::node_id_t node_id) override
     {
-        auto header_it = header_cache_.find(node_id);
-        if (header_it != header_cache_.end()) {
-            header_it->second.deleted = 1;
-            if (cfg_.store_node_header_cb) {
-                (void)cfg_.store_node_header_cb(node_id, header_it->second);
-            }
-            row_to_node_id_.erase(header_it->second.row_id);
+        auto row_it = node_to_row_id_.find(node_id);
+        vex::NodeHeader header{};
+        if (row_it != node_to_row_id_.end()) {
+            header.row_id = row_it->second;
+            row_to_node_id_.erase(row_it->second);
+            node_to_row_id_.erase(row_it);
+        } else {
+            header.row_id = static_cast<vex::row_id_t>(node_id);
+        }
+        auto chain_it = upper_chain_by_node_.find(node_id);
+        header.level = chain_it == upper_chain_by_node_.end()
+            ? 0
+            : static_cast<uint8_t>(chain_it->second.size());
+        header.deleted = 1;
+        header.level0_count = 0;
+        header.extra_row_count = 0;
+        header.reserved = 0;
+        header.upper_offset = 0;
+        header.metadata_offset = 0;
+        if (cfg_.store_node_header_cb) {
+            (void)cfg_.store_node_header_cb(node_id, header);
         }
 
         if (cfg_.on_free_node_cb && !cfg_.on_free_node_cb(node_id)) {
             ereport(ERROR, (errmsg("PG core live binding: node free hook failed")));
         }
 
-        metadata_cache_.erase(node_id);
         upper_chain_by_node_.erase(node_id);
         if (state_.node_count > 0) {
             state_.node_count--;
@@ -391,38 +394,33 @@ private:
 
     bool LoadHeader(vex::node_id_t node_id, vex::NodeHeader &header)
     {
-        auto it = header_cache_.find(node_id);
-        if (it != header_cache_.end()) {
-            header = it->second;
-        } else {
-            header = {};
-            header.row_id = static_cast<vex::row_id_t>(node_id);
-            header.level = 0;
-            header.deleted = 0;
-            header.level0_count = 0;
-            header.extra_row_count = 0;
-            header.reserved = 0;
-            header.upper_offset = 0;
-            header.metadata_offset = 0;
-        }
+        header = {};
+        auto row_it = node_to_row_id_.find(node_id);
+        header.row_id = row_it == node_to_row_id_.end()
+            ? static_cast<vex::row_id_t>(node_id)
+            : row_it->second;
+        header.level = 0;
+        header.deleted = 0;
+        header.level0_count = 0;
+        header.extra_row_count = 0;
+        header.reserved = 0;
+        header.upper_offset = 0;
+        header.metadata_offset = 0;
 
         auto chain_it = upper_chain_by_node_.find(node_id);
         header.level = chain_it == upper_chain_by_node_.end()
             ? 0
             : static_cast<uint8_t>(chain_it->second.size());
 
-        if (!cfg_.trust_live_header_cache_for_read) {
-            store_.get_itempointer(ToStoreId(node_id), [&](const point_type *elem) {
-                header.deleted = (elem->is_deleted() || elem->empty()) ? 1 : 0;
-            });
-        }
+        store_.get_itempointer(ToStoreId(node_id), [&](const point_type *elem) {
+            header.deleted = (elem->is_deleted() || elem->empty()) ? 1 : 0;
+        });
 
         if (cfg_.load_node_header_cb) {
             if (!cfg_.load_node_header_cb(node_id, header)) {
                 return false;
             }
         }
-        header_cache_[node_id] = header;
         return true;
     }
 
@@ -432,19 +430,12 @@ private:
             metadata.clear();
             return;
         }
-        auto it = metadata_cache_.find(node_id);
-        if (it != metadata_cache_.end()) {
-            metadata = it->second;
-            if (metadata.size() < cfg_.metadata_size) {
-                metadata.resize(cfg_.metadata_size, 0);
-            }
-            return;
-        }
         if (metadata.size() < cfg_.metadata_size) {
             metadata.resize(cfg_.metadata_size, 0);
         }
-        if (cfg_.load_node_metadata_cb && cfg_.load_node_metadata_cb(node_id, metadata.data(), cfg_.metadata_size)) {
-            metadata_cache_[node_id] = metadata;
+        std::fill(metadata.begin(), metadata.end(), 0);
+        if (cfg_.load_node_metadata_cb) {
+            (void)cfg_.load_node_metadata_cb(node_id, metadata.data(), cfg_.metadata_size);
         }
     }
 
@@ -472,18 +463,16 @@ private:
             }
         }
 
-        header_cache_[pin_state.node_id] = pin_state.header;
         if (pin_state.header.deleted) {
             row_to_node_id_.erase(pin_state.header.row_id);
+            node_to_row_id_.erase(pin_state.node_id);
         } else {
             row_to_node_id_[pin_state.header.row_id] = pin_state.node_id;
+            node_to_row_id_[pin_state.node_id] = pin_state.header.row_id;
         }
 
-        if (!pin_state.metadata.empty()) {
-            metadata_cache_[pin_state.node_id] = pin_state.metadata;
-            if (cfg_.store_node_metadata_cb) {
-                (void)cfg_.store_node_metadata_cb(pin_state.node_id, pin_state.metadata.data(), cfg_.metadata_size);
-            }
+        if (!pin_state.metadata.empty() && cfg_.store_node_metadata_cb) {
+            (void)cfg_.store_node_metadata_cb(pin_state.node_id, pin_state.metadata.data(), cfg_.metadata_size);
         }
 
         if (cfg_.store_node_header_cb) {
@@ -569,6 +558,7 @@ private:
                 continue;
             }
             row_to_node_id_[header.row_id] = node_id;
+            node_to_row_id_[node_id] = header.row_id;
             active_count++;
         }
         state_.node_count = active_count;
@@ -580,9 +570,8 @@ private:
     uint32_t dim_;
     int m_;
     PgCoreGraphState state_{};
-    std::unordered_map<vex::node_id_t, vex::NodeHeader> header_cache_;
-    std::unordered_map<vex::node_id_t, std::vector<uint8_t>> metadata_cache_;
     std::unordered_map<vex::row_id_t, vex::node_id_t> row_to_node_id_;
+    std::unordered_map<vex::node_id_t, vex::row_id_t> node_to_row_id_;
     std::unordered_map<vex::node_id_t, std::vector<vex::node_id_t>> upper_chain_by_node_;
     uint64_t slot_limit_ = 0;
     AccessStats access_stats_{};

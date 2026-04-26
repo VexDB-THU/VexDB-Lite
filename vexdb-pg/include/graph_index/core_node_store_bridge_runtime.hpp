@@ -119,7 +119,6 @@ struct CoreBridgeBuildRuntime {
         binding_cfg.metadata_size = 0;
         binding_cfg.index_name = RelationGetRelationName(index);
         binding_cfg.metablkno = metablkno;
-        binding_cfg.trust_live_header_cache_for_read = true;
         binding_cfg.load_graph_state_cb = [binding_cfg](PgCoreGraphState &out) {
             return LoadPgGraphStateFromMetaPage(binding_cfg, out);
         };
