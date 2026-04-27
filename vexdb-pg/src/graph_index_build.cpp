@@ -23,6 +23,7 @@
 #endif
 
 #include <chrono>
+#include <vector>
 #include <cstring>
 #include <memory>
 #include <type_traits>
@@ -333,6 +334,66 @@ private:
             ReleaseBuffer(own_metabuf);
         }
     };
+
+    struct CoreMemoryBuildRuntime {
+        std::unique_ptr<vex::MemoryNodeStore> node_store;
+        std::unique_ptr<vex::HNSWGraph> core_graph;
+        std::vector<ItemPointerData> heap_tids_by_node_id;
+        uint64_t add_point_count = 0;
+        double add_point_total_ms = 0.0;
+        double update_row_id_total_ms = 0.0;
+
+        bool Init(uint_fast16_t dimension, uint_fast16_t m, uint_fast16_t ef_construction, Metric metric)
+        {
+            if (metric != Metric::L2 &&
+                metric != Metric::INNER_PRODUCT &&
+                metric != Metric::FAST_COSINE) {
+                return false;
+            }
+            node_store = std::make_unique<vex::MemoryNodeStore>(dimension, static_cast<int>(m), 0);
+            core_graph = std::make_unique<vex::HNSWGraph>(*node_store, pgvexdb::ToCoreBridgeMetric(metric),
+                                                          static_cast<int>(m), static_cast<int>(ef_construction));
+            heap_tids_by_node_id.clear();
+            add_point_count = 0;
+            add_point_total_ms = 0.0;
+            update_row_id_total_ms = 0.0;
+            return true;
+        }
+
+        bool AddPoint(const char *query, const ItemPointerData &heap_tid, uint_fast16_t dimension)
+        {
+            auto add_point_start = std::chrono::high_resolution_clock::now();
+            auto node_id = core_graph->AddPoint(static_cast<vex::row_id_t>(0),
+                                                reinterpret_cast<const float *>(query), dimension);
+            add_point_total_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - add_point_start).count();
+            ++add_point_count;
+            if (node_id == vex::INVALID_NODE_ID) {
+                return false;
+            }
+            auto update_row_id_start = std::chrono::high_resolution_clock::now();
+            if (!vex::UpdateNodeRowId(*node_store, node_id, static_cast<vex::row_id_t>(node_id))) {
+                return false;
+            }
+            update_row_id_total_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::high_resolution_clock::now() - update_row_id_start).count();
+            if (heap_tids_by_node_id.size() <= node_id) {
+                heap_tids_by_node_id.resize(static_cast<size_t>(node_id) + 1);
+            }
+            heap_tids_by_node_id[static_cast<size_t>(node_id)] = heap_tid;
+            return true;
+        }
+
+        void Reset()
+        {
+            core_graph.reset();
+            node_store.reset();
+            heap_tids_by_node_id.clear();
+            add_point_count = 0;
+            add_point_total_ms = 0.0;
+            update_row_id_total_ms = 0.0;
+        }
+    };
 #endif
 
     /* Info */
@@ -383,6 +444,10 @@ private:
 
     /* Default U32, impossible bigger than U32 in memory build */
     Holder<MemStore<>> mem_store;
+
+#ifdef PG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE
+    std::unique_ptr<CoreMemoryBuildRuntime> core_memory_runtime;
+#endif
 
     /* Flush manager */
     LWLock flush_lock;
@@ -590,6 +655,52 @@ private:
     }
 
 #ifdef PG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE
+    bool can_use_core_memory_build() const
+    {
+        return build_state == BuildState::MEMORY &&
+               id_type == IdType::U32 &&
+               precision_type == DistPrecisionType::FLOAT &&
+               qt_type == QuantizerType::NONE &&
+               (metric == Metric::L2 ||
+                metric == Metric::INNER_PRODUCT ||
+                metric == Metric::FAST_COSINE);
+    }
+
+    static void core_memory_build_callback(Relation, ItemPointer tid, Datum *values, bool *isnull,
+                                           bool tupleIsAlive, void *state)
+    {
+        if (isnull[0] || !tupleIsAlive) {
+            return;
+        }
+
+        auto &data = *(BuildCallbackDataBase *)state;
+        GraphIndexBuild &build = *data.build;
+        data.timer->inc_loop_count_forground_report("Graph Build");
+
+        Pointer vec_p;
+        auto [query, is_alloc] = build.read_vec(vec_p, values);
+        if (!build.core_memory_runtime->AddPoint(query, *tid, build.dimension)) {
+            build.free_vec(vec_p, values, query, is_alloc);
+            ereport(ERROR, (errmsg("PG core memory build: failed to add point")));
+        }
+        build.free_vec(vec_p, values, query, is_alloc);
+    }
+
+    bool build_single_thread_core_memory(Relation heap, Relation index, IndexInfo *index_info)
+    {
+        core_memory_runtime = std::make_unique<CoreMemoryBuildRuntime>();
+        if (!core_memory_runtime->Init(dimension, m, ef_construction, metric)) {
+            core_memory_runtime.reset();
+            return false;
+        }
+
+        BuildCallbackDataBase data{this, index, heap, timer, metablkno};
+        reltuples = table_index_build_scan(heap, index, index_info, true, false,
+                                           core_memory_build_callback, (void *)&data, NULL);
+        data.destroy();
+        return true;
+    }
+
     template <typename Store>
     static void core_build_callback(Relation index, ItemPointer tid, Datum *values, bool *isnull,
                                     bool tupleIsAlive, void *state)
@@ -655,10 +766,20 @@ private:
     bool try_build_single_thread_core(Relation heap, Relation index, IndexInfo *index_info)
     {
         if (build_state == BuildState::MEMORY) {
+            if (!can_use_core_memory_build()) {
+                ereport(NOTICE,
+                        (errmsg("PG core bridge build skipped for memory build"),
+                         errdetail("reason=unsupported_true_memory_core_build_config")));
+                return false;
+            }
             ereport(NOTICE,
-                    (errmsg("PG core bridge build skipped for memory build"),
-                     errdetail("reason=true_memory_build_requires_mem_store_flush_path")));
-            return false;
+                    (errmsg("PG core memory build start"),
+                     errdetail("dim=%u m=%u ef_construction=%u metric=%d",
+                               static_cast<unsigned>(dimension),
+                               static_cast<unsigned>(m),
+                               static_cast<unsigned>(ef_construction),
+                               static_cast<int>(metric))));
+            return build_single_thread_core_memory(heap, index, index_info);
         }
 
         if (!pgvexdb::CanUseCoreBridgeBuild(id_type, precision_type, qt_type, metric)) {
@@ -729,11 +850,19 @@ private:
 #ifdef PG_VEXDB_ENABLE_LIBVEX_CORE_BRIDGE
         const bool had_memory_store = build_state == BuildState::MEMORY;
         if (try_build_single_thread_core(heap, index, index_info)) {
-            local_timer.report("PG core bridge build finished");
+            if (core_memory_runtime) {
+                local_timer.report("PG core memory build finished");
+            } else {
+                local_timer.report("PG core bridge build finished");
+            }
             local_timer.report("Graph Build Finished");
             local_timer.destroy();
             timer = NULL;
-            if (had_memory_store) {
+            if (core_memory_runtime) {
+                flush(index);
+                core_memory_runtime->Reset();
+                core_memory_runtime.reset();
+            } else if (had_memory_store) {
                 mem_store->destroy();
             }
             return;
@@ -766,6 +895,169 @@ private:
         flush_timer.set_stage("Flush Graph Index");
 
         build_state = BuildState::DISK;
+        const bool use_core_memory_runtime = core_memory_runtime && core_memory_runtime->node_store &&
+                                             core_memory_runtime->core_graph;
+
+        if (use_core_memory_runtime) {
+            auto &store = *core_memory_runtime->node_store;
+            vex::AdapterGraphState state = vex::CaptureGraphState(*core_memory_runtime->core_graph);
+            const uint32 num_vectors = static_cast<uint32>(state.node_count);
+            metap->num_vectors = static_cast<size_t>(num_vectors);
+
+            std::vector<uint32> upper_slot_by_node(num_vectors * vex::HNSW_MAX_UPPER_LEVELS,
+                                                   static_cast<uint32>(INVALID_VECTOR_ID));
+            uint32 next_upper_slot = 0;
+            for (uint32 node_id = 0; node_id < num_vectors; ++node_id) {
+                auto handle = store.PinNode(node_id);
+                if (!handle || !handle->Header() || handle->Header()->deleted) {
+                    continue;
+                }
+                const uint8_t level = handle->Header()->level;
+                for (uint8_t level_idx = 0; level_idx < level; ++level_idx) {
+                    upper_slot_by_node[static_cast<size_t>(node_id) * vex::HNSW_MAX_UPPER_LEVELS + level_idx] =
+                        next_upper_slot++;
+                }
+            }
+
+            metap->entry_level = state.has_entry_point ? static_cast<int8>(state.max_level) : -1;
+            metap->entrypoint_id = state.has_entry_point
+                ? static_cast<size_t>(state.entry_point)
+                : static_cast<size_t>(INVALID_VECTOR_ID);
+            if (!state.has_entry_point || state.max_level <= 0) {
+                metap->entry_cur_layer_idx = state.has_entry_point
+                    ? static_cast<size_t>(state.entry_point)
+                    : static_cast<size_t>(INVALID_VECTOR_ID);
+            } else {
+                metap->entry_cur_layer_idx = upper_slot_by_node[
+                    static_cast<size_t>(state.entry_point) * vex::HNSW_MAX_UPPER_LEVELS +
+                    static_cast<size_t>(state.max_level - 1)];
+            }
+
+            if (metap->num_vectors > 0) {
+                flush_timer.report("Flushing Elems");
+                PointExtensionContext elem_ctx(index, GRAPH_INDEX_PS_BLKNO, false);
+                disk_container::DiskVector<GraphIndexPoint> dv{index, metap->elems_block, false};
+                std::vector<GraphIndexPoint> batch;
+                batch.reserve(1024);
+                for (uint32 node_id = 0; node_id < num_vectors; ++node_id) {
+                    GraphIndexPoint::Data tid = core_memory_runtime->heap_tids_by_node_id[node_id];
+                    batch.emplace_back(elem_ctx, Span<const GraphIndexPoint::Data>(&tid, 1));
+                    if (batch.size() >= 1024) {
+                        dv.push_back_n(batch.data(), batch.size());
+                        batch.clear();
+                    }
+                }
+                if (!batch.empty()) {
+                    dv.push_back_n(batch.data(), batch.size());
+                }
+                dv.destroy();
+                elem_ctx.destroy();
+
+                flush_timer.report("Flushing Basepoint");
+                constexpr size_t copybuf_size = 10 * 1024 * 1024;
+                uint32 *copybuf = (uint32 *)palloc(copybuf_size);
+                size_t basepoint_size = sizeof(uint32) * m * 2;
+                size_t copy_num = copybuf_size / basepoint_size;
+                VarDiskVector<GraphIndexDiskBasePoint<uint32>> base_layer{index, metap->base_block, false, basepoint_size};
+                for (uint32 i = 0; i <= num_vectors / copy_num; ++i) {
+                    size_t batch_offset = static_cast<size_t>(i) * copy_num;
+                    size_t actual_copy_num = Min(copy_num, static_cast<size_t>(num_vectors) - batch_offset);
+                    if (actual_copy_num == 0) {
+                        break;
+                    }
+                    for (size_t j = 0; j < actual_copy_num; ++j) {
+                        auto handle = store.PinNode(static_cast<uint32>(batch_offset + j));
+                        const vex::node_id_t *src = handle->Level0Neighbors();
+                        for (size_t k = 0; k < static_cast<size_t>(m) * 2; ++k) {
+                            copybuf[j * (m * 2) + k] = src[k] == vex::INVALID_NODE_ID
+                                ? static_cast<uint32>(INVALID_VECTOR_ID)
+                                : static_cast<uint32>(src[k]);
+                        }
+                    }
+                    base_layer.push_back_n((const GraphIndexDiskBasePoint<uint32> *)copybuf, actual_copy_num);
+                }
+                base_layer.destroy();
+
+                flush_timer.report("Flushing Upperpoint");
+                size_t upperpoint_size = (m + 1) * 2 * sizeof(uint32);
+                copy_num = copybuf_size / upperpoint_size;
+                VarDiskVector<GraphIndexDiskUpperPoint<uint32>> upper_layer{index, metap->upper_block, false,
+                                                                            upperpoint_size};
+                std::vector<uint32> upper_rows;
+                upper_rows.reserve(static_cast<size_t>(next_upper_slot) * (2 + m * 2));
+                for (uint32 node_id = 0; node_id < num_vectors; ++node_id) {
+                    auto handle = store.PinNode(node_id);
+                    if (!handle || !handle->Header() || handle->Header()->deleted) {
+                        continue;
+                    }
+                    uint32 lower_layer_idx = node_id;
+                    for (uint8_t level_idx = 0; level_idx < handle->Header()->level; ++level_idx) {
+                        upper_rows.push_back(lower_layer_idx);
+                        upper_rows.push_back(node_id);
+                        const vex::node_id_t *neighbors = handle->UpperNeighbors(level_idx);
+                        for (int k = 0; k < m; ++k) {
+                            vex::node_id_t nbr = neighbors[k];
+                            upper_rows.push_back(nbr == vex::INVALID_NODE_ID
+                                ? static_cast<uint32>(INVALID_VECTOR_ID)
+                                : static_cast<uint32>(nbr));
+                        }
+                        for (int k = 0; k < m; ++k) {
+                            vex::node_id_t nbr = neighbors[k];
+                            if (nbr == vex::INVALID_NODE_ID) {
+                                upper_rows.push_back(static_cast<uint32>(INVALID_VECTOR_ID));
+                                continue;
+                            }
+                            uint32 slot = upper_slot_by_node[static_cast<size_t>(nbr) *
+                                                              vex::HNSW_MAX_UPPER_LEVELS + level_idx];
+                            upper_rows.push_back(slot);
+                        }
+                        lower_layer_idx = upper_slot_by_node[static_cast<size_t>(node_id) *
+                                                             vex::HNSW_MAX_UPPER_LEVELS + level_idx];
+                    }
+                }
+                if (!upper_rows.empty()) {
+                    upper_layer.push_back_n((const GraphIndexDiskUpperPoint<uint32> *)upper_rows.data(),
+                                            upper_rows.size() / (2 + m * 2));
+                }
+                upper_layer.destroy();
+                pfree(copybuf);
+            }
+
+            flush_timer.report("Flushing Vector");
+            elog(LOG, "pg memory flush: create_vec_data begin");
+            ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=create_vec_data_begin")));
+            create_vec_data(index, true);
+            elog(LOG, "pg memory flush: create_vec_data done");
+            ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=create_vec_data_done")));
+            constexpr size_t batch_rows = 1024;
+            std::vector<float> vector_batch(static_cast<size_t>(batch_rows) * dimension);
+            for (uint32 batch_offset = 0; batch_offset < num_vectors; batch_offset += batch_rows) {
+                size_t actual_copy_num = Min(static_cast<size_t>(batch_rows),
+                                             static_cast<size_t>(num_vectors - batch_offset));
+                for (size_t j = 0; j < actual_copy_num; ++j) {
+                    auto handle = store.PinNode(batch_offset + static_cast<uint32>(j));
+                    memcpy(vector_batch.data() + j * dimension, handle->Vector(), sizeof(float) * dimension);
+                }
+                off_t offset = static_cast<off_t>(batch_offset) * vector_size;
+                int nbytes = static_cast<int>(actual_copy_num * vector_size);
+                vec_write(index->rd_smgr, offset, nbytes, reinterpret_cast<const char *>(vector_batch.data()),
+                          false, storage_type);
+            }
+            elog(LOG, "pg memory flush: vector flush done");
+            ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=vector_flush_done")));
+
+            flush_timer.report("Flush Finished");
+            elog(LOG, "pg memory flush: mark metapage begin");
+            ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=mark_metapage_begin")));
+            LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+            MarkBufferDirty(metabuf);
+            LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+            elog(LOG, "pg memory flush: mark metapage done");
+            ereport(NOTICE, (errmsg("PG memory flush stage"), errdetail("stage=mark_metapage_done")));
+            flush_timer.destroy();
+            return;
+        }
+
         MemStore<> &store = *mem_store;
         GraphIndexEntryInfo entry_info = store.entry_info;
 
