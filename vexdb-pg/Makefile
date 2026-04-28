@@ -5,6 +5,7 @@ SRCS = \
     src/session_compat.cpp \
     src/graph_index.cpp \
     src/graph_index_build.cpp \
+    src/core_memory_build_flush.cpp \
     src/graph_index_insert.cpp \
     src/graph_index_inspect.cpp \
     src/graph_index_scan.cpp \

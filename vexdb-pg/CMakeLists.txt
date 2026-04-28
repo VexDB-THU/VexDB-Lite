@@ -99,6 +99,7 @@ set(GRAPH_INDEX_SRCS
     src/guc_config.cpp
     src/graph_index.cpp
     src/graph_index_build.cpp
+    src/core_memory_build_flush.cpp
     src/graph_index_insert.cpp
     src/graph_index_inspect.cpp
     src/graph_index_scan.cpp
