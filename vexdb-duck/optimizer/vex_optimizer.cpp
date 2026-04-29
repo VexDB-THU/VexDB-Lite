@@ -26,7 +26,7 @@ static bool IsDistanceFunction(const string &name) {
     return name == "l2_distance";
 }
 
-static bool IsColumnRefFromTable(const Expression &expr, TableIndex table_index, idx_t &col_index) {
+static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
     const Expression *cur = &expr;
     while (cur->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
         cur = cur->Cast<BoundCastExpression>().child.get();
@@ -38,11 +38,11 @@ static bool IsColumnRefFromTable(const Expression &expr, TableIndex table_index,
     if (colref.binding.table_index != table_index) {
         return false;
     }
-    col_index = colref.binding.column_index.GetIndex();
+    col_index = colref.binding.column_index;
     return true;
 }
 
-static bool HasColumnRefFromTable(const Expression &expr, TableIndex table_index) {
+static bool HasColumnRefFromTable(const Expression &expr, idx_t table_index) {
     const Expression *cur = &expr;
     while (cur->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
         cur = cur->Cast<BoundCastExpression>().child.get();

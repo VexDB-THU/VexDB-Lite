@@ -192,7 +192,7 @@ void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identi
     (void)row_identifiers;
 }
 
-void GraphIndex::ResetStorage(IndexLock &index_lock) {
+void GraphIndex::CommitDrop(IndexLock &index_lock) {
     (void)index_lock;
     vectors_.clear();
     row_ids_.clear();

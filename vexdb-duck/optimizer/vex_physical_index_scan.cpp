@@ -18,7 +18,7 @@ public:
     ColumnDataScanState scan_state;
 };
 
-LogicalVexIndexScan::LogicalVexIndexScan(TableIndex table_index_p, vector<LogicalType> output_types_p,
+LogicalVexIndexScan::LogicalVexIndexScan(idx_t table_index_p, vector<LogicalType> output_types_p,
                                          DuckTableEntry &table_p, GraphIndex &graph_index_p,
                                          unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
                                          vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
@@ -59,7 +59,7 @@ string LogicalVexIndexScan::GetExtensionName() const {
 vector<ColumnBinding> LogicalVexIndexScan::GetColumnBindings() {
     vector<ColumnBinding> result;
     for (idx_t i = 0; i < output_types.size(); i++) {
-        result.emplace_back(table_index, ProjectionIndex(i));
+        result.emplace_back(table_index, i);
     }
     for (auto &child : children) {
         auto child_bindings = child->GetColumnBindings();
@@ -189,7 +189,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                 output_chunk.data[fetch_output_positions[i]].Reference(fetch_chunk.data[i]);
             }
             if (distance_output_index.IsValid()) {
-                auto dist_data = FlatVector::GetDataMutable<float>(output_chunk.data[distance_output_index.GetIndex()]);
+                auto dist_data = FlatVector::GetData<float>(output_chunk.data[distance_output_index.GetIndex()]);
                 for (idx_t i = 0; i < fetch_chunk.size(); i++) {
                     dist_data[i] = result_distances[dist_offset + i];
                 }

@@ -88,7 +88,7 @@ static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
         output_chunk.Reset();
 
         Vector row_id_vec(LogicalType::ROW_TYPE, batch);
-        auto row_id_data = FlatVector::GetDataMutable<row_t>(row_id_vec);
+        auto row_id_data = FlatVector::GetData<row_t>(row_id_vec);
         for (idx_t i = 0; i < batch; i++) {
             row_id_data[i] = visible_row_ids[off + i];
         }
@@ -99,7 +99,7 @@ static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
             output_chunk.data[fetch_output_positions[f]].Reference(fetch_chunk.data[f]);
         }
         for (idx_t rid_pos : rowid_positions) {
-            auto rowid_data_ptr = FlatVector::GetDataMutable<row_t>(output_chunk.data[rid_pos]);
+            auto rowid_data_ptr = FlatVector::GetData<row_t>(output_chunk.data[rid_pos]);
             for (idx_t i = 0; i < batch; i++) {
                 rowid_data_ptr[i] = visible_row_ids[off + i];
             }

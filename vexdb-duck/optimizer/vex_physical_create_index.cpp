@@ -6,7 +6,6 @@
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/main/client_context.hpp"
@@ -113,9 +112,9 @@ SinkResultType PhysicalVexCreateIndex::Sink(ExecutionContext &context, DataChunk
         auto &vec_type = vec_vector.GetType();
         auto dim = ArrayType::GetSize(vec_type);
         auto &validity = FlatVector::Validity(vec_vector);
-        auto &child_vec = ArrayVector::GetChildMutable(vec_vector);
-        auto vec_data = FlatVector::GetDataMutable<float>(child_vec);
-        auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
+        auto &child_vec = ArrayVector::GetEntry(vec_vector);
+        auto vec_data = FlatVector::GetData<float>(child_vec);
+        auto row_id_data = FlatVector::GetData<row_t>(row_ids);
 
         std::lock_guard<std::mutex> lock(g_state.buffer_mutex);
         if (g_state.dimension == 0) {

@@ -305,6 +305,7 @@ CMakeUserPresets.json
 # tests
 test/test.sql
 duckdb_benchmark_data/
+vexdb-duck/test/
 
 # SQLite logic tests
 test/evidence/

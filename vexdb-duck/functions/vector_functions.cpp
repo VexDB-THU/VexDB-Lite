@@ -52,13 +52,13 @@ LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
     throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got %s", type.ToString());
 }
 
-static unique_ptr<FunctionData> BindResolveInput(BindScalarFunctionInput &input) {
-    auto &arguments = input.GetArguments();
+static unique_ptr<FunctionData> BindResolveInput(ClientContext &context, ScalarFunction &bound_function,
+                                                 vector<unique_ptr<Expression>> &arguments) {
     if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
         throw ParameterNotResolvedException();
     }
-    auto resolved = ResolveToFloatArray(input.GetClientContext(), *arguments[0]);
-    input.GetBoundFunction().GetArguments()[0] = resolved;
+    auto resolved = ResolveToFloatArray(context, *arguments[0]);
+    bound_function.arguments[0] = resolved;
     return nullptr;
 }
 
@@ -70,7 +70,7 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 
     bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
     vec.Flatten(count);
-    auto result_data = FlatVector::GetDataMutable<int32_t>(result);
+    auto result_data = FlatVector::GetData<int32_t>(result);
     auto &validity = FlatVector::Validity(vec);
 
     for (idx_t i = 0; i < count; i++) {

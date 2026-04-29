@@ -4,23 +4,21 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
-#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
 namespace duckdb {
 
-static unique_ptr<FunctionData> BindDistanceFunction(BindScalarFunctionInput &input) {
-    auto &arguments = input.GetArguments();
+static unique_ptr<FunctionData> BindDistanceFunction(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
     if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN &&
         arguments[1]->return_type.id() == LogicalTypeId::UNKNOWN) {
         throw ParameterNotResolvedException();
     }
 
     auto &primary = arguments[0]->return_type.id() != LogicalTypeId::UNKNOWN ? *arguments[0] : *arguments[1];
-    auto resolved = ResolveToFloatArray(input.GetClientContext(), primary);
-    auto &bound_function = input.GetBoundFunction();
-    bound_function.GetArguments()[0] = resolved;
-    bound_function.GetArguments()[1] = resolved;
+    auto resolved = ResolveToFloatArray(context, primary);
+    bound_function.arguments[0] = resolved;
+    bound_function.arguments[1] = resolved;
     return nullptr;
 }
 
@@ -40,12 +38,12 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
     bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
                         vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
-    auto result_data = FlatVector::GetDataMutable<float>(result);
+    auto result_data = FlatVector::GetData<float>(result);
 
     vec_a.Flatten(count);
     vec_b.Flatten(count);
-    auto &child_a = ArrayVector::GetChildMutable(vec_a);
-    auto &child_b = ArrayVector::GetChildMutable(vec_b);
+    auto &child_a = ArrayVector::GetEntry(vec_a);
+    auto &child_b = ArrayVector::GetEntry(vec_b);
     child_a.Flatten(count * dim_a);
     child_b.Flatten(count * dim_b);
     auto data_a = FlatVector::GetData<float>(child_a);
