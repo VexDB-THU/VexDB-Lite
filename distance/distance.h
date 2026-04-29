@@ -8,12 +8,35 @@
 
 #include <random>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #if !defined(PG_VEXDB_TARGET_DUCK)
 #include <boost/preprocessor/seq.hpp>
 #endif
 #include <vtl/expr_helper>
 
-#include "graph_index/graph_index_depend.h"
+/* Vector alignment constants must be available to early includes (e.g. storage headers). */
+namespace ann_helper {
+#ifdef __x86_64__
+constexpr size_t vector_aligned_size = 64ul;
+#define vector_step_size 16
+#elif defined(__arm__) || defined(__arm) || defined(__aarch64__) || defined(__aarch64)
+constexpr size_t vector_aligned_size = 32ul;
+#define vector_step_size 8
+#else
+constexpr size_t vector_aligned_size = 64ul;
+#define vector_step_size 16
+#endif
+}
+
+#if defined(PG_VEXDB_TARGET_PG)
+extern "C" {
+#include "postgres.h"
+#include "utils/rel.h"
+}
+#elif defined(PG_VEXDB_TARGET_DUCK)
+using Relation = void *;
+#endif
 
 #include "distance/architecture_macro.h"
 #include "distance/distance_func.h"
@@ -369,20 +392,13 @@ inline void transform_int16_to_int8(const int16 *src, int8 *dst, uint16 dim)
     }
 }
 
+#if defined(PG_VEXDB_TARGET_DUCK)
+Metric get_func_metric(uint32 func_id);
+#else
 Metric get_func_metric(Oid func_id);
+#endif
 
 namespace ann_helper {
-#ifdef __x86_64__
-constexpr size_t vector_aligned_size = 64ul;
-#define vector_step_size 16
-#elif defined(__arm__) || defined(__arm) || defined(__aarch64__) || defined(__aarch64)
-/* NEON & SVE only require 16-aligned to reach best performance, but some SME case may beed 32 */
-constexpr size_t vector_aligned_size = 32ul;
-#define vector_step_size 8
-#else
-constexpr size_t vector_aligned_size = 64ul;
-#define vector_step_size 16
-#endif
 
 /* use dim as input can help improve dist calculation efficiency, I guess... */
 distance_func get_general_distance_func(Metric metric, uint32 dim);
@@ -425,7 +441,11 @@ uint32 get_aligned_dim(uint32 dim);
 size_t get_aligned_vec_size(size_t vec_size);
 float *alloc_floatvector(uint32 dim, size_t n = 1);
 char *alloc_vector(size_t vec_size, size_t n = 1);
+#if defined(PG_VEXDB_TARGET_DUCK)
+inline void free_vector(void *vec) { std::free(vec); }
+#else
 inline void free_vector(void *vec) { pfree(vec); }
+#endif
 bool is_aligned(const void *ptr);
 
 /* Random number generator for level assignment */

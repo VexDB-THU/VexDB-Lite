@@ -1,8 +1,18 @@
 #ifndef ANNVECTOR_DISTANCE_FUNC_H
 #define ANNVECTOR_DISTANCE_FUNC_H
 
-#include "graph_index/graph_index_depend.h"
+#include <cstddef>
+#include <cstdint>
 #include "half.h"
+
+#if defined(PG_VEXDB_TARGET_PG)
+#include "pg_compat.h"
+#else
+using uint8 = uint8_t;
+using uint16 = uint16_t;
+using uint32 = uint32_t;
+using uint64 = uint64_t;
+#endif
 
 namespace ann_helper {
 typedef float (*distance_func)(const void *x, const void *y, uint16 dim);

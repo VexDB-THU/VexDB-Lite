@@ -60,7 +60,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "DEBUG")
     add_compile_options(-O0)
 endif()
 add_compile_options(-g)
-add_compile_definitions(PG_EXTENSION HAVE_CXX_TYPEOF_UNQUAL)
+add_compile_definitions(PG_EXTENSION HAVE_CXX_TYPEOF_UNQUAL PG_VEXDB_TARGET_PG)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set(SSE_FLAGS "-msse4.1 -msse4.2 -mfma -mf16c")

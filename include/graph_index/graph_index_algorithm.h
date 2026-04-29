@@ -354,7 +354,11 @@ retry:
                     retried = true;
                     goto retry;
                 }
+#if defined(PG_VEXDB_TARGET_DUCK)
                 Span<Vector<Cand>> nbr_span{nbr_record.data(), (size_t)search_level};
+#else
+                Span<Vector<Cand>> nbr_span{nbr_record, (size_t)search_level};
+#endif
                 auto [id, cur_layer_idx] = insert_new_point(ctx, std::move(ep), nbr_span);
                 update_entry(id, cur_layer_idx);
                 store.release_entry_lock(shared_lock);
