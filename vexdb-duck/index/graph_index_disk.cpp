@@ -5,6 +5,7 @@
 
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
+#include "duckdb/storage/partial_block_manager.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -220,50 +221,99 @@ void GraphIndex::LoadFromDiskImage(const std::string &blob) {
 
 IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     IndexStorageInfo info(name);
-    auto blob = BuildDiskImage();
-    info.options["vex_storage_format"] = Value("pg_vexdb_segmented_v1");
-    info.options["vex_graph_blob"] = Value::BLOB_RAW(blob);
+
+    if (!runtime_) {
+        return info;
+    }
+
+    auto &store = runtime_->store;
+
     info.options["dimension"] = Value::UBIGINT(uint64_t(dimension_));
     info.options["m"] = Value::INTEGER(m_);
     info.options["ef_construction"] = Value::INTEGER(ef_construction_);
     info.options["metric"] = Value("l2");
+    info.options["node_count"] = Value::UBIGINT(uint64_t(store.elems.size()));
+    info.options["upper_count"] = Value::UBIGINT(uint64_t(store.upper_points.size()));
+    info.options["entry_id"] = Value::UBIGINT(uint64_t(store.entry_info.id));
+    info.options["entry_cur_layer_idx"] = Value::UBIGINT(uint64_t(store.entry_info.cur_layer_idx));
+    info.options["entry_level"] = Value::INTEGER(int(store.entry_info.level));
 
-    FixedSizeAllocatorInfo dummy;
-    dummy.segment_size = 1;
-    info.allocator_infos.push_back(std::move(dummy));
+    if (store.node_alloc_) {
+        info.allocator_infos.push_back(store.node_alloc_->GetInfo());
+    }
+    if (store.vector_alloc_) {
+        info.allocator_infos.push_back(store.vector_alloc_->GetInfo());
+    }
+    if (store.upper_alloc_) {
+        info.allocator_infos.push_back(store.upper_alloc_->GetInfo());
+    }
+
+    if (!store.id_to_node_ptr_.empty()) {
+        string id_ptr_blob;
+        uint64_t num_entries = store.id_to_node_ptr_.size();
+        id_ptr_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
+        for (auto &ptr : store.id_to_node_ptr_) {
+            uint64_t ptr_val = ptr.Get();
+            id_ptr_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
+        }
+        info.options["id_ptr_map"] = Value::BLOB(const_data_ptr_cast(id_ptr_blob.data()), id_ptr_blob.size());
+    }
+
+    if (!store.upper_idx_to_ptr_.empty()) {
+        string upper_ptr_blob;
+        uint64_t num_entries = store.upper_idx_to_ptr_.size();
+        upper_ptr_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
+        for (auto &ptr : store.upper_idx_to_ptr_) {
+            uint64_t ptr_val = ptr.Get();
+            upper_ptr_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
+        }
+        info.options["upper_ptr_map"] = Value::BLOB(const_data_ptr_cast(upper_ptr_blob.data()), upper_ptr_blob.size());
+    }
+
     return info;
 }
 
 IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
     (void)options;
+
+    if (!runtime_ || !runtime_->store.node_alloc_) {
+        return ExportStorageInfo();
+    }
+
     auto info = ExportStorageInfo();
+
     if (!context.Valid()) {
         return info;
     }
 
     auto &block_manager = table_io_manager.GetIndexBlockManager();
-    vex_disk::DiskManifest manifest;
+    PartialBlockManager partial_block_manager(context, block_manager, PartialBlockType::FULL_CHECKPOINT);
 
-    auto blob = BuildDiskImage();
-    auto all_blocks = vex_disk::WriteBlobToBlocks(block_manager, context, blob);
-    vex_disk::SegmentBlockRef seg;
-    seg.kind = uint32_t(vex_disk::SegmentKind::META);
-    seg.size = blob.size();
-    seg.blocks = std::move(all_blocks);
-    manifest.segments.push_back(std::move(seg));
+    runtime_->store.node_alloc_->SerializeBuffers(partial_block_manager);
+    runtime_->store.vector_alloc_->SerializeBuffers(partial_block_manager);
+    runtime_->store.upper_alloc_->SerializeBuffers(partial_block_manager);
 
-    auto manifest_blob = vex_disk::SerializeManifest(manifest);
-    info.options["vex_storage_backend"] = Value("duckdb_block_manager_v1");
-    info.options["vex_graph_manifest"] = Value::BLOB_RAW(manifest_blob);
-    if (!manifest.segments.empty() && !manifest.segments[0].blocks.empty()) {
-        info.root_block_ptr = manifest.segments[0].blocks[0];
-    }
     return info;
 }
 
 IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
     (void)options;
-    return ExportStorageInfo();
+
+    if (!runtime_ || !runtime_->store.node_alloc_) {
+        return ExportStorageInfo();
+    }
+
+    auto info = ExportStorageInfo();
+
+    auto node_buffers = runtime_->store.node_alloc_->InitSerializationToWAL();
+    auto vector_buffers = runtime_->store.vector_alloc_->InitSerializationToWAL();
+    auto upper_buffers = runtime_->store.upper_alloc_->InitSerializationToWAL();
+
+    (void)node_buffers;
+    (void)vector_buffers;
+    (void)upper_buffers;
+
+    return info;
 }
 
 } // namespace duckdb

@@ -47,7 +47,6 @@ using int64 = int64_t;
 
 #if defined(PG_VEXDB_TARGET_DUCK)
 #define NEW new
-#define New(cxt) new
 #else
 #include "utils/palloc.h"
 #define NEW new

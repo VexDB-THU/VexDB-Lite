@@ -83,14 +83,13 @@ private:
     IndexStorageInfo ExportStorageInfo() const;
     std::string BuildDiskImage() const;
     void LoadFromDiskImage(const std::string &blob);
+    void DeserializeFromStorage(const IndexStorageInfo &info);
 
     idx_t dimension_;
     int m_;
     int ef_construction_;
     VexMetric metric_;
 
-    std::vector<float> vectors_;
-    std::vector<row_t> row_ids_;
     std::unique_ptr<GraphIndexRuntimeState> runtime_;
 };
 

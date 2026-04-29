@@ -1,8 +1,14 @@
 #pragma once
 
+#include "duckdb/execution/index/fixed_size_allocator.hpp"
+#include "duckdb/common/unique_ptr.hpp"
+#include "duckdb/common/unordered_map.hpp"
+#include "duckdb/storage/block_manager.hpp"
+
 #include "vex/vex_duck_point.hpp"
 #include "vex/vex_duck_memstore.hpp"
 #include "vex/vex_duckdb_compat.hpp"
+#include "vex_hnsw_node.hpp"
 
 #include <cfloat>
 #include <cstddef>
@@ -284,6 +290,17 @@ public:
     std::vector<UpperPointRec> upper_points;
     std::vector<T> async_ids;
 
+    duckdb::unique_ptr<duckdb::FixedSizeAllocator> node_alloc_;
+    duckdb::unique_ptr<duckdb::FixedSizeAllocator> vector_alloc_;
+    duckdb::unique_ptr<duckdb::FixedSizeAllocator> upper_alloc_;
+
+    std::vector<duckdb::IndexPointer> id_to_node_ptr_;
+    std::vector<duckdb::IndexPointer> upper_idx_to_ptr_;
+    duckdb::unordered_map<duckdb::idx_t, T> node_ptr_to_id_;
+
+    std::vector<std::vector<float>> level0_dists_;
+    std::vector<std::vector<float>> upper_dists_;
+
     MemStore() = default;
     MemStore(uint_fast16_t dim_in, uint_fast16_t m_in, uint_fast32_t vec_size_in)
         : dim(dim_in), m(m_in), vec_size(vec_size_in) {
@@ -307,11 +324,34 @@ public:
             vectors.emplace_back();
             base_points.push_back(MakeBasePoint());
             base_layer.current_size = base_points.size();
+
+            if (node_alloc_ && vector_alloc_) {
+                auto node_ptr = node_alloc_->New();
+                auto vec_ptr = vector_alloc_->New();
+                auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
+                std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
+                header->vector_ptr = vec_ptr;
+                if (id >= id_to_node_ptr_.size()) {
+                    id_to_node_ptr_.resize(id + 1);
+                }
+                id_to_node_ptr_[id] = node_ptr;
+                node_ptr_to_id_[node_ptr.Get()] = id;
+            }
             return id;
         } else {
             T idx = T(upper_points.size());
             upper_points.push_back(MakeUpperPoint());
             upper_layer.current_size = upper_points.size();
+
+            if (upper_alloc_) {
+                auto upper_ptr = upper_alloc_->New();
+                auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(upper_ptr));
+                std::memset(upper, 0, duckdb::vex::HNSWUpperLevel<T>::SegmentSize(m));
+                if (idx >= upper_idx_to_ptr_.size()) {
+                    upper_idx_to_ptr_.resize(idx + 1);
+                }
+                upper_idx_to_ptr_[idx] = upper_ptr;
+            }
             return idx;
         }
     }
@@ -326,6 +366,14 @@ public:
             elems.resize(id + 1);
         }
         elems[id].tids.push_back(tid);
+
+        if (node_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                header->row_id = tid.row_id;
+            }
+        }
     }
 
     void add_vector(T id, const char *query) {
@@ -333,6 +381,17 @@ public:
             vectors.resize(id + 1);
         }
         vectors[id].assign(query, query + vec_size);
+
+        if (node_alloc_ && vector_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                if (header->vector_ptr.Get()) {
+                    auto *vec_data = reinterpret_cast<float *>(vector_alloc_->Get(header->vector_ptr));
+                    std::memcpy(vec_data, query, vec_size);
+                }
+            }
+        }
     }
 
     void set_entrypoint(T id, T cur_layer_idx, int_fast8_t level) {
@@ -358,10 +417,67 @@ public:
         return elems.size();
     }
 
+    void InitAllocators(duckdb::BlockManager &block_manager) {
+        using namespace duckdb;
+        node_alloc_ = make_uniq<FixedSizeAllocator>(vex::HNSWNodeHeader<T>::SegmentSize(m), block_manager);
+        vector_alloc_ = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(dim) * sizeof(float), block_manager);
+        upper_alloc_ = make_uniq<FixedSizeAllocator>(vex::HNSWUpperLevel<T>::SegmentSize(m), block_manager);
+        auto p0 = node_alloc_->New();
+        auto p1 = vector_alloc_->New();
+        auto p2 = upper_alloc_->New();
+        node_alloc_->Get(p0);
+        vector_alloc_->Get(p1);
+        upper_alloc_->Get(p2);
+    }
+
+    duckdb::IndexPointer GetNodePtr(T id) const {
+        if (id >= id_to_node_ptr_.size()) return duckdb::IndexPointer();
+        return id_to_node_ptr_[id];
+    }
+
+    T GetNodeId(duckdb::IndexPointer ptr) const {
+        auto it = node_ptr_to_id_.find(ptr.Get());
+        return it != node_ptr_to_id_.end() ? it->second : T(INVALID_VECTOR_ID);
+    }
+
+    duckdb::vex::HNSWNodeHeader<T> *GetNodeHeader(T id) {
+        auto ptr = GetNodePtr(id);
+        if (!ptr.Get()) return nullptr;
+        return reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+    }
+
+    float *GetVectorData(T id) {
+        auto *header = GetNodeHeader(id);
+        if (!header || !header->vector_ptr.Get()) return nullptr;
+        return reinterpret_cast<float *>(vector_alloc_->Get(header->vector_ptr));
+    }
+
     char *get_data(T id) {
+        if (node_alloc_ && vector_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto *hdr = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                if (hdr->vector_ptr.Get()) {
+                    return reinterpret_cast<char *>(vector_alloc_->Get(hdr->vector_ptr));
+                }
+            }
+        }
         return vectors[id].data();
     }
     const char *get_data(T id) const {
+        if (node_alloc_ && vector_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto &alloc = *const_cast<duckdb::FixedSizeAllocator *>(node_alloc_.get());
+                auto &valloc = *const_cast<duckdb::FixedSizeAllocator *>(vector_alloc_.get());
+                auto &ptr_mutable = const_cast<duckdb::IndexPointer &>(ptr);
+                auto *hdr = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(alloc.Get(ptr_mutable));
+                if (hdr->vector_ptr.Get()) {
+                    auto &vptr = const_cast<duckdb::IndexPointer &>(hdr->vector_ptr);
+                    return reinterpret_cast<const char *>(valloc.Get(vptr));
+                }
+            }
+        }
         return vectors[id].data();
     }
 
@@ -373,14 +489,14 @@ public:
         std::vector<void *> vals;
         vals.reserve(ids.size());
         for (auto id : ids) {
-            vals.push_back(vectors[id].data());
+            vals.push_back(get_data(id));
         }
         distancer.get_distance_batch2(query, vals.data(), uint16(dim), uint16(vals.size()), dists);
     }
 
     template <typename Distancer>
     float get_distance(const Distancer &distancer, const char *query, T id) {
-        return distancer.get_distance_single(query, vectors[id].data(), uint16(dim));
+        return distancer.get_distance_single(query, get_data(id), uint16(dim));
     }
     template <typename Distancer>
     float get_distance(const Distancer &distancer, const char *query, const char *val) {
@@ -407,9 +523,23 @@ public:
     template <bool is_base_layer>
     auto get_point_info(T idx) {
         if constexpr (is_base_layer) {
+            if (node_alloc_) {
+                auto ptr = GetNodePtr(idx);
+                if (ptr.Get()) {
+                    auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                    return std::make_tuple(header->GetLevel0Neighbors(), idx, idx);
+                }
+            }
             auto &bp = base_points[idx];
             return std::make_tuple(bp.neighbors.data(), idx, idx);
         } else {
+            if (upper_alloc_ && idx < upper_idx_to_ptr_.size()) {
+                auto ptr = upper_idx_to_ptr_[idx];
+                if (ptr.Get()) {
+                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
+                    return std::make_tuple(upper->GetNeighbors(0, m), upper->lower_layer_idx, upper->id);
+                }
+            }
             auto &up = upper_points[idx];
             return std::make_tuple(up.neighbors_info.data(), up.lower_layer_idx, up.id);
         }
@@ -418,25 +548,60 @@ public:
     template <bool is_base_layer, typename CandVec, typename CandType>
     void get_neighbors(CandVec &out, const CandType &cand) {
         if constexpr (is_base_layer) {
+            T *neighbors = nullptr;
+            float *dists = nullptr;
+            size_t max_count = m * 2;
+            
+            if (node_alloc_) {
+                auto ptr = GetNodePtr(cand.cur_layer_idx);
+                if (ptr.Get()) {
+                    auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                    neighbors = header->GetLevel0Neighbors();
+                    max_count = header->level0_count > 0 ? header->level0_count : m * 2;
+                }
+            }
+            
             auto &bp = base_points[cand.cur_layer_idx];
-            out.reserve(bp.neighbors.size());
-            for (size_t i = 0; i < bp.neighbors.size(); ++i) {
-                auto id = bp.neighbors[i];
+            if (!neighbors) {
+                neighbors = bp.neighbors.data();
+            }
+            dists = bp.dists.data();
+            
+            out.reserve(max_count);
+            for (size_t i = 0; i < max_count; ++i) {
+                auto id = neighbors[i];
                 if (id == T(INVALID_VECTOR_ID)) {
                     break;
                 }
-                out.emplace_back(id, id, bp.dists[i]);
+                out.emplace_back(id, id, dists[i]);
             }
         } else {
+            T *neighbors = nullptr;
+            T *cur_layer_idxs = nullptr;
+            float *dists = nullptr;
+            
+            if (upper_alloc_ && cand.cur_layer_idx < upper_idx_to_ptr_.size()) {
+                auto ptr = upper_idx_to_ptr_[cand.cur_layer_idx];
+                if (ptr.Get()) {
+                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
+                    neighbors = upper->GetNeighbors(0, m);
+                    cur_layer_idxs = neighbors + m;
+                }
+            }
+            
             auto &up = upper_points[cand.cur_layer_idx];
-            auto *neighbors_id = up.neighbors_info.data();
-            auto *neighbors_cur_layer_idx = neighbors_id + m;
+            if (!neighbors) {
+                neighbors = up.neighbors_info.data();
+                cur_layer_idxs = neighbors + m;
+            }
+            dists = up.dists.data();
+            
             out.reserve(m);
             for (size_t i = 0; i < size_t(m); ++i) {
-                if (neighbors_id[i] == T(INVALID_VECTOR_ID)) {
+                if (neighbors[i] == T(INVALID_VECTOR_ID)) {
                     break;
                 }
-                out.emplace_back(neighbors_id[i], neighbors_cur_layer_idx[i], up.dists[i]);
+                out.emplace_back(neighbors[i], cur_layer_idxs[i], dists[i]);
             }
         }
     }
@@ -468,11 +633,33 @@ public:
             if (size_t(pruned) < bp.neighbors.size()) {
                 bp.neighbors[pruned] = newpoint_id;
             }
+
+            if (node_alloc_) {
+                auto ptr = GetNodePtr(cur_layer_idx);
+                if (ptr.Get()) {
+                    auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                    auto *neighbors = header->GetLevel0Neighbors();
+                    if (size_t(pruned) < size_t(m) * 2) {
+                        neighbors[pruned] = newpoint_id;
+                    }
+                }
+            }
         } else {
             auto &up = upper_points[cur_layer_idx];
             if (size_t(pruned) < size_t(m)) {
                 up.neighbors_info[pruned] = newpoint_id;
                 up.neighbors_info[size_t(m) + size_t(pruned)] = newpoint_cur_layer_idx;
+            }
+
+            if (upper_alloc_ && cur_layer_idx < upper_idx_to_ptr_.size()) {
+                auto ptr = upper_idx_to_ptr_[cur_layer_idx];
+                if (ptr.Get()) {
+                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
+                    auto *neighbors = upper->GetNeighbors(0, m);
+                    if (size_t(pruned) < size_t(m)) {
+                        neighbors[pruned] = newpoint_id;
+                    }
+                }
             }
         }
     }
@@ -480,10 +667,38 @@ public:
     void set_base_neighbors(T id, const T *neighbors_id) {
         auto &bp = base_points[id];
         bp.neighbors.assign(neighbors_id, neighbors_id + m * 2);
+
+        if (node_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                std::memcpy(header->GetLevel0Neighbors(), neighbors_id, m * 2 * sizeof(T));
+                header->level0_count = 0;
+                for (int i = 0; i < m * 2; ++i) {
+                    if (neighbors_id[i] != T(INVALID_VECTOR_ID)) {
+                        header->level0_count = i + 1;
+                    }
+                }
+            }
+        }
     }
     void set_upper_neighbors(T idx, const T *neighbors_info) {
         auto &up = upper_points[idx];
         up.neighbors_info.assign(neighbors_info, neighbors_info + m * 2);
+
+        if (upper_alloc_ && idx < upper_idx_to_ptr_.size()) {
+            auto ptr = upper_idx_to_ptr_[idx];
+            if (ptr.Get()) {
+                auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
+                std::memcpy(upper->GetNeighbors(0, m), neighbors_info, m * sizeof(T));
+                upper->counts[0] = 0;
+                for (int i = 0; i < m; ++i) {
+                    if (neighbors_info[i] != T(INVALID_VECTOR_ID)) {
+                        upper->counts[0] = i + 1;
+                    }
+                }
+            }
+        }
     }
 
     void add_basepoint(T id, const T *neighbors_id) {
@@ -493,6 +708,20 @@ public:
         auto &bp = base_points[id];
         bp.neighbors.assign(neighbors_id, neighbors_id + m * 2);
         base_layer.current_size = base_points.size();
+
+        if (node_alloc_) {
+            auto ptr = GetNodePtr(id);
+            if (ptr.Get()) {
+                auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
+                std::memcpy(header->GetLevel0Neighbors(), neighbors_id, m * 2 * sizeof(T));
+                header->level0_count = 0;
+                for (int i = 0; i < m * 2; ++i) {
+                    if (neighbors_id[i] != T(INVALID_VECTOR_ID)) {
+                        header->level0_count = i + 1;
+                    }
+                }
+            }
+        }
     }
 
     void add_upperpoint(T cur_layer_idx, T lower_layer_idx, T id, const T *neighbors_info) {
@@ -504,6 +733,22 @@ public:
         up.id = id;
         up.neighbors_info.assign(neighbors_info, neighbors_info + m * 2);
         upper_layer.current_size = upper_points.size();
+
+        if (upper_alloc_ && cur_layer_idx < upper_idx_to_ptr_.size()) {
+            auto ptr = upper_idx_to_ptr_[cur_layer_idx];
+            if (ptr.Get()) {
+                auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
+                upper->lower_layer_idx = lower_layer_idx;
+                upper->id = id;
+                std::memcpy(upper->GetNeighbors(0, m), neighbors_info, m * sizeof(T));
+                upper->counts[0] = 0;
+                for (int i = 0; i < m; ++i) {
+                    if (neighbors_info[i] != T(INVALID_VECTOR_ID)) {
+                        upper->counts[0] = i + 1;
+                    }
+                }
+            }
+        }
     }
 
     template <typename Func>
@@ -528,14 +773,14 @@ public:
         if (id >= vectors.size()) {
             return false;
         }
-        std::memcpy(dest, vectors[id].data(), vec_size);
+        std::memcpy(dest, get_data(id), vec_size);
         return true;
     }
     bool fetch_vec_from_heap(PointExtensionContext &, T id, char *dest) {
         if (id >= vectors.size()) {
             return false;
         }
-        std::memcpy(dest, vectors[id].data(), vec_size);
+        std::memcpy(dest, get_data(id), vec_size);
         return true;
     }
 

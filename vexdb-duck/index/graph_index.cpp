@@ -70,6 +70,13 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
                                              metric);
+    graph_index->runtime_->store.InitAllocators(input.table_io_manager.GetIndexBlockManager());
+
+    if (input.storage_info.allocator_infos.size() >= 3) {
+        graph_index->DeserializeFromStorage(input.storage_info);
+        return std::move(graph_index);
+    }
+
     auto manifest_it = input.storage_info.options.find("vex_graph_manifest");
     if (manifest_it != input.storage_info.options.end()) {
         auto manifest_blob = StringValue::Get(manifest_it->second.DefaultCastAs(LogicalType::BLOB));
@@ -121,10 +128,9 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
                                     static_cast<unsigned long long>(dimension_),
                                     static_cast<unsigned long long>(dimension));
     }
-    vectors_ = vectors;
-    row_ids_ = row_ids;
 
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
+    runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
     DuckDistancer distancer;
     DuckAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
 
@@ -194,8 +200,17 @@ void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identi
 
 void GraphIndex::CommitDrop(IndexLock &index_lock) {
     (void)index_lock;
-    vectors_.clear();
-    row_ids_.clear();
+    if (runtime_) {
+        if (runtime_->store.node_alloc_) {
+            runtime_->store.node_alloc_->Reset();
+        }
+        if (runtime_->store.vector_alloc_) {
+            runtime_->store.vector_alloc_->Reset();
+        }
+        if (runtime_->store.upper_alloc_) {
+            runtime_->store.upper_alloc_->Reset();
+        }
+    }
     runtime_.reset();
 }
 
@@ -219,7 +234,20 @@ void GraphIndex::Vacuum(IndexLock &l) {
 
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
     (void)state;
-    return static_cast<idx_t>(vectors_.size() * sizeof(float) + row_ids_.size() * sizeof(row_t));
+    if (!runtime_) {
+        return 0;
+    }
+    idx_t size = 0;
+    if (runtime_->store.node_alloc_) {
+        size += runtime_->store.node_alloc_->GetInMemorySize();
+    }
+    if (runtime_->store.vector_alloc_) {
+        size += runtime_->store.vector_alloc_->GetInMemorySize();
+    }
+    if (runtime_->store.upper_alloc_) {
+        size += runtime_->store.upper_alloc_->GetInMemorySize();
+    }
+    return size;
 }
 
 void GraphIndex::Verify(IndexLock &l) {
@@ -229,9 +257,10 @@ void GraphIndex::Verify(IndexLock &l) {
 string GraphIndex::ToString(IndexLock &l, bool display_ascii) {
     (void)l;
     (void)display_ascii;
+    size_t node_count = runtime_ ? runtime_->store.elems.size() : 0;
     return StringUtil::Format("GRAPH_INDEX(dim=%llu, m=%d, ef_construction=%d, rows=%llu)",
                               static_cast<unsigned long long>(dimension_), m_, ef_construction_,
-                              static_cast<unsigned long long>(row_ids_.size()));
+                              static_cast<unsigned long long>(node_count));
 }
 
 void GraphIndex::VerifyAllocations(IndexLock &l) {
@@ -248,6 +277,87 @@ string GraphIndex::GetConstraintViolationMessage(VerifyExistenceType verify_type
     (void)failed_index;
     (void)input;
     return "GRAPH_INDEX does not enforce constraints";
+}
+
+void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
+    if (!runtime_) {
+        return;
+    }
+
+    auto &store = runtime_->store;
+
+    if (info.allocator_infos.size() >= 3) {
+        store.node_alloc_->Init(info.allocator_infos[0]);
+        store.vector_alloc_->Init(info.allocator_infos[1]);
+        store.upper_alloc_->Init(info.allocator_infos[2]);
+    }
+
+    auto nc_it = info.options.find("node_count");
+    if (nc_it != info.options.end()) {
+        size_t node_count = nc_it->second.GetValue<uint64_t>();
+        store.elems.resize(node_count);
+        store.base_points.resize(node_count);
+        store.vectors.resize(node_count);
+        store.id_to_node_ptr_.resize(node_count);
+        store.base_layer.current_size = node_count;
+    }
+
+    auto uc_it = info.options.find("upper_count");
+    if (uc_it != info.options.end()) {
+        size_t upper_count = uc_it->second.GetValue<uint64_t>();
+        store.upper_points.resize(upper_count);
+        store.upper_idx_to_ptr_.resize(upper_count);
+        store.upper_layer.current_size = upper_count;
+    }
+
+    auto eid_it = info.options.find("entry_id");
+    auto ec_it = info.options.find("entry_cur_layer_idx");
+    auto el_it = info.options.find("entry_level");
+    if (eid_it != info.options.end() && ec_it != info.options.end() && el_it != info.options.end()) {
+        size_t entry_id = eid_it->second.GetValue<uint64_t>();
+        size_t entry_cur_idx = ec_it->second.GetValue<uint64_t>();
+        int entry_level = el_it->second.GetValue<int>();
+        store.entry_info.set(entry_id, entry_cur_idx, entry_level);
+    }
+
+    auto id_ptr_it = info.options.find("id_ptr_map");
+    if (id_ptr_it != info.options.end()) {
+        auto blob = StringValue::Get(id_ptr_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        if (ptr + sizeof(uint64_t) <= end) {
+            uint64_t num_entries;
+            std::memcpy(&num_entries, ptr, sizeof(num_entries));
+            ptr += sizeof(num_entries);
+            store.id_to_node_ptr_.resize(num_entries);
+            for (uint64_t i = 0; i < num_entries && ptr + sizeof(uint64_t) <= end; i++) {
+                uint64_t ptr_val;
+                std::memcpy(&ptr_val, ptr, sizeof(ptr_val));
+                ptr += sizeof(ptr_val);
+                store.id_to_node_ptr_[i].Set(ptr_val);
+                store.node_ptr_to_id_[ptr_val] = static_cast<uint32_t>(i);
+            }
+        }
+    }
+
+    auto upper_ptr_it = info.options.find("upper_ptr_map");
+    if (upper_ptr_it != info.options.end()) {
+        auto blob = StringValue::Get(upper_ptr_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        if (ptr + sizeof(uint64_t) <= end) {
+            uint64_t num_entries;
+            std::memcpy(&num_entries, ptr, sizeof(num_entries));
+            ptr += sizeof(num_entries);
+            store.upper_idx_to_ptr_.resize(num_entries);
+            for (uint64_t i = 0; i < num_entries && ptr + sizeof(uint64_t) <= end; i++) {
+                uint64_t ptr_val;
+                std::memcpy(&ptr_val, ptr, sizeof(ptr_val));
+                ptr += sizeof(ptr_val);
+                store.upper_idx_to_ptr_[i].Set(ptr_val);
+            }
+        }
+    }
 }
 
 } // namespace duckdb
