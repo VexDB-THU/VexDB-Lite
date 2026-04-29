@@ -73,6 +73,22 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
     });
 }
 
+static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    using IPDistancer =
+        Distancer<Arch::GENERAL, Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
+    DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint16 d) {
+        return IPDistancer::get_distance_single(a, b, d);
+    });
+}
+
+static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    using CosDistancer =
+        Distancer<Arch::GENERAL, Metric::COSINE, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
+    DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint16 d) {
+        return CosDistancer::get_distance_single(a, b, d);
+    });
+}
+
 static void VexTestVec3Function(DataChunk &args, ExpressionState &state, Vector &result) {
     (void)args;
     (void)state;
@@ -119,11 +135,25 @@ ScalarFunctionSet VexFunctions::GetL2DistanceListAlias() {
     return set;
 }
 
+ScalarFunctionSet VexFunctions::GetInnerProductFunction() {
+    ScalarFunctionSet set("inner_product");
+    AddDistanceOverloads(set, InnerProductFunction);
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
+    ScalarFunctionSet set("cosine_distance");
+    AddDistanceOverloads(set, CosineDistanceFunction);
+    return set;
+}
+
 void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2DistanceFunction());
     loader.RegisterFunction(GetL2DistanceOperator());
     loader.RegisterFunction(GetL2DistanceArrayAlias());
     loader.RegisterFunction(GetL2DistanceListAlias());
+    loader.RegisterFunction(GetInnerProductFunction());
+    loader.RegisterFunction(GetCosineDistanceFunction());
     loader.RegisterFunction(GetVectorDimsFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));

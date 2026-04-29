@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <atomic>
 #include <algorithm>
 #include <new>
@@ -300,6 +301,7 @@ public:
 
     std::vector<std::vector<float>> level0_dists_;
     std::vector<std::vector<float>> upper_dists_;
+    bool normalize_vectors_ = false;
 
     MemStore() = default;
     MemStore(uint_fast16_t dim_in, uint_fast16_t m_in, uint_fast32_t vec_size_in)
@@ -380,7 +382,29 @@ public:
         if (id >= vectors.size()) {
             vectors.resize(id + 1);
         }
-        vectors[id].assign(query, query + vec_size);
+
+        const char *store_data = query;
+        std::vector<char> normalized;
+        if (normalize_vectors_) {
+            normalized.resize(vec_size);
+            auto *dst = reinterpret_cast<float *>(normalized.data());
+            auto *src = reinterpret_cast<const float *>(query);
+            float norm2 = 0.0f;
+            for (uint_fast16_t i = 0; i < dim; i++) {
+                norm2 += src[i] * src[i];
+            }
+            if (norm2 > 0.0f) {
+                float inv_norm = 1.0f / std::sqrt(norm2);
+                for (uint_fast16_t i = 0; i < dim; i++) {
+                    dst[i] = src[i] * inv_norm;
+                }
+            } else {
+                std::memcpy(dst, src, vec_size);
+            }
+            store_data = normalized.data();
+        }
+
+        vectors[id].assign(store_data, store_data + vec_size);
 
         if (node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
@@ -388,7 +412,7 @@ public:
                 auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
                 if (header->vector_ptr.Get()) {
                     auto *vec_data = reinterpret_cast<float *>(vector_alloc_->Get(header->vector_ptr));
-                    std::memcpy(vec_data, query, vec_size);
+                    std::memcpy(vec_data, store_data, vec_size);
                 }
             }
         }

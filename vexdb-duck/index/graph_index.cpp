@@ -20,13 +20,26 @@
 
 namespace duckdb {
 
-using DuckDistancer =
+using DuckL2Distancer =
     Distancer<Arch::GENERAL, Metric::L2, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
-using DuckAlgo = GraphIndexAlgorithm<DuckStore, DuckDistancer>;
+using DuckIPDistancer =
+    Distancer<Arch::GENERAL, Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
+using DuckCosDistancer =
+    Distancer<Arch::GENERAL, Metric::COSINE, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
+using DuckL2Algo = GraphIndexAlgorithm<DuckStore, DuckL2Distancer>;
+using DuckIPAlgo = GraphIndexAlgorithm<DuckStore, DuckIPDistancer>;
+using DuckCosAlgo = GraphIndexAlgorithm<DuckStore, DuckCosDistancer>;
 
 VexMetric ParseMetric(const string &metric_name) {
-    if (StringUtil::Lower(metric_name) == "l2") {
+    auto name = StringUtil::Lower(metric_name);
+    if (name == "l2") {
         return VexMetric::L2;
+    }
+    if (name == "ip" || name == "inner_product") {
+        return VexMetric::INNER_PRODUCT;
+    }
+    if (name == "cos" || name == "cosine") {
+        return VexMetric::COSINE;
     }
     throw InvalidInputException("Unsupported GRAPH_INDEX metric: %s", metric_name);
 }
@@ -37,6 +50,7 @@ GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, 
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
       dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
       runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)) {
+    runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
 }
 
 unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
@@ -74,6 +88,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     if (input.storage_info.allocator_infos.size() >= 3) {
         graph_index->DeserializeFromStorage(input.storage_info);
+        graph_index->runtime_->store.normalize_vectors_ = (graph_index->metric_ == VexMetric::COSINE);
         return std::move(graph_index);
     }
 
@@ -86,6 +101,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
             auto disk_blob = vex_disk::ReadBlobFromBlocks(input.table_io_manager.GetIndexBlockManager(),
                                                           QueryContext(input.context), seg.blocks, seg.size);
             graph_index->LoadFromDiskImage(disk_blob);
+            graph_index->runtime_->store.normalize_vectors_ = (graph_index->metric_ == VexMetric::COSINE);
             return std::move(graph_index);
         }
     }
@@ -94,6 +110,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         auto blob = StringValue::Get(blob_it->second.DefaultCastAs(LogicalType::BLOB));
         graph_index->LoadFromDiskImage(blob);
     }
+    graph_index->runtime_->store.normalize_vectors_ = (graph_index->metric_ == VexMetric::COSINE);
     return std::move(graph_index);
 }
 
@@ -130,17 +147,48 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
     }
 
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
+    runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
-    DuckDistancer distancer;
-    DuckAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
-
-    for (idx_t i = 0; i < row_ids.size(); i++) {
-        PointExtensionContext point_ctx;
-        ItemPointerData tid;
-        tid.row_id = row_ids[i];
-        const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
-        DuckAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
-        algo.insert(insert_ctx);
+    switch (metric_) {
+    case VexMetric::L2: {
+        DuckL2Distancer distancer;
+        DuckL2Algo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < row_ids.size(); i++) {
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_ids[i];
+            const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
+            DuckL2Algo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
+    case VexMetric::INNER_PRODUCT: {
+        DuckIPDistancer distancer;
+        DuckIPAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < row_ids.size(); i++) {
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_ids[i];
+            const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
+            DuckIPAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
+    case VexMetric::COSINE: {
+        DuckCosDistancer distancer;
+        DuckCosAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < row_ids.size(); i++) {
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_ids[i];
+            const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
+            DuckCosAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
     }
 }
 
@@ -151,27 +199,138 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     if (!runtime_) {
         return;
     }
-    if (metric_ != VexMetric::L2) {
-        throw NotImplementedException("Only L2 metric is implemented in GRAPH_INDEX");
-    }
-
-    DuckDistancer distancer;
     auto &store = runtime_->store;
-    DuckAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), store, distancer);
     PointExtensionContext point_ctx;
-    auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), uint_fast16_t(std::max<idx_t>(k, ef)));
-    for (auto &tid : res.first) {
-        row_ids.push_back(tid.row_id);
+    auto search_k = uint_fast16_t(std::max<idx_t>(k, ef));
+
+    switch (metric_) {
+    case VexMetric::L2: {
+        DuckL2Distancer distancer;
+        DuckL2Algo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), store, distancer);
+        auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
+        for (auto &tid : res.first) row_ids.push_back(tid.row_id);
+        for (auto &dist : res.second) distances.push_back(dist);
+        break;
     }
-    for (auto &dist : res.second) {
-        distances.push_back(dist);
+    case VexMetric::INNER_PRODUCT: {
+        DuckIPDistancer distancer;
+        DuckIPAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), store, distancer);
+        auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
+        for (auto &tid : res.first) row_ids.push_back(tid.row_id);
+        for (auto &dist : res.second) distances.push_back(dist);
+        break;
+    }
+    case VexMetric::COSINE: {
+        DuckCosDistancer distancer;
+        DuckCosAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), store, distancer);
+        auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
+        for (auto &tid : res.first) row_ids.push_back(tid.row_id);
+        for (auto &dist : res.second) distances.push_back(dist);
+        break;
+    }
     }
 }
 
 ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     (void)l;
-    (void)chunk;
-    (void)row_ids;
+    auto count = chunk.size();
+    if (count == 0) {
+        return ErrorData();
+    }
+
+    if (!runtime_) {
+        runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
+        runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
+    }
+    if (!runtime_->store.node_alloc_ || !runtime_->store.vector_alloc_ || !runtime_->store.upper_alloc_) {
+        runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
+    }
+
+    if (column_ids.empty()) {
+        return ErrorData(ExceptionType::INTERNAL, "GRAPH_INDEX has no indexed columns");
+    }
+    auto vec_col_idx = static_cast<idx_t>(column_ids[0]);
+    if (vec_col_idx >= chunk.ColumnCount()) {
+        return ErrorData(ExceptionType::INTERNAL,
+                         StringUtil::Format("GRAPH_INDEX column index out of range: %llu (chunk columns=%llu)",
+                                            static_cast<unsigned long long>(vec_col_idx),
+                                            static_cast<unsigned long long>(chunk.ColumnCount())));
+    }
+
+    auto &vec_vector = chunk.data[vec_col_idx];
+    auto &vec_type = vec_vector.GetType();
+    if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
+        return ErrorData(ExceptionType::INVALID_INPUT,
+                         StringUtil::Format("GRAPH_INDEX column must be FLOAT[N], got %s", vec_type.ToString()));
+    }
+
+    auto dim = ArrayType::GetSize(vec_type);
+    if (dim != dimension_) {
+        return ErrorData(ExceptionType::INVALID_INPUT,
+                         StringUtil::Format("GRAPH_INDEX dimension mismatch: expected %llu, got %llu",
+                                            static_cast<unsigned long long>(dimension_),
+                                            static_cast<unsigned long long>(dim)));
+    }
+
+    vec_vector.Flatten(count);
+    row_ids.Flatten(count);
+
+    auto &vec_validity = FlatVector::Validity(vec_vector);
+    auto &child_vec = ArrayVector::GetEntry(vec_vector);
+    child_vec.Flatten(count * dim);
+    auto vec_data = FlatVector::GetData<float>(child_vec);
+    auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+
+    switch (metric_) {
+    case VexMetric::L2: {
+        DuckL2Distancer distancer;
+        DuckL2Algo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < count; i++) {
+            if (!vec_validity.RowIsValid(i)) {
+                continue;
+            }
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_id_data[i];
+            const char *query = reinterpret_cast<const char *>(vec_data + i * dim);
+            DuckL2Algo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
+    case VexMetric::INNER_PRODUCT: {
+        DuckIPDistancer distancer;
+        DuckIPAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < count; i++) {
+            if (!vec_validity.RowIsValid(i)) {
+                continue;
+            }
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_id_data[i];
+            const char *query = reinterpret_cast<const char *>(vec_data + i * dim);
+            DuckIPAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
+    case VexMetric::COSINE: {
+        DuckCosDistancer distancer;
+        DuckCosAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
+        for (idx_t i = 0; i < count; i++) {
+            if (!vec_validity.RowIsValid(i)) {
+                continue;
+            }
+            PointExtensionContext point_ctx;
+            ItemPointerData tid;
+            tid.row_id = row_id_data[i];
+            const char *query = reinterpret_cast<const char *>(vec_data + i * dim);
+            DuckCosAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+            algo.insert(insert_ctx);
+        }
+        break;
+    }
+    }
     return ErrorData();
 }
 

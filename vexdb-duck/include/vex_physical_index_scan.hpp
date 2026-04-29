@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/common/column_index.hpp"
 #include "duckdb/execution/physical_operator.hpp"
+#include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/planner/operator/logical_extension_operator.hpp"
 
 namespace duckdb {
@@ -43,11 +44,12 @@ class PhysicalVexIndexScan : public PhysicalOperator {
 public:
     static constexpr const PhysicalOperatorType TYPE = PhysicalOperatorType::EXTENSION;
 
-    PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
-                         DuckTableEntry &table, GraphIndex &graph_index,
-                         unique_ptr<Expression> query_vec_expr, idx_t k,
-                         vector<ColumnIndex> column_ids, vector<idx_t> fetch_output_positions,
-                         optional_idx distance_output_index, vector<LogicalType> returned_types);
+	PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<LogicalType> types, idx_t estimated_cardinality,
+	                     DuckTableEntry &table, GraphIndex &graph_index,
+	                     unique_ptr<Expression> query_vec_expr, idx_t k,
+	                     vector<ColumnIndex> column_ids, vector<idx_t> fetch_output_positions,
+	                     optional_idx distance_output_index, vector<LogicalType> returned_types,
+	                     idx_t base_output_count);
 
     string GetName() const override;
     InsertionOrderPreservingMap<string> ParamsToString() const override;
@@ -62,10 +64,11 @@ public:
                                             GlobalOperatorState &gstate, OperatorState &state) const override;
 
 public:
-    DuckTableEntry &table;
-    GraphIndex &graph_index;
-    unique_ptr<Expression> query_vec_expr;
-    idx_t k;
+	DuckTableEntry &table;
+	GraphIndex &graph_index;
+	unique_ptr<Expression> query_vec_expr;
+	idx_t base_output_count;
+	idx_t k;
     vector<ColumnIndex> column_ids;
     vector<idx_t> fetch_output_positions;
     optional_idx distance_output_index;

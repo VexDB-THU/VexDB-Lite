@@ -30,9 +30,9 @@ LogicalVexIndexScan::LogicalVexIndexScan(idx_t table_index_p, vector<LogicalType
 }
 
 PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
-    auto &scan = planner.Make<PhysicalVexIndexScan>(types, estimated_cardinality, table, graph_index,
-                                                    query_vec_expr->Copy(), k, column_ids, fetch_output_positions,
-                                                    distance_output_index, returned_types);
+	auto &scan = planner.Make<PhysicalVexIndexScan>(types, estimated_cardinality, table, graph_index,
+	                                                query_vec_expr->Copy(), k, column_ids, fetch_output_positions,
+	                                                distance_output_index, returned_types, output_types.size());
     if (children.empty()) {
         auto &dummy_scan = planner.Make<PhysicalDummyScan>(vector<LogicalType> {LogicalType::INTEGER}, 1);
         scan.children.push_back(dummy_scan);
@@ -85,14 +85,16 @@ void LogicalVexIndexScan::ResolveTypes() {
 }
 
 PhysicalVexIndexScan::PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<LogicalType> types_p,
-                                           idx_t estimated_cardinality, DuckTableEntry &table_p,
-                                           GraphIndex &graph_index_p, unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
-                                           vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
-                                           optional_idx distance_output_index_p, vector<LogicalType> returned_types_p)
-    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
-      table(table_p), graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
-      column_ids(std::move(column_ids_p)), fetch_output_positions(std::move(fetch_output_positions_p)),
-      distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)) {
+	                                           idx_t estimated_cardinality, DuckTableEntry &table_p,
+	                                           GraphIndex &graph_index_p, unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
+	                                           vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
+	                                           optional_idx distance_output_index_p, vector<LogicalType> returned_types_p,
+	                                           idx_t base_output_count_p)
+	: PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, std::move(types_p), estimated_cardinality),
+	  table(table_p), graph_index(graph_index_p), query_vec_expr(std::move(query_vec_expr_p)), k(k_p),
+	  column_ids(std::move(column_ids_p)), fetch_output_positions(std::move(fetch_output_positions_p)),
+	  distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)),
+	  base_output_count(base_output_count_p) {
 }
 
 string PhysicalVexIndexScan::GetName() const {
@@ -145,8 +147,28 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
     auto &scan_state = state.Cast<VexIndexScanOperatorState>();
     (void)gstate;
 
-    if (!scan_state.searched) {
-        auto query_val = ExpressionExecutor::EvaluateScalar(context.client, *query_vec_expr);
+	if (!scan_state.searched) {
+		DataChunk query_input;
+		if (!input.data.empty() && input.size() > 0) {
+			vector<LogicalType> base_types;
+			base_types.reserve(input.ColumnCount());
+			for (idx_t i = 0; i < input.ColumnCount(); i++) {
+				base_types.push_back(input.data[i].GetType());
+			}
+			query_input.Initialize(context.client, base_types);
+			query_input.SetCardinality(1);
+			for (idx_t i = 0; i < input.ColumnCount(); i++) {
+				query_input.data[i].Reference(input.data[i]);
+			}
+		}
+		ExpressionExecutor query_executor(context.client, *query_vec_expr);
+		if (query_input.ColumnCount() > 0) {
+			query_executor.SetChunk(query_input);
+		}
+		Vector query_result(query_vec_expr->return_type);
+		query_executor.ExecuteExpression(query_result);
+		query_result.Flatten(1);
+		auto query_val = query_result.GetValue(0);
 
         vector<float> query_vec;
         if (!ExtractFloatVector(query_val, query_vec)) {
@@ -187,6 +209,17 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
             }
             for (idx_t i = 0; i < fetch_output_positions.size(); i++) {
                 output_chunk.data[fetch_output_positions[i]].Reference(fetch_chunk.data[i]);
+            }
+            if (!input.data.empty() && base_output_count < output_chunk.ColumnCount()) {
+                for (idx_t child_idx = 0; child_idx < input.ColumnCount(); child_idx++) {
+                    auto out_idx = base_output_count + child_idx;
+                    if (out_idx >= output_chunk.ColumnCount()) {
+                        break;
+                    }
+                    auto value = input.data[child_idx].GetValue(0);
+                    output_chunk.data[out_idx].SetValue(0, value);
+                    output_chunk.data[out_idx].SetVectorType(VectorType::CONSTANT_VECTOR);
+                }
             }
             if (distance_output_index.IsValid()) {
                 auto dist_data = FlatVector::GetData<float>(output_chunk.data[distance_output_index.GetIndex()]);

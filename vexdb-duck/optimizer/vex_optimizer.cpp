@@ -23,7 +23,7 @@
 namespace duckdb {
 
 static bool IsDistanceFunction(const string &name) {
-    return name == "l2_distance";
+    return name == "l2_distance" || name == "inner_product" || name == "cosine_distance";
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
