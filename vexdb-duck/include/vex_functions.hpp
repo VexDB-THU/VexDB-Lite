@@ -6,30 +6,17 @@
 
 namespace duckdb {
 
-// Resolve a single expression's type to FLOAT[N]:
-// - ARRAY → ensure child type is FLOAT
-// - LIST literal → evaluate to get size, then convert to FLOAT[N]
-// - Other → throw
 LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr);
 
 struct VexFunctions {
-	static void Register(ExtensionLoader &loader);
+    static void Register(ExtensionLoader &loader);
 
-	static ScalarFunctionSet GetL2DistanceFunction();
-	static ScalarFunctionSet GetL2DistanceOperator();      // <->
-	static ScalarFunctionSet GetInnerProductFunction();
-	static ScalarFunctionSet GetNegativeInnerProductFunction();  // <~>
-	static ScalarFunctionSet GetCosineDistanceFunction();
-	static ScalarFunctionSet GetCosineDistanceOperator();  // <=>
+    static ScalarFunctionSet GetL2DistanceFunction();
+    static ScalarFunctionSet GetL2DistanceOperator();
+    static ScalarFunctionSet GetL2DistanceArrayAlias();
+    static ScalarFunctionSet GetL2DistanceListAlias();
 
-	static ScalarFunctionSet GetVectorDimsFunction();
-	static ScalarFunctionSet GetVectorNormFunction();
-	static ScalarFunctionSet GetL2NormalizeFunction();
-	static ScalarFunctionSet GetVectorAddFunction();
-	static ScalarFunctionSet GetVectorSubFunction();
-
-	static void RegisterANNSearchFunction(ExtensionLoader &loader);
-	static void RegisterIndexInfoFunction(ExtensionLoader &loader);
+    static ScalarFunctionSet GetVectorDimsFunction();
 };
 
 } // namespace duckdb

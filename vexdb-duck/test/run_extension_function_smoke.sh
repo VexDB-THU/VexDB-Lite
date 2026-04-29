@@ -2,28 +2,22 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DUCKDB_SOURCE_DIR="${1:-/tmp/duckdb-v1.4.4}"
-DUCKDB_HOST_LIB_DIR="${2:-$ROOT_DIR/build/duckhost-v144/src}"
-EXTENSION_PATH="${3:-$ROOT_DIR/build/standalone-v144/_duckdb/extension/vex/vex.duckdb_extension}"
-HARNESS_SRC="$ROOT_DIR/vexdb-duck/test/vex_extension_function_smoke.cpp"
-HARNESS_BIN="$ROOT_DIR/build/duckhost-v144/vex_extension_function_smoke"
+DUCKDB_BUILD_DIR="${1:-/tmp/vexdb-duck-build}"
+EXTENSION_PATH="${2:-$DUCKDB_BUILD_DIR/extension/vex/vex.duckdb_extension}"
+SMOKE_SRC="$ROOT_DIR/vexdb-duck/test/smoke_create_index.cpp"
+SMOKE_BIN="${3:-$DUCKDB_BUILD_DIR/vexdb_duck_smoke}"
+CXX_BIN="${CXX:-c++}"
 
-if [[ "$(uname -s)" == "Darwin" ]]; then
-  DUCKDB_HOST_LIB_NAME="libduckdb.dylib"
-else
-  DUCKDB_HOST_LIB_NAME="libduckdb.so"
-fi
-
-if [[ ! -f "$HARNESS_SRC" ]]; then
-  echo "missing harness source: $HARNESS_SRC" >&2
+if [[ ! -f "$SMOKE_SRC" ]]; then
+  echo "missing smoke source: $SMOKE_SRC" >&2
   exit 2
 fi
-if [[ ! -d "$DUCKDB_SOURCE_DIR/src/include" ]]; then
-  echo "missing duckdb source include dir: $DUCKDB_SOURCE_DIR/src/include" >&2
+if [[ ! -f "$DUCKDB_BUILD_DIR/src/libduckdb_static.a" ]]; then
+  echo "missing duckdb static lib: $DUCKDB_BUILD_DIR/src/libduckdb_static.a" >&2
   exit 2
 fi
-if [[ ! -f "$DUCKDB_HOST_LIB_DIR/$DUCKDB_HOST_LIB_NAME" ]]; then
-  echo "missing duckdb host library: $DUCKDB_HOST_LIB_DIR/$DUCKDB_HOST_LIB_NAME" >&2
+if [[ ! -f "$DUCKDB_BUILD_DIR/extension/libdummy_static_extension_loader.a" ]]; then
+  echo "missing dummy loader: $DUCKDB_BUILD_DIR/extension/libdummy_static_extension_loader.a" >&2
   exit 2
 fi
 if [[ ! -f "$EXTENSION_PATH" ]]; then
@@ -31,34 +25,11 @@ if [[ ! -f "$EXTENSION_PATH" ]]; then
   exit 2
 fi
 
-mkdir -p "$(dirname "$HARNESS_BIN")"
+"$CXX_BIN" -std=c++17 -O2 \
+  "$SMOKE_SRC" \
+  -I"/Users/sunji/Work/duckdb/src/include" \
+  "$DUCKDB_BUILD_DIR/src/libduckdb_static.a" \
+  "$DUCKDB_BUILD_DIR/extension/libdummy_static_extension_loader.a" \
+  -o "$SMOKE_BIN"
 
-clang++ -std=c++17 -O0 -g \
-  "$HARNESS_SRC" \
-  -I"$DUCKDB_SOURCE_DIR/src/include" \
-  -L"$DUCKDB_HOST_LIB_DIR" \
-  -lduckdb \
-  -Wl,-rpath,"$DUCKDB_HOST_LIB_DIR" \
-  -o "$HARNESS_BIN"
-
-tests=(
-  load_and_basic_query
-  create_index_and_ann
-  explain_ann_plan
-  insert_delete_update_regression
-)
-
-fail_count=0
-
-for test_name in "${tests[@]}"; do
-  echo "==> $test_name"
-  if ! ASAN_OPTIONS="${ASAN_OPTIONS:-detect_container_overflow=0}" \
-      "$HARNESS_BIN" "$test_name" "$EXTENSION_PATH"; then
-    fail_count=$((fail_count + 1))
-  fi
-done
-
-if [[ "$fail_count" -ne 0 ]]; then
-  echo "FAILED $fail_count test(s)" >&2
-  exit 1
-fi
+"$SMOKE_BIN" "$EXTENSION_PATH"

@@ -1,0 +1,269 @@
+#include "vex_graph_index.hpp"
+
+#include "vex/vex_disk_block_store.hpp"
+#include "vex/vex_disk_layout.hpp"
+
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
+
+#include <cstring>
+#include <stdexcept>
+
+namespace duckdb {
+
+namespace {
+
+template <class T>
+static void AppendBytes(std::string &out, const T &value) {
+    auto old_size = out.size();
+    out.resize(old_size + sizeof(T));
+    std::memcpy(out.data() + old_size, &value, sizeof(T));
+}
+
+static void AppendRaw(std::string &out, const void *ptr, size_t len) {
+    auto old_size = out.size();
+    out.resize(old_size + len);
+    std::memcpy(out.data() + old_size, ptr, len);
+}
+
+template <class T>
+static T ReadBytes(const std::string &blob, size_t &offset) {
+    if (offset + sizeof(T) > blob.size()) {
+        throw InvalidInputException("GRAPH_INDEX disk image truncated");
+    }
+    T value;
+    std::memcpy(&value, blob.data() + offset, sizeof(T));
+    offset += sizeof(T);
+    return value;
+}
+
+static void ReadRaw(const std::string &blob, size_t &offset, void *ptr, size_t len) {
+    if (offset + len > blob.size()) {
+        throw InvalidInputException("GRAPH_INDEX disk image truncated");
+    }
+    std::memcpy(ptr, blob.data() + offset, len);
+    offset += len;
+}
+
+} // namespace
+
+std::string GraphIndex::BuildDiskImage() const {
+    using namespace vex_disk;
+
+    if (!runtime_) {
+        return {};
+    }
+
+    std::string meta_blob;
+    std::string base_blob;
+    std::string upper_blob;
+    std::string vec_blob;
+    std::string rowid_blob;
+
+    const auto &store = runtime_->store;
+
+    DiskMeta meta;
+    meta.dimension = uint32_t(dimension_);
+    meta.m = uint32_t(m_);
+    meta.ef_construction = uint32_t(ef_construction_);
+    meta.metric = uint32_t(metric_);
+    meta.vector_count = store.elems.size();
+    meta.upper_count = store.upper_points.size();
+    meta.entry_id = store.entry_info.id;
+    meta.entry_cur_layer_idx = store.entry_info.cur_layer_idx;
+    meta.entry_level = store.entry_info.level;
+    AppendBytes(meta_blob, meta);
+
+    for (idx_t i = 0; i < store.base_points.size(); i++) {
+        auto &bp = store.base_points[i];
+        vex_disk::DiskBaseRecordHeader hdr;
+        hdr.neighbor_count = uint32_t(bp.neighbors.size());
+        AppendBytes(base_blob, hdr);
+        if (!bp.neighbors.empty()) {
+            AppendRaw(base_blob, bp.neighbors.data(), bp.neighbors.size() * sizeof(bp.neighbors[0]));
+        }
+        if (!bp.dists.empty()) {
+            AppendRaw(base_blob, bp.dists.data(), bp.dists.size() * sizeof(bp.dists[0]));
+        }
+    }
+
+    for (idx_t i = 0; i < store.upper_points.size(); i++) {
+        auto &up = store.upper_points[i];
+        vex_disk::DiskUpperRecordHeader hdr;
+        hdr.neighbor_count = uint32_t(m_);
+        hdr.lower_layer_idx = uint32_t(up.lower_layer_idx);
+        hdr.id = uint32_t(up.id);
+        AppendBytes(upper_blob, hdr);
+        if (!up.neighbors_info.empty()) {
+            AppendRaw(upper_blob, up.neighbors_info.data(), up.neighbors_info.size() * sizeof(up.neighbors_info[0]));
+        }
+        if (!up.dists.empty()) {
+            AppendRaw(upper_blob, up.dists.data(), up.dists.size() * sizeof(up.dists[0]));
+        }
+    }
+
+    for (idx_t i = 0; i < store.vectors.size(); i++) {
+        auto &vec = store.vectors[i];
+        if (!vec.empty()) {
+            AppendRaw(vec_blob, vec.data(), vec.size());
+        }
+    }
+
+    for (idx_t i = 0; i < store.elems.size(); i++) {
+        auto &elem = store.elems[i];
+        vex_disk::DiskRowIdRecordHeader hdr;
+        hdr.row_count = uint32_t(elem.tids.size());
+        AppendBytes(rowid_blob, hdr);
+        if (!elem.tids.empty()) {
+            AppendRaw(rowid_blob, elem.tids.data(), elem.tids.size() * sizeof(elem.tids[0]));
+        }
+    }
+
+    DiskImageHeader header;
+    size_t offset = sizeof(DiskImageHeader);
+    header.meta_offset = offset;
+    header.meta_size = meta_blob.size();
+    offset += meta_blob.size();
+    header.base_offset = offset;
+    header.base_size = base_blob.size();
+    offset += base_blob.size();
+    header.upper_offset = offset;
+    header.upper_size = upper_blob.size();
+    offset += upper_blob.size();
+    header.vec_offset = offset;
+    header.vec_size = vec_blob.size();
+    offset += vec_blob.size();
+    header.rowid_offset = offset;
+    header.rowid_size = rowid_blob.size();
+    offset += rowid_blob.size();
+    header.total_size = offset;
+
+    std::string out;
+    out.reserve(header.total_size);
+    AppendBytes(out, header);
+    AppendRaw(out, meta_blob.data(), meta_blob.size());
+    AppendRaw(out, base_blob.data(), base_blob.size());
+    AppendRaw(out, upper_blob.data(), upper_blob.size());
+    AppendRaw(out, vec_blob.data(), vec_blob.size());
+    AppendRaw(out, rowid_blob.data(), rowid_blob.size());
+    return out;
+}
+
+void GraphIndex::LoadFromDiskImage(const std::string &blob) {
+    using namespace vex_disk;
+
+    if (blob.empty()) {
+        return;
+    }
+
+    size_t offset = 0;
+    auto header = ReadBytes<DiskImageHeader>(blob, offset);
+    if (header.magic != GRAPH_INDEX_DISK_MAGIC) {
+        throw InvalidInputException("GRAPH_INDEX disk image magic mismatch");
+    }
+    if (header.version != GRAPH_INDEX_DISK_VERSION) {
+        throw InvalidInputException("GRAPH_INDEX disk image version mismatch");
+    }
+
+    auto meta = ReadBytes<DiskMeta>(blob, offset);
+
+    dimension_ = meta.dimension;
+    m_ = int(meta.m);
+    ef_construction_ = int(meta.ef_construction);
+    metric_ = VexMetric(meta.metric);
+    runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
+    auto &store = runtime_->store;
+    store.entry_info.set(meta.entry_id, meta.entry_cur_layer_idx, meta.entry_level);
+
+    for (idx_t i = 0; i < idx_t(meta.vector_count); i++) {
+        auto hdr = ReadBytes<DiskBaseRecordHeader>(blob, offset);
+        auto id = store.template assign_vector_id<true>();
+        (void)id;
+        auto &bp = store.base_points.back();
+        bp.neighbors.resize(hdr.neighbor_count);
+        bp.dists.resize(hdr.neighbor_count);
+        if (hdr.neighbor_count > 0) {
+            ReadRaw(blob, offset, bp.neighbors.data(), hdr.neighbor_count * sizeof(bp.neighbors[0]));
+            ReadRaw(blob, offset, bp.dists.data(), hdr.neighbor_count * sizeof(bp.dists[0]));
+        }
+    }
+
+    for (idx_t i = 0; i < idx_t(meta.upper_count); i++) {
+        auto hdr = ReadBytes<DiskUpperRecordHeader>(blob, offset);
+        auto idx = store.template assign_vector_id<false>();
+        (void)idx;
+        auto &up = store.upper_points.back();
+        up.lower_layer_idx = hdr.lower_layer_idx;
+        up.id = hdr.id;
+        up.neighbors_info.resize(hdr.neighbor_count * 2);
+        up.dists.resize(hdr.neighbor_count);
+        if (hdr.neighbor_count > 0) {
+            ReadRaw(blob, offset, up.neighbors_info.data(), up.neighbors_info.size() * sizeof(up.neighbors_info[0]));
+            ReadRaw(blob, offset, up.dists.data(), up.dists.size() * sizeof(up.dists[0]));
+        }
+    }
+
+    for (idx_t i = 0; i < idx_t(meta.vector_count); i++) {
+        store.vectors[i].resize(dimension_ * sizeof(float));
+        ReadRaw(blob, offset, store.vectors[i].data(), store.vectors[i].size());
+    }
+
+    for (idx_t i = 0; i < idx_t(meta.vector_count); i++) {
+        auto hdr = ReadBytes<DiskRowIdRecordHeader>(blob, offset);
+        auto &elem = store.elems[i];
+        elem.tids.resize(hdr.row_count);
+        if (hdr.row_count > 0) {
+            ReadRaw(blob, offset, elem.tids.data(), hdr.row_count * sizeof(elem.tids[0]));
+        }
+    }
+}
+
+IndexStorageInfo GraphIndex::ExportStorageInfo() const {
+    IndexStorageInfo info(name);
+    auto blob = BuildDiskImage();
+    info.options["vex_storage_format"] = Value("pg_vexdb_segmented_v1");
+    info.options["vex_graph_blob"] = Value::BLOB_RAW(blob);
+    info.options["dimension"] = Value::UBIGINT(uint64_t(dimension_));
+    info.options["m"] = Value::INTEGER(m_);
+    info.options["ef_construction"] = Value::INTEGER(ef_construction_);
+    info.options["metric"] = Value("l2");
+
+    FixedSizeAllocatorInfo dummy;
+    dummy.segment_size = 1;
+    info.allocator_infos.push_back(std::move(dummy));
+    return info;
+}
+
+IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
+    (void)options;
+    auto info = ExportStorageInfo();
+    if (!context.Valid()) {
+        return info;
+    }
+
+    auto &block_manager = table_io_manager.GetIndexBlockManager();
+    vex_disk::DiskManifest manifest;
+
+    auto blob = BuildDiskImage();
+    auto all_blocks = vex_disk::WriteBlobToBlocks(block_manager, context, blob);
+    vex_disk::SegmentBlockRef seg;
+    seg.kind = uint32_t(vex_disk::SegmentKind::META);
+    seg.size = blob.size();
+    seg.blocks = std::move(all_blocks);
+    manifest.segments.push_back(std::move(seg));
+
+    auto manifest_blob = vex_disk::SerializeManifest(manifest);
+    info.options["vex_storage_backend"] = Value("duckdb_block_manager_v1");
+    info.options["vex_graph_manifest"] = Value::BLOB_RAW(manifest_blob);
+    if (!manifest.segments.empty() && !manifest.segments[0].blocks.empty()) {
+        info.root_block_ptr = manifest.segments[0].blocks[0];
+    }
+    return info;
+}
+
+IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
+    (void)options;
+    return ExportStorageInfo();
+}
+
+} // namespace duckdb

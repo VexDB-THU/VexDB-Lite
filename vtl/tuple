@@ -1,0 +1,573 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_TUPLE_H
+#define CONTAINER_TUPLE_H
+
+#include <vtl/internal/container.hpp>
+#if CONTAINER_USE_STL_TUPLE
+#include <tuple>
+template <typename... Types>
+using tuple = std::tuple<Types...>;
+using std::get;
+using std::apply;
+using std::for_each;
+using std::tuple_cat;
+using std::tie;
+using std::forward_as_tuple;
+using std::ignore;
+namespace vtl {
+using std::make_tuple;
+}
+#else
+#include <type_traits>
+#include <utility>
+#include <vtl/pair>
+#include <vtl/internal/expr.hpp>
+
+namespace vtl {
+template <typename... Types>
+class TupleImpl;
+
+template <>
+class TupleImpl<> {
+public:
+    static constexpr size_t size = 0;
+
+    constexpr TupleImpl() = default;
+    constexpr TupleImpl(const TupleImpl &) = default;
+    constexpr TupleImpl(TupleImpl &&) = default;
+    constexpr TupleImpl &operator=(const TupleImpl &) = default;
+    constexpr TupleImpl &operator=(TupleImpl &&) = default;
+    void destroy() {}
+
+    template <size_t I>
+    constexpr const auto &get() const
+    {
+        static_assert(I < 0, "Empty tuple used");
+        return *static_cast<const void *>(NULL);
+    }
+    template<size_t I>
+    constexpr auto &get()
+    {
+        static_assert(I < 0, "Empty tuple used");
+        return *static_cast<void *>(NULL);
+    }
+    template <typename T>
+    constexpr const auto &get() const
+    {
+        static_assert(std::is_same<T, void>::value, "Empty tuple used");
+        return *static_cast<T *>(NULL);
+    }
+    template <typename T>
+    constexpr auto &get()
+    {
+        static_assert(std::is_same<T, void>::value, "Empty tuple used");
+        return *static_cast<T *>(NULL);
+    }
+};
+
+template <typename T>
+class TupleImpl<T> {
+    template <typename... Types> friend class TupleImpl;
+private:
+    T head;
+public:
+    static constexpr size_t size = 1ul;
+
+    constexpr TupleImpl() = default;
+    template <typename U>
+    constexpr TupleImpl(U &&first) : head(std::forward<U>(first)) {}
+    constexpr TupleImpl(const TupleImpl &) = default;
+    constexpr TupleImpl(TupleImpl &&) = default;
+    constexpr TupleImpl &operator=(const TupleImpl &) = default;
+    constexpr TupleImpl &operator=(TupleImpl &&) = default;
+    void destroy() { ann_helper::optional_destroy(head); }
+
+    template <size_t I>
+    constexpr const auto &get() const &
+    {
+        static_assert(I == 0, "incorrect get index");
+        return head;
+    }
+    template<size_t I>
+    constexpr auto &get() &
+    {
+        static_assert(I == 0, "incorrect get index");
+        return head;
+    }
+    template<size_t I>
+    constexpr auto &&get() &&
+    {
+        static_assert(I == 0, "incorrect get index");
+        return std::move(head);
+    }
+    template <typename U>
+    constexpr const auto &get() const &
+    {
+        static_assert(std::is_same<U, T>::value, "incorrect type parameter for get");
+        return head;
+    }
+    template <typename U>
+    constexpr auto &get() &
+    {
+        static_assert(std::is_same<U, T>::value, "incorrect type parameter for get");
+        return head;
+    }
+    template <typename U>
+    constexpr auto &&get() &&
+    {
+        static_assert(std::is_same<U, T>::value, "incorrect type parameter for get");
+        return std::move(head);
+    }
+
+private:
+    constexpr const T &head_ref() const { return head; }
+    constexpr T &head_ref() { return head; }
+};
+
+template <typename T, typename... Rest>
+class TupleImpl<T, Rest...> {
+    template <typename... Types> friend class TupleImpl;
+private:
+    T head;
+    TupleImpl<Rest...> tail;
+
+    template<size_t I, typename T1, typename... Rest1>
+    struct TypeAt {
+        using type = typename TypeAt<I - 1, Rest1...>::type;
+    };
+    template<typename T1, typename... Rest1>
+    struct TypeAt<0, T1, Rest1...> {
+        using type = T1;
+    };
+
+public:
+    static constexpr size_t size = sizeof...(Rest) + 1ul;
+
+    constexpr TupleImpl() = default;
+    template <typename U, typename... Us,
+              typename std::enable_if<sizeof...(Us) == sizeof...(Rest), int>::type = 0>
+    constexpr TupleImpl(U &&first, Us &&...rest)
+        : head(std::forward<U>(first)), tail(std::forward<Us>(rest)...) {}
+    constexpr TupleImpl(const TupleImpl &) = default;
+    constexpr TupleImpl(TupleImpl &&) = default;
+    template <typename U, typename V>
+    constexpr TupleImpl(const Pair<U, V> &other)
+        : head(other.first), tail(other.second)
+        { static_assert(sizeof...(Rest) == 1ul, "compile error with constructor mismatch"); }
+    template <typename U, typename V>
+    constexpr TupleImpl(Pair<U, V> &&other)
+        : head(std::move(other.first)), tail(std::move(other.second))
+        { static_assert(sizeof...(Rest) == 1ul, "compile error with constructor mismatch"); }
+    constexpr TupleImpl &operator=(const TupleImpl &) = default;
+    constexpr TupleImpl &operator=(TupleImpl &&) = default;
+    /* only works for TupleImpl with exactly 2 elements */
+    template <typename U, typename V>
+    constexpr TupleImpl &operator=(const Pair<U, V> &other)
+    {
+        static_assert(sizeof...(Rest) == 1ul, "compile error with assignment mismatch");
+        head = other.first;
+        tail.head_ref() = other.second;
+        return *this;
+    }
+    template <typename U, typename V>
+    constexpr TupleImpl &operator=(Pair<U, V> &&other)
+    {
+        static_assert(sizeof...(Rest) == 1ul, "compile error with assignment mismatch");
+        head = std::move(other.first);
+        tail.head_ref() = std::move(other.second);
+        return *this;
+    }
+
+    void destroy()
+    {
+        ann_helper::optional_destroy(head);
+        tail.destroy();
+    }
+
+    template<size_t I>
+    constexpr const typename TypeAt<I, T, Rest...>::type &get() const & {
+        CONSTEXPR_IF (I == 0) {
+            return head;
+        } else {
+            return tail.template get<I - 1ul>();
+        }
+    }
+
+    template<size_t I>
+    constexpr typename TypeAt<I, T, Rest...>::type &get() &
+    {
+        CONSTEXPR_IF (I == 0) {
+            return head;
+        } else {
+            return tail.template get<I - 1ul>();
+        }
+    }
+
+    template<size_t I>
+    constexpr typename TypeAt<I, T, Rest...>::type &&get() &&
+    {
+        CONSTEXPR_IF (I == 0) {
+            tail.destroy();
+            return std::move(head);
+        } else {
+            ann_helper::optional_destroy(head);
+            return std::move(tail).template get<I - 1ul>();
+        }
+    }
+
+    template<typename U>
+    constexpr const U &get() const & {
+        CONSTEXPR_IF (std::is_same<T, U>::value) {
+            return head;
+        } else {
+            return tail.template get<U>();
+        }
+    }
+
+    template<typename U>
+    constexpr U &get() & {
+        CONSTEXPR_IF (std::is_same<T, U>::value) {
+            return head;
+        } else {
+            return tail.template get<U>();
+        }
+    }
+
+    template<typename U>
+    constexpr U &&get() && {
+        CONSTEXPR_IF (std::is_same<T, U>::value) {
+            tail.destroy();
+            return std::move(head);
+        } else {
+            ann_helper::optional_destroy(head);
+            return std::move(tail).template get<U>();
+        }
+    }
+
+private:
+    constexpr const T &head_ref() const { return head; }
+    constexpr const TupleImpl<Rest...> &tail_ref() const { return tail; }
+    constexpr T &head_ref() { return head; }
+    constexpr TupleImpl<Rest...> &tail_ref() { return tail; }
+};
+} /* namespace vtl */
+
+template <typename T>
+struct tuple_size;
+template <typename... Types>
+struct tuple_size<vtl::TupleImpl<Types...>> : std::integral_constant<size_t, sizeof...(Types)> {};
+template <typename T>
+_GLIBCXX17_INLINE constexpr size_t tuple_size_v = tuple_size<T>::value;
+
+template <size_t I, typename T>
+struct tuple_element;
+template <size_t I, typename T, typename... Rest>
+struct tuple_element<I, vtl::TupleImpl<T, Rest...>> : tuple_element<I - 1, vtl::TupleImpl<Rest...>> {};
+template <typename T, typename... Rest>
+struct tuple_element<0, vtl::TupleImpl<T, Rest...>> { using type = T; };
+template <size_t I, typename T>
+using tuple_element_t = typename tuple_element<I, T>::type;
+
+namespace detail {
+template <typename T>
+struct IsTupleImpl : std::false_type {};
+template <typename... U>
+struct IsTupleImpl<vtl::TupleImpl<U...>> : std::true_type {};
+template <typename T>
+constexpr bool IsTuple() { return IsTupleImpl<typename std::decay<T>::type>::value; }
+
+template<typename... Tuples>
+struct total_size_impl;
+template<>
+struct total_size_impl<> { static constexpr size_t value = 0; };
+template<typename First, typename... Rest>
+struct total_size_impl<First, Rest...> {
+    static constexpr size_t value()
+    {
+        CONSTEXPR_IF (IsTuple<First>()) {
+            return First::size + total_size_impl<Rest...>::value;
+        } else {
+            return 1ul + total_size_impl<Rest...>::value;
+        }
+    }
+};
+template<typename... Tuples>
+_GLIBCXX17_INLINE constexpr size_t total_size = total_size_impl<Tuples...>::value();
+
+template<size_t I, typename... Tuples>
+struct nth_element_impl;
+template<size_t I, typename First, typename... Rest>
+struct nth_element_impl<I, First, Rest...> {
+private:
+    static constexpr size_t first_size = total_size<typename std::decay<First>::type>;
+public:
+    using type = std::conditional_t<
+        I < first_size,
+        nth_element_impl<I, typename std::decay<First>::type>,
+        typename nth_element_impl<I - first_size, Rest...>::type
+    >;
+};
+template<size_t I, typename TupleImpl>
+struct nth_element_impl<I, TupleImpl> {
+    using type = nth_element_impl<I, typename std::decay<TupleImpl>::type>;
+};
+template<size_t I, typename... Tuples>
+using nth_element_t = typename nth_element_impl<I, Tuples...>::type;
+
+template<typename... Tuples>
+struct cat_result_type;
+template<typename... Tuples>
+struct cat_result_type {
+    template<size_t... Is>
+    static vtl::TupleImpl<nth_element_t<Is, Tuples...>...> build_type(std::index_sequence<Is...>);
+    using type = decltype(build_type(std::make_index_sequence<total_size<Tuples...>>{}));
+};
+
+template<typename... Tuples>
+using cat_result_t = typename cat_result_type<Tuples...>::type;
+
+template<size_t I, size_t... Is, typename First, typename... Rest>
+constexpr decltype(auto) get_nth_impl(std::index_sequence<Is...>, First &&first, Rest &&...rest)
+{
+    constexpr size_t first_size = tuple_size_v<typename std::decay<First>::type>;
+    CONSTEXPR_IF (I < first_size) {
+        return std::get<I>(std::forward<First>(first));
+    } else {
+        constexpr size_t new_index = I - first_size;
+        return get_nth_impl<new_index>(
+            std::index_sequence<Is...>{}, 
+            std::forward<Rest>(rest)...
+        );
+    }
+}
+
+template<size_t I, size_t... Is, typename TupleImpl>
+constexpr decltype(auto) get_nth_impl(std::index_sequence<Is...>, TupleImpl &&tuple)
+    { return std::get<I>(std::forward<TupleImpl>(tuple)); }
+
+template<size_t I, typename... Tuples>
+constexpr decltype(auto) get_nth_element(Tuples &&...tuples)
+{
+    return get_nth_impl<I>(std::make_index_sequence<sizeof...(Tuples)>{}, 
+                           std::forward<Tuples>(tuples)...);
+}
+} /* namespace detail */
+
+namespace detail {
+template<typename T>
+struct is_member_function_pointer : std::false_type {};
+template<typename T, typename U>
+struct is_member_function_pointer<T U::*> : std::is_function<T> {};
+template<typename T>
+_GLIBCXX17_INLINE constexpr bool is_member_function_pointer_v = is_member_function_pointer<T>::value;
+
+template<typename T>
+struct is_member_object_pointer : std::false_type {};
+template<typename T, typename U>
+struct is_member_object_pointer<T U::*> : std::true_type {};
+template<typename T>
+_GLIBCXX17_INLINE constexpr bool is_member_object_pointer_v = is_member_object_pointer<T>::value;
+
+template<typename F, typename... Args>
+constexpr auto invoke_impl(F &&f, Args &&...args) 
+    -> typename std::enable_if<!is_member_function_pointer_v<typename std::decay<F>::type> && 
+                               !is_member_object_pointer_v<typename std::decay<F>::type>,
+        decltype(std::forward<F>(f)(std::forward<Args>(args)...))>::type
+    { return std::forward<F>(f)(std::forward<Args>(args)...); }
+
+template<typename F, typename T, typename... Args>
+constexpr auto invoke_impl(F &&f, T &&obj, Args &&...args)
+    -> typename std::enable_if<is_member_function_pointer_v<typename std::decay<F>::type> && 
+        std::is_base_of<typename std::decay<decltype(obj.*f)>::type,
+                        typename std::decay<T>::type>::value,
+        decltype((std::forward<T>(obj).*f)(std::forward<Args>(args)...))>::type
+    { return (std::forward<T>(obj).*f)(std::forward<Args>(args)...); }
+
+template<typename F, typename T, typename... Args>
+constexpr auto invoke_impl(F &&f, T &&obj, Args &&...args)
+    -> typename std::enable_if<is_member_function_pointer_v<typename std::decay<F>::type> && 
+        !std::is_base_of<typename std::decay<decltype(obj->*f)>::type,
+                         typename std::decay<T>::type>::value,
+        decltype((std::forward<T>(obj)->*f)(std::forward<Args>(args)...))>::type
+    { return (std::forward<T>(obj)->*f)(std::forward<Args>(args)...); }
+
+template<typename F, typename T>
+constexpr auto invoke_impl(F &&f, T &&obj)
+    -> typename std::enable_if<is_member_object_pointer_v<typename std::decay<F>::type>,
+        decltype(std::forward<T>(obj).*f)>::type
+    { return std::forward<T>(obj).*f; }
+
+template<typename F, typename T>
+constexpr auto invoke_impl(F &&f, T &&obj)
+    -> typename std::enable_if<is_member_object_pointer_v<typename std::decay<F>::type>,
+        decltype(std::forward<T>(obj)->*f)>::type
+    { return std::forward<T>(obj)->*f; }
+} /* namespace detail */
+
+template<typename F, typename... Args>
+constexpr auto invoke(F &&f, Args &&...args)
+    -> decltype(detail::invoke_impl(std::forward<F>(f), std::forward<Args>(args)...))
+    { return detail::invoke_impl(std::forward<F>(f), std::forward<Args>(args)...); }
+
+namespace detail {
+template<typename F, typename TupleImpl, std::size_t... Is>
+constexpr decltype(auto) apply_impl(F &&f, TupleImpl &&t, std::index_sequence<Is...>)
+    { return invoke(std::forward<F>(f), get<Is>(std::forward<TupleImpl>(t))...); }
+
+template<typename F, typename T, typename TupleImpl, std::size_t... Is>
+constexpr decltype(auto) apply_member_impl(F &&f, T &&obj, TupleImpl &&t, std::index_sequence<Is...>)
+    { return invoke(std::forward<F>(f), std::forward<T>(obj), get<Is>(std::forward<TupleImpl>(t))...); }
+} /* namespace detail */
+
+template<size_t I, typename... Types>
+constexpr const auto &get(const vtl::TupleImpl<Types...> &tuple) { return tuple.template get<I>(); }
+template<size_t I, typename... Types>
+constexpr auto &get(vtl::TupleImpl<Types...> &tuple) { return tuple.template get<I>(); }
+template<size_t I, typename... Types>
+constexpr auto &&get(vtl::TupleImpl<Types...> &&tuple) { return std::move(tuple).template get<I>(); }
+
+template <typename T, typename... Types>
+constexpr const auto &get(const vtl::TupleImpl<Types...> &tuple) { return tuple.template get<T>(); }
+template <typename T, typename... Types>
+constexpr auto &get(vtl::TupleImpl<Types...> &tuple) { return tuple.template get<T>(); }
+template <typename T, typename... Types>
+constexpr auto &&get(vtl::TupleImpl<Types...> &&tuple) { return std::move(tuple).template get<T>(); }
+
+template<typename F, typename TupleImpl>
+constexpr decltype(auto) apply(F &&f, TupleImpl &&t)
+{
+    return detail::apply_impl(
+        std::forward<F>(f),
+        std::forward<TupleImpl>(t),
+        std::make_index_sequence<tuple_size_v<typename std::remove_reference<TupleImpl>::type>>{}
+    );
+}
+
+template<typename F, typename T, typename TupleImpl>
+constexpr decltype(auto) apply(F &&f, T &&obj, TupleImpl &&t)
+{
+    return detail::apply_member_impl(
+        std::forward<F>(f),
+        std::forward<T>(obj),
+        std::forward<TupleImpl>(t),
+        std::make_index_sequence<tuple_size_v<typename std::remove_reference<TupleImpl>::type>>{}
+    );
+}
+
+template<typename TupleImpl, typename F>
+constexpr void for_each(TupleImpl &&tuple, F &&f)
+{
+#if __cplusplus >= 201703L
+    constexpr size_t n = tuple_size_v<std::decay_t<TupleImpl>>;
+    ann_helper::unroll<n>([&](auto i) {
+        if constexpr (std::is_invocable_v<F, decltype(i),
+            decltype(std::get<i>(std::forward<TupleImpl>(tuple)))>) {
+            return f(i, std::get<i>(std::forward<TupleImpl>(tuple)));
+        } else {
+            return f(std::get<i>(std::forward<TupleImpl>(tuple)));
+        }
+    });
+#else
+    auto for_each_impl = [&]<size_t... Is>(std::index_sequence<Is...>) {
+        (f(get<Is>(std::forward<TupleImpl>(tuple))), ...);
+    };
+    for_each_impl(std::make_index_sequence<tuple_size_v<typename std::decay<TupleImpl>::type>>{});
+#endif
+}
+
+template<typename... Tuples>
+constexpr auto tuple_cat(Tuples &&...tuples)
+{
+    using result_type = detail::cat_result_t<Tuples...>;
+    constexpr size_t total_elements = detail::total_size<Tuples...>;
+    return [&]<size_t... Is>(std::index_sequence<Is...>) {
+        return result_type{detail::get_nth_element<Is>(
+            std::forward<Tuples>(tuples)...)...};
+    }(std::make_index_sequence<total_elements>{});
+}
+
+template <typename... Types>
+vtl::TupleImpl<Types &...> tie(Types &...args) { return vtl::TupleImpl<Types &...>(args...); }
+
+template <class... Types>
+vtl::TupleImpl<Types &&...> forward_as_tuple(Types &&...args)
+    { return vtl::TupleImpl<Types &&...>(std::forward<Types>(args)...); }
+
+namespace detail {
+struct ignore_t {
+    template<typename T>
+    constexpr ignore_t(const T&) {}
+    constexpr ignore_t() = default;
+    constexpr ignore_t(const ignore_t &) = default;
+    template<typename T>
+    constexpr const ignore_t &operator=(const T &) const { return *this; }
+    constexpr const ignore_t &operator=(const ignore_t &) const { return *this; }
+};
+} /* namespace detail */
+
+/* to make it lower std compatible, we make it static rather than inline;
+ * and mix use may cause odr violation */
+static constexpr detail::ignore_t ignore{};
+
+template <typename... Types>
+using tuple = vtl::TupleImpl<Types...>;
+
+/* variable pack (auto [a, b] = ...) only use std::get :( */
+namespace std {
+template <typename... Types>
+struct tuple_size<vtl::TupleImpl<Types...>> : integral_constant<size_t, sizeof...(Types)> {};
+
+template <size_t I, typename... Types>
+struct tuple_element<I, vtl::TupleImpl<Types...>> {
+    using type = typename tuple_element<I, vtl::TupleImpl<Types...>>::type;
+};
+template <typename T, typename... Rest>
+struct tuple_element<0, vtl::TupleImpl<T, Rest...>> { 
+    using type = T; 
+};
+template <size_t I, typename T, typename... Rest>
+struct tuple_element<I, vtl::TupleImpl<T, Rest...>>
+    : tuple_element<I - 1ul, vtl::TupleImpl<Rest...>> {};
+
+template<size_t I, typename... Types>
+constexpr auto &&get(vtl::TupleImpl<Types...> &&tuple) { return std::move(tuple).template get<I>(); }
+template<size_t I, typename... Types>
+constexpr const auto &get(const vtl::TupleImpl<Types...> &tuple) { return tuple.template get<I>(); }
+template<size_t I, typename... Types>
+constexpr auto &get(vtl::TupleImpl<Types...> &tuple) { return tuple.template get<I>(); }
+
+} /* namespace std */
+
+#if __cplusplus >= 201703L
+namespace vtl {
+struct null_field {};
+template <typename... Ts>
+constexpr auto make_tuple([[maybe_unused]] Ts &&...vs)
+{
+    auto one_or_none = []([[maybe_unused]] auto &&x) {
+        if constexpr (std::is_convertible_v<decltype(x), const null_field &>) {
+            return tuple<>();
+        } else {
+            return tuple<>(std::forward<decltype(x)>(x));
+        }
+    };
+    return tuple_cat(one_or_none(std::forward<Ts>(vs))...);
+}
+
+template <size_t n, typename F, size_t... i>
+constexpr auto unroll_to_tuple(F &&f, std::index_sequence<i...> = {})
+{
+    if constexpr (sizeof...(i) != n) {
+        return unroll_to_tuple<n>(std::forward<F>(f), std::make_index_sequence<n>());
+    } else {
+        return make_tuple(f(std::integral_constant<size_t, i>())...);
+    }
+}
+} /* namespace vtl */
+#endif
+
+#endif /* CONTAINER_USE_STL_TUPLE */
+#endif /* CONTAINER_TUPLE_H */

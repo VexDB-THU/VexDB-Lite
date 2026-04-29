@@ -1,0 +1,653 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_VECTOR_H
+#define CONTAINER_VECTOR_H
+
+#include <vtl/allocator>
+
+#if CONTAINER_USE_STL_VECTOR
+#include <vector>
+template <typename T, bool = false, class Allocator = DEFAULT_ALLOCATOR<T>>
+using Vector = std::vector<T, Allocator>;
+#else
+#include <type_traits>  /* is_trivially_destructible */
+#include <utility>      /* forward */
+#include <algorithm>    /* min, max */
+#include <initializer_list>
+#include <vtl/internal/expr.hpp>
+#if !defined(PG_VEXDB_TARGET_DUCK)
+#include "utils/palloc.h"
+#include "utils/memutils.h"
+#endif
+
+template <typename T, class Allocator = DEFAULT_ALLOCATOR<T>, bool auto_init = true>
+class Vector {
+    constexpr static size_t default_capacity() { return sizeof(T) < 128lu ? 16lu : 4lu; }
+    /**
+     * msvc impl is amplifier = 1.5, gcc impl is amplifier = 2.
+     * Of course using amplifier = 2 helps to reduce the number of reallocations,
+     * but it prevent the possibilities for recollect memory fragmentation.
+     * The argument for gcc vector impl is that memory allocator tends not to
+     * reuse the memory that was freed since they like to put allocation with the same size
+     * in the same memory block.
+     * However, as the memvector is used to store the data while index construction,
+     * the common and bottlenecked use case is palloc_huge, which is not affected by above
+     * memory management, we choose amplifier = 1.5 for better huge memory alocation use case.
+     * Additionally, since the maintenace_work_mem is not considered internally, it's better to
+     * reallocate memory conservatively to prevent memory shortage.
+     */
+    constexpr static double amplifier = 1.5;
+public:
+    using value_type = T;
+    using iterator = T *;
+    using const_iterator = const T *;
+    using allocator_type = Allocator;
+    constexpr static bool return_reference = true;
+    FORCE_INLINE const allocator_type &get_allocator() const { return _store; }
+    FORCE_INLINE allocator_type &get_allocator() { return _store; }
+
+    Vector(size_t expect_size, const Allocator &alloc)
+        : _store(alloc, expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _end = _start = alloc0(get_allocator(), expect_size);
+    }
+    Vector(size_t expect_size, Allocator &&alloc)
+        : _store(std::move(alloc), expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _end = _start = alloc0(get_allocator(), expect_size);
+    }
+    explicit Vector(size_t expect_size) : Vector(expect_size, Allocator()) {}
+    Vector(size_t expect_size, const T &init_value, const Allocator &alloc)
+        : _store(alloc, expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(expect_size);
+        _end = _start + expect_size;
+        for (T *it = _start; it < _end; ++it) {
+            get_allocator().construct(it, init_value);
+        }
+    }
+    template <typename U, typename std::enable_if<
+        !std::is_same<T, typename std::decay<U>::type>::value &&
+            std::is_constructible<T, const U &>::value,
+        int>::type = 0>
+    Vector(size_t expect_size, const U &init_value, const Allocator &alloc)
+        : _store(alloc, expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(expect_size);
+        _end = _start + expect_size;
+        for (T *it = _start; it < _end; ++it) {
+            get_allocator().construct(it, init_value);
+        }
+    }
+    Vector(size_t expect_size, const T &init_value, Allocator &&alloc)
+        : _store(std::move(alloc), expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(expect_size);
+        _end = _start + expect_size;
+        for (T *it = _start; it < _end; ++it) {
+            get_allocator().construct(it, init_value);
+        }
+    }
+    template <typename U, typename std::enable_if<
+        !std::is_same<T, typename std::decay<U>::type>::value &&
+            std::is_constructible<T, const U &>::value,
+        int>::type = 0>
+    Vector(size_t expect_size, const U &init_value, Allocator &&alloc)
+        : _store(std::move(alloc), expect_size)
+    {
+        if (!auto_init && expect_size == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(expect_size);
+        _end = _start + expect_size;
+        for (T *it = _start; it < _end; ++it) {
+            get_allocator().construct(it, init_value);
+        }
+    }
+    Vector(size_t expect_size, const T &init_value) : Vector(expect_size, init_value, Allocator()) {}
+    template <typename U, typename std::enable_if<
+        !std::is_same<T, typename std::decay<U>::type>::value &&
+            std::is_constructible<T, const U &>::value,
+        int>::type = 0>
+    Vector(size_t expect_size, const U &init_value) : Vector(expect_size, init_value, Allocator()) {}
+    Vector(std::initializer_list<T> list, const Allocator &alloc)
+        : _store(alloc, list.size())
+    {
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        _end = _start;
+        for (const auto &i : list) {
+            get_allocator().construct(_end, i);
+            ++_end;
+        }
+    }
+    Vector(std::initializer_list<T> list, Allocator &&alloc)
+        : _store(std::move(alloc), list.size())
+    {
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        _end = _start;
+        for (const auto &i : list) {
+            get_allocator().construct(_end, i);
+            ++_end;
+        }
+    }
+    Vector(std::initializer_list<T> list) : Vector(list, Allocator()) {}
+    template <typename F_IN, class F>
+    Vector(std::initializer_list<F_IN> list, F &&f, const Allocator &alloc)
+        : _store(alloc, list.size())
+    {
+        static_assert(IS_INVOCABLE(F, F_IN), "F must be called by elements in list");
+        static_assert(std::is_constructible<T, RESULT_OF(F, F_IN)>::value,
+                      "T must be constructiable by result of F(F_IN)");
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        _end = _start;
+        for (const auto &i : list) {
+            get_allocator().construct(_end, f(i));
+            ++_end;
+        }
+    }
+    template <typename F_IN, class F>
+    Vector(std::initializer_list<F_IN> list, F &&f, Allocator &&alloc)
+        : _store(std::move(alloc), list.size())
+    {
+        static_assert(IS_INVOCABLE(F, F_IN), "F must be called by elements in list");
+        static_assert(std::is_constructible<T, RESULT_OF(F, F_IN)>::value,
+                      "T must be constructiable by result of F(F_IN)");
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        _end = _start;
+        for (const auto &i : list) {
+            get_allocator().construct(_end, f(i));
+            ++_end;
+        }
+    }
+    template <typename F_IN, class F>
+    Vector(std::initializer_list<F_IN> list, F &&f) : Vector(list, std::forward<F>(f), Allocator()) {}
+    template <typename InputIt>
+    Vector(InputIt start, InputIt end, const Allocator &alloc)
+        : _store(alloc, std::distance(start, end))
+    {
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        CONSTEXPR_IF(copy_by_mem<InputIt>) {
+            memcpy(_start, start, sizeof(T) * capacity());
+            _end = _start + capacity();
+        } else {
+            _end = _start;
+            for (auto i = start; i != end; ++i) {
+                get_allocator().construct(_end, *i);
+                ++_end;
+            }
+        }
+    }
+    template <typename InputIt>
+    Vector(InputIt start, InputIt end, Allocator &&alloc)
+        : _store(std::move(alloc), std::distance(start, end))
+    {
+        if (!auto_init && capacity() == 0) {
+            return;
+        }
+        _start = get_allocator().allocate(capacity());
+        CONSTEXPR_IF(copy_by_mem<InputIt>) {
+            memcpy(_start, start, sizeof(T) * capacity());
+            _end = _start + capacity();
+        } else {
+            _end = _start;
+            for (auto i = start; i != end; ++i) {
+                get_allocator().construct(_end, *i);
+                ++_end;
+            }
+        }
+    }
+    template <typename InputIt>
+    Vector(InputIt start, InputIt end) : Vector(start, end, Allocator()) {}
+    
+    Vector() : Vector(auto_init ? default_capacity() : 0, Allocator()) {}
+    explicit Vector(const Allocator &alloc) : Vector(auto_init ? default_capacity() : 0, alloc) {}
+    explicit Vector(Allocator &&alloc) : Vector(auto_init ? default_capacity() : 0, std::move(alloc)) {}
+    Vector(Vector &&other)
+        : _start(other._start), _end(other._end), _store(std::move(other._store))
+    {
+        other._start = NULL;
+        other._end = NULL;
+        other._store.capacity = 0;
+    }
+    Vector(const Vector &other, const Allocator &alloc)
+        : _store(alloc, other.capacity())
+    {
+        _start = get_allocator().allocate(capacity());
+        _end = _start + other.size();
+        T *other_it = other._start;
+        for (T *it = _start; it < _end; ++it, ++other_it) {
+            get_allocator().construct(it, *other_it);
+        }
+    }
+    Vector(const Vector &other, Allocator &&alloc)
+        : _store(std::move(alloc), other.size())
+    {
+        _start = get_allocator().allocate(capacity());
+        _end = _start + other.size();
+        T *other_it = other._start;
+        for (T *it = _start; it < _end; ++it, ++other_it) {
+            get_allocator().construct(it, *other_it);
+        }
+    }
+    Vector(const Vector &other) : Vector(other, Allocator()) {}
+    Vector &operator=(Vector &&other)
+    {
+        if (this != &other) {
+            destroy();
+            swap(other);
+        }
+        return *this;
+    }
+    Vector &operator=(const Vector &other)
+    {
+        if (this != &other) {
+            destroy();
+            _store = other._store;
+            _start = get_allocator().allocate(capacity());
+            _end = _start + other.size();
+            T *other_it = other._start;
+            for (T *it = _start; it < _end; ++it, ++other_it) {
+                get_allocator().construct(it, *other_it);
+            }
+        }
+        return *this;
+    }
+    void swap(Vector &other)
+    {
+        std::swap(_start, other._start);
+        std::swap(_end, other._end);
+        std::swap(_store, other._store);
+    }
+
+    void reserve(size_t expect_size) { expand_to(expect_size); }
+    
+    void expand_size(size_t expect_size)
+    {
+        if (!auto_init && !_start) {
+            capacity() = expect_size;
+            _start = alloc0(get_allocator(), expect_size);
+            _end = _start + expect_size;
+        }
+        if (expect_size <= size()) {
+            return;
+        }
+        if (expect_size <= capacity()) {
+            _end = _start + expect_size;
+            return;
+        }
+        capacity() = std::max(size_t(capacity() * amplifier), expect_size + 1ul);
+        _start = realloc(get_allocator(), _start, capacity());
+        _end = _start + expect_size;
+    }
+
+    template <typename U>
+    void resize(size_t expect_size, const U &arg)
+    {
+        if (expect_size == size()) {
+            return;
+        }
+        if (expect_size < size()) {
+            if (require_dest) {
+                for (T *it = _start + expect_size; it < _end; ++it) {
+                    destroy_element(it);
+                }
+            }
+            shrink_to(expect_size);
+        } else {
+            expand_to(expect_size);
+            T *new_end = _start + expect_size;
+            for (T *it = _end; it < new_end; ++it) {
+                get_allocator().construct(it, arg);
+            }
+        }
+        _end = _start + expect_size;
+    }
+    void resize(size_t expect_size)
+    {
+        if (expect_size == size()) {
+            return;
+        }
+        if (expect_size < size()) {
+            if (require_dest) {
+                for (T *it = _start + expect_size; it < _end; ++it) {
+                    destroy_element(it);
+                }
+            }
+            shrink_to(expect_size);
+        } else {
+            expand_to(expect_size);
+            if (!std::is_trivially_default_constructible<T>::value) {
+                T *new_end = _start + expect_size;
+                for (T *it = _end; it < new_end; ++it) {
+                    get_allocator().construct(it);
+                }
+            }
+        }
+        _end = _start + expect_size;
+    }
+
+    void set(size_t idx, const T &val) { Assert(idx < size()); _start[idx] = val; }
+    void insert(size_t idx, const T &val)
+    {
+        Assert(idx <= size());
+        expand_to(size() + 1ul);
+        T *pos = _start + idx;
+        if (idx < size()) {
+            move_elem(pos + 1, pos, _end - pos);
+        }
+        get_allocator().construct(pos, val);
+        ++_end;
+    }
+    void insert(size_t idx, T &&val)
+    {
+        Assert(idx <= size());
+        expand_to(size() + 1ul);
+        T *pos = _start + idx;
+        if (idx < size()) {
+            move_elem(pos + 1, pos, _end - pos);
+        }
+        get_allocator().construct(pos, std::move(val));
+        ++_end;
+    }
+    void insert(iterator pos, const T &val) { insert(pos - _start, val); }
+    void insert(iterator pos, T &&val) { insert(pos - _start, std::move(val)); }
+    void insert(const_iterator pos, const T &val) { insert(pos - _start, val); }
+    void insert(const_iterator pos, T &&val) { insert(pos - _start, std::move(val)); }
+    template <class InputIt>
+    void insert(iterator pos, InputIt first, InputIt last)
+    {
+        Assert(pos >= _start && pos <= _end);
+        if (pos == _end) {
+            push_back(first, last);
+            return;
+        }
+        size_t n = std::distance(first, last);
+        size_t nmoved = _end - pos;
+        expand_to(size() + n);
+        move_elem(pos + n, pos, nmoved);
+        CONSTEXPR_IF(copy_by_mem<InputIt>) {
+            /* if first is not in the range, it will be wierd for last be in the range */
+            if (first >= _start && first < _end) {
+                memmove(pos, first, sizeof(T) * n);
+            } else {
+                memcpy(pos, first, sizeof(T) * n);
+            }
+        } else {
+            for (auto it = first; it != last; ++it) {
+                get_allocator().construct(pos++, *it);
+            }
+        }
+        _end += n;
+    }
+
+    void push_back(const T &val)
+    {
+        expand_to(size() + 1ul);
+        get_allocator().construct(_end++, val);
+    }
+    void push_back(T &&val) { expand_to(size() + 1ul); get_allocator().construct(_end++, std::move(val)); }
+    template <class InputIt>
+    void push_back(InputIt first, InputIt last)
+    {
+        size_t n = std::distance(first, last);
+        expand_to(size() + n);
+        CONSTEXPR_IF(copy_by_mem<InputIt>) {
+            /* if first is not in the range, it will be wierd for last be in the range */
+            if (first >= _start && first < _end) {
+                memmove(_end, first, sizeof(T) * n);
+            } else {
+                memcpy(_end, first, sizeof(T) * n);
+            }
+            _end += n;
+            return;
+        }
+        for (auto it = first; it != last; ++it) {
+            get_allocator().construct(_end++, *it);
+        }
+    }
+    template <typename... Args>
+    void emplace_back(Args &&...args)
+    {
+        expand_to(size() + 1ul);
+        get_allocator().construct(_end++, std::forward<Args>(args)...);
+    }
+    void pop_back() { destroy_element(--_end); }
+    void pop_front()
+    {
+        destroy_element(*_start);
+        move_left(_start);
+        --_end;
+    }
+    iterator erase(iterator it)
+    {
+        if (it == end()) {
+            return end();
+        }
+        destroy_element(*it);
+        move_left(it);
+        --_end;
+        return it;
+    }
+    const_iterator erase(const_iterator it)
+    {
+        if (it == cend()) {
+            return cend();
+        }
+        destroy_element(const_cast<T &>(*it));
+        move_left(const_cast<T *>(it));
+        --_end;
+        return it;
+    }
+    template <class F>
+    size_t erase_if(F f, bool erase_once = false)
+    {
+        static_assert(IS_INVOCABLE_R(F, bool, T &) || IS_INVOCABLE_R(F, bool, const T &),
+                      "F must be invocable with (const) T & and return bool");
+        static_assert(std::is_standard_layout<T>::value, "T must be standard layout");
+        size_t res = 0;
+        for (T *cursor = _end - 1; cursor >= _start; --cursor) {
+            if (!f(*cursor)) {
+                continue;
+            }
+            destroy_element(cursor);
+            move_left(cursor);
+            --_end;
+            ++res;
+            if (erase_once) {
+                break;
+            }
+        }
+        return res;
+    }
+
+    size_t size() const { return _end - _start; }
+    const size_t &capacity() const { return _store.capacity; }
+    size_t &capacity() { return _store.capacity; }
+    bool empty() const { return _start == _end; }
+
+    bool operator==(const Vector &other) const
+    {
+        if (size() != other.size()) {
+            return false;
+        }
+        const_iterator it1 = cbegin();
+        const_iterator it2 = other.cbegin();
+        while (it1 != cend()) {
+            if (*it1 != *it2) {
+                return false;
+            }
+            ++it1;
+            ++it2;
+        }
+        return true;
+    }
+    bool operator!=(const Vector &other) const { return !(*this == other); }
+
+    const T &operator[](size_t idx) const { Assert(idx < size()); return _start[idx]; }
+    T &operator[](size_t idx) { Assert(idx < size()); return _start[idx]; }
+    const T &front() const { Assert(_end > _start); return *_start; }
+    T &front() { Assert(_end > _start); return *_start; }
+    const T &back() const { Assert(_end > _start); return *(_end - 1); }
+    T &back() { Assert(_end > _start); return *(_end - 1); }
+    const_iterator cat(size_t idx) const { return std::min(_start + idx, _end); }
+    const_iterator at(size_t idx) const { return cat(idx); }
+    iterator at(size_t idx) { return std::min(_start + idx, _end); }
+
+    const_iterator of(const T &elem) const { return get_allocator().address(elem);}
+    iterator of(T &elem) { return get_allocator().address(elem); }
+
+    size_t offset(const_iterator it) const
+    {
+        Assert(it >= _start && it < _end);
+        return it - _start;
+    }
+    size_t offset(const T &elem) const { return offset(of(elem)); }
+
+    const T *data() const { return _start; }
+    T *data() { return _start; }
+    const_iterator cbegin() const { return _start; }
+    const_iterator cend() const { return _end; }
+    const_iterator begin() const { return _start; } /* for const for loop */
+    const_iterator end() const { return _end; }
+    iterator begin() { return _start; }
+    iterator end() { return _end; }
+    const_iterator crbegin() const { return _end - 1; }
+    const_iterator crend() const { return _start - 1; }
+    iterator rbegin() { return _end - 1; }
+    iterator rend() { return _start - 1; }
+
+    void destroy()
+    {
+        if (_start) {
+            if (require_dest) {
+                for (auto &v : *this) {
+                    destroy_element(v);
+                }
+            }
+            get_allocator().deallocate(_start, capacity());
+            _start = NULL;
+            _end = NULL;
+            capacity() = 0;
+        }
+    }
+    void clear_no_destroy() { _end = _start; }
+    void clear()
+    {
+        if (require_dest) {
+            for (auto &v : *this) {
+                destroy_element(v);
+            }
+        }
+        clear_no_destroy();
+    }
+    void shrink_to_fit() { shrink_to(size()); }
+private:
+    constexpr static bool require_dest =
+        !std::is_trivially_destructible<T>::value || ann_helper::internal::has_destroyer<T>::value;
+    template <typename InputIt>
+    constexpr static bool copy_by_mem = std::is_pointer<InputIt>::value &&
+        std::is_same<PureType(typename std::remove_pointer<InputIt>::type), T>::value &&
+        std::is_trivially_copy_constructible<T>::value;
+
+    T *_start{NULL};
+    T *_end{NULL};
+    struct Store : public Allocator {
+        Store(const Allocator &alloc, size_t cap) : Allocator(alloc), capacity(cap) {}
+        Store(Allocator &&alloc, size_t cap) : Allocator(std::move(alloc)), capacity(cap) {}
+        Store(const Store &) = default;
+        Store(Store &&) = default;
+        Store &operator=(const Store &) = default;
+        Store &operator=(Store &&) = default;
+        void swap(Store &other)
+        {
+            std::swap(static_cast<Allocator &>(*this), static_cast<Allocator &>(other));
+            std::swap(capacity, other.capacity);
+        }
+        size_t capacity;
+    } _store;
+
+    void expand_to(size_t expect_size)
+    {
+        if (!auto_init && !_start) {
+            capacity() = expect_size;
+            _start = alloc0(get_allocator(), expect_size);
+            _end = _start;
+        }
+        if (expect_size <= capacity()) {
+            return;
+        }
+        capacity() = std::max(size_t(capacity() * amplifier), expect_size + 1ul);
+        const size_t old_size = size();
+        _start = realloc(get_allocator(), _start, capacity());
+        _end = _start + old_size;
+    }
+    void shrink_to(size_t expect_size)
+    {
+        capacity() = std::max(expect_size, default_capacity());
+        size_t old_size = size();
+        _start = realloc(get_allocator(), _start, capacity());
+        _end = _start + std::min(old_size, capacity());
+    }
+
+    void destroy_element(T &elem)
+    {
+        if (!std::is_pointer<T>::value) {
+            get_allocator().destroy(&elem);
+        }
+    }
+    void destroy_element(T *elem)
+    {
+        if (!std::is_pointer<T>::value) {
+            get_allocator().destroy(elem);
+        }
+    }
+    void move_elem(T *from, T *to, size_t size)
+    {
+#if defined(__GNUC__) && __GNUC__ >= 8 && __cplusplus >= 201703L
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wclass-memaccess"
+#endif
+        memmove(from, to, sizeof(T) * size);
+#if defined(__GNUC__) && __GNUC__ >= 8 && __cplusplus >= 201703L
+#pragma GCC diagnostic pop
+#endif
+    }
+    void move_left(T *start)
+    {
+        move_elem(start, start + 1, _end - start - 1);
+    }
+};
+#endif /* CONTAINER_USE_STL_VECTOR */
+#endif /* CONTAINER_VECTOR_H */

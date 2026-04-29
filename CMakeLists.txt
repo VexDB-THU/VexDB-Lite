@@ -1,38 +1,125 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.14)
+project(pg_vexdb CXX C)
 
-project(VexDBLiteStandalone)
-
-set(DUCKDB_SOURCE_DIR "" CACHE PATH "Absolute path to DuckDB source tree")
-if(NOT DUCKDB_SOURCE_DIR)
-  message(FATAL_ERROR
-    "DUCKDB_SOURCE_DIR is required. Example: cmake -S . -B build -DDUCKDB_SOURCE_DIR=/path/to/duckdb")
+set(PG_CONFIG_BIN "$ENV{PG_CONFIG}" CACHE STRING "Path to pg_config")
+if(NOT PG_CONFIG_BIN)
+    set(PG_CONFIG_BIN pg_config)
 endif()
 
-get_filename_component(VEXDB_ROOT_REAL "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
-get_filename_component(DUCKDB_ROOT_REAL "${DUCKDB_SOURCE_DIR}" REALPATH)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if(VEXDB_ROOT_REAL STREQUAL DUCKDB_ROOT_REAL)
-  message(FATAL_ERROR
-    "DUCKDB_SOURCE_DIR cannot point to this repository itself in standalone mode. "
-    "Use a separate DuckDB checkout.")
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+    message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
 endif()
 
-if(NOT EXISTS "${DUCKDB_SOURCE_DIR}/CMakeLists.txt")
-  message(FATAL_ERROR "Invalid DUCKDB_SOURCE_DIR: '${DUCKDB_SOURCE_DIR}' (CMakeLists.txt not found)")
+execute_process(
+    COMMAND ${PG_CONFIG_BIN} --includedir-server
+    OUTPUT_VARIABLE PG_INCLUDE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+    COMMAND ${PG_CONFIG_BIN} --libdir
+    OUTPUT_VARIABLE PG_LIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+    COMMAND ${PG_CONFIG_BIN} --pkglibdir
+    OUTPUT_VARIABLE PG_PKGLIB_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+execute_process(
+    COMMAND ${PG_CONFIG_BIN} --sharedir
+    OUTPUT_VARIABLE PG_SHARE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+message(STATUS "PostgreSQL include: ${PG_INCLUDE_DIR}")
+message(STATUS "PostgreSQL lib: ${PG_LIB_DIR}")
+message(STATUS "PostgreSQL pkglib: ${PG_PKGLIB_DIR}")
+message(STATUS "PostgreSQL sharedir: ${PG_SHARE_DIR}")
+
+include_directories(
+    ${PG_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/distance
+    ${CMAKE_SOURCE_DIR}/src/distance
+    ${CMAKE_SOURCE_DIR}/vec_types
+    ${CMAKE_SOURCE_DIR}/rabitq
+    ${CMAKE_SOURCE_DIR}/module
+    /usr/include
+)
+
+add_compile_options(-std=c++17 -fPIC -fno-exceptions -Wno-write-strings -Wno-ignored-attributes)
+
+if(CMAKE_BUILD_TYPE STREQUAL "DEBUG")
+    add_compile_options(-O0)
+endif()
+add_compile_options(-g)
+add_compile_definitions(PG_EXTENSION HAVE_CXX_TYPEOF_UNQUAL)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set(SSE_FLAGS "-msse4.1 -msse4.2 -mfma -mf16c")
+    set(AVX_FLAGS "-mavx2 -mfma -mf16c")
+    set(AVX512_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512vl -mf16c")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(SSE_FLAGS "")
+    set(AVX_FLAGS "")
+    set(AVX512_FLAGS "")
 endif()
 
-# Build extension selection via custom config file.
-set(BUILD_EXTENSIONS "" CACHE STRING "DuckDB extensions to build" FORCE)
-set(DUCKDB_EXTENSION_CONFIGS
-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/vex_standalone_extension_config.cmake"
-    CACHE STRING "Extra DuckDB extension config files" FORCE)
+set(GRAPH_INDEX_SRCS
+    src/graph_index_am.cpp
+    src/session_compat.cpp
+    src/guc_config.cpp
+    src/graph_index.cpp
+    src/graph_index_build.cpp
+    src/graph_index_insert.cpp
+    src/graph_index_inspect.cpp
+    src/graph_index_scan.cpp
+    src/graph_index_utils.cpp
+    src/graph_index_vacuum.cpp
+    src/graph_index_xlog.cpp
+    src/floatvector.cpp
+    src/halfvec.cpp
+    src/ann_utils.cpp
+    src/pg_yield.cpp
+    src/vector_storage.cpp
+    src/vector_smgr.cpp
+    src/pq.cpp
+    src/rabitq_distancer.cpp
+    src/bulkbuf_smgr.cpp
+    src/quantizer_stubs.cpp
+    src/shared_alloc_set.cpp
+    src/vecbuf_worker.cpp
+    knl/knl_alloc.cpp
+)
 
-# Keep the build focused on extension artifacts.
-set(BUILD_EXTENSIONS_ONLY ON CACHE BOOL "Build only extensions" FORCE)
-set(BUILD_MAIN_DUCKDB_LIBRARY OFF CACHE BOOL "Skip building DuckDB core binaries" FORCE)
-set(BUILD_UNITTESTS OFF CACHE BOOL "Disable DuckDB unittests" FORCE)
-set(BUILD_BENCHMARKS OFF CACHE BOOL "Disable DuckDB benchmarks" FORCE)
-set(BUILD_SHELL OFF CACHE BOOL "Disable DuckDB shell" FORCE)
-set(EXTENSION_STATIC_BUILD OFF CACHE BOOL "Do not link extension against duckdb_static" FORCE)
+set(DISTANCE_SRCS
+    src/distance/architecture.cpp
+    src/distance/distance.cpp
+    src/distance/general.cpp
+    src/distance/general_dispatcher.cpp
+    src/distance/sse.cpp
+    src/distance/avx.cpp
+    src/distance/avx512.cpp
+    src/distance/sse_dispatcher.cpp
+    src/distance/avx_dispatcher.cpp
+    src/distance/avx512_dispatcher.cpp
+)
 
-add_subdirectory("${DUCKDB_SOURCE_DIR}" _duckdb)
+add_library(pg_vexdb SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS})
+set_target_properties(pg_vexdb PROPERTIES OUTPUT_NAME "pg_vexdb" PREFIX "")
+target_link_libraries(pg_vexdb stdc++)
+
+set_source_files_properties(src/distance/sse.cpp src/distance/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
+set_source_files_properties(src/distance/avx.cpp src/distance/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
+set_source_files_properties(src/distance/avx512.cpp src/distance/avx512_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX512_FLAGS}")
+
+install(TARGETS pg_vexdb LIBRARY DESTINATION "${PG_PKGLIB_DIR}")
+install(FILES sql/pg_vexdb--1.0.sql DESTINATION "${PG_SHARE_DIR}/extension")
+install(FILES pg_vexdb.control DESTINATION "${PG_SHARE_DIR}/extension")

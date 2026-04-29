@@ -1,0 +1,423 @@
+/**
+ * Copyright ...
+ */
+
+#ifndef CONTAINER_BIT_VECTOR_H
+#define CONTAINER_BIT_VECTOR_H
+
+#include <vtl/allocator>
+#include <vtl/internal/expr.hpp>
+#if !defined(PG_VEXDB_TARGET_DUCK)
+#include "utils/palloc.h"
+#endif
+
+template <class Allocator = DEFAULT_ALLOCATOR<uint64>>
+class BitVector : public Allocator {
+    using alloc_type = Allocator;
+public:
+    struct iterator {
+        iterator(uint64 *data, size_t idx)
+            : _data(data + idx / BIT_PER_UNIT),
+              _idx(idx % BIT_PER_UNIT) {}
+        iterator &operator++()
+        {
+            ++_idx;
+            if (_idx >= BIT_PER_UNIT) {
+                ++_data;
+                _idx = 0;
+            }
+            return *this;
+        }
+        bool operator!=(const iterator &other) const
+            { return _data != other._data || _idx != other._idx; }
+        bool operator*() const { return (*_data & (1ul << _idx)) != 0; }
+    private:
+        uint64 *_data;
+        size_t _idx;
+    };
+
+    explicit BitVector(const Allocator &alloc = Allocator()) : alloc_type(alloc) {}
+    BitVector(size_t size, const Allocator &alloc = Allocator())
+        : alloc_type(alloc) { reserve(size); }
+    ~BitVector() = default;
+    void swap(BitVector &other)
+    {
+        std::swap(_data, other._data);
+        std::swap(_size, other._size);
+        std::swap(_num_bits, other._num_bits);
+        std::swap(get_allocator(), other.get_allocator());
+    }
+
+    void clear()
+    {
+        if (_data) {
+            memset(_data, 0, _size * sizeof(uint64));
+        }
+        _num_bits = 0;
+    }
+    void destroy()
+    {
+        if (_data) {
+            get_allocator().deallocate(_data, _size);
+            _data = NULL;
+            _size = 0;
+        }
+    }
+
+    void reserve(size_t size)
+    {
+        size_t nunit = (size + BIT_PER_UNIT - 1) / BIT_PER_UNIT;
+        expand_to(nunit);
+    }
+    size_t size() const { return _num_bits; }
+    FORCE_INLINE const Allocator &get_allocator() const { return *this; }
+    FORCE_INLINE Allocator &get_allocator() { return *this; }
+
+    bool operator[](size_t idx) const
+    {
+        size_t nunit = idx / BIT_PER_UNIT;
+        return (_data[nunit] & (1ul << (idx % BIT_PER_UNIT))) != 0;
+    }
+    bool get(size_t idx)
+    {
+        size_t nunit = idx / BIT_PER_UNIT;
+        if (_num_bits <= idx) {
+            _num_bits = idx + 1ul;
+            expand_to(nunit + 1ul);
+        }
+        size_t offset = idx % BIT_PER_UNIT;
+        return (_data[nunit] & (1ul << offset)) != 0;
+    }
+    void set(size_t idx, bool val = true)
+    {
+        size_t nunit = idx / BIT_PER_UNIT;
+        if (_num_bits <= idx) {
+            _num_bits = idx + 1ul;
+            expand_to(nunit + 1ul);
+        }
+        size_t offset = idx % BIT_PER_UNIT;
+        if (val) {
+            _data[nunit] |= (1ul << offset);
+        } else {
+            _data[nunit] &= ~(1ul << offset);
+        }
+    }
+    void append() { get(size()); }
+
+    size_t rank(size_t idx) const
+    {
+        size_t unit_id = idx / BIT_PER_UNIT;
+        size_t res = 0;
+        for (size_t i = 0; i < unit_id; ++i) {
+            res += __builtin_popcountll(_data[i]);
+        }
+        return res + __builtin_popcountll(_data[unit_id] & (~0ul >> (BIT_PER_UNIT - (idx % BIT_PER_UNIT))));
+    }
+    size_t num_ones() const { return rank(size() - 1ul); }
+
+    iterator begin() const { return iterator(_data, 0); }
+    iterator end() const { return iterator(_data, size()); }
+    iterator at(size_t idx) const { return iterator(_data, idx); }
+private:
+    constexpr static size_t BIT_PER_UNIT = sizeof(uint64) * __CHAR_BIT__;
+    uint64 *_data{NULL};
+    size_t _size{0};
+    size_t _num_bits{0};
+
+    void expand_to(size_t elem_size)
+    {
+        if (_size >= elem_size) {
+            return;
+        }
+        if (_data) {
+            _data = realloc(get_allocator(), _data, elem_size);
+            memset(_data + _size, 0, (elem_size - _size) * sizeof(uint64));
+        } else {
+            _data = alloc0(get_allocator(), elem_size);
+        }
+        _size = elem_size;
+    }
+};
+
+template <size_t N>
+class BitSet : public BaseObject {
+    using base_unit = std::conditional_t<N <= 8ul, uint8,
+                        std::conditional_t<N <= 16ul, uint16,
+                            std::conditional_t<N <= 32ul, uint32,
+                                uint64>>>;
+    constexpr static size_t unit_bits = sizeof(base_unit) * __CHAR_BIT__;
+    constexpr static size_t alloc_size = (N + unit_bits - 1ul) / unit_bits;
+    constexpr static base_unit one = 1u;
+public:
+    struct iterator {
+        iterator(base_unit *data, size_t idx)
+            : _data(data + idx / unit_bits),
+              _idx(idx % unit_bits) {}
+        iterator &operator++()
+        {
+            ++_idx;
+            if (_idx >= unit_bits) {
+                ++_data;
+                _idx = 0;
+            }
+            return *this;
+        }
+        bool operator!=(const iterator &other) const
+            { return _data != other._data || _idx != other._idx; }
+        bool operator*() const { return (*_data & (one << _idx)) != 0; }
+    private:
+        base_unit *_data;
+        size_t _idx;
+    };
+
+    BitSet()
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = 0;
+        }
+    }
+    BitSet(const BitSet &other)
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = other._data[i];
+        }
+    }
+    BitSet(BitSet &&other)
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = other._data[i];
+        }
+    }
+    void swap(BitSet &other)
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            std::swap(_data[i], other._data[i]);
+        }
+    }
+    BitSet &operator=(const BitSet &other)
+    {
+        if (this != &other) {
+            for (size_t i = 0; i < alloc_size; ++i) {
+                _data[i] = other._data[i];
+            }
+        }
+        return *this;
+    }
+    BitSet &operator=(BitSet &&other)
+    {
+        if (this != &other) {
+            for (size_t i = 0; i < alloc_size; ++i) {
+                _data[i] = other._data[i];
+            }
+        }
+        return *this;
+    }
+
+    void set()
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = ~base_unit(0);
+        }
+    }
+    void set(size_t idx)
+    {
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        _data[unit_idx] |= (one << offset);
+    }
+    bool try_set(size_t idx)
+    {
+        const size_t unit_idx = idx / unit_bits;
+        const auto mask = one << (idx % unit_bits);
+        if (_data[unit_idx] | mask) {
+            return false;
+        }
+        _data[unit_idx] |= mask;
+        return true;
+    }
+    void reset()
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = 0;
+        }
+    }
+    void reset(size_t idx)
+    {
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        _data[unit_idx] &= ~(one << offset);
+    }
+
+    void flip()
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            _data[i] = ~_data[i];
+        }
+    }
+
+    bool any() const
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            if (_data[i] != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    bool none() const { return !any(); }
+    bool all() const
+    {
+        for (size_t i = 0; i < alloc_size; ++i) {
+            if (_data[i] != ~base_unit(0)) {
+                if (i == alloc_size - 1ul && N % unit_bits != 0) {
+                    base_unit mask = (one << (N % unit_bits)) - 1u;
+                    if ((_data[i] & mask) != mask) {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool get(size_t idx) const
+    {
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        return (_data[unit_idx] & (one << offset)) != 0;
+    }
+    bool operator[](size_t idx) const { return get(idx); }
+    /* idx == -1 for the first index */
+    size_t next(size_t idx) const
+    {
+        do {
+            ++idx;
+        } while (!get(idx));
+        return idx;
+    }
+
+    constexpr size_t size() const { return N; }
+    size_t count() const
+    {
+        size_t res = 0;
+        CONSTEXPR_IF(std::is_same<base_unit, uint64>::value) {
+            for (uint32 i = 0; i < alloc_size; ++i) {
+                res += __builtin_popcountll(_data[i]);
+            }
+            return res;
+        }
+        /* no need to optimize uint16/8, alloc_size is 1 anyway */
+        for (uint32 i = 0; i < alloc_size; ++i) {
+            res += __builtin_popcount(_data[i]);
+        }
+        return res;
+    }
+
+    iterator begin() const { return iterator(_data, 0); }
+    iterator end() const { return iterator(_data, N); }
+    iterator at(size_t idx) const { return iterator(_data, idx); }
+    const base_unit *data() const { return _data; }
+    base_unit *data() { return _data; }
+private:
+    base_unit _data[alloc_size];
+};
+
+template <typename base_unit>
+class BitSpan {
+    static_assert(std::is_integral<base_unit>::value, "invalid use of BitSpan");
+    constexpr static size_t unit_bits = sizeof(base_unit) * __CHAR_BIT__;
+    constexpr static base_unit one = 1u;
+public:
+    struct iterator {
+        iterator(base_unit *data, size_t idx)
+            : _data(data + idx / unit_bits),
+              _idx(idx % unit_bits) {}
+        iterator &operator++()
+        {
+            ++_idx;
+            if (_idx >= unit_bits) {
+                ++_data;
+                _idx = 0;
+            }
+            return *this;
+        }
+        bool operator!=(const iterator &other) const
+            { return _data != other._data || _idx != other._idx; }
+        bool operator*() const { return (*_data & (one << _idx)) != 0; }
+    private:
+        base_unit *_data;
+        size_t _idx;
+    };
+
+    template <class Allocator>
+    BitSpan(BitVector<Allocator> &bv, size_t offset = 0)
+        : _bits(bv.data()),
+          _N(bv.size()),
+          _offset(offset) { adjust_offset(); }
+    template <size_t N>
+    BitSpan(BitSet<N> &bs, size_t offset = 0)
+        : _bits(bs.data()),
+          _N(N),
+          _offset(offset) { adjust_offset(); }
+    BitSpan(base_unit *data, size_t len, size_t offset = 0)
+        : _bits(data),
+          _N(len),
+          _offset(offset) { adjust_offset(); }
+
+    iterator begin() const { return iterator(_bits, _offset); }
+    iterator end() const { return iterator(_bits, _N); }
+    iterator at(size_t idx) const { return iterator(_bits, idx); }
+
+    void reset(size_t idx)
+    {
+        Assert(idx < size());
+        idx += _offset;
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        _bits[unit_idx] &= ~(one << offset);
+    }
+    void set(size_t idx)
+    {
+        Assert(idx < size());
+        idx += _offset;
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        _bits[unit_idx] |= (one << offset);
+    }
+    void set(size_t idx, bool flag)
+    {
+        if (flag) {
+            set(idx);
+        } else {
+            reset(idx);
+        }
+    }
+    bool get(size_t idx) const
+    {
+        Assert(idx < size());
+        idx += _offset;
+        size_t unit_idx = idx / unit_bits;
+        size_t offset = idx % unit_bits;
+        return (_bits[unit_idx] & (one << offset)) != 0;
+    }
+    bool operator[](size_t idx) const { return get(idx); }
+    size_t size() const { return _N - _offset; }
+private:
+    base_unit *_bits;
+    size_t _N;
+    size_t _offset;
+
+    void adjust_offset()
+    {
+        size_t n_shift = _offset / unit_bits;
+        if (n_shift > 0) {
+            _bits += n_shift;
+            size_t bits_shift = n_shift * unit_bits;
+            _N -= bits_shift;
+            _offset -= bits_shift;
+        }
+    }
+};
+#endif /* CONTAINER_BIT_VECTOR_H */

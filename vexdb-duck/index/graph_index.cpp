@@ -1,1370 +1,253 @@
 #include "vex_graph_index.hpp"
-#include "duckdb/common/exception.hpp"
-#include "duckdb/common/vector_operations/vector_operations.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
-#include "duckdb/planner/operator/logical_create_index.hpp"
-#include "duckdb/execution/operator/projection/physical_projection.hpp"
-#include "duckdb/execution/operator/filter/physical_filter.hpp"
-#include "duckdb/planner/expression/bound_operator_expression.hpp"
-#include "duckdb/planner/expression/bound_reference_expression.hpp"
-#include "duckdb/planner/expression/bound_function_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
+
+#include "graph_index/graph_index_algorithm.h"
+
+#include "vex/vex_disk_block_store.hpp"
+#include "vex_distance.hpp"
 #include "vex_physical_create_index.hpp"
-#include "duckdb/parser/expression_util.hpp"
-#include "duckdb/common/allocator.hpp"
-#include "duckdb/storage/table_io_manager.hpp"
+
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/value.hpp"
+#include "duckdb/common/types/string_type.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/main/config.hpp"
-#include "vex_duckdb_compat.hpp"
-#include "vex_core_bridge_graph_helpers.hpp"
-#include "vex/vex_quant_distancer.hpp"
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <thread>
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/parser/parsed_data/create_index_info.hpp"
+#include "duckdb/planner/operator/logical_create_index.hpp"
+#include "duckdb/storage/table_io_manager.hpp"
 
 namespace duckdb {
 
-// ============================================================
-// GraphIndex Factory Methods
-// ============================================================
+using DuckDistancer =
+    Distancer<Arch::GENERAL, Metric::L2, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
+using DuckAlgo = GraphIndexAlgorithm<DuckStore, DuckDistancer>;
+
+VexMetric ParseMetric(const string &metric_name) {
+    if (StringUtil::Lower(metric_name) == "l2") {
+        return VexMetric::L2;
+    }
+    throw InvalidInputException("Unsupported GRAPH_INDEX metric: %s", metric_name);
+}
+
+GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
+                       TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
+                       AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric)
+    : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
+      dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
+      runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)) {
+}
 
 unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
-	// First column must be FLOAT[N] (vector column)
-	// Subsequent columns are metadata columns (for filtered search)
-	if (input.unbound_expressions.empty()) {
-		throw InvalidInputException("GRAPH_INDEX requires at least one column");
-	}
-	auto &vec_type = input.unbound_expressions[0]->return_type;
-	if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
-		throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N] (ARRAY(FLOAT)), got %s",
-		                            vec_type.ToString());
-	}
+    if (input.unbound_expressions.empty()) {
+        throw InvalidInputException("GRAPH_INDEX requires at least one indexed expression");
+    }
 
-	int m = GraphIndexConfig::DEFAULT_M;
-	int ef_construction = GraphIndexConfig::DEFAULT_EF_CONSTRUCTION;
-	bool use_pq = false;
-	uint32_t pq_m = 0;
+    auto &vec_type = input.unbound_expressions[0]->return_type;
+    if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
+        throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s", vec_type.ToString());
+    }
 
-	auto m_it = input.options.find("m");
-	if (m_it != input.options.end()) {
-		try {
-			m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-		} catch (const std::exception &) {
-			throw InvalidInputException("GRAPH_INDEX: 'm' must be a valid integer, got '%s'", m_it->second.ToString());
-		}
-		if (m < GraphIndexConfig::MIN_M || m > GraphIndexConfig::MAX_M) {
-			throw InvalidInputException("GRAPH_INDEX: 'm' must be between %d and %d, got %d",
-			                            GraphIndexConfig::MIN_M, GraphIndexConfig::MAX_M, m);
-		}
-	}
-	auto ef_it = input.options.find("ef_construction");
-	if (ef_it != input.options.end()) {
-		try {
-			ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-		} catch (const std::exception &) {
-			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be a valid integer, got '%s'",
-			                            ef_it->second.ToString());
-		}
-		if (ef_construction < GraphIndexConfig::MIN_EF_CONSTRUCTION || ef_construction > GraphIndexConfig::MAX_EF_CONSTRUCTION) {
-			throw InvalidInputException("GRAPH_INDEX: 'ef_construction' must be between %d and %d, got %d",
-			                            GraphIndexConfig::MIN_EF_CONSTRUCTION, GraphIndexConfig::MAX_EF_CONSTRUCTION, ef_construction);
-		}
-	}
-	auto q_it = input.options.find("quantizer");
-	if (q_it != input.options.end()) {
-		auto q_val = q_it->second.GetValue<string>();
-		if (q_val == "pq") {
-			use_pq = true;
-		} else if (q_val != "none") {
-			throw InvalidInputException("GRAPH_INDEX: 'quantizer' must be 'pq' or 'none', got '%s'", q_val);
-		}
-	}
-	auto pqm_it = input.options.find("pq_m");
-	if (pqm_it != input.options.end()) {
-		int pq_m_int;
-		try {
-			pq_m_int = pqm_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-		} catch (const std::exception &) {
-			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be a valid integer, got '%s'",
-			                            pqm_it->second.ToString());
-		}
-		if (pq_m_int < 1 || pq_m_int > 256) {
-			throw InvalidInputException("GRAPH_INDEX: 'pq_m' must be between 1 and 256, got %d", pq_m_int);
-		}
-		pq_m = static_cast<uint32_t>(pq_m_int);
-	}
-	uint16_t max_dedup = GraphIndexCore::DEFAULT_MAX_DEDUP;
-	auto dedup_it = input.options.find("max_dedup");
-	if (dedup_it != input.options.end()) {
-		int val;
-		try {
-			val = dedup_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
-		} catch (const std::exception &) {
-			throw InvalidInputException("GRAPH_INDEX: 'max_dedup' must be a valid integer, got '%s'",
-			                            dedup_it->second.ToString());
-		}
-		if (val < 1 || val > 65535) {
-			throw InvalidInputException("GRAPH_INDEX: 'max_dedup' must be between 1 and 65535, got %d", val);
-		}
-		max_dedup = static_cast<uint16_t>(val);
-	}
-	vex::VexMetric metric = vex::VexMetric::L2;
-	auto metric_it = input.options.find("metric");
-	if (metric_it != input.options.end()) {
-		metric = vex::ParseMetric(metric_it->second.GetValue<string>());
-	}
+    idx_t dimension = ArrayType::GetSize(vec_type);
+    int m = 16;
+    int ef_construction = 64;
+    VexMetric metric = VexMetric::L2;
 
-	string memory_mode = "full";
-	auto mm_it = input.options.find("memory_mode");
-	if (mm_it != input.options.end()) {
-		memory_mode = mm_it->second.GetValue<string>();
-		if (memory_mode != "full" && memory_mode != "compact") {
-			throw InvalidInputException(
-			    "GRAPH_INDEX: 'memory_mode' must be 'full' or 'compact', got '%s'", memory_mode);
-		}
-	}
-	if (memory_mode == "compact" && !use_pq) {
-		use_pq = true;
-	}
+    auto m_it = input.options.find("m");
+    if (m_it != input.options.end()) {
+        m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+    }
+    auto ef_it = input.options.find("ef_construction");
+    if (ef_it != input.options.end()) {
+        ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+    }
+    auto metric_it = input.options.find("metric");
+    if (metric_it != input.options.end()) {
+        metric = ParseMetric(metric_it->second.GetValue<string>());
+    }
 
-	auto graph_index = make_uniq<GraphIndex>(
-		input.name, input.constraint_type, input.column_ids, input.table_io_manager,
-		input.unbound_expressions, input.db, m, ef_construction, metric, use_pq, pq_m);
-	graph_index->graph_.max_dedup = max_dedup;
-	graph_index->memory_mode_ = memory_mode;
-	graph_index->dimension_ = ArrayType::GetSize(vec_type);
-	graph_index->graph_.dimension = graph_index->dimension_;
-
-	// Setup metadata columns (columns after the first vector column)
-	if (input.unbound_expressions.size() > 1) {
-		uint32_t meta_offset = 0;
-		for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
-			auto &col_type = input.unbound_expressions[i]->return_type;
-			auto type_id = col_type.id();
-			uint32_t type_size = vex::MetaColumnDesc::GetTypeSize(type_id);
-
-			vex::MetaColumnDesc desc;
-			desc.type_id = type_id;
-			desc.offset = meta_offset;
-			desc.size = type_size;
-			graph_index->graph_.meta_columns.push_back(desc);
-			graph_index->meta_col_types_.push_back(col_type);
-			if (i < input.column_ids.size()) {
-				graph_index->meta_col_ids_.push_back(input.column_ids[i]);
-			}
-			meta_offset += type_size;
-		}
-		graph_index->graph_.meta_segment_size = meta_offset;
-	}
-
-	// Deserialize from storage if available (allocator-based)
-	// Only deserialize if we have actual data (dimension stored means there was data)
-	if (input.storage_info.IsValid() && input.storage_info.options.count("dimension")) {
-		graph_index->DeserializeFromStorage(input.storage_info);
-	} else {
-		// Legacy BLOB deserialization (backward compatibility)
-		auto data_it = input.storage_info.options.find("graph_data");
-		if (data_it != input.storage_info.options.end()) {
-			auto blob = data_it->second.GetValueUnsafe<string>();
-			if (!graph_index->DeserializeFromBlob(blob)) {
-				throw IOException("GRAPH_INDEX: failed to deserialize from legacy BLOB — data may be corrupted");
-			}
-		}
-	}
-	graph_index->EnsureSerializableState();
-
-	return std::move(graph_index);
+    auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
+                                             input.unbound_expressions, input.db, dimension, m, ef_construction,
+                                             metric);
+    auto manifest_it = input.storage_info.options.find("vex_graph_manifest");
+    if (manifest_it != input.storage_info.options.end()) {
+        auto manifest_blob = StringValue::Get(manifest_it->second.DefaultCastAs(LogicalType::BLOB));
+        auto manifest = vex_disk::DeserializeManifest(manifest_blob);
+        if (!manifest.segments.empty()) {
+            auto &seg = manifest.segments[0];
+            auto disk_blob = vex_disk::ReadBlobFromBlocks(input.table_io_manager.GetIndexBlockManager(),
+                                                          QueryContext(input.context), seg.blocks, seg.size);
+            graph_index->LoadFromDiskImage(disk_blob);
+            return std::move(graph_index);
+        }
+    }
+    auto blob_it = input.storage_info.options.find("vex_graph_blob");
+    if (blob_it != input.storage_info.options.end()) {
+        auto blob = StringValue::Get(blob_it->second.DefaultCastAs(LogicalType::BLOB));
+        graph_index->LoadFromDiskImage(blob);
+    }
+    return std::move(graph_index);
 }
 
 PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
-	auto &op = input.op;
-	auto &planner = input.planner;
+    auto &op = input.op;
+    auto &planner = input.planner;
 
-	vector<LogicalType> new_column_types;
-	vector<unique_ptr<Expression>> select_list;
-	for (idx_t i = 0; i < op.expressions.size(); i++) {
-		new_column_types.push_back(op.expressions[i]->return_type);
-		select_list.push_back(std::move(op.expressions[i]));
-	}
-	new_column_types.emplace_back(LogicalType::ROW_TYPE);
-	select_list.push_back(make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, op.info->scan_types.size() - 1));
+    vector<LogicalType> proj_types;
+    vector<unique_ptr<Expression>> select_list;
+    for (idx_t i = 0; i < op.expressions.size(); i++) {
+        proj_types.push_back(op.expressions[i]->return_type);
+        select_list.push_back(std::move(op.expressions[i]));
+    }
+    proj_types.emplace_back(LogicalType::ROW_TYPE);
+    select_list.push_back(
+        make_uniq<BoundReferenceExpression>(LogicalType::ROW_TYPE, op.info->scan_types.size() - 1));
 
-	auto &proj = planner.Make<PhysicalProjection>(new_column_types, std::move(select_list), op.estimated_cardinality);
-	proj.children.push_back(input.table_scan);
+    auto &proj = planner.Make<PhysicalProjection>(proj_types, std::move(select_list), op.estimated_cardinality);
+    proj.children.push_back(input.table_scan);
 
-	reference<PhysicalOperator> prev_op(proj);
-	auto is_alter = op.alter_table_info != nullptr;
-	if (!is_alter) {
-		vector<LogicalType> filter_types;
-		vector<unique_ptr<Expression>> filter_select_list;
-		auto not_null_type = ExpressionType::OPERATOR_IS_NOT_NULL;
-
-		// Only filter NULL on the vector column (index 0).
-		// Metadata columns (index 1+) are allowed to be NULL.
-		for (idx_t i = 0; i < new_column_types.size() - 1; i++) {
-			filter_types.push_back(new_column_types[i]);
-			if (i == 0) {
-				// Vector column: NOT NULL filter
-				auto is_not_null_expr = make_uniq<BoundOperatorExpression>(not_null_type, LogicalType::BOOLEAN);
-				auto bound_ref = make_uniq<BoundReferenceExpression>(new_column_types[i], i);
-				is_not_null_expr->children.push_back(std::move(bound_ref));
-				filter_select_list.push_back(std::move(is_not_null_expr));
-			} else {
-				// Metadata columns: pass through (constant TRUE)
-				filter_select_list.push_back(make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
-			}
-		}
-
-		prev_op = planner.Make<PhysicalFilter>(std::move(filter_types), std::move(filter_select_list),
-		                                       op.estimated_cardinality);
-		prev_op.get().types.emplace_back(LogicalType::ROW_TYPE);
-		prev_op.get().children.push_back(proj);
-	}
-
-	auto &create_idx = planner.Make<PhysicalVexCreateIndex>(op, op.table, op.info->column_ids, std::move(op.info),
-	                                                        std::move(op.unbound_expressions), op.estimated_cardinality,
-	                                                        std::move(op.alter_table_info));
-	create_idx.children.push_back(prev_op);
-	return create_idx;
+    auto &create_idx = planner.Make<PhysicalVexCreateIndex>(op, op.table, op.info->column_ids, std::move(op.info),
+                                                            std::move(op.unbound_expressions),
+                                                            op.estimated_cardinality,
+                                                            std::move(op.alter_table_info));
+    create_idx.children.push_back(proj);
+    return create_idx;
 }
 
-// ============================================================
-// Constructor
-// ============================================================
+void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids, idx_t dimension) {
+    if (dimension_ != dimension) {
+        throw InvalidInputException("GRAPH_INDEX dimension mismatch: expected %llu, got %llu",
+                                    static_cast<unsigned long long>(dimension_),
+                                    static_cast<unsigned long long>(dimension));
+    }
+    vectors_ = vectors;
+    row_ids_ = row_ids;
 
-GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type,
-                       const vector<column_t> &column_ids, TableIOManager &table_io_manager,
-                       const vector<unique_ptr<Expression>> &unbound_expressions,
-                       AttachedDatabase &db, int m, int ef_construction,
-                       vex::VexMetric metric, bool use_pq, uint32_t pq_m)
-    : BoundIndex(name, GraphIndex::TYPE_NAME, constraint_type, column_ids, table_io_manager,
-                 unbound_expressions, db),
-      m_(m),
-      ef_construction_(ef_construction),
-      dimension_(0),
-      use_pq_(use_pq),
-      pq_m_(pq_m),
-      rng_(std::random_device{}()),
-      dist_(0.0, 1.0),
-      metric_(metric) {
+    runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
+    DuckDistancer distancer;
+    DuckAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), runtime_->store, distancer);
 
-	distance_func_ = vex::GetDistanceFunc(metric_);
-
-	if (m_ < GraphIndexConfig::MIN_M || m_ > GraphIndexConfig::MAX_M) {
-		throw InvalidInputException("M must be between %d and %d, got %d",
-		                            GraphIndexConfig::MIN_M, GraphIndexConfig::MAX_M, m_);
-	}
-	if (ef_construction_ < GraphIndexConfig::MIN_EF_CONSTRUCTION ||
-	    ef_construction_ > GraphIndexConfig::MAX_EF_CONSTRUCTION) {
-		throw InvalidInputException("ef_construction must be between %d and %d, got %d",
-		                            GraphIndexConfig::MIN_EF_CONSTRUCTION,
-		                            GraphIndexConfig::MAX_EF_CONSTRUCTION, ef_construction_);
-	}
-
-	// Initialize graph core parameters
-	graph_.m = m_;
+    for (idx_t i = 0; i < row_ids.size(); i++) {
+        PointExtensionContext point_ctx;
+        ItemPointerData tid;
+        tid.row_id = row_ids[i];
+        const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
+        DuckAlgo::InsertContextBase insert_ctx(point_ctx, query, &tid);
+        algo.insert(insert_ctx);
+    }
 }
 
-// ============================================================
-// Helper: ensure allocators are initialized
-// ============================================================
+void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
+                           std::vector<float> &distances) const {
+    row_ids.clear();
+    distances.clear();
+    if (!runtime_) {
+        return;
+    }
+    if (metric_ != VexMetric::L2) {
+        throw NotImplementedException("Only L2 metric is implemented in GRAPH_INDEX");
+    }
 
-void GraphIndex::EnsureAllocators() {
-	if (!graph_.node_alloc && dimension_ > 0) {
-		auto &block_manager = table_io_manager.GetIndexBlockManager();
-		graph_.dimension = dimension_;
-		graph_.InitAllocators(block_manager);
-	}
+    DuckDistancer distancer;
+    auto &store = runtime_->store;
+    DuckAlgo algo(uint_fast16_t(ef_construction_), uint_fast16_t(m_), store, distancer);
+    PointExtensionContext point_ctx;
+    auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), uint_fast16_t(std::max<idx_t>(k, ef)));
+    for (auto &tid : res.first) {
+        row_ids.push_back(tid.row_id);
+    }
+    for (auto &dist : res.second) {
+        distances.push_back(dist);
+    }
 }
-
-void GraphIndex::EnsureSerializableState() {
-	EnsureAllocators();
-}
-
-void GraphIndex::EnsurePQCodesUpToDate() {
-	if (!use_pq_ || !graph_.pq.trained) {
-		return;
-	}
-	auto expected_size = graph_.row_id_map.size() * graph_.pq.CodeSize();
-	if (graph_.pq_codes.size() != expected_size) {
-		graph_.EncodeAllPQ();
-	}
-}
-
-// ============================================================
-// Helper: Get Random Level
-// ============================================================
-
-int GraphIndex::GetRandomLevel() {
-	double ml = GraphIndexConfig::GetMl(m_);
-	double r = dist_(rng_);
-	if (r == 0.0) r = std::numeric_limits<double>::min();
-	int level = static_cast<int>(-std::log(r) * ml);
-	return std::min(level, GraphIndexConfig::GetMaxLevel(m_));
-}
-
-// ============================================================
-// Build Index from Data Chunk
-// ============================================================
-
-void GraphIndex::Build(DataChunk &chunk, Vector &row_ids) {
-	D_ASSERT(chunk.ColumnCount() >= 1);
-
-	auto count = chunk.size();
-	if (count == 0) return;
-
-	auto &vec_vector = chunk.data[0];
-
-	vec_vector.Flatten(count);
-	row_ids.Flatten(count);
-
-	// Detect dimension from the actual data type
-	if (dimension_ == 0) {
-		auto &vec_type = vec_vector.GetType();
-		if (vec_type.id() == LogicalTypeId::ARRAY) {
-			dimension_ = ArrayType::GetSize(vec_type);
-		} else if (!logical_types.empty() && logical_types[0].id() == LogicalTypeId::ARRAY) {
-			dimension_ = ArrayType::GetSize(logical_types[0]);
-		}
-		if (dimension_ == 0) {
-			throw InvalidInputException("GRAPH_INDEX: cannot determine vector dimension from type %s, logical_types size=%d",
-			                            vec_vector.GetType().ToString(), static_cast<int>(logical_types.size()));
-		}
-		graph_.dimension = dimension_;
-	}
-
-	EnsureAllocators();
-	BuildViaCoreBridgeOrThrow(chunk, row_ids);
-}
-
-// ============================================================
-// Thread-Safe Build for Parallel Index Creation
-// ============================================================
-
-void GraphIndex::BuildConcurrent(DataChunk &chunk, Vector &row_ids) {
-	D_ASSERT(chunk.ColumnCount() >= 1);
-	auto count = chunk.size();
-	if (count == 0) return;
-
-	auto &vec_vector = chunk.data[0];
-	vec_vector.Flatten(count);
-	row_ids.Flatten(count);
-
-	// Thread-safe one-time initialization (dimension, allocators, mutex)
-	std::call_once(dimension_init_flag_, [&]() {
-		auto &vec_type = vec_vector.GetType();
-		if (vec_type.id() == LogicalTypeId::ARRAY) {
-			dimension_ = ArrayType::GetSize(vec_type);
-		} else if (!logical_types.empty() && logical_types[0].id() == LogicalTypeId::ARRAY) {
-			dimension_ = ArrayType::GetSize(logical_types[0]);
-		}
-		if (dimension_ == 0) {
-			throw InvalidInputException("GRAPH_INDEX: cannot determine vector dimension");
-		}
-		graph_.dimension = dimension_;
-		EnsureAllocators();
-		graph_.InitGraphMutex();
-	});
-	BuildViaCoreBridgeOrThrow(chunk, row_ids);
-}
-
-// ============================================================
-// BuildParallel: Allocate all nodes first, then insert in parallel
-// ============================================================
-
-void GraphIndex::BuildParallel(const std::vector<float> &all_vectors, const std::vector<row_t> &all_row_ids,
-                                idx_t total_count, uint32_t dim, int num_threads,
-                                const std::vector<uint8_t> &all_metadata) {
-	if (total_count == 0) return;
-
-	// Initialize dimension and allocators (single-threaded)
-	if (dimension_ == 0) {
-		dimension_ = dim;
-		graph_.dimension = dim;
-	}
-	EnsureAllocators();
-	graph_.InitGraphMutex();
-	BuildParallelViaCoreBridgeOrThrow(all_vectors, all_row_ids, total_count, dim, all_metadata);
-}
-
-// ============================================================
-// BoundIndex Interface Implementation
-// ============================================================
 
 ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
-	// Check memory budget before inserting
-	{
-		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
-		Value budget_val;
-		if (db_config.TryGetCurrentSetting("vex_memory_budget", budget_val)) {
-			int64_t budget = budget_val.GetValue<int64_t>();
-			if (budget > 0) {
-				idx_t current = GetInMemorySize(l);
-				if (current > static_cast<idx_t>(budget)) {
-					throw InvalidInputException(
-					    "VEX memory budget exceeded: current %llu bytes > budget %lld bytes. "
-					    "Increase with SET vex_memory_budget, or use memory_mode='compact'.",
-					    static_cast<unsigned long long>(current),
-					    static_cast<long long>(budget));
-				}
-			}
-		}
-	}
-
-	// Remap columns: chunk contains all table columns in physical order,
-	// but Build() expects columns in index order (vec first, then metadata).
-	// Always remap via column_ids to ensure correct ordering.
-	DataChunk key_chunk;
-	key_chunk.InitializeEmpty(logical_types);
-	for (idx_t i = 0; i < column_ids.size() && i < logical_types.size(); i++) {
-		if (column_ids[i] < chunk.ColumnCount()) {
-			key_chunk.data[i].Reference(chunk.data[column_ids[i]]);
-		}
-	}
-	key_chunk.SetCardinality(chunk.size());
-	Build(key_chunk, row_ids);
-	return ErrorData();
+    (void)l;
+    (void)chunk;
+    (void)row_ids;
+    return ErrorData();
 }
 
 ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids, IndexAppendInfo &info) {
-	return Append(l, chunk, row_ids);
+    (void)info;
+    return Append(l, chunk, row_ids);
 }
 
 void GraphIndex::VerifyAppend(DataChunk &chunk, IndexAppendInfo &info, optional_ptr<ConflictManager> manager) {
+    (void)chunk;
+    (void)info;
+    (void)manager;
 }
 
 void GraphIndex::VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, ConflictManager &manager) {
+    (void)chunk;
+    (void)info;
+    (void)manager;
 }
 
 void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) {
-	auto count = entries.size();
-	row_identifiers.Flatten(count);
-	if (count == 0) {
-		return;
-	}
-	DeleteViaCoreBridgeOrThrow(row_identifiers, count);
+    (void)state;
+    (void)entries;
+    (void)row_identifiers;
 }
 
 void GraphIndex::CommitDrop(IndexLock &index_lock) {
-	Clear();
+    (void)index_lock;
+    vectors_.clear();
+    row_ids_.clear();
+    runtime_.reset();
 }
 
 ErrorData GraphIndex::Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
-	return Append(l, chunk, row_ids);
+    return Append(l, chunk, row_ids);
 }
 
 ErrorData GraphIndex::Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids, IndexAppendInfo &info) {
-	return Insert(l, chunk, row_ids);
+    return Append(l, chunk, row_ids, info);
 }
 
 bool GraphIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
-	auto &other = other_index.Cast<GraphIndex>();
-
-	if (dimension_ == 0) {
-		dimension_ = other.dimension_;
-		graph_.dimension = dimension_;
-		metric_ = other.metric_;
-		distance_func_ = vex::GetDistanceFunc(metric_);
-	}
-
-	EnsureAllocators();
-
-	// Re-insert nodes from other index
-	unordered_set<idx_t> seen_nodes;
-	for (auto &pair : other.graph_.row_id_map) {
-		// Skip extra dedup row_ids — they share the same node_ptr
-		if (seen_nodes.find(pair.second.Get()) != seen_nodes.end()) continue;
-		seen_nodes.insert(pair.second.Get());
-
-		auto *other_header = other.graph_.GetNode(pair.second);
-		if (other_header->deleted) continue;
-
-		auto *other_vec = other.graph_.GetVector(other_header->vector_ptr);
-
-		// Collect all row_ids for this node (primary + extras)
-		std::vector<row_t> all_row_ids;
-		other.graph_.CollectNodeRowIds(pair.second, all_row_ids);
-
-		// Insert primary
-		row_t primary_rid = all_row_ids[0];
-
-		// Try dedup into existing node first
-		if (graph_.max_dedup > 1 && graph_.TryDedup(primary_rid, other_vec, dimension_, distance_func_)) {
-			// Primary merged; also try merging extras
-			for (idx_t r = 1; r < all_row_ids.size(); r++) {
-				if (!graph_.TryDedup(all_row_ids[r], other_vec, dimension_, distance_func_)) {
-					// Can't merge extra — need a new node for remaining
-					IndexPointer new_node = graph_.AllocateNode(all_row_ids[r], other_vec, dimension_, 0);
-					graph_.InsertNode(new_node, m_, ef_construction_, distance_func_);
-				}
-			}
-		} else {
-			IndexPointer new_node = graph_.AllocateNode(primary_rid, other_vec, dimension_, other_header->level);
-			graph_.InsertNode(new_node, m_, ef_construction_, distance_func_);
-			// Add extras via dedup
-			for (idx_t r = 1; r < all_row_ids.size(); r++) {
-				if (!graph_.TryDedup(all_row_ids[r], other_vec, dimension_, distance_func_)) {
-					IndexPointer extra_node = graph_.AllocateNode(all_row_ids[r], other_vec, dimension_, 0);
-					graph_.InsertNode(extra_node, m_, ef_construction_, distance_func_);
-				}
-			}
-		}
-	}
-
-	return true;
+    (void)state;
+    (void)other_index;
+    return false;
 }
 
 void GraphIndex::Vacuum(IndexLock &l) {
-	// Deleted nodes are freed synchronously in Delete(), nothing to do here.
+    (void)l;
 }
-
-// ============================================================
-// Serialization — using FixedSizeAllocator native persistence
-// ============================================================
-
-IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context,
-                                              const case_insensitive_map_t<Value> &options) {
-	IndexStorageInfo info;
-	info.name = name;
-	EnsureSerializableState();
-	EnsurePQCodesUpToDate();
-	if (!graph_.node_alloc) {
-		return info;
-	}
-
-	// Store index metadata in options
-	info.options["m"] = Value::INTEGER(m_);
-	info.options["ef_construction"] = Value::INTEGER(ef_construction_);
-	info.options["dimension"] = Value::UINTEGER(dimension_);
-	info.options["node_count"] = Value::UBIGINT(graph_.node_count);
-	info.options["max_level"] = Value::INTEGER(graph_.max_level);
-	info.options["entry_point"] = Value::UBIGINT(graph_.entry_point.Get());
-	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
-	info.options["pq_m"] = Value::UINTEGER(pq_m_);
-	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
-	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
-	info.options["memory_mode"] = Value(memory_mode_);
-	ExportBridgeGraphState(info, graph_);
-
-	// Serialize row_id_map as BLOB (row_id -> IndexPointer pairs)
-	{
-		string rid_blob;
-		uint64_t num_entries = graph_.row_id_map.size();
-		rid_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
-		for (auto &pair : graph_.row_id_map) {
-			row_t rid = pair.first;
-			uint64_t ptr_val = pair.second.Get();
-			rid_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
-			rid_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
-		}
-		info.options["row_id_map"] = Value::BLOB(const_data_ptr_cast(rid_blob.data()), rid_blob.size());
-	}
-
-	// Serialize dedup_map_ as BLOB
-	if (!graph_.dedup_map_.empty()) {
-		string dedup_blob;
-		uint64_t num_nodes = graph_.dedup_map_.size();
-		dedup_blob.append(reinterpret_cast<const char *>(&num_nodes), sizeof(num_nodes));
-		for (auto &pair : graph_.dedup_map_) {
-			uint64_t node_key = pair.first;
-			uint64_t num_extras = pair.second.size();
-			dedup_blob.append(reinterpret_cast<const char *>(&node_key), sizeof(node_key));
-			dedup_blob.append(reinterpret_cast<const char *>(&num_extras), sizeof(num_extras));
-			for (auto &rid : pair.second) {
-				dedup_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
-			}
-		}
-		info.options["dedup_map"] = Value::BLOB(const_data_ptr_cast(dedup_blob.data()), dedup_blob.size());
-	}
-
-	// Serialize metadata column schema
-	if (!graph_.meta_columns.empty()) {
-		string meta_schema_blob;
-		uint32_t num_meta_cols = static_cast<uint32_t>(graph_.meta_columns.size());
-		meta_schema_blob.append(reinterpret_cast<const char *>(&num_meta_cols), sizeof(num_meta_cols));
-		for (auto &mc : graph_.meta_columns) {
-			uint8_t tid = static_cast<uint8_t>(mc.type_id);
-			meta_schema_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
-			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.offset), sizeof(mc.offset));
-			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.size), sizeof(mc.size));
-		}
-		info.options["meta_segment_size"] = Value::UINTEGER(graph_.meta_segment_size);
-		info.options["meta_schema"] = Value::BLOB(const_data_ptr_cast(meta_schema_blob.data()), meta_schema_blob.size());
-
-		// Serialize metadata column types
-		string meta_types_blob;
-		uint32_t num_types = static_cast<uint32_t>(meta_col_types_.size());
-		meta_types_blob.append(reinterpret_cast<const char *>(&num_types), sizeof(num_types));
-		for (auto &t : meta_col_types_) {
-			uint8_t tid = static_cast<uint8_t>(t.id());
-			meta_types_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
-		}
-		info.options["meta_col_types"] = Value::BLOB(const_data_ptr_cast(meta_types_blob.data()), meta_types_blob.size());
-
-		// Serialize metadata column IDs
-		if (!meta_col_ids_.empty()) {
-			string meta_ids_blob;
-			uint32_t num_ids = static_cast<uint32_t>(meta_col_ids_.size());
-			meta_ids_blob.append(reinterpret_cast<const char *>(&num_ids), sizeof(num_ids));
-			for (auto &id : meta_col_ids_) {
-				meta_ids_blob.append(reinterpret_cast<const char *>(&id), sizeof(id));
-			}
-			info.options["meta_col_ids"] = Value::BLOB(const_data_ptr_cast(meta_ids_blob.data()), meta_ids_blob.size());
-		}
-	}
-
-	// Serialize allocator buffers to disk
-	auto &block_manager = table_io_manager.GetIndexBlockManager();
-	PartialBlockManager partial_block_manager(context, block_manager, PartialBlockType::FULL_CHECKPOINT);
-
-	graph_.node_alloc->SerializeBuffers(partial_block_manager);
-	graph_.vector_alloc->SerializeBuffers(partial_block_manager);
-	graph_.upper_alloc->SerializeBuffers(partial_block_manager);
-	if (graph_.meta_alloc) {
-		graph_.meta_alloc->SerializeBuffers(partial_block_manager);
-	}
-	partial_block_manager.FlushPartialBlocks();
-
-	// Collect allocator infos
-	info.allocator_infos.push_back(graph_.node_alloc->GetInfo());
-	info.allocator_infos.push_back(graph_.vector_alloc->GetInfo());
-	info.allocator_infos.push_back(graph_.upper_alloc->GetInfo());
-	if (graph_.meta_alloc) {
-		info.allocator_infos.push_back(graph_.meta_alloc->GetInfo());
-	}
-
-	// PQ data stored as BLOB in options (PQ codes are relatively small)
-	if (use_pq_ && graph_.pq.trained) {
-		std::vector<char> pq_blob;
-		pq_blob.push_back(1);
-		graph_.pq.SerializeTo(pq_blob);
-		uint64_t codes_size = graph_.pq_codes.size();
-		size_t pos = pq_blob.size();
-		pq_blob.resize(pos + 8 + codes_size);
-		memcpy(pq_blob.data() + pos, &codes_size, 8);
-		memcpy(pq_blob.data() + pos + 8, graph_.pq_codes.data(), codes_size);
-		info.options["pq_data"] = Value::BLOB(const_data_ptr_cast(pq_blob.data()), pq_blob.size());
-	}
-
-	return info;
-}
-
-IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
-	IndexStorageInfo info;
-	info.name = name;
-	EnsureSerializableState();
-	EnsurePQCodesUpToDate();
-	if (!graph_.node_alloc) {
-		return info;
-	}
-
-	// Store index metadata
-	info.options["m"] = Value::INTEGER(m_);
-	info.options["ef_construction"] = Value::INTEGER(ef_construction_);
-	info.options["dimension"] = Value::UINTEGER(dimension_);
-	info.options["node_count"] = Value::UBIGINT(graph_.node_count);
-	info.options["max_level"] = Value::INTEGER(graph_.max_level);
-	info.options["entry_point"] = Value::UBIGINT(graph_.entry_point.Get());
-	info.options["use_pq"] = Value::BOOLEAN(use_pq_);
-	info.options["pq_m"] = Value::UINTEGER(pq_m_);
-	info.options["metric"] = Value::UTINYINT(static_cast<uint8_t>(metric_));
-	info.options["max_dedup"] = Value::USMALLINT(graph_.max_dedup);
-	info.options["memory_mode"] = Value(memory_mode_);
-	ExportBridgeGraphState(info, graph_);
-
-	// Serialize row_id_map as BLOB
-	{
-		string rid_blob;
-		uint64_t num_entries = graph_.row_id_map.size();
-		rid_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
-		for (auto &pair : graph_.row_id_map) {
-			row_t rid = pair.first;
-			uint64_t ptr_val = pair.second.Get();
-			rid_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
-			rid_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
-		}
-		info.options["row_id_map"] = Value::BLOB(const_data_ptr_cast(rid_blob.data()), rid_blob.size());
-	}
-
-	// Serialize dedup_map_ as BLOB
-	if (!graph_.dedup_map_.empty()) {
-		string dedup_blob;
-		uint64_t num_nodes = graph_.dedup_map_.size();
-		dedup_blob.append(reinterpret_cast<const char *>(&num_nodes), sizeof(num_nodes));
-		for (auto &pair : graph_.dedup_map_) {
-			uint64_t node_key = pair.first;
-			uint64_t num_extras = pair.second.size();
-			dedup_blob.append(reinterpret_cast<const char *>(&node_key), sizeof(node_key));
-			dedup_blob.append(reinterpret_cast<const char *>(&num_extras), sizeof(num_extras));
-			for (auto &rid : pair.second) {
-				dedup_blob.append(reinterpret_cast<const char *>(&rid), sizeof(rid));
-			}
-		}
-		info.options["dedup_map"] = Value::BLOB(const_data_ptr_cast(dedup_blob.data()), dedup_blob.size());
-	}
-
-	// Serialize metadata schema (same as SerializeToDisk)
-	if (!graph_.meta_columns.empty()) {
-		string meta_schema_blob;
-		uint32_t num_meta_cols = static_cast<uint32_t>(graph_.meta_columns.size());
-		meta_schema_blob.append(reinterpret_cast<const char *>(&num_meta_cols), sizeof(num_meta_cols));
-		for (auto &mc : graph_.meta_columns) {
-			uint8_t tid = static_cast<uint8_t>(mc.type_id);
-			meta_schema_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
-			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.offset), sizeof(mc.offset));
-			meta_schema_blob.append(reinterpret_cast<const char *>(&mc.size), sizeof(mc.size));
-		}
-		info.options["meta_segment_size"] = Value::UINTEGER(graph_.meta_segment_size);
-		info.options["meta_schema"] = Value::BLOB(const_data_ptr_cast(meta_schema_blob.data()), meta_schema_blob.size());
-
-		string meta_types_blob;
-		uint32_t num_types = static_cast<uint32_t>(meta_col_types_.size());
-		meta_types_blob.append(reinterpret_cast<const char *>(&num_types), sizeof(num_types));
-		for (auto &t : meta_col_types_) {
-			uint8_t tid = static_cast<uint8_t>(t.id());
-			meta_types_blob.append(reinterpret_cast<const char *>(&tid), sizeof(tid));
-		}
-		info.options["meta_col_types"] = Value::BLOB(const_data_ptr_cast(meta_types_blob.data()), meta_types_blob.size());
-
-		if (!meta_col_ids_.empty()) {
-			string meta_ids_blob;
-			uint32_t num_ids = static_cast<uint32_t>(meta_col_ids_.size());
-			meta_ids_blob.append(reinterpret_cast<const char *>(&num_ids), sizeof(num_ids));
-			for (auto &id : meta_col_ids_) {
-				meta_ids_blob.append(reinterpret_cast<const char *>(&id), sizeof(id));
-			}
-			info.options["meta_col_ids"] = Value::BLOB(const_data_ptr_cast(meta_ids_blob.data()), meta_ids_blob.size());
-		}
-	}
-
-	// WAL serialization: include buffer data
-	info.buffers.push_back(graph_.node_alloc->InitSerializationToWAL());
-	info.buffers.push_back(graph_.vector_alloc->InitSerializationToWAL());
-	info.buffers.push_back(graph_.upper_alloc->InitSerializationToWAL());
-	if (graph_.meta_alloc) {
-		info.buffers.push_back(graph_.meta_alloc->InitSerializationToWAL());
-	}
-
-	info.allocator_infos.push_back(graph_.node_alloc->GetInfo());
-	info.allocator_infos.push_back(graph_.vector_alloc->GetInfo());
-	info.allocator_infos.push_back(graph_.upper_alloc->GetInfo());
-	if (graph_.meta_alloc) {
-		info.allocator_infos.push_back(graph_.meta_alloc->GetInfo());
-	}
-
-	// PQ data
-	if (use_pq_ && graph_.pq.trained) {
-		std::vector<char> pq_blob;
-		pq_blob.push_back(1);
-		graph_.pq.SerializeTo(pq_blob);
-		uint64_t codes_size = graph_.pq_codes.size();
-		size_t pos = pq_blob.size();
-		pq_blob.resize(pos + 8 + codes_size);
-		memcpy(pq_blob.data() + pos, &codes_size, 8);
-		memcpy(pq_blob.data() + pos + 8, graph_.pq_codes.data(), codes_size);
-		info.options["pq_data"] = Value::BLOB(const_data_ptr_cast(pq_blob.data()), pq_blob.size());
-	}
-
-	return info;
-}
-
-// ============================================================
-// Deserialization from allocator-based storage
-// ============================================================
-
-void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
-	// Read metadata from options
-	auto m_it = info.options.find("m");
-	if (m_it != info.options.end()) {
-		m_ = m_it->second.GetValue<int>();
-		graph_.m = m_;
-	}
-	auto ef_it = info.options.find("ef_construction");
-	if (ef_it != info.options.end()) {
-		ef_construction_ = ef_it->second.GetValue<int>();
-	}
-	auto dim_it = info.options.find("dimension");
-	if (dim_it != info.options.end()) {
-		dimension_ = dim_it->second.GetValue<uint32_t>();
-		graph_.dimension = dimension_;
-	}
-	const bool has_bridge_state = ImportBridgeGraphState(info, graph_);
-	auto nc_it = info.options.find("node_count");
-	if (nc_it != info.options.end() && !has_bridge_state) {
-		graph_.node_count = nc_it->second.GetValue<uint64_t>();
-	}
-	auto ml_it = info.options.find("max_level");
-	if (ml_it != info.options.end() && !has_bridge_state) {
-		graph_.max_level = ml_it->second.GetValue<int>();
-	}
-	auto ep_it = info.options.find("entry_point");
-	if (ep_it != info.options.end() && !has_bridge_state) {
-		graph_.entry_point.Set(ep_it->second.GetValue<uint64_t>());
-	}
-	if (!has_bridge_state) {
-		graph_.has_entry_point = (graph_.node_count > 0);
-	}
-	auto pq_it = info.options.find("use_pq");
-	if (pq_it != info.options.end()) {
-		use_pq_ = pq_it->second.GetValue<bool>();
-	}
-	auto pqm_it = info.options.find("pq_m");
-	if (pqm_it != info.options.end()) {
-		pq_m_ = pqm_it->second.GetValue<uint32_t>();
-	}
-	auto metric_opt = info.options.find("metric");
-	if (metric_opt != info.options.end()) {
-		metric_ = static_cast<vex::VexMetric>(metric_opt->second.GetValue<uint8_t>());
-		distance_func_ = vex::GetDistanceFunc(metric_);
-	}
-
-	auto dedup_opt = info.options.find("max_dedup");
-	if (dedup_opt != info.options.end()) {
-		graph_.max_dedup = dedup_opt->second.GetValue<uint16_t>();
-	}
-	auto mm_opt = info.options.find("memory_mode");
-	if (mm_opt != info.options.end()) {
-		memory_mode_ = mm_opt->second.GetValue<string>();
-	}
-
-	// Deserialize metadata schema
-	auto meta_seg_it = info.options.find("meta_segment_size");
-	if (meta_seg_it != info.options.end()) {
-		graph_.meta_segment_size = meta_seg_it->second.GetValue<uint32_t>();
-	}
-
-	auto meta_schema_it = info.options.find("meta_schema");
-	if (meta_schema_it != info.options.end()) {
-		auto blob = meta_schema_it->second.GetValueUnsafe<string>();
-		const char *ptr = blob.data();
-		const char *end = ptr + blob.size();
-		if (ptr + sizeof(uint32_t) <= end) {
-			uint32_t num_cols;
-			memcpy(&num_cols, ptr, sizeof(num_cols));
-			ptr += sizeof(num_cols);
-			graph_.meta_columns.clear();
-			for (uint32_t i = 0; i < num_cols && ptr + 9 <= end; i++) {
-				vex::MetaColumnDesc desc;
-				uint8_t tid;
-				memcpy(&tid, ptr, 1); ptr += 1;
-				desc.type_id = static_cast<LogicalTypeId>(tid);
-				memcpy(&desc.offset, ptr, 4); ptr += 4;
-				memcpy(&desc.size, ptr, 4); ptr += 4;
-				graph_.meta_columns.push_back(desc);
-			}
-		}
-	}
-
-	auto meta_types_it = info.options.find("meta_col_types");
-	if (meta_types_it != info.options.end()) {
-		auto blob = meta_types_it->second.GetValueUnsafe<string>();
-		const char *ptr = blob.data();
-		const char *end = ptr + blob.size();
-		if (ptr + sizeof(uint32_t) <= end) {
-			uint32_t num_types;
-			memcpy(&num_types, ptr, sizeof(num_types));
-			ptr += sizeof(num_types);
-			meta_col_types_.clear();
-			for (uint32_t i = 0; i < num_types && ptr + 1 <= end; i++) {
-				uint8_t tid;
-				memcpy(&tid, ptr, 1); ptr += 1;
-				meta_col_types_.push_back(LogicalType(static_cast<LogicalTypeId>(tid)));
-			}
-		}
-	}
-
-	auto meta_ids_it = info.options.find("meta_col_ids");
-	if (meta_ids_it != info.options.end()) {
-		auto blob = meta_ids_it->second.GetValueUnsafe<string>();
-		const char *ptr = blob.data();
-		const char *end = ptr + blob.size();
-		if (ptr + sizeof(uint32_t) <= end) {
-			uint32_t num_ids;
-			memcpy(&num_ids, ptr, sizeof(num_ids));
-			ptr += sizeof(num_ids);
-			meta_col_ids_.clear();
-			for (uint32_t i = 0; i < num_ids && ptr + sizeof(column_t) <= end; i++) {
-				column_t col_id;
-				memcpy(&col_id, ptr, sizeof(col_id));
-				ptr += sizeof(col_id);
-				meta_col_ids_.push_back(col_id);
-			}
-		}
-	}
-
-	// Create allocators WITHOUT slot-0 reservation.
-	// The serialized bitmask already has slot 0 reserved from the original InitAllocators().
-	// Calling EnsureAllocators() here would reserve slot 0 again (adding buffer 0 to
-	// buffers_with_free_space), then Init() replaces buffer 0 with the on-disk version
-	// but leaves the stale buffers_with_free_space entry. If the on-disk buffer is full,
-	// a subsequent New() would try to allocate from a full buffer and hit
-	// "Invalid bitmask for FixedSizeAllocator".
-	if (!graph_.node_alloc && dimension_ > 0) {
-		auto &block_manager = table_io_manager.GetIndexBlockManager();
-		graph_.dimension = dimension_;
-		graph_.node_alloc = make_uniq<FixedSizeAllocator>(vex::HNSWNodeHeader::SegmentSize(graph_.m), block_manager);
-		graph_.vector_alloc = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(dimension_) * sizeof(float), block_manager);
-		graph_.upper_alloc = make_uniq<FixedSizeAllocator>(vex::HNSWUpperLevel::SegmentSize(graph_.m), block_manager);
-		if (graph_.meta_segment_size > 0) {
-			graph_.meta_alloc = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(graph_.meta_segment_size), block_manager);
-		}
-	}
-
-	// Initialize allocators from storage info (lazy disk loading)
-	if (info.allocator_infos.size() >= 3) {
-		graph_.node_alloc->Init(info.allocator_infos[0]);
-		graph_.vector_alloc->Init(info.allocator_infos[1]);
-		graph_.upper_alloc->Init(info.allocator_infos[2]);
-		if (info.allocator_infos.size() >= 4 && graph_.meta_alloc) {
-			graph_.meta_alloc->Init(info.allocator_infos[3]);
-		}
-	}
-
-	// Restore row_id_map from serialized BLOB
-	auto rid_it = info.options.find("row_id_map");
-	if (rid_it != info.options.end()) {
-		auto rid_blob = rid_it->second.GetValueUnsafe<string>();
-		const char *rptr = rid_blob.data();
-		const char *rend = rptr + rid_blob.size();
-		if (rptr + sizeof(uint64_t) <= rend) {
-			uint64_t num_entries;
-			memcpy(&num_entries, rptr, sizeof(num_entries));
-			rptr += sizeof(num_entries);
-			for (uint64_t i = 0; i < num_entries && rptr + sizeof(row_t) + sizeof(uint64_t) <= rend; i++) {
-				row_t rid;
-				uint64_t ptr_val;
-				memcpy(&rid, rptr, sizeof(rid));
-				rptr += sizeof(rid);
-				memcpy(&ptr_val, rptr, sizeof(ptr_val));
-				rptr += sizeof(ptr_val);
-				IndexPointer nptr;
-				nptr.Set(ptr_val);
-				graph_.row_id_map[rid] = nptr;
-			}
-		}
-	}
-	graph_.row_id_map_built = true;
-
-	// Deserialize dedup_map_ from BLOB
-	auto dedup_map_it = info.options.find("dedup_map");
-	if (dedup_map_it != info.options.end()) {
-		auto dedup_blob = dedup_map_it->second.GetValueUnsafe<string>();
-		const char *dptr = dedup_blob.data();
-		const char *dend = dptr + dedup_blob.size();
-		if (dptr + sizeof(uint64_t) <= dend) {
-			uint64_t num_nodes;
-			memcpy(&num_nodes, dptr, sizeof(num_nodes));
-			dptr += sizeof(num_nodes);
-			for (uint64_t i = 0; i < num_nodes && dptr + 2 * sizeof(uint64_t) <= dend; i++) {
-				uint64_t node_key, num_extras;
-				memcpy(&node_key, dptr, sizeof(node_key));
-				dptr += sizeof(node_key);
-				memcpy(&num_extras, dptr, sizeof(num_extras));
-				dptr += sizeof(num_extras);
-				std::vector<row_t> extras;
-				extras.reserve(num_extras);
-				for (uint64_t j = 0; j < num_extras && dptr + sizeof(row_t) <= dend; j++) {
-					row_t rid;
-					memcpy(&rid, dptr, sizeof(rid));
-					dptr += sizeof(rid);
-					extras.push_back(rid);
-				}
-				if (!extras.empty()) {
-					graph_.dedup_map_[static_cast<idx_t>(node_key)] = std::move(extras);
-				}
-			}
-		}
-	}
-
-	// Deserialize PQ data
-	auto pq_data_it = info.options.find("pq_data");
-	if (pq_data_it != info.options.end()) {
-		auto pq_blob = pq_data_it->second.GetValueUnsafe<string>();
-		const char *ptr = pq_blob.data();
-		const char *end = ptr + pq_blob.size();
-		if (ptr < end) {
-			uint8_t has_pq = static_cast<uint8_t>(*ptr); ptr += 1;
-			if (has_pq) {
-				use_pq_ = true;
-				if (!graph_.pq.DeserializeFrom(ptr, end)) {
-					use_pq_ = false;
-					return; // PQ data corrupt, skip
-				}
-				if (ptr + 8 <= end) {
-					uint64_t codes_size;
-					memcpy(&codes_size, ptr, 8); ptr += 8;
-					if (ptr + codes_size <= end) {
-						graph_.pq_codes.resize(codes_size);
-						memcpy(graph_.pq_codes.data(), ptr, codes_size);
-					}
-				}
-			}
-		}
-	}
-}
-
-void GraphIndex::RebuildRowIdMap() {
-	// row_id_map is now restored from serialized BLOB in DeserializeFromStorage.
-	// This method is kept for interface compatibility but is a no-op.
-	graph_.row_id_map_built = true;
-}
-
-// ============================================================
-// Legacy BLOB deserialization (backward compatibility)
-// ============================================================
-
-static constexpr uint32_t GRAPH_INDEX_MAGIC = 0x58444947; // "GIDX"
-
-bool GraphIndex::DeserializeFromBlob(const string &blob) {
-	if (blob.empty()) return false;
-
-	const char *ptr = blob.data();
-	const char *end = ptr + blob.size();
-
-	auto read_u32 = [&]() -> uint32_t {
-		if (ptr + 4 > end) throw IOException("GIDX blob truncated at u32 read");
-		uint32_t v; memcpy(&v, ptr, 4); ptr += 4; return v;
-	};
-	auto read_u64 = [&]() -> uint64_t {
-		if (ptr + 8 > end) throw IOException("GIDX blob truncated at u64 read");
-		uint64_t v; memcpy(&v, ptr, 8); ptr += 8; return v;
-	};
-	auto read_i32 = [&]() -> int32_t {
-		if (ptr + 4 > end) throw IOException("GIDX blob truncated at i32 read");
-		int32_t v; memcpy(&v, ptr, 4); ptr += 4; return v;
-	};
-	auto read_i64 = [&]() -> int64_t {
-		if (ptr + 8 > end) throw IOException("GIDX blob truncated at i64 read");
-		int64_t v; memcpy(&v, ptr, 8); ptr += 8; return v;
-	};
-	auto read_u8 = [&]() -> uint8_t {
-		if (ptr + 1 > end) throw IOException("GIDX blob truncated at u8 read");
-		uint8_t v = static_cast<uint8_t>(*ptr); ptr += 1; return v;
-	};
-
-	if (static_cast<size_t>(end - ptr) < 40) return false;
-	uint32_t magic = read_u32();
-	if (magic != GRAPH_INDEX_MAGIC) return false;
-	uint32_t version = read_u32();
-	if (version != 1 && version != 2) return false;
-
-	m_ = static_cast<int>(read_u32());
-	ef_construction_ = static_cast<int>(read_u32());
-	dimension_ = read_u32();
-	uint64_t node_count = read_u64();
-	int32_t max_level = read_i32();
-	int64_t ep_idx = read_i64();
-
-	graph_.m = m_;
-	graph_.dimension = dimension_;
-	graph_.max_level = max_level;
-
-	EnsureAllocators();
-
-	// Read nodes: first pass - allocate and store vectors
-	struct TempNode {
-		IndexPointer node_ptr;
-		row_t row_id;
-		uint8_t level;
-	};
-	std::vector<TempNode> temp_nodes;
-	temp_nodes.reserve(node_count);
-
-	for (uint64_t i = 0; i < node_count; i++) {
-		if (static_cast<size_t>(end - ptr) < 10 + dimension_ * sizeof(float)) return false;
-		row_t row_id = static_cast<row_t>(read_i64());
-		uint8_t level = read_u8();
-		read_u8(); // deleted flag (always 0 in serialized data)
-
-		const float *vec_data = reinterpret_cast<const float *>(ptr);
-		ptr += dimension_ * sizeof(float);
-
-		IndexPointer node_ptr = graph_.AllocateNode(row_id, vec_data, dimension_, level);
-		temp_nodes.push_back({node_ptr, row_id, level});
-	}
-
-	// Read neighbor lists: second pass
-	for (uint64_t i = 0; i < node_count; i++) {
-		auto &tn = temp_nodes[i];
-		auto *header = graph_.GetNode(tn.node_ptr);
-
-		for (uint8_t l = 0; l <= header->level; l++) {
-			uint32_t neighbor_count = read_u32();
-
-			IndexPointer *neighbors;
-			uint16_t dummy_count;
-			graph_.GetNeighbors(tn.node_ptr, l, neighbors, dummy_count);
-			if (!neighbors) {
-				// Skip neighbor data (with bounds check)
-				size_t skip_bytes = static_cast<size_t>(neighbor_count) * 8;
-				if (ptr + skip_bytes > end) return false;
-				ptr += skip_bytes;
-				continue;
-			}
-
-			uint16_t actual_count = 0;
-			for (uint32_t n = 0; n < neighbor_count; n++) {
-				uint64_t neighbor_idx = read_u64();
-				if (neighbor_idx < temp_nodes.size()) {
-					neighbors[actual_count++] = temp_nodes[neighbor_idx].node_ptr;
-				}
-			}
-			graph_.SetNeighborCount(tn.node_ptr, l, actual_count);
-		}
-	}
-
-	// Set entry point
-	if (ep_idx >= 0 && static_cast<uint64_t>(ep_idx) < temp_nodes.size()) {
-		graph_.entry_point = temp_nodes[ep_idx].node_ptr;
-		graph_.has_entry_point = true;
-	}
-
-	// v2: PQ data
-	if (version >= 2 && ptr < end) {
-		uint8_t has_pq = static_cast<uint8_t>(*ptr); ptr += 1;
-		if (has_pq) {
-			use_pq_ = true;
-			graph_.pq.DeserializeFrom(ptr, end);
-			if (ptr + 8 <= end) {
-				uint64_t codes_size;
-				memcpy(&codes_size, ptr, 8); ptr += 8;
-				if (ptr + codes_size <= end) {
-					graph_.pq_codes.resize(codes_size);
-					memcpy(graph_.pq_codes.data(), ptr, codes_size);
-				}
-			}
-		}
-	}
-
-	graph_.row_id_map_built = true;
-	return true;
-}
-
-// ============================================================
-// Other BoundIndex methods
-// ============================================================
 
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
-	idx_t size = sizeof(GraphIndex);
-	if (graph_.node_alloc) size += graph_.node_alloc->GetInMemorySize();
-	if (graph_.vector_alloc) size += graph_.vector_alloc->GetInMemorySize();
-	if (graph_.upper_alloc) size += graph_.upper_alloc->GetInMemorySize();
-	if (graph_.meta_alloc) size += graph_.meta_alloc->GetInMemorySize();
-	size += graph_.row_id_map.size() * (sizeof(row_t) + sizeof(IndexPointer));
-	return size;
+    (void)state;
+    return static_cast<idx_t>(vectors_.size() * sizeof(float) + row_ids_.size() * sizeof(row_t));
 }
 
-namespace {
-
-static string GraphIndexDebugString(GraphIndexCore &graph, int m, uint32_t dimension) {
-	return StringUtil::Format("GraphIndex: %d nodes, %d levels, M=%d, dim=%d",
-	                          static_cast<int>(graph.node_count), graph.max_level, m, dimension);
-}
-
-} // namespace
-
-#if VEX_DUCKDB_HAS_VERIFY_AND_TOSTRING
-string GraphIndex::VerifyAndToString(IndexLock &l, const bool only_verify) {
-	if (only_verify) {
-		return string();
-	}
-	return GraphIndexDebugString(graph_, m_, dimension_);
-}
-#else
 void GraphIndex::Verify(IndexLock &l) {
+    (void)l;
 }
 
 string GraphIndex::ToString(IndexLock &l, bool display_ascii) {
-	return GraphIndexDebugString(graph_, m_, dimension_);
+    (void)l;
+    (void)display_ascii;
+    return StringUtil::Format("GRAPH_INDEX(dim=%llu, m=%d, ef_construction=%d, rows=%llu)",
+                              static_cast<unsigned long long>(dimension_), m_, ef_construction_,
+                              static_cast<unsigned long long>(row_ids_.size()));
 }
-#endif
 
 void GraphIndex::VerifyAllocations(IndexLock &l) {
+    (void)l;
 }
 
 void GraphIndex::VerifyBuffers(IndexLock &l) {
+    (void)l;
 }
 
 string GraphIndex::GetConstraintViolationMessage(VerifyExistenceType verify_type, idx_t failed_index,
-                                                  DataChunk &input) {
-	throw NotImplementedException("Graph index does not support uniqueness constraints");
+                                                 DataChunk &input) {
+    (void)verify_type;
+    (void)failed_index;
+    (void)input;
+    return "GRAPH_INDEX does not enforce constraints";
 }
-
-// ============================================================
-// Search API
-// ============================================================
-
-void GraphIndex::Search(const float *query_vec, idx_t k, int ef,
-                         std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
-                         idx_t brute_force_threshold) {
-	if (graph_.node_count == 0) {
-		return;
-	}
-
-	// For cosine metric, normalize query vector to match stored normalized vectors
-	std::vector<float> norm_query;
-	const float *search_vec = query_vec;
-	if (metric_ == vex::VexMetric::COSINE && graph_.dimension > 0) {
-		norm_query.assign(query_vec, query_vec + graph_.dimension);
-		vex::NormalizeVector(norm_query.data(), graph_.dimension);
-		search_vec = norm_query.data();
-	}
-	if (use_pq_ && metric_ == vex::VexMetric::L2) {
-		if (!graph_.pq.trained && graph_.node_count > 0) {
-			graph_.TrainPQ(pq_m_);
-		} else {
-			EnsurePQCodesUpToDate();
-		}
-		PQSearchViaCoreBridgeOrThrow(search_vec, k, ef, out_row_ids, out_distances, brute_force_threshold);
-	} else {
-		SearchViaCoreBridgeOrThrow(search_vec, k, ef, out_row_ids, out_distances, brute_force_threshold);
-	}
-	// Evict clean buffers after search to reduce memory (controlled by vex_enable_eviction)
-	{
-		auto &db_config = DBConfig::GetConfig(db.GetDatabase());
-		Value evict_val;
-		if (db_config.TryGetCurrentSetting("vex_enable_eviction", evict_val) && evict_val.GetValue<bool>()) {
-			graph_.EvictCleanBuffers();
-		}
-	}
-}
-
-unique_ptr<IndexScanState> GraphIndex::TryInitializeScan(const Expression &expr, const Expression &filter_expr) {
-	return nullptr;
-}
-
-bool GraphIndex::Scan(IndexScanState &state, idx_t max_count, set<row_t> &row_ids) {
-	auto &scan_state = state.Cast<GraphIndexScanState>();
-
-	if (!scan_state.initialized) return false;
-
-	if (scan_state.current_offset == 0 && !scan_state.query_vector.empty()) {
-		Search(scan_state.query_vector.data(), scan_state.k, scan_state.ef,
-		       scan_state.row_ids, scan_state.distances);
-	}
-
-	row_ids.clear();
-	if (scan_state.current_offset >= scan_state.row_ids.size()) return true;
-	idx_t remaining = std::min(max_count, scan_state.row_ids.size() - scan_state.current_offset);
-	for (idx_t i = 0; i < remaining; i++) {
-		row_ids.insert(scan_state.row_ids[scan_state.current_offset + i]);
-	}
-	scan_state.current_offset += remaining;
-
-	return scan_state.current_offset >= scan_state.row_ids.size();
-}
-
-void GraphIndex::ANNSearch(const float *query_vec, idx_t k, int ef,
-                           std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
-                           idx_t brute_force_threshold) {
-	Search(query_vec, k, ef, out_row_ids, out_distances, brute_force_threshold);
-}
-
-void GraphIndex::FilteredSearch(const float *query_vec, idx_t k, int ef,
-                                std::vector<row_t> &out_row_ids, std::vector<float> &out_distances,
-                                const vex::FilterPredicate &filter,
-                                idx_t brute_force_threshold) {
-	if (graph_.node_count == 0) {
-		return;
-	}
-
-	// For cosine metric, normalize query vector
-	std::vector<float> norm_query;
-	const float *search_vec = query_vec;
-	if (metric_ == vex::VexMetric::COSINE && graph_.dimension > 0) {
-		norm_query.assign(query_vec, query_vec + graph_.dimension);
-		vex::NormalizeVector(norm_query.data(), graph_.dimension);
-		search_vec = norm_query.data();
-	}
-	FilteredSearchViaCoreBridgeOrThrow(search_vec, k, ef, out_row_ids, out_distances,
-	                                  filter, brute_force_threshold);
-}
-
-void GraphIndex::SerializeMetaValue(const Value &val, LogicalTypeId type_id, uint8_t *dest, uint32_t size) {
-	std::memset(dest, 0, size);
-	if (val.IsNull()) return;
-	switch (type_id) {
-	case LogicalTypeId::BOOLEAN: {
-		uint8_t v = BooleanValue::Get(val) ? 1 : 0;
-		std::memcpy(dest, &v, 1);
-		break;
-	}
-	case LogicalTypeId::TINYINT: {
-		auto v = TinyIntValue::Get(val);
-		std::memcpy(dest, &v, 1);
-		break;
-	}
-	case LogicalTypeId::SMALLINT: {
-		auto v = SmallIntValue::Get(val);
-		std::memcpy(dest, &v, 2);
-		break;
-	}
-	case LogicalTypeId::INTEGER: {
-		auto v = IntegerValue::Get(val);
-		std::memcpy(dest, &v, 4);
-		break;
-	}
-	case LogicalTypeId::BIGINT: {
-		auto v = BigIntValue::Get(val);
-		std::memcpy(dest, &v, 8);
-		break;
-	}
-	case LogicalTypeId::UINTEGER: {
-		auto v = UIntegerValue::Get(val);
-		std::memcpy(dest, &v, 4);
-		break;
-	}
-	case LogicalTypeId::UBIGINT: {
-		auto v = UBigIntValue::Get(val);
-		std::memcpy(dest, &v, 8);
-		break;
-	}
-	case LogicalTypeId::FLOAT: {
-		auto v = FloatValue::Get(val);
-		std::memcpy(dest, &v, 4);
-		break;
-	}
-	case LogicalTypeId::DOUBLE: {
-		auto v = DoubleValue::Get(val);
-		std::memcpy(dest, &v, 8);
-		break;
-	}
-	case LogicalTypeId::VARCHAR: {
-		auto str = StringValue::Get(val);
-		uint64_t h = vex::FNV1aHash(str.data(), str.size());
-		std::memcpy(dest, &h, std::min(size, static_cast<uint32_t>(8)));
-		break;
-	}
-	default: {
-		try {
-			auto v = val.DefaultCastAs(LogicalType::BIGINT);
-			auto iv = BigIntValue::Get(v);
-			std::memcpy(dest, &iv, std::min(size, static_cast<uint32_t>(8)));
-		} catch (...) {
-			// Leave as zero
-		}
-		break;
-	}
-	}
-}
-
-void GraphIndex::ExtractMetadata(DataChunk &chunk, idx_t row_idx, uint8_t *meta_buf) {
-	auto &meta_cols = graph_.meta_columns;
-	for (idx_t col = 0; col < meta_cols.size(); col++) {
-		idx_t chunk_col = col + 1; // skip vector column at index 0
-		if (chunk_col >= chunk.ColumnCount()) break;
-		auto &vec = chunk.data[chunk_col];
-		auto val = vec.GetValue(row_idx);
-		SerializeMetaValue(val, meta_cols[col].type_id,
-		                   meta_buf + meta_cols[col].offset, meta_cols[col].size);
-	}
-}
-
-void GraphIndex::Clear() {
-	graph_.Clear();
-	dimension_ = 0;
-}
-
-constexpr const char *GraphIndex::TYPE_NAME;
 
 } // namespace duckdb
