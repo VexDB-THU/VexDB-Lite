@@ -1,19 +1,19 @@
 /**
  * Copyright ...
- * Definitions for distance names
+ * Core (PG-free) distance utility declarations
  */
 
-#ifndef DISTANCE_UTILS_H
-#define DISTANCE_UTILS_H
+#ifndef DISTANCE_UTILS_CORE_H
+#define DISTANCE_UTILS_CORE_H
 
 #include <boost/preprocessor/seq.hpp>
 #include <boost/preprocessor/repetition/repeat_from_to.hpp>
 #include <boost/preprocessor/arithmetic/add.hpp>
 #include <boost/preprocessor/control/if.hpp>
 
-#include "pg_compat.h"
+#include <type_traits>
+
 #include "distance/core/distance.h"
-#include "floatvector.h"
 
 #if __GNUC__ >= 10
 #define INLINE_PROP FORCE_INLINE
@@ -22,7 +22,7 @@
 #endif
 
 #include "distance/core/distance_template.h"
-#include "distance/pg/transform_template.h"
+#include "distance/core/transform_template_core.h"
 
 #define NEONV8_FUNC(name) neonv8_##name
 #define SVEV8_FUNC(name) svev8_##name
@@ -64,8 +64,10 @@ constexpr inline uint32 floor_log2(uint32 n)
     }
     return res;
 }
+#ifdef FLOATVECTOR_MAX_DIM
 static_assert(floor_log2(FLOATVECTOR_MAX_DIM) <= max_vector_bottom_dim,
     "incorrect max_vector_bottom_dim");
+#endif
 }   /* detail */
 
 #define DECL_DISTANCE(z, data, isa) \
@@ -76,7 +78,7 @@ static_assert(floor_log2(FLOATVECTOR_MAX_DIM) <= max_vector_bottom_dim,
     uint32 BOOST_PP_CAT(isa, _FUNC(fvec_L2sqr_ny_nearest))(float *distances_tmp_buffer, \
         const float *x, const float *y, uint32 d, uint32 ny); \
     half BOOST_PP_CAT(isa, _FUNC(float_to_half))(float num); \
-    float BOOST_PP_CAT(isa, _FUNC(half_to_float))(half num); 
+    float BOOST_PP_CAT(isa, _FUNC(half_to_float))(half num);
 #define DECL_DISTANCE2(z, data, isa) \
     float BOOST_PP_CAT(isa, _FUNC(distance_single_code_g))( \
         uint32 M, uint32 nbits, const float *sim_table, const uint8 *code); \
@@ -200,11 +202,9 @@ struct TransformDispatcher {
 };
 
 #undef DECL_DISTANCE3_HELPER
-#undef DECL_DISTANCE3_HELPER2
-#undef DECL_DISTANCE3_HELPER3
-#undef DECL_DISTANCE
-#undef DECL_DISTANCE2
 #undef DECL_DISTANCE3
+#undef DECL_DISTANCE2
+#undef DECL_DISTANCE
 #undef GENERATE_ISA_DECLARATIONS
 
-#endif /* DISTANCE_UTILS_H */
+#endif /* DISTANCE_UTILS_CORE_H */

@@ -1,6 +1,7 @@
 #include "vex_functions.hpp"
 
 #include "distance/core/distance.h"
+#include "distance/core/distance_dispatcher.h"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -66,27 +67,39 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
 }
 
 static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    using L2Distancer =
-        Distancer<Arch::GENERAL, Metric::L2, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
-    DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint16 d) {
-        return L2Distancer::get_distance_single(a, b, d);
-    });
+    static const auto func = DispatchRunner<false,
+        MetricList<Metric::L2>,
+        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
+        DispatcherMode::NO_QUANT>::call(
+            Metric::L2, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
+            [](auto &d) -> ann_helper::distance_func {
+                return std::decay_t<decltype(d)>::get_distance_single;
+            });
+    DistanceFunctionImpl(args, state, result, func);
 }
 
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    using IPDistancer =
-        Distancer<Arch::GENERAL, Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
-    DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint16 d) {
-        return IPDistancer::get_distance_single(a, b, d);
-    });
+    static const auto func = DispatchRunner<false,
+        MetricList<Metric::INNER_PRODUCT>,
+        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
+        DispatcherMode::NO_QUANT>::call(
+            Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
+            [](auto &d) -> ann_helper::distance_func {
+                return std::decay_t<decltype(d)>::get_distance_single;
+            });
+    DistanceFunctionImpl(args, state, result, func);
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    using CosDistancer =
-        Distancer<Arch::GENERAL, Metric::COSINE, DistPrecisionType::FLOAT, RemainderSituation::Unknown, false>;
-    DistanceFunctionImpl(args, state, result, [](const float *a, const float *b, uint16 d) {
-        return CosDistancer::get_distance_single(a, b, d);
-    });
+    static const auto func = DispatchRunner<false,
+        MetricList<Metric::COSINE>,
+        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
+        DispatcherMode::NO_QUANT>::call(
+            Metric::COSINE, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
+            [](auto &d) -> ann_helper::distance_func {
+                return std::decay_t<decltype(d)>::get_distance_single;
+            });
+    DistanceFunctionImpl(args, state, result, func);
 }
 
 static void VexTestVec3Function(DataChunk &args, ExpressionState &state, Vector &result) {

@@ -35,8 +35,25 @@ set(VEXDB_DUCK_EXTENSION_FILES
     optimizer/vex_optimizer.cpp
     optimizer/vex_physical_create_index.cpp
     optimizer/vex_physical_index_scan.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/architecture.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/general_dispatcher.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
 )
 
 build_static_extension(vex ${VEXDB_DUCK_EXTENSION_FILES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(vex ${PARAMETERS} ${VEXDB_DUCK_EXTENSION_FILES})
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
+        PROPERTIES COMPILE_FLAGS "-msse4.1 -msse4.2 -mfma -mf16c -Wno-ignored-attributes")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
+        PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -mf16c -Wno-ignored-attributes")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
+        PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512vl -mf16c -Wno-ignored-attributes")
+endif()

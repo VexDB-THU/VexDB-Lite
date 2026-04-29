@@ -20,7 +20,10 @@ SRCS = \
     src/distance/architecture_minimal.cpp \
     src/distance/distance.cpp \
     src/distance/general.cpp \
-    src/distance/general_dispatcher.cpp
+    src/distance/core/general_dispatcher.cpp \
+    src/distance/core/sse_dispatcher.cpp \
+    src/distance/core/avx_dispatcher.cpp \
+    src/distance/core/avx512_dispatcher.cpp
 # Defer full SIMD implementations:
 #    src/distance/general.cpp \
 #    src/distance/sse.cpp \
@@ -36,9 +39,9 @@ DATA = sql/pg_vexdb--1.0.sql
 PG_CONFIG = /home/mingwei6/workspace/postgres/pg-install/bin/pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 
-PG_CPPFLAGS = -I$(CURDIR)/include -I$(CURDIR) -I$(CURDIR)/distance -I$(CURDIR)/vec_types -I$(CURDIR)/rabitq -I$(CURDIR)/module -I/usr/include
+PG_CPPFLAGS = -I$(CURDIR)/include -I$(CURDIR) -I$(CURDIR)/distance -I$(CURDIR)/distance/core -I$(CURDIR)/distance/pg -I$(CURDIR)/vec_types -I$(CURDIR)/rabitq -I$(CURDIR)/module -I/usr/include -DPG_EXTENSION -DHAVE_CXX_TYPEOF_UNQUAL -DPG_VEXDB_TARGET_PG
 
-override CXXFLAGS := -std=c++17 -O2 -fPIC -Wno-error=vla
+override CXXFLAGS := -std=c++17 -O2 -fPIC -Wno-error=vla -Wno-write-strings
 
 ifneq ($(filter x86_64 amd64,$(shell uname -m)),)
     CXXFLAGS += -march=native
@@ -54,6 +57,9 @@ SHLIB_LINK += -lstdc++
 src/distance/sse.o: CXXFLAGS += -msse4.1
 src/distance/avx.o: CXXFLAGS += -mavx2 -mfma
 src/distance/avx512.o: CXXFLAGS += -mavx512f -mavx512dq -mavx512bw -mavx512vl
+src/distance/core/sse_dispatcher.o: CXXFLAGS += -msse4.1
+src/distance/core/avx_dispatcher.o: CXXFLAGS += -mavx2 -mfma
+src/distance/core/avx512_dispatcher.o: CXXFLAGS += -mavx512f -mavx512dq -mavx512bw -mavx512vl
 
 # Override PGXS implicit rule for C++
 %.o: %.cpp

@@ -1,9 +1,9 @@
 #include <immintrin.h>
 
-#include "pg_compat.h"
-#include "distance/pg/distance_utils.h"
-#include "halfvec.h"
-#include "halfutils.h"
+#include "distance/core/distance_utils_core.h"
+#include "half.h"
+#include "distance/core/halfutils_core.h"
+#include "distance/core/transform_template_core.h"
 
 class Avx512DistancePatcher {
     static constexpr uint16 unroll_factor = 4u;

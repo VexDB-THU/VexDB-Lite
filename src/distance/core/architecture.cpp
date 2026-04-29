@@ -3,9 +3,12 @@
  * No dependencies on halfutils or complex headers
  */
 
-#include "pg_compat.h"
 #include "distance/core/distance.h"
 #include "distance/core/architecture_macro.h"
+
+#if defined(PG_VEXDB_TARGET_PG)
+#include "pg_compat.h"
+#endif
 
 /* Declarations from distance_utils.h */
 namespace ann_helper {

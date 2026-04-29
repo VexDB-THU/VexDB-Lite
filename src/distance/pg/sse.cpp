@@ -1,7 +1,8 @@
 #include "distance/core/architecture_macro.h"
 
 #if COMPILER_SUPPORT_SSE
-#include "distance/pg/distance_utils.h"
+#include "distance/core/distance_utils_core.h"
+#include "distance/core/transform_template_core.h"
 #include "distance/pg/cblas_interface.h"
 
 #define DISTANCE_FUNC_NAME(name)  SSE_FUNC(name)

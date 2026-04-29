@@ -2,18 +2,17 @@
  * Copyright ...
  */
 
-#ifndef TRANSFORM_TEMPLATE_H
-#define TRANSFORM_TEMPLATE_H
+#ifndef TRANSFORM_TEMPLATE_CORE_H
+#define TRANSFORM_TEMPLATE_CORE_H
 
 #include <math.h>
 #include <string.h>
 
 #include <vtl/expr_helper>
 
-#include "postgres.h"
 #include "distance/core/distance.h"
-#include "halfvec.h"
-#include "halfutils.h"
+#include "half.h"
+#include "distance/core/halfutils_core.h"
 
 template <typename Policy>
 struct TransformHelper {
@@ -215,4 +214,4 @@ private:
     }
 };
 
-#endif /* TRANSFORM_TEMPLATE_H */
+#endif /* TRANSFORM_TEMPLATE_CORE_H */

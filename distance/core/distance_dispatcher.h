@@ -6,9 +6,16 @@
 #define DISTANCE_DISPATCHER_H
 
 #include "distance/core/distance.h"
+#include <boost/preprocessor/seq/for_each.hpp>
+#include <type_traits>
+
+#if defined(PG_VEXDB_TARGET_PG)
 #include "pq.h"
 #include "rabitq/rabitq_distancer.h"
 #include "graph_index/graph_index_struct.h"
+#elif defined(PG_VEXDB_TARGET_DUCK)
+#include "vex_graph_index_depend_duck.hpp"
+#endif
 
 enum class DispatcherMode {
     DEFAULT,        /* use direct distancer */
@@ -30,13 +37,20 @@ class DispatchRunner;
 template <bool aligned, Metric... Ms, DistPrecisionType... Ds, DispatcherMode mode>
 class DispatchRunner<aligned, MetricList<Ms...>, DistPrecisionTypeList<Ds...>, mode> {
 public:
+#if defined(PG_VEXDB_TARGET_PG)
     template <typename F>
     static auto call(const GraphIndexMetaPage metap, F &&f) {
         return call(metap->metric, metap->precision_type, metap->dimension,
             metap->quantizer_metainfo.get_type(), std::forward<F>(f));
     }
+#endif
     template <typename F>
     static auto call(Metric m, DistPrecisionType dp, uint16 dim, QuantizerType qt, F &&f) {
+#if !defined(PG_VEXDB_TARGET_PG)
+        static_assert(mode == DispatcherMode::NO_QUANT || mode == DispatcherMode::BUILD_PAIR_NO_QUANT,
+                      "Quantizer dispatch modes are PG-only");
+#endif
+#if defined(PG_VEXDB_TARGET_PG)
         CONSTEXPR_IF (mode != DispatcherMode::NO_QUANT && mode != DispatcherMode::BUILD_PAIR_NO_QUANT) {
             if (qt == QuantizerType::PQ) {
                 CONSTEXPR_IF (mode == DispatcherMode::DEFAULT) {
@@ -67,6 +81,9 @@ public:
         } else {
             Assert(qt == QuantizerType::NONE);
         }
+#else
+        Assert(qt == QuantizerType::NONE);
+#endif
         if (m == Metric::FAST_COSINE) {
             m = Metric::INNER_PRODUCT;
         }

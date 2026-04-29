@@ -1,9 +1,9 @@
 #include <immintrin.h>
 
-#include "pg_compat.h"
-#include "distance/pg/distance_utils.h"
-#include "halfvec.h"
-#include "halfutils.h"
+#include "distance/core/distance_utils_core.h"
+#include "half.h"
+#include "distance/core/halfutils_core.h"
+#include "distance/core/transform_template_core.h"
 
 class SseDistancePatcher {
     static constexpr uint16 unroll_factor = 4u;
@@ -93,7 +93,7 @@ private:
                     } else {
                         res += x[2] * y[2];
                     }
-                } /* fall through */
+                }
                 case 2u: {
                     if constexpr (m == Metric::L2) {
                         const float diff1 = x[1] - y[1];
@@ -101,7 +101,7 @@ private:
                     } else {
                         res += x[1] * y[1];
                     }
-                } /* fall through */
+                }
                 case 1u: {
                     if constexpr (m == Metric::L2) {
                         const float diff0 = x[0] - y[0];
@@ -166,7 +166,7 @@ private:
 
         static INLINE_PROP AccT madd_vectors(VecT a, VecT b, AccT s) {
             __m128i d_lo = _mm_sub_epi16(_mm_cvtepi8_epi16(a), _mm_cvtepi8_epi16(b));
-            __m128i d_hi = _mm_sub_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(a, 8)), 
+            __m128i d_hi = _mm_sub_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(a, 8)),
                                          _mm_cvtepi8_epi16(_mm_srli_si128(b, 8)));
             s = _mm_add_epi32(s, _mm_madd_epi16(d_lo, d_lo));
             return _mm_add_epi32(s, _mm_madd_epi16(d_hi, d_hi));

@@ -104,24 +104,24 @@ set(GRAPH_INDEX_SRCS
 
 set(DISTANCE_SRCS
     src/distance/core/architecture.cpp
+    src/distance/core/general_dispatcher.cpp
+    src/distance/core/sse_dispatcher.cpp
+    src/distance/core/avx_dispatcher.cpp
+    src/distance/core/avx512_dispatcher.cpp
     src/distance/pg/distance.cpp
     src/distance/pg/general.cpp
-    src/distance/pg/general_dispatcher.cpp
     src/distance/pg/sse.cpp
     src/distance/pg/avx.cpp
     src/distance/pg/avx512.cpp
-    src/distance/pg/sse_dispatcher.cpp
-    src/distance/pg/avx_dispatcher.cpp
-    src/distance/pg/avx512_dispatcher.cpp
 )
 
 add_library(pg_vexdb SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS})
 set_target_properties(pg_vexdb PROPERTIES OUTPUT_NAME "pg_vexdb" PREFIX "")
 target_link_libraries(pg_vexdb stdc++)
 
-set_source_files_properties(src/distance/pg/sse.cpp src/distance/pg/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
-set_source_files_properties(src/distance/pg/avx.cpp src/distance/pg/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
-set_source_files_properties(src/distance/pg/avx512.cpp src/distance/pg/avx512_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX512_FLAGS}")
+set_source_files_properties(src/distance/pg/sse.cpp src/distance/core/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
+set_source_files_properties(src/distance/pg/avx.cpp src/distance/core/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
+set_source_files_properties(src/distance/pg/avx512.cpp src/distance/core/avx512_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX512_FLAGS}")
 
 install(TARGETS pg_vexdb LIBRARY DESTINATION "${PG_PKGLIB_DIR}")
 install(FILES sql/pg_vexdb--1.0.sql DESTINATION "${PG_SHARE_DIR}/extension")

@@ -10,9 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
-#if !defined(PG_VEXDB_TARGET_DUCK)
 #include <boost/preprocessor/seq.hpp>
-#endif
 #include <vtl/expr_helper>
 
 /* Vector alignment constants must be available to early includes (e.g. storage headers). */
@@ -119,6 +117,10 @@ enum class RemainderSituation {
     NoPartial,
     NoTail
 };
+
+#define DIST_PRECISION_TYPE_SEQ ((FLOAT, 4)) ((HALF, 2)) ((INT8, 1))
+#define REMAINDER_SITUATION_SEQ (Unknown)(NoPartial)(NoTail)
+#define TRANSFORM_OP_SEQ (ADD)(SUB)(MUL_SCALAR)(NORMALIZE)
 #else
 #define METRIC_SEQ \
     ((L2, 0)) \

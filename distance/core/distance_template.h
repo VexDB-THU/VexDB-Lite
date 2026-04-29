@@ -11,6 +11,15 @@
 
 #include "distance/core/distance.h"
 
+#if defined(PG_VEXDB_TARGET_DUCK)
+#ifndef Assert
+#define Assert(cond) ((void)0)
+#endif
+#ifndef Assume
+#define Assume(cond) ((void)0)
+#endif
+#endif
+
 #define ASSUME_ALIGNED(v) v = (const plaint *)__builtin_assume_aligned(v, 64) // TD vector_aligned_size
 
 template <std::size_t N, typename T, std::size_t... i>

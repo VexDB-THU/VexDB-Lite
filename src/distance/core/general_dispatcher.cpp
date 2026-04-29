@@ -1,9 +1,10 @@
 #include <boost/preprocessor/seq/transform.hpp>
 #include <boost/preprocessor/seq/for_each_product.hpp>
 
-#include "distance/pg/distance_utils.h"
-#include "halfvec.h"
-#include "halfutils.h"
+#include "distance/core/distance_utils_core.h"
+#include "half.h"
+#include "distance/core/halfutils_core.h"
+#include "distance/core/transform_template_core.h"
 
 class GeneralDistancePatcher {
 public:
