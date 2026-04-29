@@ -113,9 +113,9 @@ SinkResultType PhysicalVexCreateIndex::Sink(ExecutionContext &context, DataChunk
         auto &vec_type = vec_vector.GetType();
         auto dim = ArrayType::GetSize(vec_type);
         auto &validity = FlatVector::Validity(vec_vector);
-        auto &child_vec = ArrayVector::GetEntry(vec_vector);
-        auto vec_data = FlatVector::GetData<float>(child_vec);
-        auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+        auto &child_vec = ArrayVector::GetChildMutable(vec_vector);
+        auto vec_data = FlatVector::GetDataMutable<float>(child_vec);
+        auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 
         std::lock_guard<std::mutex> lock(g_state.buffer_mutex);
         if (g_state.dimension == 0) {

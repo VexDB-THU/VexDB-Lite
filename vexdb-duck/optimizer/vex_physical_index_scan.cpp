@@ -189,7 +189,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                 output_chunk.data[fetch_output_positions[i]].Reference(fetch_chunk.data[i]);
             }
             if (distance_output_index.IsValid()) {
-                auto dist_data = FlatVector::GetData<float>(output_chunk.data[distance_output_index.GetIndex()]);
+                auto dist_data = FlatVector::GetDataMutable<float>(output_chunk.data[distance_output_index.GetIndex()]);
                 for (idx_t i = 0; i < fetch_chunk.size(); i++) {
                     dist_data[i] = result_distances[dist_offset + i];
                 }
