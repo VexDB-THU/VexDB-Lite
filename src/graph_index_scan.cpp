@@ -15,7 +15,7 @@
 #include "graph_index/graph_index_storage.h"
 #include "graph_index/graph_index_algorithm.h"
 #include "ann_utils.h"
-#include "distance/distance_dispatcher.h"
+#include "distance/pg/distance_dispatcher.h"
 #include "floatvector.h"
 
 struct GraphIndexScanOpaqueData {

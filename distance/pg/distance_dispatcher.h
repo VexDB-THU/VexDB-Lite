@@ -5,7 +5,7 @@
 #ifndef DISTANCE_DISPATCHER_H
 #define DISTANCE_DISPATCHER_H
 
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "pq.h"
 #include "rabitq/rabitq_distancer.h"
 #include "graph_index/graph_index_struct.h"

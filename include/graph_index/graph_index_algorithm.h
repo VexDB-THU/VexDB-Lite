@@ -11,7 +11,7 @@
 #include <algorithm>    /* max_element */
 
 #include "graph_index/graph_index_depend.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 #include <vtl/bitvector>
 #include <vtl/optional>

@@ -36,7 +36,7 @@
 
 #include "vector_smgr.h"
 #include "vector_buffer_manager.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "module/parallel_counter.h"
 #include "module/size_format.h"
 #include "knl/knl_variable.h"

@@ -1,7 +1,7 @@
 #include <immintrin.h>
 
 #include "pg_compat.h"
-#include "distance/distance_utils.h"
+#include "distance/pg/distance_utils.h"
 #include "halfvec.h"
 #include "halfutils.h"
 
@@ -437,6 +437,6 @@ private:
 
 #define PatcherName AvxDistancePatcher
 #define CUR_ARCH Arch::AVX
-#include "distance/distance.templ"
+#include "distance/core/distance.templ"
 #undef CUR_ARCH
 #undef PatcherName

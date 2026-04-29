@@ -38,8 +38,8 @@ extern "C" {
 using Relation = void *;
 #endif
 
-#include "distance/architecture_macro.h"
-#include "distance/distance_func.h"
+#include "distance/core/architecture_macro.h"
+#include "distance/core/distance_func.h"
 #if !defined(PG_VEXDB_TARGET_DUCK)
 #include "quantizer.h"
 #endif

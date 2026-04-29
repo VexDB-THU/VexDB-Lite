@@ -46,8 +46,11 @@ include_directories(
     ${PG_INCLUDE_DIR}
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}
-    ${CMAKE_SOURCE_DIR}/distance
-    ${CMAKE_SOURCE_DIR}/src/distance
+    ${CMAKE_SOURCE_DIR}/distance/core
+    ${CMAKE_SOURCE_DIR}/distance/pg
+    ${CMAKE_SOURCE_DIR}/distance/pq
+    ${CMAKE_SOURCE_DIR}/src/distance/core
+    ${CMAKE_SOURCE_DIR}/src/distance/pg
     ${CMAKE_SOURCE_DIR}/vec_types
     ${CMAKE_SOURCE_DIR}/rabitq
     ${CMAKE_SOURCE_DIR}/module
@@ -100,25 +103,25 @@ set(GRAPH_INDEX_SRCS
 )
 
 set(DISTANCE_SRCS
-    src/distance/architecture.cpp
-    src/distance/distance.cpp
-    src/distance/general.cpp
-    src/distance/general_dispatcher.cpp
-    src/distance/sse.cpp
-    src/distance/avx.cpp
-    src/distance/avx512.cpp
-    src/distance/sse_dispatcher.cpp
-    src/distance/avx_dispatcher.cpp
-    src/distance/avx512_dispatcher.cpp
+    src/distance/core/architecture.cpp
+    src/distance/pg/distance.cpp
+    src/distance/pg/general.cpp
+    src/distance/pg/general_dispatcher.cpp
+    src/distance/pg/sse.cpp
+    src/distance/pg/avx.cpp
+    src/distance/pg/avx512.cpp
+    src/distance/pg/sse_dispatcher.cpp
+    src/distance/pg/avx_dispatcher.cpp
+    src/distance/pg/avx512_dispatcher.cpp
 )
 
 add_library(pg_vexdb SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS})
 set_target_properties(pg_vexdb PROPERTIES OUTPUT_NAME "pg_vexdb" PREFIX "")
 target_link_libraries(pg_vexdb stdc++)
 
-set_source_files_properties(src/distance/sse.cpp src/distance/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
-set_source_files_properties(src/distance/avx.cpp src/distance/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
-set_source_files_properties(src/distance/avx512.cpp src/distance/avx512_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX512_FLAGS}")
+set_source_files_properties(src/distance/pg/sse.cpp src/distance/pg/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
+set_source_files_properties(src/distance/pg/avx.cpp src/distance/pg/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
+set_source_files_properties(src/distance/pg/avx512.cpp src/distance/pg/avx512_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX512_FLAGS}")
 
 install(TARGETS pg_vexdb LIBRARY DESTINATION "${PG_PKGLIB_DIR}")
 install(FILES sql/pg_vexdb--1.0.sql DESTINATION "${PG_SHARE_DIR}/extension")

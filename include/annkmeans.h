@@ -3,7 +3,7 @@
 
 #include "floatvector.h"
 #include "access/reloptions.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 struct AnnKmeansState {
     bool skipCheckDuplicate;

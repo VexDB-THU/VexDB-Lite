@@ -45,7 +45,7 @@ extern "C" {
 
 #include "knl/knl_variable.h"
 #include "module/parallel_counter.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "vecbuf_shared.h"
 
 #define RELAXED_ORDER std::memory_order_relaxed

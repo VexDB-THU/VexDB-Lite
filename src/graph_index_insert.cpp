@@ -5,7 +5,7 @@
 #include "graph_index/graph_index.h"
 #include "graph_index/graph_index_algorithm.h"
 #include "ann_utils.h"
-#include "distance/distance_dispatcher.h"
+#include "distance/pg/distance_dispatcher.h"
 #include "annkmeans.h"
 #include "buffer_manager.h"
 

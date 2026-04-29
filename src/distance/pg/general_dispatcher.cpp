@@ -1,7 +1,7 @@
 #include <boost/preprocessor/seq/transform.hpp>
 #include <boost/preprocessor/seq/for_each_product.hpp>
 
-#include "distance/distance_utils.h"
+#include "distance/pg/distance_utils.h"
 #include "halfvec.h"
 #include "halfutils.h"
 
@@ -109,7 +109,7 @@ public:
 #define PatcherName GeneralDistancePatcher
 #define REMAINDER_SITUATION_ENUM_SEQ (RemainderSituation::Unknown)
 #define CUR_ARCH Arch::GENERAL
-#include "distance/distance.templ"
+#include "distance/core/distance.templ"
 #undef CUR_ARCH
 #undef REMAINDER_SITUATION_ENUM_SEQ
 #undef PatcherName

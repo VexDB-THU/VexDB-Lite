@@ -1,7 +1,7 @@
 #include <immintrin.h>
 
 #include "pg_compat.h"
-#include "distance/distance_utils.h"
+#include "distance/pg/distance_utils.h"
 #include "halfvec.h"
 #include "halfutils.h"
 
@@ -380,6 +380,6 @@ public:
 
 #define PatcherName SseDistancePatcher
 #define CUR_ARCH Arch::SSE
-#include "distance/distance.templ"
+#include "distance/core/distance.templ"
 #undef CUR_ARCH
 #undef PatcherName

@@ -9,7 +9,7 @@
 #include <vtl/expr_helper>
 #include <vtl/array>
 
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 #define ASSUME_ALIGNED(v) v = (const plaint *)__builtin_assume_aligned(v, 64) // TD vector_aligned_size
 

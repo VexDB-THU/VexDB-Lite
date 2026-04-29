@@ -25,7 +25,7 @@ extern "C" {
 #include "graph_index/graph_index_xlog.h"
 #include "ann_utils.h"
 #include "module/timer.h"
-#include "distance/distance_dispatcher.h"
+#include "distance/pg/distance_dispatcher.h"
 #include "floatvector.h"
 #include "rel_utils.h"
 

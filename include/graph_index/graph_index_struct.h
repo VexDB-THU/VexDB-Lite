@@ -10,7 +10,7 @@
 
 #include "graph_index/graph_index_param.h"
 #include "graph_index_stats.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "quantizer.h"
 
 enum class IdType : uint8 { U32 = 0, U64 };

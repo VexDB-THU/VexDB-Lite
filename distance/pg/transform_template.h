@@ -11,7 +11,7 @@
 #include <vtl/expr_helper>
 
 #include "postgres.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "halfvec.h"
 #include "halfutils.h"
 

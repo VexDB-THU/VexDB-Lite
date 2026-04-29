@@ -21,7 +21,7 @@ static_assert(false, "don't use the file without definition DISTANCE_FUNC_NAME")
 #include <vtl/expr_helper>
 
 #include "pg_compat.h"
-#include "distance/distance_utils.h"
+#include "distance/pg/distance_utils.h"
 
 template<uint32 LOG_N>
 static inline void DISTANCE_FUNC_NAME(helper_float)(float *buf) {

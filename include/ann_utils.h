@@ -4,7 +4,7 @@
 #include <cstddef>
 #include "pg_compat.h"
 #include "floatvector.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 #define VEC_ELEM_SIZE(precision_type) \
     (precision_type == DistPrecisionType::FLOAT ? sizeof(float) : precision_type == DistPrecisionType::HALF ? sizeof(half) : sizeof(int8_t))

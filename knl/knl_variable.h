@@ -1,7 +1,7 @@
 #ifndef KNL_VARIABLE_H
 #define KNL_VARIABLE_H
 
-#include "distance/distance_func.h"
+#include "distance/core/distance_func.h"
 #include "utils/memutils.h"
 
 typedef struct knl_g_annvec_context {

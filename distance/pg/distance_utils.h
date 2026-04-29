@@ -12,7 +12,7 @@
 #include <boost/preprocessor/control/if.hpp>
 
 #include "pg_compat.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "floatvector.h"
 
 #if __GNUC__ >= 10
@@ -21,8 +21,8 @@
 #define INLINE_PROP
 #endif
 
-#include "distance/distance_template.h"
-#include "distance/transform_template.h"
+#include "distance/core/distance_template.h"
+#include "distance/pg/transform_template.h"
 
 #define NEONV8_FUNC(name) neonv8_##name
 #define SVEV8_FUNC(name) svev8_##name

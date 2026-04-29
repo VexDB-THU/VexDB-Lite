@@ -4,7 +4,7 @@
 
 #include "pg_compat.h"
 #include "guc_config.h"
-#include "distance/distance_guc.h"
+#include "distance/pg/distance_guc.h"
 
 /* GUC variables */
 static int pg_vexdb_ef_search = 64;

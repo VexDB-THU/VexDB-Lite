@@ -4,8 +4,8 @@
  */
 
 #include "pg_compat.h"
-#include "distance/distance.h"
-#include "distance/architecture_macro.h"
+#include "distance/core/distance.h"
+#include "distance/core/architecture_macro.h"
 
 /* Declarations from distance_utils.h */
 namespace ann_helper {

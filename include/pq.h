@@ -6,7 +6,7 @@
 #include "postgres.h"
 #include "utils/relcache.h"
 #include "floatvector.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 struct AnnKmeansState;
 

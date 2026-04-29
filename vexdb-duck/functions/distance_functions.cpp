@@ -1,6 +1,6 @@
 #include "vex_functions.hpp"
 
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"

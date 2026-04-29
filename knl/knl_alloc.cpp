@@ -2,7 +2,7 @@
 
 #include <cstdlib>
 #include "knl/knl_variable.h"
-#include "distance/distance.h"
+#include "distance/core/distance.h"
 #include "vector_smgr.h"
 #include "guc_config.h"
 #include "shared_alloc_set.h"
