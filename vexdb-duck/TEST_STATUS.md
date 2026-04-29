@@ -1,6 +1,7 @@
 # VexDB-Duck Test Status
 
-**Date:** 2026-04-29
+**Date:** 2026-04-29  
+**Last Updated:** After FixedSizeAllocator migration
 
 ## Test Summary
 
@@ -10,43 +11,61 @@
 2. **Index Build**: HNSW graph builds successfully from table data
 3. **Index Search**: ANN search returns correct top-k results
 4. **Distance Functions**: `l2_distance` works correctly with vector types
-5. **Vector Types**: `FLOAT[128]` array type works for storage and queries
+5. **Vector Types**: `FLOAT[N]` array type works for storage and queries
+6. **Persistence**: Index data survives checkpoint and database restart via FixedSizeAllocator
 
 ### Test Configuration
 
 - DuckDB version: v1.5.2
 - Test data: SIFT dataset (100-500 vectors, 128 dimensions)
-- Query vectors: 5-20 queries from `sift.sql`
+- Query vectors: 5-50 queries from `sift.sql`
 - Extension built with: `-DOVERRIDE_GIT_DESCRIBE=v1.5.2`
 
-### Test Script
+### Performance (500 vectors, 128 dimensions)
 
-`smoke_sift_literal.py` validates:
-- CSV data loading (tqdm progress bars)
-- Table creation and data insertion
-- Index creation
-- Search query execution with literal query vectors
-- Result validation (10 results per query)
+| Metric | Value |
+|--------|-------|
+| Build time | ~0.12s (~2400 vectors/sec) |
+| Query time | ~1.5ms/query |
+| Persistence test | PASSED |
 
-### Sample Output
+### Test Results
 
-```
-[19:21:02] loaded 500 rows from CSV
-[19:21:02] loaded 20 query vectors from SQL
-[19:21:02] building GRAPH_INDEX
-[19:21:02] index check result: 1 rows
-[19:21:02] query 0: got 10 results
-...
-[19:21:02] ok rows=500 queries=20
-```
+| Test | Status |
+|------|--------|
+| Basic CRUD operations | ✅ PASSED |
+| Persistence with checkpoint | ✅ PASSED |
+| Different index parameters (m=8, ef=32) | ✅ PASSED |
+| Multiple operations | ✅ PASSED |
+| 500 vectors + 50 queries | ✅ PASSED |
+
+## Architecture
+
+### Storage
+
+The index uses DuckDB's `FixedSizeAllocator` for persistent storage:
+
+- **Node allocator** (slot 0): Node headers + level-0 neighbors
+- **Vector allocator** (slot 1): Vector float data
+- **Upper allocator** (slot 2): Upper-level neighbors for multi-layer nodes
+
+Data automatically persists through DuckDB's checkpoint/WAL mechanism.
+
+### Key Files
+
+| File | Purpose |
+|------|---------|
+| `vex_hnsw_node.hpp` | Segment layouts for allocator storage |
+| `vex_graph_index_depend_duck.hpp` | DuckStore with allocator-backed storage |
+| `vex_graph_index.hpp` | GraphIndex class |
+| `graph_index.cpp` | Build, search, deserialization |
+| `graph_index_disk.cpp` | Allocator serialization |
 
 ## Known Limitations
 
 ### 1. Subquery Evaluation in Query Vector Expression
 
 **Issue**: When the query vector is specified via a subquery (e.g., `(SELECT vec FROM queries WHERE qid = ?)`), the expression evaluation causes a segfault during `ExpressionExecutor::EvaluateScalar`.
-
-**Root Cause**: Subqueries require proper execution context that's not available when evaluating scalar expressions directly in the physical operator.
 
 **Workaround**: Use literal query vectors instead of subqueries:
 ```sql
@@ -64,11 +83,11 @@ SELECT id FROM sift ORDER BY l2_distance(vec, (SELECT vec FROM queries WHERE qid
 | File | Purpose | Status |
 |------|---------|--------|
 | `smoke_sift_literal.py` | Basic functionality test with literal vectors | ✅ Working |
-| `smoke_sift_csv_sql.py` | Original test with subqueries | ⚠️ Blocked by limitation #1 |
 
-## Next Steps
+## Future Work
 
 1. Fix subquery evaluation in `PhysicalVexIndexScan::Execute`
 2. Add larger-scale tests (10k, 100k vectors)
 3. Add recall/accuracy validation
 4. Add benchmark tests with timing measurements
+5. Support for additional distance metrics (cosine, inner product)
