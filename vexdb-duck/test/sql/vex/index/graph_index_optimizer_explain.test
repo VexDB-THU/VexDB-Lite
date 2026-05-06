@@ -38,7 +38,7 @@ physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 # Test 2: L2 result correctness
 # ============================================================
 query I
-SELECT id FROM t_l2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+SELECT id FROM t_l2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 3;
 ----
 1
 8
@@ -94,7 +94,7 @@ physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 # Test 6: Cosine result correctness
 # ============================================================
 query I
-SELECT id FROM t_cos ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+SELECT id FROM t_cos ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 3;
 ----
 1
 8
@@ -157,8 +157,10 @@ physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 # ============================================================
 # Test 11: IP result correctness (DESC = highest similarity first)
 # ============================================================
+# Note: tie-breaking by id ascending so the result is deterministic regardless
+# of HNSW traversal order.
 query I
-SELECT id FROM t_ip ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 3;
+SELECT id FROM t_ip ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC, id LIMIT 3;
 ----
 1
 8
@@ -199,7 +201,7 @@ SELECT id FROM t_alias ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMI
 # Parameters are substituted as constants before optimization, so the index IS used.
 # ============================================================
 statement ok
-PREPARE ann_query AS SELECT id FROM t_l2 ORDER BY l2_distance(vec, $1::FLOAT[3]) LIMIT 3;
+PREPARE ann_query AS SELECT id FROM t_l2 ORDER BY l2_distance(vec, $1::FLOAT[3]), id LIMIT 3;
 
 query I
 EXECUTE ann_query([1.0, 0.0, 0.0]);
@@ -215,7 +217,7 @@ DEALLOCATE ann_query;
 # Test 15: LIMIT with OFFSET
 # ============================================================
 query I
-SELECT id FROM t_l2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2 OFFSET 1;
+SELECT id FROM t_l2 ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 2 OFFSET 1;
 ----
 8
 4
@@ -246,7 +248,7 @@ EXPLAIN SELECT id FROM t_l2 ORDER BY l2_distance(vec, '[1.0, 0.0, 0.0]'::FLOAT[3
 physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 query I
-SELECT id FROM t_l2 ORDER BY l2_distance(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]) LIMIT 3;
+SELECT id FROM t_l2 ORDER BY l2_distance(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]), id LIMIT 3;
 ----
 1
 8
@@ -261,7 +263,7 @@ EXPLAIN SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]'::FLOAT[3] LIMIT 3
 physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 query I
-SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]'::FLOAT[3] LIMIT 3;
+SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]'::FLOAT[3] , id LIMIT 3;
 ----
 1
 8
@@ -279,7 +281,7 @@ EXPLAIN SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]' LIMIT 3;
 physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 query I
-SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]' LIMIT 3;
+SELECT id FROM t_l2 ORDER BY vec <-> '[1.0, 0.0, 0.0]' , id LIMIT 3;
 ----
 1
 8
@@ -294,7 +296,7 @@ EXPLAIN SELECT id FROM t_cos ORDER BY cosine_distance(vec, '[1.0, 0.0, 0.0]'::FL
 physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 query I
-SELECT id FROM t_cos ORDER BY cosine_distance(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]) LIMIT 3;
+SELECT id FROM t_cos ORDER BY cosine_distance(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]) , id LIMIT 3;
 ----
 1
 8
@@ -317,7 +319,7 @@ EXPLAIN SELECT id FROM t_ip ORDER BY inner_product(vec, '[1.0, 0.0, 0.0]'::FLOAT
 physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
 
 query I
-SELECT id FROM t_ip ORDER BY inner_product(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]) DESC LIMIT 3;
+SELECT id FROM t_ip ORDER BY inner_product(vec, '[1.0, 0.0, 0.0]'::FLOAT[3]) DESC, id LIMIT 3;
 ----
 1
 8
@@ -384,7 +386,7 @@ physical_plan	<REGEX>:.*SEQ_SCAN.*
 # (Parameters are substituted before optimization)
 # ============================================================
 statement ok
-PREPARE ann_prep AS SELECT id FROM t_l2 ORDER BY l2_distance(vec, $1::FLOAT[3]) LIMIT 3;
+PREPARE ann_prep AS SELECT id FROM t_l2 ORDER BY l2_distance(vec, $1::FLOAT[3]), id LIMIT 3;
 
 query I
 EXECUTE ann_prep([1.0, 0.0, 0.0]);

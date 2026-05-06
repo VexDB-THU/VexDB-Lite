@@ -27,7 +27,7 @@ INSERT INTO items VALUES
 statement ok
 CREATE VIEW v_near_origin AS
 SELECT id, name FROM items
-ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3])
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]), id
 LIMIT 3;
 
 query IT
