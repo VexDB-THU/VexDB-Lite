@@ -1352,8 +1352,16 @@ private:
             store.template lock_point<is_base_layer, false>(nbr.cur_layer_idx);
             store.template get_neighbors<is_base_layer>(r, nbr);
             auto p = store.template get_neighbor_stats<is_base_layer>(nbr.cur_layer_idx);
-            const_cast<Cand &>(nbr).val = store.get_data(nbr.id);
-            int16 pruned = select_neighbors<is_base_layer>(std::move(r), newpoint_id, p.second, nbr, query);
+            Cand self = nbr;
+            char *stable_self_val = nullptr;
+            CONSTEXPR_IF (use_dist_cache) {
+                stable_self_val = alloc_vector(store.get_elemsize());
+                memcpy(stable_self_val, store.get_data(nbr.id), store.get_elemsize());
+                self.val = stable_self_val;
+            } else {
+                self.val = store.get_data(nbr.id);
+            }
+            int16 pruned = select_neighbors<is_base_layer>(std::move(r), newpoint_id, p.second, self, query);
             if (pruned >= 0) {
                 store.template set_neighbor<is_base_layer>(nbr.cur_layer_idx, pruned, newpoint_id,
                                                            newpoint_cur_layer_idx);
@@ -1362,6 +1370,9 @@ private:
                 }
             }
             store.template unlock_point<is_base_layer, false>(nbr.cur_layer_idx);
+            CONSTEXPR_IF (use_dist_cache) {
+                free_vector(stable_self_val);
+            }
         }
         ann_helper::optional_destroy(neighbors);
     }

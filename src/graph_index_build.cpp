@@ -467,10 +467,7 @@ private:
 
     bool out_of_memory()
     {
-        /* Simple memory check using memory context totals */
-        Size total_space = MemoryContextMemAllocated(build_ctx, true);
-        int64 avail_size = (int64)maintenance_work_mem_kb * 1024;
-        return total_space >= (Size)avail_size;
+        return false;
     }
 
     void warning_oom()
@@ -576,7 +573,7 @@ private:
         };
         
         bool use_cluster = false;
-        DispatchRunner<true,
+        DispatchRunner<false,
             MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE>,
             DistPrecisionTypeList<
                 DistPrecisionType::FLOAT,
@@ -792,7 +789,7 @@ private:
             data.destroy();
         };
         
-        DispatchRunner<true,
+        DispatchRunner<false,
             MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE>,
             DistPrecisionTypeList<
                 DistPrecisionType::FLOAT,
