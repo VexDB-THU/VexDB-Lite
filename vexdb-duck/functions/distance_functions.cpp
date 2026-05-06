@@ -169,13 +169,34 @@ ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
     return set;
 }
 
+ScalarFunctionSet VexFunctions::GetCosineDistanceOperator() {
+    ScalarFunctionSet set("<~>");
+    AddDistanceOverloads(set, CosineDistanceFunction);
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetCosineDistanceOperatorAlt() {
+    ScalarFunctionSet set("<=>");
+    AddDistanceOverloads(set, CosineDistanceFunction);
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetInnerProductOperator() {
+    ScalarFunctionSet set("<#>");
+    AddDistanceOverloads(set, InnerProductFunction);
+    return set;
+}
+
 void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2DistanceFunction());
     loader.RegisterFunction(GetL2DistanceOperator());
     loader.RegisterFunction(GetL2DistanceArrayAlias());
     loader.RegisterFunction(GetL2DistanceListAlias());
     loader.RegisterFunction(GetInnerProductFunction());
+    loader.RegisterFunction(GetInnerProductOperator());
     loader.RegisterFunction(GetCosineDistanceFunction());
+    loader.RegisterFunction(GetCosineDistanceOperator());
+    loader.RegisterFunction(GetCosineDistanceOperatorAlt());
     loader.RegisterFunction(GetVectorDimsFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));

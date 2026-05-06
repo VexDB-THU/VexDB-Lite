@@ -16,7 +16,10 @@ struct VexFunctions {
     static ScalarFunctionSet GetL2DistanceArrayAlias();
     static ScalarFunctionSet GetL2DistanceListAlias();
     static ScalarFunctionSet GetInnerProductFunction();
+    static ScalarFunctionSet GetInnerProductOperator();
     static ScalarFunctionSet GetCosineDistanceFunction();
+    static ScalarFunctionSet GetCosineDistanceOperator();
+    static ScalarFunctionSet GetCosineDistanceOperatorAlt();
 
     static ScalarFunctionSet GetVectorDimsFunction();
 
