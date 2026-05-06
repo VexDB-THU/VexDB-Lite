@@ -22,6 +22,7 @@ struct VexFunctions {
     static ScalarFunctionSet GetCosineDistanceOperatorAlt();
 
     static ScalarFunctionSet GetVectorDimsFunction();
+    static ScalarFunctionSet GetL2NormalizeFunction();
 
     static void RegisterIndexInfoFunction(ExtensionLoader &loader);
 };

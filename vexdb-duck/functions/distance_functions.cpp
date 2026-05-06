@@ -198,6 +198,7 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetCosineDistanceOperator());
     loader.RegisterFunction(GetCosineDistanceOperatorAlt());
     loader.RegisterFunction(GetVectorDimsFunction());
+    loader.RegisterFunction(GetL2NormalizeFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));
     RegisterIndexInfoFunction(loader);
