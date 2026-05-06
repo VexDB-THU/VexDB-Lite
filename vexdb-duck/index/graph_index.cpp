@@ -8,6 +8,7 @@
 
 #include "vex/vex_disk_block_store.hpp"
 #include "vex_distance.hpp"
+#include "vex_hnsw_node.hpp"
 #include "vex_physical_create_index.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -537,6 +538,50 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 store.node_ptr_to_id_[ptr_val] = static_cast<uint32_t>(i);
             }
         }
+    }
+
+    // Restore the deleted_rids set so the in-memory delete tracking survives restart.
+    auto del_it = info.options.find("deleted_rids");
+    if (del_it != info.options.end()) {
+        auto blob = StringValue::Get(del_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        deleted_rids_.clear();
+        if (ptr + sizeof(uint64_t) <= end) {
+            uint64_t num_deleted;
+            std::memcpy(&num_deleted, ptr, sizeof(num_deleted));
+            ptr += sizeof(num_deleted);
+            for (uint64_t i = 0; i < num_deleted && ptr + sizeof(int64_t) <= end; i++) {
+                int64_t rid_val;
+                std::memcpy(&rid_val, ptr, sizeof(rid_val));
+                ptr += sizeof(rid_val);
+                deleted_rids_.insert(static_cast<row_t>(rid_val));
+            }
+        }
+    }
+
+    // Repopulate elems[id].tids from disk-backed HNSWNodeHeader.row_id.
+    // get_itempointer / get_tids read from elems[id], not from node_alloc_, so without
+    // this step search returns empty result sets after restart. Skip nodes whose
+    // header->deleted flag was set by a prior Delete() — restoring their tids would
+    // resurrect rows the table no longer has.
+    for (size_t i = 0; i < store.id_to_node_ptr_.size() && i < store.elems.size(); i++) {
+        auto ptr = store.id_to_node_ptr_[i];
+        if (!ptr.Get() || !store.node_alloc_) {
+            continue;
+        }
+        auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<uint32_t> *>(store.node_alloc_->Get(ptr));
+        if (!header || header->deleted) {
+            continue;
+        }
+        if (deleted_rids_.find(header->row_id) != deleted_rids_.end()) {
+            continue;
+        }
+        auto &elem = store.elems[i];
+        elem.tids.clear();
+        ItemPointerData tid;
+        tid.row_id = header->row_id;
+        elem.tids.push_back(tid);
     }
 
     auto upper_ptr_it = info.options.find("upper_ptr_map");
