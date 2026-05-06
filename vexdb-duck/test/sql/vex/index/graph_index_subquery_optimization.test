@@ -252,8 +252,11 @@ SELECT id FROM t ORDER BY v <~> (SELECT v FROM q) DESC LIMIT 5;
 physical_plan	<REGEX>:.*SEQ_SCAN.*
 
 # ============================================================
-# Test 20: <~> with ASC subquery - should trigger optimizer
+# Test 20: <~> with ASC subquery - should trigger optimizer (uses cosine index)
 # ============================================================
+statement ok
+CREATE INDEX idx_cos ON t USING GRAPH_INDEX (v) WITH (metric='cosine');
+
 query II
 EXPLAIN WITH q AS (SELECT [0.5, 1.0, 1.5, 2.0]::FLOAT[4] AS v)
 SELECT id FROM t ORDER BY v <~> (SELECT v FROM q) ASC LIMIT 5;
