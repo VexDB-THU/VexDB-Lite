@@ -43,7 +43,7 @@ void LoadInternal(ExtensionLoader &loader) {
     OptimizerExtension::Register(config, VexOptimizerExtension());
 
     config.AddExtensionOption("vex_ef_search", "Search expansion factor for GRAPH_INDEX.",
-                              LogicalType::INTEGER, Value::INTEGER(64));
+                              LogicalType::INTEGER, Value::INTEGER(40));
     config.AddExtensionOption("vex_brute_force_threshold", "Temporary brute-force threshold for GRAPH_INDEX.",
                               LogicalType::UBIGINT, Value::UBIGINT(64));
 }

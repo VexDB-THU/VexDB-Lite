@@ -175,10 +175,23 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
             throw InvalidInputException("VEX_INDEX_SCAN query vector expression did not evaluate to FLOAT[N]");
         }
 
-        int ef = 64;
+        int ef = 40;
         Value ef_val;
         if (context.client.TryGetCurrentSetting("vex_ef_search", ef_val)) {
             ef = ef_val.GetValue<int>();
+            if (ef < 1 || ef > 65535) {
+                throw InvalidInputException(
+                    "vex_ef_search must be in [1, 65535], got %d", ef);
+            }
+        }
+        Value bft_val;
+        if (context.client.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
+            int64_t bft = bft_val.GetValue<int64_t>();
+            if (bft < 0 || bft > 1000000) {
+                throw InvalidInputException(
+                    "vex_brute_force_threshold must be in [0, 1000000], got %lld",
+                    static_cast<long long>(bft));
+            }
         }
         if (static_cast<int>(k) > ef) {
             ef = static_cast<int>(k) * 2;

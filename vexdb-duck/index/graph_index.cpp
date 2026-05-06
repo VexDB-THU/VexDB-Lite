@@ -1,5 +1,7 @@
 #include "vex_graph_index.hpp"
 
+#include <set>
+
 #include "graph_index/graph_index_algorithm.h"
 #include "distance/core/distance_dispatcher.h"
 
@@ -85,6 +87,27 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s", vec_type.ToString());
     }
 
+    // Only the first column may be the FLOAT[N] vector. Any subsequent vector columns
+    // are rejected because vexdb-duck does not yet support multi-vector indexes.
+    for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
+        auto &t = input.unbound_expressions[i]->return_type;
+        if (t.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(t).id() == LogicalTypeId::FLOAT) {
+            throw InvalidInputException(
+                "GRAPH_INDEX accepts only the first column may be a vector "
+                "(got an additional FLOAT[%llu] at position %llu)",
+                static_cast<unsigned long long>(ArrayType::GetSize(t)),
+                static_cast<unsigned long long>(i));
+        }
+    }
+    // Reject duplicate columns. DuckDB collapses duplicates in `column_ids`, so the
+    // mismatch between unbound_expressions size and column_ids size is the signal.
+    if (input.unbound_expressions.size() > input.column_ids.size()) {
+        throw InvalidInputException(
+            "GRAPH_INDEX rejects duplicate column in expression list (%llu expressions, %llu unique columns)",
+            static_cast<unsigned long long>(input.unbound_expressions.size()),
+            static_cast<unsigned long long>(input.column_ids.size()));
+    }
+
     idx_t dimension = ArrayType::GetSize(vec_type);
     int m = 16;
     int ef_construction = 64;
@@ -92,15 +115,67 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto m_it = input.options.find("m");
     if (m_it != input.options.end()) {
-        m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        try {
+            m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'm' must be a valid integer");
+        }
+        if (m < 2 || m > 128) {
+            throw InvalidInputException("GRAPH_INDEX option 'm' must be in [2, 128], got %d", m);
+        }
     }
     auto ef_it = input.options.find("ef_construction");
     if (ef_it != input.options.end()) {
-        ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        try {
+            ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'ef_construction' must be a valid integer");
+        }
+        if (ef_construction < 1 || ef_construction > 10000) {
+            throw InvalidInputException(
+                "GRAPH_INDEX option 'ef_construction' must be in [1, 10000], got %d", ef_construction);
+        }
     }
     auto metric_it = input.options.find("metric");
     if (metric_it != input.options.end()) {
         metric = ParseMetric(metric_it->second.GetValue<string>());
+    }
+    auto threads_it = input.options.find("threads");
+    if (threads_it != input.options.end()) {
+        int threads_val = 0;
+        try {
+            threads_val = threads_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'threads' must be a valid integer in [1, 1024]");
+        }
+        if (threads_val < 1 || threads_val > 1024) {
+            throw InvalidInputException("GRAPH_INDEX option 'threads' must be in [1, 1024], got %d", threads_val);
+        }
+        // vexdb-duck currently builds single-threaded; the option is accepted but ignored.
+    }
+    auto pq_m_it = input.options.find("pq_m");
+    if (pq_m_it != input.options.end()) {
+        int pq_m_val = 0;
+        try {
+            pq_m_val = pq_m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'pq_m' must be a valid integer");
+        }
+        if (pq_m_val < 0) {
+            throw InvalidInputException("GRAPH_INDEX option 'pq_m' must be >= 0, got %d", pq_m_val);
+        }
+        // vexdb-duck does not yet implement PQ; option is accepted for compatibility but ignored.
+    }
+    // Reject unknown options.
+    static const char *known_options[] = {"m", "ef_construction", "metric", "threads", "quantizer", "pq_m"};
+    for (auto &kv : input.options) {
+        bool ok = false;
+        for (auto *known : known_options) {
+            if (StringUtil::CIEquals(kv.first, known)) { ok = true; break; }
+        }
+        if (!ok) {
+            throw InvalidInputException("GRAPH_INDEX got unknown option '%s'", kv.first);
+        }
     }
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
