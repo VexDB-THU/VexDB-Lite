@@ -276,11 +276,12 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     }
     auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
 
+    bool has_deleted = !deleted_rids_.empty();
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
         auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
         for (idx_t i = 0; i < res.first.size() && row_ids.size() < k; i++) {
             row_t rid = res.first[i].row_id;
-            if (deleted_rids_.find(rid) != deleted_rids_.end()) {
+            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
                 continue;
             }
             row_ids.push_back(rid);
@@ -378,7 +379,6 @@ void GraphIndex::VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, Confl
 
 void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) {
     (void)state;
-    (void)entries;
     auto count = entries.size();
     if (count == 0) {
         return;
@@ -540,7 +540,6 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         }
     }
 
-    // Restore the deleted_rids set so the in-memory delete tracking survives restart.
     auto del_it = info.options.find("deleted_rids");
     if (del_it != info.options.end()) {
         auto blob = StringValue::Get(del_it->second.DefaultCastAs(LogicalType::BLOB));
