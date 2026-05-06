@@ -280,10 +280,8 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
         return ExportStorageInfo();
     }
 
-    auto info = ExportStorageInfo();
-
     if (!context.Valid()) {
-        return info;
+        return ExportStorageInfo();
     }
 
     auto &block_manager = table_io_manager.GetIndexBlockManager();
@@ -292,8 +290,9 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
     runtime_->store.node_alloc_->SerializeBuffers(partial_block_manager);
     runtime_->store.vector_alloc_->SerializeBuffers(partial_block_manager);
     runtime_->store.upper_alloc_->SerializeBuffers(partial_block_manager);
+    partial_block_manager.FlushPartialBlocks();
 
-    return info;
+    return ExportStorageInfo();
 }
 
 IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {

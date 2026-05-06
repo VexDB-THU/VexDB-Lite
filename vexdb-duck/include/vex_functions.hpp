@@ -19,6 +19,8 @@ struct VexFunctions {
     static ScalarFunctionSet GetCosineDistanceFunction();
 
     static ScalarFunctionSet GetVectorDimsFunction();
+
+    static void RegisterIndexInfoFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb

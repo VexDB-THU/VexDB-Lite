@@ -91,7 +91,7 @@ static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
+    static const auto neg_cos_func = DispatchRunner<false,
         MetricList<Metric::COSINE>,
         DistPrecisionTypeList<DistPrecisionType::FLOAT>,
         DispatcherMode::NO_QUANT>::call(
@@ -99,7 +99,10 @@ static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vect
             [](auto &d) -> ann_helper::distance_func {
                 return std::decay_t<decltype(d)>::get_distance_single;
             });
-    DistanceFunctionImpl(args, state, result, func);
+    auto cos_dist_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return 1.0f + neg_cos_func(xx, yy, dim);
+    };
+    DistanceFunctionImpl(args, state, result, cos_dist_func);
 }
 
 static void VexTestVec3Function(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -170,6 +173,7 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetVectorDimsFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));
+    RegisterIndexInfoFunction(loader);
 }
 
 } // namespace duckdb

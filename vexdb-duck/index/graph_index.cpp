@@ -106,13 +106,18 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
                                              metric);
-    graph_index->runtime_->store.InitAllocators(input.table_io_manager.GetIndexBlockManager());
 
     if (input.storage_info.allocator_infos.size() >= 3) {
+        // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
+        // bitmask already has slot 0 reserved from the original InitAllocators().
+        // Reserving it again would corrupt buffers_with_free_space tracking.
+        graph_index->runtime_->store.CreateAllocators(input.table_io_manager.GetIndexBlockManager());
         graph_index->DeserializeFromStorage(input.storage_info);
         graph_index->runtime_->store.normalize_vectors_ = (graph_index->metric_ == VexMetric::COSINE);
         return std::move(graph_index);
     }
+
+    graph_index->runtime_->store.InitAllocators(input.table_io_manager.GetIndexBlockManager());
 
     auto manifest_it = input.storage_info.options.find("vex_graph_manifest");
     if (manifest_it != input.storage_info.options.end()) {
@@ -161,13 +166,7 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
     return create_idx;
 }
 
-void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids, idx_t dimension) {
-    if (dimension_ != dimension) {
-        throw InvalidInputException("GRAPH_INDEX dimension mismatch: expected %llu, got %llu",
-                                    static_cast<unsigned long long>(dimension_),
-                                    static_cast<unsigned long long>(dimension));
-    }
-
+void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids) {
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
@@ -327,6 +326,13 @@ void GraphIndex::Vacuum(IndexLock &l) {
     (void)l;
 }
 
+idx_t GraphIndex::GetNodeCount() const {
+    if (!runtime_) {
+        return 0;
+    }
+    return runtime_->store.elems.size();
+}
+
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
     (void)state;
     if (!runtime_) {
@@ -387,23 +393,19 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         store.upper_alloc_->Init(info.allocator_infos[2]);
     }
 
+    size_t node_count = 0;
+    size_t upper_count = 0;
     auto nc_it = info.options.find("node_count");
     if (nc_it != info.options.end()) {
-        size_t node_count = nc_it->second.GetValue<uint64_t>();
-        store.elems.resize(node_count);
-        store.base_points.resize(node_count);
-        store.vectors.resize(node_count);
-        store.id_to_node_ptr_.resize(node_count);
-        store.base_layer.current_size = node_count;
+        node_count = nc_it->second.GetValue<uint64_t>();
     }
-
     auto uc_it = info.options.find("upper_count");
     if (uc_it != info.options.end()) {
-        size_t upper_count = uc_it->second.GetValue<uint64_t>();
-        store.upper_points.resize(upper_count);
-        store.upper_idx_to_ptr_.resize(upper_count);
-        store.upper_layer.current_size = upper_count;
+        upper_count = uc_it->second.GetValue<uint64_t>();
     }
+    store.ResizeForReload(node_count, upper_count);
+    store.id_to_node_ptr_.resize(node_count);
+    store.upper_idx_to_ptr_.resize(upper_count);
 
     auto eid_it = info.options.find("entry_id");
     auto ec_it = info.options.find("entry_cur_layer_idx");

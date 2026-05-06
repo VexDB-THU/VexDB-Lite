@@ -41,7 +41,7 @@ public:
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric);
 
-    void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids, idx_t dimension);
+    void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
 
@@ -57,6 +57,8 @@ public:
     VexMetric GetMetric() const {
         return metric_;
     }
+
+    idx_t GetNodeCount() const;
 
 public:
     ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;

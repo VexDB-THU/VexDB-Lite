@@ -152,7 +152,7 @@ SinkFinalizeType PhysicalVexCreateIndex::Finalize(Pipeline &pipeline, Event &eve
 
     if (state.is_graph_index) {
         auto &graph_index = state.global_index->Cast<GraphIndex>();
-        graph_index.BuildBulk(state.all_vectors, state.all_row_ids, state.dimension);
+        graph_index.BuildBulk(state.all_vectors, state.all_row_ids);
     }
 
     auto &schema = table.schema;
