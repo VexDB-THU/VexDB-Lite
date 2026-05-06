@@ -7,6 +7,8 @@
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
 
+#include <unordered_set>
+
 namespace duckdb {
 
 class PhysicalOperator;
@@ -93,6 +95,7 @@ private:
     VexMetric metric_;
 
     std::unique_ptr<GraphIndexRuntimeState> runtime_;
+    std::unordered_set<row_t> deleted_rids_;
 };
 
 } // namespace duckdb

@@ -1,6 +1,7 @@
 #include "vex_graph_index.hpp"
 
 #include <set>
+#include <limits>
 
 #include "graph_index/graph_index_algorithm.h"
 #include "distance/core/distance_dispatcher.h"
@@ -268,12 +269,22 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     }
     auto &store = runtime_->store;
     PointExtensionContext point_ctx;
-    auto search_k = uint_fast16_t(std::max<idx_t>(k, ef));
+    idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
+    if (!deleted_rids_.empty()) {
+        needed += deleted_rids_.size();
+    }
+    auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
 
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
         auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
-        for (auto &tid : res.first) row_ids.push_back(tid.row_id);
-        for (auto &dist : res.second) distances.push_back(dist);
+        for (idx_t i = 0; i < res.first.size() && row_ids.size() < k; i++) {
+            row_t rid = res.first[i].row_id;
+            if (deleted_rids_.find(rid) != deleted_rids_.end()) {
+                continue;
+            }
+            row_ids.push_back(rid);
+            distances.push_back(res.second[i]);
+        }
     });
 }
 
@@ -336,6 +347,9 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
             PointExtensionContext point_ctx;
             ItemPointerData tid;
             tid.row_id = row_id_data[i];
+            if (!deleted_rids_.empty()) {
+                deleted_rids_.erase(tid.row_id);
+            }
             const char *query = reinterpret_cast<const char *>(vec_data + i * dim);
             typename AlgoT::InsertContextBase insert_ctx(point_ctx, query, &tid);
             algo.insert(insert_ctx);
@@ -364,7 +378,20 @@ void GraphIndex::VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, Confl
 void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) {
     (void)state;
     (void)entries;
-    (void)row_identifiers;
+    auto count = entries.size();
+    if (count == 0) {
+        return;
+    }
+    UnifiedVectorFormat rid_format;
+    row_identifiers.ToUnifiedFormat(count, rid_format);
+    auto rid_data = UnifiedVectorFormat::GetData<row_t>(rid_format);
+    for (idx_t i = 0; i < count; i++) {
+        auto idx = rid_format.sel->get_index(i);
+        if (!rid_format.validity.RowIsValid(idx)) {
+            continue;
+        }
+        deleted_rids_.insert(rid_data[idx]);
+    }
 }
 
 void GraphIndex::CommitDrop(IndexLock &index_lock) {
