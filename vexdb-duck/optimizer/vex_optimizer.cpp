@@ -23,7 +23,41 @@
 namespace duckdb {
 
 static bool IsDistanceFunction(const string &name) {
-    return name == "l2_distance" || name == "inner_product" || name == "cosine_distance";
+    return name == "l2_distance" || name == "inner_product" || name == "cosine_distance" ||
+           name == "array_distance" || name == "list_distance" ||
+           name == "array_inner_product" || name == "list_inner_product" ||
+           name == "array_negative_inner_product" || name == "list_negative_inner_product" ||
+           name == "array_cosine_distance" || name == "list_cosine_distance" ||
+           name == "array_cosine_similarity" || name == "list_cosine_similarity" ||
+           name == "<->" || name == "<#>" || name == "<~>" || name == "<=>";
+}
+
+static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) {
+    if (name == "l2_distance" || name == "<->" || name == "array_distance" || name == "list_distance") {
+        return metric == VexMetric::L2;
+    }
+    if (name == "inner_product" || name == "<#>" ||
+        name == "array_inner_product" || name == "list_inner_product" ||
+        name == "array_negative_inner_product" || name == "list_negative_inner_product") {
+        return metric == VexMetric::INNER_PRODUCT;
+    }
+    if (name == "cosine_distance" || name == "<~>" || name == "<=>" ||
+        name == "array_cosine_distance" || name == "list_cosine_distance" ||
+        name == "array_cosine_similarity" || name == "list_cosine_similarity") {
+        return metric == VexMetric::COSINE;
+    }
+    return false;
+}
+
+// Returns true if the distance function returns "smaller = closer" semantics.
+// ASC ordering of such functions matches the index's internal ranking.
+static bool IsAscDistanceFunction(const string &name) {
+    if (name == "inner_product" || name == "<#>" ||
+        name == "array_inner_product" || name == "list_inner_product") {
+        // these return positive a·b → user does DESC for nearest
+        return false;
+    }
+    return true;
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
@@ -93,7 +127,14 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
     if (!IsDistanceFunction(info.func_expr->function.name) || info.func_expr->children.size() != 2) {
         return false;
     }
-    if (order_type != OrderType::ASCENDING) {
+    // For inner_product / <#> the user-facing scalar returns +(a·b) (greater = more similar),
+    // so the natural query is ORDER BY ... DESC. The index ranks by -(a·b) ascending, which
+    // matches; for L2 / cosine the user does ASC and the index ranks by sqrt-L2 / -cos_sim
+    // ascending, also matching.
+    OrderType expected = IsAscDistanceFunction(info.func_expr->function.name)
+                             ? OrderType::ASCENDING
+                             : OrderType::DESCENDING;
+    if (order_type != expected) {
         return false;
     }
 
@@ -161,9 +202,11 @@ static void ReplaceGetWithVexScan(unique_ptr<LogicalOperator> &get_owner, const 
 }
 
 static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
-    if (!get->types.empty()) {
-        return get->types;
-    }
+    // We always derive types from the full column_ids list so that the LogicalVexIndexScan
+    // exposes one column binding per column read by the original LogicalGet. Upstream
+    // operators (Filter, Order) bind to columns by index into column_ids; falling back to
+    // get->types here would silently drop bindings when filter pushdown adds extra read
+    // columns that aren't part of the projected output (e.g. WHERE tag = '...' adds 'tag').
     return BuildOutputTypes(get->GetColumnIds(), get->returned_types);
 }
 
@@ -172,7 +215,7 @@ struct IndexMatch {
 };
 
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, const vector<ColumnIndex> &column_ids,
-                                 idx_t col_index, IndexMatch &match) {
+                                 idx_t col_index, const string &distance_func, IndexMatch &match) {
     column_t physical_col_id = DConstants::INVALID_INDEX;
     if (col_index < column_ids.size()) {
         physical_col_id = column_ids[col_index].GetPrimaryIndex();
@@ -182,6 +225,7 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
     }
 
     auto &index_list = storage.GetDataTableInfo()->GetIndexes();
+    GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
         if (!index.IsBound()) {
             continue;
@@ -190,11 +234,22 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
         if (bound.GetIndexType() != GraphIndex::TYPE_NAME) {
             continue;
         }
-        if (!bound.GetColumnIds().empty() && bound.GetColumnIds()[0] == physical_col_id) {
-            match.graph_idx = &bound.Cast<GraphIndex>();
+        if (bound.GetColumnIds().empty() || bound.GetColumnIds()[0] != physical_col_id) {
+            continue;
+        }
+        auto &candidate = bound.Cast<GraphIndex>();
+        if (DistanceFunctionMatchesMetric(distance_func, candidate.GetMetric())) {
+            match.graph_idx = &candidate;
             return true;
         }
+        if (!fallback) {
+            fallback = &candidate;
+        }
     }
+    // No metric-matching index; fall back to any column-matching index only if no
+    // distance function was specified (shouldn't normally happen, but keeps backward
+    // compat for the legacy single-index code path).
+    (void)fallback;
     return false;
 }
 
@@ -217,7 +272,8 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
 
     auto &column_ids = get->GetColumnIds();
     IndexMatch match;
-    if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index, match)) {
+    if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index,
+                              dist_info.func_expr->function.name, match)) {
         return false;
     }
 
