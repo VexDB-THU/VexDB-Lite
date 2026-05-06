@@ -67,7 +67,7 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
 }
 
 static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
+    static const auto squared_func = DispatchRunner<false,
         MetricList<Metric::L2>,
         DistPrecisionTypeList<DistPrecisionType::FLOAT>,
         DispatcherMode::NO_QUANT>::call(
@@ -75,11 +75,14 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
             [](auto &d) -> ann_helper::distance_func {
                 return std::decay_t<decltype(d)>::get_distance_single;
             });
-    DistanceFunctionImpl(args, state, result, func);
+    auto sqrt_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return std::sqrt(squared_func(xx, yy, dim));
+    };
+    DistanceFunctionImpl(args, state, result, sqrt_func);
 }
 
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
+    static const auto neg_ip_func = DispatchRunner<false,
         MetricList<Metric::INNER_PRODUCT>,
         DistPrecisionTypeList<DistPrecisionType::FLOAT>,
         DispatcherMode::NO_QUANT>::call(
@@ -87,7 +90,10 @@ static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector
             [](auto &d) -> ann_helper::distance_func {
                 return std::decay_t<decltype(d)>::get_distance_single;
             });
-    DistanceFunctionImpl(args, state, result, func);
+    auto ip_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return -neg_ip_func(xx, yy, dim);
+    };
+    DistanceFunctionImpl(args, state, result, ip_func);
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
