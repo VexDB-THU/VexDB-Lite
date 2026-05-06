@@ -236,12 +236,16 @@ DROP TABLE t_noindex;
 
 # ============================================================
 # SECTION 8: WHERE clause + ORDER BY distance
-# (plain GRAPH_INDEX uses post-filter — index scan with FILTER above)
+# vexdb-duck does not yet implement post-filter on top of VEX_INDEX_SCAN
+# (would require pulling the WHERE predicate back out of LogicalGet's
+# table_filters and re-emitting it as a wrapping LogicalFilter). For now
+# the optimizer leaves the query alone so DuckDB's seq-scan + filter +
+# sort path runs and returns correct results — slower but correct.
 # ============================================================
 query II
 EXPLAIN SELECT id FROM t_plan WHERE tag = 'tag_1' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
 ----
-physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+physical_plan	<REGEX>:.*SEQ_SCAN.*
 
 # ============================================================
 # SECTION 9: Expression wrapping — CAST around distance
