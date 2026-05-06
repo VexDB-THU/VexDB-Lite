@@ -1,0 +1,103 @@
+# name: test/sql/vex/index/graph_index_prepared.test
+# description: Test prepared statements and parameterized queries with graph index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup
+# ============================================================
+statement ok
+CREATE TABLE t_prep (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_prep ON t_prep USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_prep VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [0.5, 0.5, 0.0]::FLOAT[3]),
+  (5, [0.0, 0.5, 0.5]::FLOAT[3]);
+
+# ============================================================
+# Test 1: Prepared statement with LIMIT parameter
+# ============================================================
+statement ok
+PREPARE q1 AS SELECT id FROM t_prep ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT $1;
+
+query I
+EXECUTE q1(2);
+----
+1
+4
+
+query I
+EXECUTE q1(1);
+----
+1
+
+statement ok
+DEALLOCATE q1;
+
+# ============================================================
+# Test 2: View wrapping ANN query
+# ============================================================
+statement ok
+CREATE VIEW v_nearest AS
+SELECT id, l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) as dist
+FROM t_prep
+ORDER BY dist
+LIMIT 3;
+
+query I
+SELECT id FROM v_nearest;
+----
+1
+4
+5
+
+statement ok
+DROP VIEW v_nearest;
+
+# ============================================================
+# Test 3: Multiple sequential prepared statement executions
+# ============================================================
+statement ok
+PREPARE q3 AS SELECT id FROM t_prep ORDER BY l2_distance(vec, [0.0, 0.0, 1.0]::FLOAT[3]) LIMIT $1;
+
+query I
+EXECUTE q3(1);
+----
+3
+
+query I
+EXECUTE q3(3);
+----
+3
+5
+4
+
+statement ok
+DEALLOCATE q3;
+
+# ============================================================
+# Test 4: Subquery in prepared statement
+# ============================================================
+statement ok
+PREPARE q4 AS SELECT count(*) FROM (SELECT id FROM t_prep ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT $1);
+
+query I
+EXECUTE q4(3);
+----
+3
+
+statement ok
+DEALLOCATE q4;
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE t_prep;

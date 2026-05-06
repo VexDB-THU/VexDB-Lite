@@ -1,0 +1,35 @@
+# name: test/sql/vex/bf_threshold_explain.test
+# description: Verify vex_brute_force_threshold is reflected in EXPLAIN ANALYZE (TAPD Bug 1078122)
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t_bf (id BIGINT, v FLOAT[4]);
+
+statement ok
+INSERT INTO t_bf SELECT i, [(i*0.1)::FLOAT, (i*0.2)::FLOAT, (i*0.3)::FLOAT, (i*0.4)::FLOAT]::FLOAT[4] FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_bf ON t_bf USING GRAPH_INDEX(v) WITH (metric='cosine');
+
+# With threshold >> node_count, the operator should report brute-force.
+statement ok
+SET vex_brute_force_threshold = 100000;
+
+query II
+EXPLAIN ANALYZE WITH tmp AS (SELECT [0.1,0.2,0.3,0.4]::FLOAT[4] AS vec) SELECT id FROM t_bf ORDER BY v <=> (SELECT vec FROM tmp) LIMIT 5;
+----
+analyzed_plan	<REGEX>:.*Algorithm.*brute-force.*
+
+# With threshold << node_count, the operator should report hnsw.
+statement ok
+SET vex_brute_force_threshold = 10;
+
+query II
+EXPLAIN ANALYZE WITH tmp AS (SELECT [0.1,0.2,0.3,0.4]::FLOAT[4] AS vec) SELECT id FROM t_bf ORDER BY v <=> (SELECT vec FROM tmp) LIMIT 5;
+----
+analyzed_plan	<REGEX>:.*Algorithm.*hnsw.*
+
+statement ok
+DROP TABLE t_bf;

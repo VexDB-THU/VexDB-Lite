@@ -1,0 +1,27 @@
+# name: test/sql/vex/index/graph_index_debug.test
+# description: Debug test for graph index registration
+# group: [vex]
+
+require vex
+
+# Check available functions - should include vex functions
+query I
+SELECT COUNT(*) >= 5 FROM duckdb_functions() WHERE function_name LIKE '%distance%' OR function_name LIKE '%vector%';
+----
+1
+
+# Create a simple table and try to create index
+statement ok
+CREATE TABLE test_vectors (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO test_vectors VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
+
+# GRAPH_INDEX should be registered and work
+statement ok
+CREATE INDEX test_idx ON test_vectors USING GRAPH_INDEX (vec);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
+----
+1

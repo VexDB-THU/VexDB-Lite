@@ -1,0 +1,40 @@
+# name: test/sql/vex/index/graph_index_search.test
+# description: Test graph index vector search (ANN)
+# group: [vex]
+
+require vex
+
+# Create a table with vectors and insert data
+statement ok
+CREATE TABLE items (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO items VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [0.9, 0.1, 0.0]::FLOAT[3]),
+  (5, [0.0, 0.9, 0.1]::FLOAT[3]),
+  (6, [0.1, 0.0, 0.9]::FLOAT[3]);
+
+# Create the index
+statement ok
+CREATE INDEX idx_items ON items USING GRAPH_INDEX (vec);
+
+# Basic nearest neighbor query
+# id=1: [1,0,0] dist=0, id=4: [0.9,0.1,0] dist=0.141, id=6: [0.1,0,0.9] dist=1.273
+query I
+SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+1
+4
+6
+
+# Search near [0,1,0]
+# id=2: [0,1,0] dist=0, id=5: [0,0.9,0.1] dist=0.141, id=4: [0.9,0.1,0] dist=1.273
+query I
+SELECT id FROM items ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+2
+5
+4

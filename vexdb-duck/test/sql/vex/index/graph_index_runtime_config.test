@@ -1,0 +1,141 @@
+# name: test/sql/vex/index/graph_index_runtime_config.test
+# description: Test runtime configuration parameters (vex_ef_search, vex_brute_force_threshold)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Default values are accessible
+# ============================================================
+query I
+SELECT current_setting('vex_ef_search');
+----
+40
+
+query I
+SELECT current_setting('vex_brute_force_threshold');
+----
+64
+
+# ============================================================
+# Test 2: SET vex_ef_search
+# ============================================================
+statement ok
+SET vex_ef_search = 100;
+
+query I
+SELECT current_setting('vex_ef_search');
+----
+100
+
+statement ok
+SET vex_ef_search = 200;
+
+query I
+SELECT current_setting('vex_ef_search');
+----
+200
+
+# Reset to default
+statement ok
+RESET vex_ef_search;
+
+query I
+SELECT current_setting('vex_ef_search');
+----
+40
+
+# ============================================================
+# Test 3: SET vex_brute_force_threshold
+# ============================================================
+statement ok
+SET vex_brute_force_threshold = 128;
+
+query I
+SELECT current_setting('vex_brute_force_threshold');
+----
+128
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+query I
+SELECT current_setting('vex_brute_force_threshold');
+----
+0
+
+statement ok
+RESET vex_brute_force_threshold;
+
+query I
+SELECT current_setting('vex_brute_force_threshold');
+----
+64
+
+# ============================================================
+# Test 4: ef_search affects search results (higher ef = better recall)
+# ============================================================
+statement ok
+CREATE TABLE t_config (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_config SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_config ON t_config USING GRAPH_INDEX (vec);
+
+# Search with low ef
+statement ok
+SET vex_ef_search = 10;
+
+query I
+SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Search with high ef
+statement ok
+SET vex_ef_search = 200;
+
+query I
+SELECT count(*) FROM (SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# The top-1 result should be id=0 regardless of ef
+query I
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+statement ok
+RESET vex_ef_search;
+
+# ============================================================
+# Test 5: brute_force_threshold changes search path
+# ============================================================
+
+# Set threshold very high → forces brute-force on 500 rows
+statement ok
+SET vex_brute_force_threshold = 1000;
+
+query I
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+# Set threshold to 0 → always use graph traversal
+statement ok
+SET vex_brute_force_threshold = 0;
+
+query I
+SELECT id FROM t_config ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+statement ok
+RESET vex_brute_force_threshold;
+
+statement ok
+DROP TABLE t_config;
+

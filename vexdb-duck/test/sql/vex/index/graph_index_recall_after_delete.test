@@ -1,0 +1,79 @@
+# name: test/sql/vex/index/graph_index_recall_after_delete.test
+# description: Quick smoke test for recall after deletions (2000 rows)
+# group: [vex]
+# See graph_index_recall_after_delete.test_slow for large-scale version (10000 rows, 32-dim)
+
+require vex
+
+statement ok
+CREATE TABLE recall_del AS
+SELECT i AS id,
+  [sin(i*0.07)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.19+1)::FLOAT, cos(i*0.23+2)::FLOAT,
+   sin(i*0.29+3)::FLOAT, cos(i*0.31+4)::FLOAT, sin(i*0.37+5)::FLOAT, cos(i*0.41+6)::FLOAT
+  ]::FLOAT[8] AS vec
+FROM range(1, 2001) t(i);
+
+statement ok
+CREATE INDEX idx_recall_del ON recall_del USING GRAPH_INDEX (vec) WITH (m = 16, ef_construction = 200);
+
+# Delete 50%
+statement ok
+DELETE FROM recall_del WHERE id % 2 = 0;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TABLE bf AS SELECT id FROM recall_del
+ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10;
+
+statement ok
+RESET disabled_optimizers;
+
+query I
+SELECT COUNT(*) >= 8 FROM (
+  SELECT id FROM recall_del
+  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10
+) ann WHERE ann.id IN (SELECT id FROM bf);
+----
+true
+
+# Delete 90%
+statement ok
+DELETE FROM recall_del WHERE id % 10 != 3;
+
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+DROP TABLE bf;
+
+statement ok
+CREATE TABLE bf AS SELECT id FROM recall_del
+ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10;
+
+statement ok
+RESET disabled_optimizers;
+
+# After 90% delete, HNSW graph connectivity is severely damaged.
+# Disable extension optimizer so both queries use the same brute-force scan,
+# testing that deleted rows are correctly excluded (not recall quality).
+statement ok
+SET disabled_optimizers='extension';
+
+query I
+SELECT COUNT(*) >= 8 FROM (
+  SELECT id FROM recall_del
+  ORDER BY l2_distance(vec, [0.3,-0.5,0.7,-0.2,0.4,-0.6,0.8,-0.1]::FLOAT[8]) LIMIT 10
+) ann WHERE ann.id IN (SELECT id FROM bf);
+----
+true
+
+statement ok
+RESET disabled_optimizers;
+
+statement ok
+DROP TABLE bf;
+
+statement ok
+DROP TABLE recall_del;

@@ -1,0 +1,351 @@
+# name: test/sql/vex/index/graph_index_optimizer_plan.test
+# description: Execution plan verification — ensure optimizer produces VEX_INDEX_SCAN (index) or SEQ_SCAN (fallback) as expected
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: table with enough rows to exceed brute-force threshold
+# ============================================================
+statement ok
+CREATE TABLE t_plan (id INTEGER, tag VARCHAR, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_plan SELECT i, 'tag_' || (i % 5)::VARCHAR, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOAT[4]
+FROM range(1, 501) t(i);
+
+statement ok
+CREATE INDEX idx_l2 ON t_plan USING GRAPH_INDEX (vec) WITH (metric='l2');
+
+statement ok
+CREATE INDEX idx_cos ON t_plan USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+statement ok
+CREATE INDEX idx_ip ON t_plan USING GRAPH_INDEX (vec) WITH (metric='ip');
+
+# ============================================================
+# SECTION 1: Uncast literals — should still use index
+# ============================================================
+
+# 1a: Uncast float literal array
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 1b: Uncast integer literal array
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [1, 0, 0, 0]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 1c: Mixed int/float literal
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [1, 0.5, 0, 0.5]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 1d: Cosine with uncast literal
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 1e: Inner product with uncast literal (DESC)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY inner_product(vec, [0.5, 0.5, 0.5, 0.5]) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 2: Argument order — literal first, column second
+# ============================================================
+
+# 2a: l2_distance(literal, column)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance([0.5, 0.5, 0.5, 0.5]::FLOAT[4], vec) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 2b: cosine_distance(literal, column)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY cosine_distance([0.5, 0.5, 0.5, 0.5]::FLOAT[4], vec) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 2c: inner_product(literal, column) DESC
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY inner_product([0.5, 0.5, 0.5, 0.5]::FLOAT[4], vec) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 3: Subquery / CTE wrapping — optimizer should still fire
+# ============================================================
+
+# 3a: Subquery wrapping
+query II
+EXPLAIN SELECT * FROM (SELECT id, l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) AS dist FROM t_plan ORDER BY dist LIMIT 5);
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 3b: CTE wrapping
+query II
+EXPLAIN WITH nn AS (SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5) SELECT * FROM nn;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 4: SELECT * and extra columns — should use index
+# ============================================================
+
+# 4a: SELECT * with ORDER BY distance
+query II
+EXPLAIN SELECT * FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 4b: SELECT with distance as extra column
+query II
+EXPLAIN SELECT id, l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) AS dist FROM t_plan ORDER BY dist LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 4c: SELECT with non-vector column
+query II
+EXPLAIN SELECT id, tag FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 5: LIMIT + OFFSET — should use index
+# ============================================================
+
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5 OFFSET 10;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 6: Negative cases — must NOT use index (SEQ_SCAN)
+# ============================================================
+
+# 6a: No LIMIT clause — full sort, no index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]);
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6b: ORDER BY DESC for L2 (wrong direction)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6c: ORDER BY ASC for inner_product (wrong direction)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY inner_product(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) ASC LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6d: ORDER BY DESC for cosine (wrong direction)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6e: ORDER BY DESC for <~> (negative inner product, DESC is wrong)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY vec <~> [0.5, 0.5, 0.5, 0.5]::FLOAT[4] DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6f: Metric mismatch — l2 query on cosine-only table
+statement ok
+CREATE TABLE t_cos_only (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_cos_only SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT)::FLOAT[4] FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_cos_only ON t_cos_only USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+query II
+EXPLAIN SELECT id FROM t_cos_only ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# cosine query on same table should use index
+query II
+EXPLAIN SELECT id FROM t_cos_only ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+statement ok
+DROP TABLE t_cos_only;
+
+# 6g: Multiple ORDER BY columns — cannot use index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]), id LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# 6h: Distance between two columns (no constant) — cannot use index
+statement ok
+CREATE TABLE t_two_vec (id INTEGER, v1 FLOAT[4], v2 FLOAT[4]);
+
+statement ok
+INSERT INTO t_two_vec VALUES (1, [1,0,0,0]::FLOAT[4], [0,1,0,0]::FLOAT[4]), (2, [0.5,0.5,0,0]::FLOAT[4], [0.5,0.5,0,0]::FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_two ON t_two_vec USING GRAPH_INDEX (v1);
+
+query II
+EXPLAIN SELECT id FROM t_two_vec ORDER BY l2_distance(v1, v2) LIMIT 1;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+statement ok
+DROP TABLE t_two_vec;
+
+# 6i: Non-distance function in ORDER BY
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY abs(id) LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+# ============================================================
+# SECTION 7: No index on table — must fallback
+# ============================================================
+statement ok
+CREATE TABLE t_noindex (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_noindex SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT)::FLOAT[4] FROM range(1, 201) t(i);
+
+query II
+EXPLAIN SELECT id FROM t_noindex ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+statement ok
+DROP TABLE t_noindex;
+
+# ============================================================
+# SECTION 8: WHERE clause + ORDER BY distance
+# (plain GRAPH_INDEX uses post-filter — index scan with FILTER above)
+# ============================================================
+query II
+EXPLAIN SELECT id FROM t_plan WHERE tag = 'tag_1' ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 9: Expression wrapping — CAST around distance
+# ============================================================
+
+# 9a: Explicit CAST to REAL
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY CAST(l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) AS REAL) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 10: JOIN — optimizer should NOT fire (multi-table)
+# ============================================================
+statement ok
+CREATE TABLE t_meta (id INTEGER, label VARCHAR);
+
+statement ok
+INSERT INTO t_meta SELECT i, 'label_' || i::VARCHAR FROM range(1, 501) t(i);
+
+query II
+EXPLAIN SELECT t_plan.id, t_meta.label FROM t_plan JOIN t_meta ON t_plan.id = t_meta.id ORDER BY l2_distance(t_plan.vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*SEQ_SCAN.*
+
+statement ok
+DROP TABLE t_meta;
+
+# ============================================================
+# SECTION 11: Operator variants plan verification
+# ============================================================
+
+# 11a: <-> uses L2 index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY vec <-> [0.5, 0.5, 0.5, 0.5]::FLOAT[4] LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 11b: <=> uses cosine index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY vec <=> [0.5, 0.5, 0.5, 0.5]::FLOAT[4] LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 11c: <~> uses IP index (ASC)
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY vec <~> [0.5, 0.5, 0.5, 0.5]::FLOAT[4] LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# SECTION 12: DuckDB built-in array_distance/array_cosine_distance aliases
+# ============================================================
+
+# 12a: array_distance → L2 index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY array_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12b: list_distance → L2 index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY list_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12c: array_cosine_distance → cosine index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY array_cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12d: list_cosine_distance → cosine index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY list_cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12e: array_inner_product DESC → IP index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY array_inner_product(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12f: list_inner_product DESC → IP index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY list_inner_product(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) DESC LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12g: array_negative_inner_product ASC → IP index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY array_negative_inner_product(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# 12h: list_negative_inner_product ASC → IP index
+query II
+EXPLAIN SELECT id FROM t_plan ORDER BY list_negative_inner_product(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE t_plan;

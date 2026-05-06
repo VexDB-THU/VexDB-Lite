@@ -1,0 +1,214 @@
+# name: test/sql/vex/index/graph_index_lowdim.test
+# description: Test graph index with low-dimensional vectors (common for mobile/lightweight models)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: dim=2 — create, insert, search
+# ============================================================
+statement ok
+CREATE TABLE t_dim2 (id INTEGER, vec FLOAT[2]);
+
+statement ok
+INSERT INTO t_dim2 VALUES
+  (1, [0.0, 0.0]::FLOAT[2]),
+  (2, [1.0, 0.0]::FLOAT[2]),
+  (3, [0.0, 1.0]::FLOAT[2]),
+  (4, [1.0, 1.0]::FLOAT[2]),
+  (5, [-1.0, 0.0]::FLOAT[2]),
+  (6, [0.5, 0.5]::FLOAT[2]);
+
+statement ok
+CREATE INDEX idx_dim2 ON t_dim2 USING GRAPH_INDEX (vec);
+
+# Nearest to origin
+query I
+SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [0.0, 0.0]::FLOAT[2]) LIMIT 1;
+----
+1
+
+# Nearest to [1,1]
+query I
+SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [1.0, 1.0]::FLOAT[2]) LIMIT 1;
+----
+4
+
+# Nearest to [0.5, 0.5]
+query I
+SELECT id FROM t_dim2 ORDER BY l2_distance(vec, [0.5, 0.5]::FLOAT[2]) LIMIT 1;
+----
+6
+
+statement ok
+DROP TABLE t_dim2;
+
+# ============================================================
+# Test 2: dim=4 with L2 metric
+# ============================================================
+statement ok
+CREATE TABLE t_dim4_l2 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dim4_l2 SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(100) t(i);
+
+statement ok
+CREATE INDEX idx_dim4_l2 ON t_dim4_l2 USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM t_dim4_l2 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+statement ok
+DROP TABLE t_dim4_l2;
+
+# ============================================================
+# Test 3: dim=4 with cosine metric
+# ============================================================
+statement ok
+CREATE TABLE t_dim4_cos (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dim4_cos VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (3, [0.0, 0.0, 1.0, 0.0]::FLOAT[4]),
+  (4, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]),
+  (5, [0.5, 0.5, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_dim4_cos ON t_dim4_cos USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+# Nearest by cosine to [1,0,0,0] should be id=1 (exact match direction)
+query I
+SELECT id FROM t_dim4_cos ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+1
+
+# Nearest by cosine to [0.5,0.5,0,0] should be id=5
+query I
+SELECT id FROM t_dim4_cos ORDER BY cosine_distance(vec, [0.5, 0.5, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+5
+
+statement ok
+DROP TABLE t_dim4_cos;
+
+# ============================================================
+# Test 4: dim=4 with inner product metric
+# ============================================================
+statement ok
+CREATE TABLE t_dim4_ip (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dim4_ip VALUES
+  (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]),
+  (2, [0.0, 1.0, 0.0, 0.0]::FLOAT[4]),
+  (3, [0.5, 0.5, 0.0, 0.0]::FLOAT[4]),
+  (4, [0.9, 0.1, 0.0, 0.0]::FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_dim4_ip ON t_dim4_ip USING GRAPH_INDEX (vec) WITH (metric='ip');
+
+# Inner product search: closest to [1,0,0,0] by IP should be id=1 (highest dot product)
+query I
+SELECT id FROM t_dim4_ip ORDER BY inner_product(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) DESC LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_dim4_ip;
+
+# ============================================================
+# Test 5: dim=8 — bulk insert 1000 rows, verify recall
+# ============================================================
+statement ok
+CREATE TABLE t_dim8 (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO t_dim8 SELECT i, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT,
+                               (i * 0.05)::FLOAT, (i * 0.06)::FLOAT, (i * 0.07)::FLOAT, (i * 0.08)::FLOAT]::FLOAT[8]
+FROM range(1000) t(i);
+
+statement ok
+CREATE INDEX idx_dim8 ON t_dim8 USING GRAPH_INDEX (vec);
+
+# Top-1 recall: nearest to origin should be id=0
+query I
+SELECT id FROM t_dim8 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 1;
+----
+0
+
+# Top-1 recall: nearest to [5,10,15,20,25,30,35,40] should be id=500
+query I
+SELECT id FROM t_dim8 ORDER BY l2_distance(vec, [5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0]::FLOAT[8]) LIMIT 1;
+----
+500
+
+# Top-5: first 5 nearest to origin
+query I
+SELECT id FROM t_dim8 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+statement ok
+DROP TABLE t_dim8;
+
+# ============================================================
+# Test 6: dim=16 — common for mobile embedding models
+# ============================================================
+statement ok
+CREATE TABLE t_dim16 (id INTEGER, vec FLOAT[16]);
+
+statement ok
+INSERT INTO t_dim16 SELECT i, list_transform(range(16), x -> (x + i)::FLOAT / 100.0)::FLOAT[16] FROM range(200) t(i);
+
+statement ok
+CREATE INDEX idx_dim16 ON t_dim16 USING GRAPH_INDEX (vec);
+
+# Nearest to row 0's vector should be id=0
+query I
+SELECT id FROM t_dim16 ORDER BY l2_distance(vec, list_transform(range(16), x -> x::FLOAT / 100.0)::FLOAT[16]) LIMIT 1;
+----
+0
+
+# Nearest to row 100's vector should be id=100
+query I
+SELECT id FROM t_dim16 ORDER BY l2_distance(vec, list_transform(range(16), x -> (x + 100)::FLOAT / 100.0)::FLOAT[16]) LIMIT 1;
+----
+100
+
+statement ok
+DROP TABLE t_dim16;
+
+# ============================================================
+# Test 7: dim=32 with PQ quantization on low dim
+# ============================================================
+statement ok
+CREATE TABLE t_dim32_pq (id INTEGER, vec FLOAT[32]);
+
+statement ok
+INSERT INTO t_dim32_pq SELECT i, list_transform(range(32), x -> (x + i)::FLOAT / 200.0)::FLOAT[32] FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_dim32_pq ON t_dim32_pq USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 8);
+
+# PQ search: nearest to row 0 should be id=0
+query I
+SELECT id FROM t_dim32_pq ORDER BY l2_distance(vec, list_transform(range(32), x -> x::FLOAT / 200.0)::FLOAT[32]) LIMIT 1;
+----
+0
+
+# PQ search: nearest to row 250 should be id=250
+query I
+SELECT id FROM t_dim32_pq ORDER BY l2_distance(vec, list_transform(range(32), x -> (x + 250)::FLOAT / 200.0)::FLOAT[32]) LIMIT 1;
+----
+250
+
+statement ok
+DROP TABLE t_dim32_pq;

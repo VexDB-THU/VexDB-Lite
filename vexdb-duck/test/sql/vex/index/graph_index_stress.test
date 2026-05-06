@@ -1,0 +1,172 @@
+# name: test/sql/vex/index/graph_index_stress.test
+# description: Stress and volume tests for graph index - 2000 rows, bulk delete, re-insert, multiple searches
+# group: [vex]
+
+require vex
+
+# =============================================================================
+# Phase 1: Insert 2000 rows with 4-dim vectors, create index
+# =============================================================================
+
+statement ok
+CREATE TABLE stress_vecs (id INTEGER, vec FLOAT[4]);
+
+# Row 0 = [0,0,0,0], Row 1 = [0.01,0.02,0.03,0.04], etc.
+statement ok
+INSERT INTO stress_vecs SELECT i AS id, [(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT]::FLOAT[4] FROM range(2000) t(i);
+
+query I
+SELECT COUNT(*) FROM stress_vecs;
+----
+2000
+
+statement ok
+CREATE INDEX idx_stress ON stress_vecs USING GRAPH_INDEX (vec);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx_stress';
+----
+1
+
+# =============================================================================
+# Phase 2: Verify top-1 search - closest to origin should be row 0
+# =============================================================================
+
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+# Row 1000 should be closest to its own vector
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOAT[4]) LIMIT 1;
+----
+1000
+
+# =============================================================================
+# Phase 3: Delete 500 rows (id < 500), verify search excludes deleted rows
+# =============================================================================
+
+statement ok
+DELETE FROM stress_vecs WHERE id < 500;
+
+query I
+SELECT COUNT(*) FROM stress_vecs;
+----
+1500
+
+# Verify deleted rows are gone
+query I
+SELECT COUNT(*) FROM stress_vecs WHERE id < 500;
+----
+0
+
+# Search near origin should NOT return any id < 500
+# Closest remaining is id=500 with vec [5.0, 10.0, 15.0, 20.0]
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+500
+
+# Top-5 near origin should all be >= 500
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM stress_vecs
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4])
+  LIMIT 5
+) t
+WHERE t.id >= 500;
+----
+5
+
+# =============================================================================
+# Phase 4: Insert 500 new rows, verify count is 2000
+# =============================================================================
+
+# Insert rows with id 2000..2499, vectors near origin to test they are found
+statement ok
+INSERT INTO stress_vecs SELECT 2000 + i AS id, [(i * 0.005)::FLOAT, (i * 0.01)::FLOAT, (i * 0.015)::FLOAT, (i * 0.02)::FLOAT]::FLOAT[4] FROM range(500) t(i);
+
+query I
+SELECT COUNT(*) FROM stress_vecs;
+----
+2000
+
+# New row id=2000 has vec [0,0,0,0] - should be closest to origin
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+2000
+
+# =============================================================================
+# Phase 5: Multiple sequential searches with different query vectors
+# =============================================================================
+
+# Search 1: Near [10, 20, 30, 40] - should find id=1000
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [10.0, 20.0, 30.0, 40.0]::FLOAT[4]) LIMIT 1;
+----
+1000
+
+# Search 2: Near [15, 30, 45, 60] - should find id=1500
+query I
+SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [15.0, 30.0, 45.0, 60.0]::FLOAT[4]) LIMIT 1;
+----
+1500
+
+# Search 3: Near [19.99, 39.98, 59.97, 79.96] - should find id close to 1999
+# HNSW is approximate; accept any of the nearest neighbors
+query I
+SELECT abs(id - 1999) <= 2 FROM stress_vecs ORDER BY l2_distance(vec, [19.99, 39.98, 59.97, 79.96]::FLOAT[4]) LIMIT 1;
+----
+true
+
+# Search 4: Top-10 near [5, 10, 15, 20] should return 10 results
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM stress_vecs
+  ORDER BY l2_distance(vec, [5.0, 10.0, 15.0, 20.0]::FLOAT[4])
+  LIMIT 10
+) t;
+----
+10
+
+# Search 5: Top-20 near [0.5, 1.0, 1.5, 2.0] should return 20 results
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM stress_vecs
+  ORDER BY l2_distance(vec, [0.5, 1.0, 1.5, 2.0]::FLOAT[4])
+  LIMIT 20
+) t;
+----
+20
+
+# Search 6: Cosine distance search should also work
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM stress_vecs
+  ORDER BY cosine_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4])
+  LIMIT 10
+) t;
+----
+10
+
+# =============================================================================
+# Verify all searches return non-empty, consistent results
+# =============================================================================
+
+# Every search in the top-10 should have non-negative distance
+query I
+SELECT COUNT(*) FROM (
+  SELECT id, l2_distance(vec, [7.5, 15.0, 22.5, 30.0]::FLOAT[4]) AS dist
+  FROM stress_vecs
+  ORDER BY dist
+  LIMIT 10
+) t
+WHERE dist >= 0;
+----
+10
+
+# Cleanup
+statement ok
+DROP TABLE stress_vecs;

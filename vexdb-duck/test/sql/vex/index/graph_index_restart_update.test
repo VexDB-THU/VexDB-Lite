@@ -1,0 +1,179 @@
+# name: test/sql/vex/index/graph_index_restart_update.test
+# description: Verify UPDATE operations work correctly after restart (UPDATE = DELETE + INSERT)
+# group: [vex]
+#
+# UPDATE depends on row_id_map for the DELETE phase and correct INSERT for the new value.
+# This is the most comprehensive test for row_id_map restoration since it exercises both paths.
+
+require vex
+
+# ============================================================
+# Test 1: restart → UPDATE vector column → search reflects new value
+# ============================================================
+
+load __TEST_DIR__/restart_update1.db
+
+statement ok
+CREATE TABLE t1 (id INTEGER, label VARCHAR, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t1 VALUES
+  (1, 'a', [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'b', [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, 'c', [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, 'd', [0.5, 0.5, 0.0]::FLOAT[3]),
+  (5, 'e', [0.0, 0.5, 0.5]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
+
+# Before restart: nearest to origin is id=4 or id=5 (both dist ~0.707)
+query I
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+4
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# UPDATE vector column: move id=1 to origin
+statement ok
+UPDATE t1 SET vec = [0.01, 0.01, 0.01]::FLOAT[3] WHERE id = 1;
+
+# Now id=1 should be nearest to origin
+query I
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# node_count should remain consistent (UPDATE = DELETE old + INSERT new)
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# All 5 rows should still exist
+query I
+SELECT count(*) FROM t1;
+----
+5
+
+# ============================================================
+# Test 2: restart → UPDATE non-vector column → search unaffected
+# ============================================================
+
+# UPDATE non-vector column should not affect index
+statement ok
+UPDATE t1 SET label = 'updated' WHERE id = 2;
+
+query IT
+SELECT id, label FROM t1 ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+2	updated
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# ============================================================
+# Test 3: restart → bulk UPDATE → CHECKPOINT → restart → verify
+# ============================================================
+
+# Bulk update all vectors
+statement ok
+UPDATE t1 SET vec = [(id * 0.1)::FLOAT, 0.0, 0.0]::FLOAT[3];
+
+# After bulk update: id=1→[0.1,0,0], id=2→[0.2,0,0], etc.
+query I
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# Persist the updated state
+statement ok
+CHECKPOINT;
+
+restart
+
+# After restart, search should reflect the bulk update
+statement ok
+DELETE FROM t1 WHERE id = -999;
+
+query I
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+query I
+SELECT id FROM t1 ORDER BY l2_distance(vec, [0.5, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+5
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+statement ok
+DROP TABLE t1;
+
+# ============================================================
+# Test 4: Larger dataset — restart → scattered UPDATEs
+# ============================================================
+
+load __TEST_DIR__/restart_update2.db
+
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t2 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Update every 10th row to a known position near origin
+statement ok
+UPDATE t2 SET vec = [0.001, 0.001, 0.001, 0.001]::FLOAT[4] WHERE id % 10 = 0;
+
+# Verify consistency (dedup may reduce node_count for identical updated vectors)
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+# The nearest to origin should be one of the updated rows (id divisible by 10)
+query I
+SELECT id % 10 = 0 FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 1;
+----
+true
+
+# Verify count unchanged
+query I
+SELECT count(*) FROM t2;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOAT[4]) LIMIT 20);
+----
+20
+
+statement ok
+DROP TABLE t2;

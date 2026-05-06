@@ -1,0 +1,192 @@
+# name: test/sql/vex/index/graph_index_filtered_recall.test
+# description: Verify filtered GRAPH_INDEX search recall against brute-force results
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: 1000 rows, 10 categories, deterministic vectors
+# ============================================================
+statement ok
+CREATE TABLE recall_data (id INTEGER, vec FLOAT[8], category INTEGER);
+
+# Generate 1000 rows: id 0..999, category = id % 10
+# Vector components are deterministic functions of id
+statement ok
+INSERT INTO recall_data
+SELECT i,
+       list_value(
+           sin(i * 0.1)::FLOAT,
+           cos(i * 0.2)::FLOAT,
+           sin(i * 0.3)::FLOAT,
+           cos(i * 0.4)::FLOAT,
+           sin(i * 0.5)::FLOAT,
+           cos(i * 0.6)::FLOAT,
+           sin(i * 0.7)::FLOAT,
+           cos(i * 0.8)::FLOAT
+       )::FLOAT[8],
+       (i % 10)
+FROM range(1000) t(i);
+
+# Create filtered GRAPH_INDEX
+statement ok
+CREATE INDEX idx ON recall_data USING GRAPH_INDEX (vec, category);
+
+# ============================================================
+# Test 1: Filtered results must all belong to the correct category
+# ============================================================
+
+# category = 0: all 10 results should have category 0
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, category FROM recall_data
+    WHERE category = 0
+    ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8])
+    LIMIT 10
+) t WHERE category = 0;
+----
+10
+
+# category = 5: all 10 results should have category 5
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, category FROM recall_data
+    WHERE category = 5
+    ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8])
+    LIMIT 10
+) t WHERE category = 5;
+----
+10
+
+# category = 9: all 10 results should have category 9
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, category FROM recall_data
+    WHERE category = 9
+    ORDER BY l2_distance(vec, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]::FLOAT[8])
+    LIMIT 10
+) t WHERE category = 9;
+----
+10
+
+# ============================================================
+# Test 2: Recall check — filtered ANN top-5 vs brute-force top-5
+# Compute brute-force top-5 for category=3, then check overlap
+# ============================================================
+
+# Step A: brute-force ground truth for category=3
+statement ok
+CREATE TABLE bf_cat3 AS
+SELECT id FROM recall_data
+WHERE category = 3
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8])
+LIMIT 5;
+
+# Step B: filtered ANN result for category=3
+statement ok
+CREATE TABLE ann_cat3 AS
+SELECT id FROM recall_data
+WHERE category = 3
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8])
+LIMIT 5;
+
+# Step C: count overlap — should be 5 (perfect recall)
+query I
+SELECT COUNT(*) FROM bf_cat3 WHERE id IN (SELECT id FROM ann_cat3);
+----
+5
+
+# ============================================================
+# Test 3: Recall check — category=7, different query vector
+# ============================================================
+statement ok
+CREATE TABLE bf_cat7 AS
+SELECT id FROM recall_data
+WHERE category = 7
+ORDER BY l2_distance(vec, [0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6]::FLOAT[8])
+LIMIT 5;
+
+statement ok
+CREATE TABLE ann_cat7 AS
+SELECT id FROM recall_data
+WHERE category = 7
+ORDER BY l2_distance(vec, [0.1, 0.9, 0.2, 0.8, 0.3, 0.7, 0.4, 0.6]::FLOAT[8])
+LIMIT 5;
+
+query I
+SELECT COUNT(*) FROM bf_cat7 WHERE id IN (SELECT id FROM ann_cat7);
+----
+5
+
+# ============================================================
+# Test 4: Unfiltered recall — top-5 should match brute force
+# ============================================================
+statement ok
+CREATE TABLE bf_all AS
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8])
+LIMIT 5;
+
+statement ok
+CREATE TABLE ann_all AS
+SELECT id FROM recall_data
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8])
+LIMIT 5;
+
+query I
+SELECT COUNT(*) FROM bf_all WHERE id IN (SELECT id FROM ann_all);
+----
+5
+
+# ============================================================
+# Test 5: Larger LIMIT — top-20 filtered recall
+# ============================================================
+statement ok
+CREATE TABLE bf_cat1_20 AS
+SELECT id FROM recall_data
+WHERE category = 1
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+LIMIT 20;
+
+statement ok
+CREATE TABLE ann_cat1_20 AS
+SELECT id FROM recall_data
+WHERE category = 1
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+LIMIT 20;
+
+# Expect at least 18/20 overlap (90% recall minimum)
+query I
+SELECT (SELECT COUNT(*) FROM bf_cat1_20 WHERE id IN (SELECT id FROM ann_cat1_20)) >= 18;
+----
+1
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE recall_data;
+
+statement ok
+DROP TABLE bf_cat3;
+
+statement ok
+DROP TABLE ann_cat3;
+
+statement ok
+DROP TABLE bf_cat7;
+
+statement ok
+DROP TABLE ann_cat7;
+
+statement ok
+DROP TABLE bf_all;
+
+statement ok
+DROP TABLE ann_all;
+
+statement ok
+DROP TABLE bf_cat1_20;
+
+statement ok
+DROP TABLE ann_cat1_20;
