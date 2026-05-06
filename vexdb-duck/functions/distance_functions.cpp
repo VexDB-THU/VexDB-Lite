@@ -5,6 +5,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
 namespace duckdb {

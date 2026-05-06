@@ -16,6 +16,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/types/string_type.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"

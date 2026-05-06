@@ -44,10 +44,15 @@ set(VEXDB_DUCK_EXTENSION_FILES
     optimizer/vex_physical_index_scan.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/architecture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/general_dispatcher.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
 )
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    list(APPEND VEXDB_DUCK_EXTENSION_FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
+    )
+endif()
 
 build_static_extension(vex ${VEXDB_DUCK_EXTENSION_FILES})
 set(PARAMETERS "-warnings")
