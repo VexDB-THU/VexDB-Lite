@@ -270,6 +270,18 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         return false;
     }
 
+    // If WHERE predicates have been pushed into the LogicalGet (table_filters /
+    // dynamic_filters), the rewrite would silently drop them: VEX_INDEX_SCAN reads
+    // by row_id and does not honor LogicalGet's pushdown filters. Fall back to the
+    // default plan (seq scan + sort), which produces correct results (just without
+    // the index acceleration for the filter case).
+    if (!get->table_filters.filters.empty()) {
+        return false;
+    }
+    if (get->dynamic_filters && get->dynamic_filters->HasFilters()) {
+        return false;
+    }
+
     auto &column_ids = get->GetColumnIds();
     IndexMatch match;
     if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index,
