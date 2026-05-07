@@ -279,7 +279,17 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
         return false;
     }
 
-    auto &index_list = storage.GetDataTableInfo()->GetIndexes();
+    auto &table_info = *storage.GetDataTableInfo();
+    // After DB reopen, GRAPH_INDEX entries are lazy-deserialized — IsBound() returns
+    // false until something triggers Bind(). Without this call the loop below skips
+    // every unbound GRAPH_INDEX and the optimizer falls back to a sequential scan.
+    // BindIndexes is the same API used by physical_insert / table_scan; it short-
+    // circuits when there are no unbound entries, and must be called *before* we
+    // enter the Indexes() iterator (which holds index_entries_lock).
+    if (table_info.GetIndexes().HasUnbound()) {
+        table_info.BindIndexes(context, GraphIndex::TYPE_NAME);
+    }
+    auto &index_list = table_info.GetIndexes();
     GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
         if (!index.IsBound()) {
