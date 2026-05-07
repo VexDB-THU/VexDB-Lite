@@ -72,9 +72,11 @@ VexMetric ParseMetric(const string &metric_name) {
 
 GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
                        TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
-                       AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric)
+                       AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
+                       idx_t vec_column_index)
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
       dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
+      vec_column_index_(vec_column_index),
       runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)) {
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
 }
@@ -84,23 +86,28 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         throw InvalidInputException("GRAPH_INDEX requires at least one indexed expression");
     }
 
-    auto &vec_type = input.unbound_expressions[0]->return_type;
-    if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
-        throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s", vec_type.ToString());
-    }
-
-    // Only the first column may be the FLOAT[N] vector. Any subsequent vector columns
-    // are rejected because vexdb-duck does not yet support multi-vector indexes.
-    for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
+    // Locate the FLOAT[N] column the user listed in CREATE INDEX. The column list
+    // may have scalar columns mixed in (e.g. for filtered ANN with metadata), so we
+    // pick the vector by type rather than assuming position 0.
+    optional_idx vec_pos;
+    for (idx_t i = 0; i < input.unbound_expressions.size(); i++) {
         auto &t = input.unbound_expressions[i]->return_type;
-        if (t.id() == LogicalTypeId::ARRAY && ArrayType::GetChildType(t).id() == LogicalTypeId::FLOAT) {
+        if (t.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(t).id() != LogicalTypeId::FLOAT) {
+            continue;
+        }
+        if (vec_pos.IsValid()) {
             throw InvalidInputException(
-                "GRAPH_INDEX accepts only the first column may be a vector "
-                "(got an additional FLOAT[%llu] at position %llu)",
-                static_cast<unsigned long long>(ArrayType::GetSize(t)),
+                "GRAPH_INDEX accepts at most one FLOAT[N] vector column "
+                "(got vectors at positions %llu and %llu)",
+                static_cast<unsigned long long>(vec_pos.GetIndex()),
                 static_cast<unsigned long long>(i));
         }
+        vec_pos = optional_idx(i);
     }
+    if (!vec_pos.IsValid()) {
+        throw InvalidInputException("GRAPH_INDEX requires one FLOAT[N] vector column");
+    }
+    auto &vec_type = input.unbound_expressions[vec_pos.GetIndex()]->return_type;
     // Reject duplicate columns. DuckDB collapses duplicates in `column_ids`, so the
     // mismatch between unbound_expressions size and column_ids size is the signal.
     if (input.unbound_expressions.size() > input.column_ids.size()) {
@@ -182,7 +189,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
-                                             metric);
+                                             metric, vec_pos.GetIndex());
 
     if (input.storage_info.allocator_infos.size() >= 3) {
         // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
@@ -308,7 +315,10 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     if (column_ids.empty()) {
         return ErrorData(ExceptionType::INTERNAL, "GRAPH_INDEX has no indexed columns");
     }
-    auto vec_col_idx = static_cast<idx_t>(column_ids[0]);
+    if (vec_column_index_ >= column_ids.size()) {
+        return ErrorData(ExceptionType::INTERNAL, "GRAPH_INDEX vec column index out of range");
+    }
+    auto vec_col_idx = static_cast<idx_t>(column_ids[vec_column_index_]);
     if (vec_col_idx >= chunk.ColumnCount()) {
         return ErrorData(ExceptionType::INTERNAL,
                          StringUtil::Format("GRAPH_INDEX column index out of range: %llu (chunk columns=%llu)",
