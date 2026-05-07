@@ -225,6 +225,29 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
     }
 
     auto &index_list = storage.GetDataTableInfo()->GetIndexes();
+
+    // After DB reopen indexes are lazy-deserialized; IsBound() returns false until
+    // someone calls Bind(). Without this trigger, ANN queries silently fall back to
+    // sequential scan because the loop below skips every index.
+    bool needs_bind = false;
+    for (auto &index : index_list.Indexes()) {
+        if (index.IsBound() || index.GetIndexType() != GraphIndex::TYPE_NAME) {
+            continue;
+        }
+        for (auto idx_col : index.GetColumnIds()) {
+            if (idx_col == physical_col_id) {
+                needs_bind = true;
+                break;
+            }
+        }
+        if (needs_bind) {
+            break;
+        }
+    }
+    if (needs_bind) {
+        index_list.Bind(context, *storage.GetDataTableInfo());
+    }
+
     GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
         if (!index.IsBound()) {
