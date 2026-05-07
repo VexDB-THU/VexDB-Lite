@@ -22,42 +22,57 @@
 
 namespace duckdb {
 
+struct DistanceFuncEntry {
+    const char *name;
+    VexMetric metric;
+    // smaller = closer ⇒ user-friendly ASC matches index ranking; for raw inner
+    // product (positive a·b ⇒ similar) the user must specify DESC.
+    bool ascending;
+};
+
+static const DistanceFuncEntry kDistanceFuncs[] = {
+    {"l2_distance", VexMetric::L2, true},
+    {"<->", VexMetric::L2, true},
+    {"array_distance", VexMetric::L2, true},
+    {"list_distance", VexMetric::L2, true},
+
+    {"inner_product", VexMetric::INNER_PRODUCT, false},
+    {"<#>", VexMetric::INNER_PRODUCT, false},
+    {"array_inner_product", VexMetric::INNER_PRODUCT, false},
+    {"list_inner_product", VexMetric::INNER_PRODUCT, false},
+    {"array_negative_inner_product", VexMetric::INNER_PRODUCT, true},
+    {"list_negative_inner_product", VexMetric::INNER_PRODUCT, true},
+
+    {"cosine_distance", VexMetric::COSINE, true},
+    {"<~>", VexMetric::COSINE, true},
+    {"<=>", VexMetric::COSINE, true},
+    {"array_cosine_distance", VexMetric::COSINE, true},
+    {"list_cosine_distance", VexMetric::COSINE, true},
+    {"array_cosine_similarity", VexMetric::COSINE, false},
+    {"list_cosine_similarity", VexMetric::COSINE, false},
+};
+
+static const DistanceFuncEntry *FindDistanceFunc(const string &name) {
+    for (auto &entry : kDistanceFuncs) {
+        if (name == entry.name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 static bool IsDistanceFunction(const string &name) {
-    return name == "l2_distance" || name == "inner_product" || name == "cosine_distance" ||
-           name == "array_distance" || name == "list_distance" ||
-           name == "array_inner_product" || name == "list_inner_product" ||
-           name == "array_negative_inner_product" || name == "list_negative_inner_product" ||
-           name == "array_cosine_distance" || name == "list_cosine_distance" ||
-           name == "array_cosine_similarity" || name == "list_cosine_similarity" ||
-           name == "<->" || name == "<#>" || name == "<~>" || name == "<=>";
+    return FindDistanceFunc(name) != nullptr;
 }
 
 static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) {
-    if (name == "l2_distance" || name == "<->" || name == "array_distance" || name == "list_distance") {
-        return metric == VexMetric::L2;
-    }
-    if (name == "inner_product" || name == "<#>" ||
-        name == "array_inner_product" || name == "list_inner_product" ||
-        name == "array_negative_inner_product" || name == "list_negative_inner_product") {
-        return metric == VexMetric::INNER_PRODUCT;
-    }
-    if (name == "cosine_distance" || name == "<~>" || name == "<=>" ||
-        name == "array_cosine_distance" || name == "list_cosine_distance" ||
-        name == "array_cosine_similarity" || name == "list_cosine_similarity") {
-        return metric == VexMetric::COSINE;
-    }
-    return false;
+    auto *entry = FindDistanceFunc(name);
+    return entry && entry->metric == metric;
 }
 
-// Returns true if the distance function returns "smaller = closer" semantics.
-// ASC ordering of such functions matches the index's internal ranking.
 static bool IsAscDistanceFunction(const string &name) {
-    if (name == "inner_product" || name == "<#>" ||
-        name == "array_inner_product" || name == "list_inner_product") {
-        // these return positive a·b → user does DESC for nearest
-        return false;
-    }
-    return true;
+    auto *entry = FindDistanceFunc(name);
+    return entry ? entry->ascending : true;
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
