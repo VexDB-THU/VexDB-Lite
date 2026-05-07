@@ -1,0 +1,483 @@
+# name: test/sql/vex/index/graph_index_dedup.test
+# description: Test vector deduplication (max_dedup option)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Basic dedup — identical vectors reduce graph node count
+# ============================================================
+statement ok
+CREATE TABLE t_dedup1 AS
+SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOAT[4] AS vec
+FROM range(1, 11) t(i);
+
+statement ok
+CREATE INDEX idx_dedup1 ON t_dedup1 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# 10 identical vectors → graph nodes reduced (exact count depends on pipeline batching)
+query I
+SELECT node_count < 10 FROM vex_index_info() WHERE index_name = 'idx_dedup1';
+----
+true
+
+# row_id_map must have ALL 10 entries (each row_id is tracked)
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup1';
+----
+10
+
+# Search must still return all 10 rows
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup1 ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]) LIMIT 10
+) t;
+----
+10
+
+statement ok
+DROP TABLE t_dedup1;
+
+# ============================================================
+# Test 2: Mixed vectors — only identical duplicates are merged
+# ============================================================
+statement ok
+CREATE TABLE t_dedup2(id INT, vec FLOAT[4]);
+
+# 5 rows with vector A, 5 rows with vector B, 3 unique
+statement ok
+INSERT INTO t_dedup2 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
+
+statement ok
+INSERT INTO t_dedup2 SELECT i, [0.0, 1.0, 0.0, 0.0]::FLOAT[4] FROM range(6, 11) t(i);
+
+statement ok
+INSERT INTO t_dedup2 VALUES (11, [0.1, 0.2, 0.3, 0.4]::FLOAT[4]),
+                            (12, [0.5, 0.6, 0.7, 0.8]::FLOAT[4]),
+                            (13, [0.9, 0.8, 0.7, 0.6]::FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_dedup2 ON t_dedup2 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# 3 distinct groups + 3 unique = at most 6 nodes; with pipeline batching may be slightly more
+query I
+SELECT node_count < 13 FROM vex_index_info() WHERE index_name = 'idx_dedup2';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup2';
+----
+13
+
+statement ok
+DROP TABLE t_dedup2;
+
+# ============================================================
+# Test 3: Default max_dedup=8 — dedup is enabled by default
+# ============================================================
+statement ok
+CREATE TABLE t_dedup3 AS
+SELECT i AS id, [1.0, 2.0, 3.0, 4.0]::FLOAT[4] AS vec
+FROM range(1, 6) t(i);
+
+statement ok
+CREATE INDEX idx_dedup3 ON t_dedup3 USING GRAPH_INDEX (vec);
+
+# With default max_dedup=8, identical vectors may be deduped
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup3';
+----
+true
+
+statement ok
+DROP TABLE t_dedup3;
+
+# ============================================================
+# Test 4: Delete with dedup — extra row_ids removed, node survives
+# ============================================================
+statement ok
+CREATE TABLE t_dedup4(id INT, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dedup4 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
+
+statement ok
+CREATE INDEX idx_dedup4 ON t_dedup4 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# Dedup working
+query I
+SELECT node_count < 5 FROM vex_index_info() WHERE index_name = 'idx_dedup4';
+----
+true
+
+# Delete 3 rows — node should survive with promoted primary
+statement ok
+DELETE FROM t_dedup4 WHERE id <= 3;
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup4';
+----
+2
+
+# Remaining 2 rows must be searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup4
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5
+) t;
+----
+2
+
+# Delete all remaining → node_count = 0
+statement ok
+DELETE FROM t_dedup4 WHERE id > 0;
+
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_dedup4';
+----
+0
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup4';
+----
+0
+
+statement ok
+DROP TABLE t_dedup4;
+
+# ============================================================
+# Test 5: Search correctness — brute force baseline comparison
+# ============================================================
+statement ok
+CREATE TABLE t_dedup5(id INT, vec FLOAT[4]);
+
+# 100 rows: 10 groups of 10 identical vectors
+statement ok
+INSERT INTO t_dedup5
+SELECT i AS id,
+  [sin(((i-1)//10)*0.5)::FLOAT, cos(((i-1)//10)*0.7)::FLOAT,
+   sin(((i-1)//10)*1.1)::FLOAT, cos(((i-1)//10)*1.3)::FLOAT]::FLOAT[4] AS vec
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_dedup5 ON t_dedup5 USING GRAPH_INDEX (vec) WITH (max_dedup = 16);
+
+# 10 unique vectors → significant reduction from 100
+query I
+SELECT node_count <= 20 FROM vex_index_info() WHERE index_name = 'idx_dedup5';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup5';
+----
+100
+
+# Brute force baseline
+statement ok
+SET disabled_optimizers='extension';
+
+statement ok
+CREATE TABLE bf5 AS SELECT id FROM t_dedup5
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOAT[4]) LIMIT 20;
+
+statement ok
+RESET disabled_optimizers;
+
+# ANN search with dedup must match brute force
+query I
+SELECT COUNT(*) >= 15 FROM (
+  SELECT id FROM t_dedup5
+  ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, -1.0]::FLOAT[4]) LIMIT 20
+) ann WHERE ann.id IN (SELECT id FROM bf5);
+----
+true
+
+statement ok
+DROP TABLE bf5;
+
+statement ok
+DROP TABLE t_dedup5;
+
+# ============================================================
+# Test 6: UPDATE scenario (DELETE + INSERT internally)
+# ============================================================
+statement ok
+CREATE TABLE t_dedup6(id INT PRIMARY KEY, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dedup6 SELECT i, [i*0.1, i*0.2, i*0.3, i*0.4]::FLOAT[4] FROM range(1, 51) t(i);
+
+statement ok
+CREATE INDEX idx_dedup6 ON t_dedup6 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# 50 unique vectors → 50 nodes (no dedup opportunity)
+query I
+SELECT node_count FROM vex_index_info() WHERE index_name = 'idx_dedup6';
+----
+50
+
+# UPDATE 10 rows to the same vector → internal DELETE old 10 + INSERT new 10
+statement ok
+UPDATE t_dedup6 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id <= 10;
+
+# Old 10 nodes removed; new 10 dedup'd into fewer → total < 50
+query I
+SELECT node_count < 50 FROM vex_index_info() WHERE index_name = 'idx_dedup6';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup6';
+----
+50
+
+# All 50 rows still searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup6
+  ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 50
+) results;
+----
+50
+
+statement ok
+DROP TABLE t_dedup6;
+
+# ============================================================
+# Test 7: Parameter validation
+# ============================================================
+statement ok
+CREATE TABLE t_dedup7(id INT, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dedup7 VALUES (1, [1.0, 2.0, 3.0, 4.0]::FLOAT[4]);
+
+# max_dedup=0 is invalid (minimum is 1)
+statement error
+CREATE INDEX idx_dedup7 ON t_dedup7 USING GRAPH_INDEX (vec) WITH (max_dedup = 0);
+----
+
+# max_dedup=1 is valid (means disabled)
+statement ok
+CREATE INDEX idx_dedup7a ON t_dedup7 USING GRAPH_INDEX (vec) WITH (max_dedup = 1);
+
+statement ok
+DROP INDEX idx_dedup7a;
+
+# max_dedup=100 is valid
+statement ok
+CREATE INDEX idx_dedup7b ON t_dedup7 USING GRAPH_INDEX (vec) WITH (max_dedup = 100);
+
+statement ok
+DROP INDEX idx_dedup7b;
+
+statement ok
+DROP TABLE t_dedup7;
+
+# ============================================================
+# Test 8: INSERT after CREATE INDEX — dedup into existing graph
+# ============================================================
+statement ok
+CREATE TABLE t_dedup8(id INT, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 4) t(i);
+
+statement ok
+CREATE INDEX idx_dedup8 ON t_dedup8 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# Insert more identical vectors after index creation
+statement ok
+INSERT INTO t_dedup8 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(4, 7) t(i);
+
+query I
+SELECT node_count < 6 FROM vex_index_info() WHERE index_name = 'idx_dedup8';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup8';
+----
+6
+
+# All 6 rows searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup8
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 6
+) t;
+----
+6
+
+statement ok
+DROP TABLE t_dedup8;
+
+# ============================================================
+# Test 9: Persistence — dedup state survives restart
+# ============================================================
+statement ok
+CREATE TABLE t_dedup9(id INT, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_dedup9 SELECT i, [2.0, 3.0, 4.0, 5.0]::FLOAT[4] FROM range(1, 9) t(i);
+
+statement ok
+CREATE INDEX idx_dedup9 ON t_dedup9 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+query I
+SELECT node_count < 8 FROM vex_index_info() WHERE index_name = 'idx_dedup9';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup9';
+----
+8
+
+statement ok
+CHECKPOINT;
+
+statement ok
+CHECKPOINT;
+
+# After restart-like checkpoint, dedup state must be preserved
+query I
+SELECT node_count < 8 FROM vex_index_info() WHERE index_name = 'idx_dedup9';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup9';
+----
+8
+
+# Search must still work after persistence
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup9
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 8
+) t;
+----
+8
+
+# Delete after restart — dedup delete logic must still work
+statement ok
+DELETE FROM t_dedup9 WHERE id <= 4;
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup9';
+----
+4
+
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup9
+  ORDER BY l2_distance(vec, [2.0, 3.0, 4.0, 5.0]::FLOAT[4]) LIMIT 8
+) t;
+----
+4
+
+statement ok
+DROP TABLE t_dedup9;
+
+# ============================================================
+# Test 10: Cosine metric + dedup (single INSERT to ensure identical batching)
+# ============================================================
+statement ok
+CREATE TABLE t_dedup10 AS
+SELECT i AS id, [1.0, 1.0, 0.0, 0.0]::FLOAT[4] AS vec
+FROM range(1, 9) t(i);
+
+statement ok
+CREATE INDEX idx_dedup10 ON t_dedup10 USING GRAPH_INDEX (vec)
+  WITH (max_dedup = 8, metric = 'cosine');
+
+# 8 identical vectors (after cosine normalization) → dedup should reduce
+query I
+SELECT node_count < 8 FROM vex_index_info() WHERE index_name = 'idx_dedup10';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup10';
+----
+8
+
+# Cosine search must return all rows
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup10
+  ORDER BY cosine_distance(vec, [1.0, 1.0, 0.0, 0.0]::FLOAT[4]) LIMIT 8
+) t;
+----
+8
+
+statement ok
+DROP TABLE t_dedup10;
+
+# ============================================================
+# Test 11: Capacity overflow — beyond max_dedup creates new nodes
+# ============================================================
+statement ok
+CREATE TABLE t_dedup11 AS
+SELECT i AS id, [5.0, 5.0, 5.0, 5.0]::FLOAT[4] AS vec
+FROM range(1, 21) t(i);
+
+# max_dedup=4 means at most 4 row_ids per node
+statement ok
+CREATE INDEX idx_dedup11 ON t_dedup11 USING GRAPH_INDEX (vec) WITH (max_dedup = 4);
+
+# 20 identical vectors / max 4 per node → at least ceil(20/4) = 5 nodes
+# (could be more due to pipeline batching, but should be far less than 20)
+query I
+SELECT node_count >= 5 AND node_count <= 10 FROM vex_index_info() WHERE index_name = 'idx_dedup11';
+----
+true
+
+query I
+SELECT row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_dedup11';
+----
+20
+
+# All 20 rows must be searchable
+query I
+SELECT COUNT(*) FROM (
+  SELECT id FROM t_dedup11
+  ORDER BY l2_distance(vec, [5.0, 5.0, 5.0, 5.0]::FLOAT[4]) LIMIT 20
+) t;
+----
+20
+
+statement ok
+DROP TABLE t_dedup11;
+
+# ============================================================
+# Test 12: Search result distances — dedup'd rows have same distance
+# ============================================================
+statement ok
+CREATE TABLE t_dedup12(id INT, vec FLOAT[4]);
+
+# 5 identical vectors at [1,0,0,0], 1 different vector at [0,0,0,1]
+statement ok
+INSERT INTO t_dedup12 SELECT i, [1.0, 0.0, 0.0, 0.0]::FLOAT[4] FROM range(1, 6) t(i);
+
+statement ok
+INSERT INTO t_dedup12 VALUES (6, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_dedup12 ON t_dedup12 USING GRAPH_INDEX (vec) WITH (max_dedup = 8);
+
+# Query from [1,0,0,0]: dedup'd rows should all have distance 0
+query I
+SELECT COUNT(*) FROM (
+  SELECT id, l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) AS dist
+  FROM t_dedup12
+  ORDER BY dist LIMIT 6
+) t WHERE dist < 0.001;
+----
+5
+
+statement ok
+DROP TABLE t_dedup12;

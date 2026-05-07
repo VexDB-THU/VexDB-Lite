@@ -1,0 +1,103 @@
+# name: test/sql/vex/index/graph_index_pq_delete.test
+# description: Test PQ index with delete operations (covers SearchWithPQ null pointer path)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: PQ index with enough data to trigger PQ search (>64 nodes)
+# ============================================================
+statement ok
+CREATE TABLE pq_del (id INTEGER PRIMARY KEY, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_del SELECT i, list_value(
+    sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT,
+    sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT
+)::FLOAT[8]
+FROM range(1, 301) t(i);
+
+statement ok
+CREATE INDEX idx_pq ON pq_del USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# Baseline search
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 1: Delete some nodes, then PQ search
+# ============================================================
+statement ok
+DELETE FROM pq_del WHERE id BETWEEN 1 AND 30;
+
+query I
+SELECT count(*) FROM pq_del;
+----
+270
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 2: Delete every 3rd element (scattered deletion), PQ search
+# ============================================================
+statement ok
+DELETE FROM pq_del WHERE id % 3 = 0;
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [-1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# ============================================================
+# Test 3: Heavy delete (>50%), PQ search still works
+# ============================================================
+statement ok
+DELETE FROM pq_del WHERE id % 2 = 0;
+
+statement ok
+SELECT count(*) FROM pq_del;
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Test 4: Insert after heavy delete, PQ search
+# ============================================================
+statement ok
+INSERT INTO pq_del SELECT i, list_value(
+    cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT,
+    cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.9)::FLOAT, sin(i*1.0)::FLOAT
+)::FLOAT[8]
+FROM range(301, 401) t(i);
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 20);
+----
+20
+
+# ============================================================
+# Test 5: Delete all but a few, PQ search on tiny remnant
+# ============================================================
+statement ok
+DELETE FROM pq_del WHERE id > 305;
+
+statement ok
+SELECT count(*) FROM pq_del;
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM pq_del ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 100);
+
+statement ok
+DROP TABLE pq_del;

@@ -1,0 +1,113 @@
+# name: test/sql/vex/index/graph_index_pq_persistence.test
+# description: PQ index persistence - checkpoint, restart, delete + restart
+# group: [vex]
+
+require vex
+
+load __TEST_DIR__/pq_persist.db
+
+# ============================================================
+# Phase 1: Create PQ index and populate
+# ============================================================
+statement ok
+CREATE TABLE pq_p (id INTEGER PRIMARY KEY, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_p SELECT i, list_value(
+    sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT,
+    sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT
+)::FLOAT[8]
+FROM range(1, 301) t(i);
+
+statement ok
+CREATE INDEX idx ON pq_p USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 2: Checkpoint + restart, PQ data survives
+# ============================================================
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM pq_p;
+----
+300
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 3: Delete, checkpoint, restart, PQ search still works
+# ============================================================
+statement ok
+DELETE FROM pq_p WHERE id BETWEEN 1 AND 50;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM pq_p;
+----
+250
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 4: Heavy delete + restart without checkpoint (WAL replay)
+# ============================================================
+statement ok
+DELETE FROM pq_p WHERE id % 2 = 0;
+
+# NO CHECKPOINT
+restart
+
+statement ok
+SELECT count(*) FROM pq_p;
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 5: Insert new data, checkpoint, restart
+# ============================================================
+statement ok
+INSERT INTO pq_p SELECT i, list_value(
+    cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT,
+    cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.9)::FLOAT, sin(i*1.0)::FLOAT
+)::FLOAT[8]
+FROM range(301, 501) t(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SELECT count(*) FROM pq_p;
+
+query I
+SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE pq_p;

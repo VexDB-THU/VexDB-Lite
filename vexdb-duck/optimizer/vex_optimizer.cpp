@@ -1,5 +1,7 @@
 #include "vex_optimizer.hpp"
 
+#include <cmath>
+
 #include "vex_fetch_utils.hpp"
 #include "vex_graph_index.hpp"
 #include "vex_physical_index_scan.hpp"
@@ -22,8 +24,57 @@
 
 namespace duckdb {
 
+struct DistanceFuncEntry {
+    const char *name;
+    VexMetric metric;
+    // smaller = closer ⇒ user-friendly ASC matches index ranking; for raw inner
+    // product (positive a·b ⇒ similar) the user must specify DESC.
+    bool ascending;
+};
+
+static const DistanceFuncEntry kDistanceFuncs[] = {
+    {"l2_distance", VexMetric::L2, true},
+    {"<->", VexMetric::L2, true},
+    {"array_distance", VexMetric::L2, true},
+    {"list_distance", VexMetric::L2, true},
+
+    {"inner_product", VexMetric::INNER_PRODUCT, false},
+    {"<#>", VexMetric::INNER_PRODUCT, false},
+    {"array_inner_product", VexMetric::INNER_PRODUCT, false},
+    {"list_inner_product", VexMetric::INNER_PRODUCT, false},
+    {"array_negative_inner_product", VexMetric::INNER_PRODUCT, true},
+    {"list_negative_inner_product", VexMetric::INNER_PRODUCT, true},
+
+    {"cosine_distance", VexMetric::COSINE, true},
+    {"<~>", VexMetric::COSINE, true},
+    {"<=>", VexMetric::COSINE, true},
+    {"array_cosine_distance", VexMetric::COSINE, true},
+    {"list_cosine_distance", VexMetric::COSINE, true},
+    {"array_cosine_similarity", VexMetric::COSINE, false},
+    {"list_cosine_similarity", VexMetric::COSINE, false},
+};
+
+static const DistanceFuncEntry *FindDistanceFunc(const string &name) {
+    for (auto &entry : kDistanceFuncs) {
+        if (name == entry.name) {
+            return &entry;
+        }
+    }
+    return nullptr;
+}
+
 static bool IsDistanceFunction(const string &name) {
-    return name == "l2_distance" || name == "inner_product" || name == "cosine_distance";
+    return FindDistanceFunc(name) != nullptr;
+}
+
+static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) {
+    auto *entry = FindDistanceFunc(name);
+    return entry && entry->metric == metric;
+}
+
+static bool IsAscDistanceFunction(const string &name) {
+    auto *entry = FindDistanceFunc(name);
+    return entry ? entry->ascending : true;
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
@@ -93,7 +144,14 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
     if (!IsDistanceFunction(info.func_expr->function.name) || info.func_expr->children.size() != 2) {
         return false;
     }
-    if (order_type != OrderType::ASCENDING) {
+    // For inner_product / <#> the user-facing scalar returns +(a·b) (greater = more similar),
+    // so the natural query is ORDER BY ... DESC. The index ranks by -(a·b) ascending, which
+    // matches; for L2 / cosine the user does ASC and the index ranks by sqrt-L2 / -cos_sim
+    // ascending, also matching.
+    OrderType expected = IsAscDistanceFunction(info.func_expr->function.name)
+                             ? OrderType::ASCENDING
+                             : OrderType::DESCENDING;
+    if (order_type != expected) {
         return false;
     }
 
@@ -116,6 +174,7 @@ struct GetChildInfo {
     LogicalFilter *filter = nullptr;
     LogicalOperator *cross_product = nullptr;
     idx_t subquery_child_idx = 0;
+    bool filter_inside_cross_product = false;
 };
 
 static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
@@ -138,10 +197,24 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 
     if (cur->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT && cur->children.size() == 2) {
         for (idx_t i = 0; i < 2; i++) {
-            if (cur->children[i]->type == LogicalOperatorType::LOGICAL_GET) {
-                info.get = &cur->children[i]->Cast<LogicalGet>();
+            auto *cp_child = cur->children[i].get();
+            if (cp_child->type == LogicalOperatorType::LOGICAL_GET) {
+                info.get = &cp_child->Cast<LogicalGet>();
                 info.cross_product = cur;
                 info.subquery_child_idx = 1 - i;
+                return true;
+            }
+            // CROSS_PRODUCT -> [FILTER -> GET, subquery]: WHERE clause + scalar
+            // subquery query vector. Rewrite the GET; FILTER stays where it is and
+            // post-filters VEX_INDEX_SCAN's row_id-fetched output.
+            if (cp_child->type == LogicalOperatorType::LOGICAL_FILTER &&
+                cp_child->children.size() == 1 &&
+                cp_child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
+                info.filter = &cp_child->Cast<LogicalFilter>();
+                info.get = &cp_child->children[0]->Cast<LogicalGet>();
+                info.cross_product = cur;
+                info.subquery_child_idx = 1 - i;
+                info.filter_inside_cross_product = true;
                 return true;
             }
         }
@@ -161,9 +234,11 @@ static void ReplaceGetWithVexScan(unique_ptr<LogicalOperator> &get_owner, const 
 }
 
 static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
-    if (!get->types.empty()) {
-        return get->types;
-    }
+    // We always derive types from the full column_ids list so that the LogicalVexIndexScan
+    // exposes one column binding per column read by the original LogicalGet. Upstream
+    // operators (Filter, Order) bind to columns by index into column_ids; falling back to
+    // get->types here would silently drop bindings when filter pushdown adds extra read
+    // columns that aren't part of the projected output (e.g. WHERE tag = '...' adds 'tag').
     return BuildOutputTypes(get->GetColumnIds(), get->returned_types);
 }
 
@@ -171,8 +246,31 @@ struct IndexMatch {
     GraphIndex *graph_idx = nullptr;
 };
 
+// Default over-sample factor when the planner can't estimate filter selectivity.
+// Picked so a moderately selective filter (~25%) still produces k results without
+// burning budget on filters that are barely selective at all.
+static constexpr idx_t kDefaultOversampleFactor = 4;
+
+// Decide how many rows VEX_INDEX_SCAN should produce so that, after the post-filter
+// trims, the outer TOPN still has at least k rows. When cardinality estimates are
+// unavailable or the filter isn't selective, fall back to k * factor; clamp to the
+// table's row count so we never ask for more than exists.
+static idx_t ComputeScanK(idx_t k, idx_t get_card, idx_t filter_card) {
+    idx_t k_scan;
+    if (get_card > 0 && filter_card > 0 && filter_card < get_card) {
+        double selectivity = static_cast<double>(filter_card) / static_cast<double>(get_card);
+        k_scan = static_cast<idx_t>(std::ceil(static_cast<double>(k) / selectivity));
+    } else {
+        k_scan = k * kDefaultOversampleFactor;
+    }
+    if (get_card > 0) {
+        k_scan = MinValue<idx_t>(k_scan, get_card);
+    }
+    return MaxValue<idx_t>(k_scan, k);
+}
+
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, const vector<ColumnIndex> &column_ids,
-                                 idx_t col_index, IndexMatch &match) {
+                                 idx_t col_index, const string &distance_func, IndexMatch &match) {
     column_t physical_col_id = DConstants::INVALID_INDEX;
     if (col_index < column_ids.size()) {
         physical_col_id = column_ids[col_index].GetPrimaryIndex();
@@ -181,7 +279,18 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
         return false;
     }
 
-    auto &index_list = storage.GetDataTableInfo()->GetIndexes();
+    auto &table_info = *storage.GetDataTableInfo();
+    // After DB reopen, GRAPH_INDEX entries are lazy-deserialized — IsBound() returns
+    // false until something triggers Bind(). Without this call the loop below skips
+    // every unbound GRAPH_INDEX and the optimizer falls back to a sequential scan.
+    // BindIndexes is the same API used by physical_insert / table_scan; it short-
+    // circuits when there are no unbound entries, and must be called *before* we
+    // enter the Indexes() iterator (which holds index_entries_lock).
+    if (table_info.GetIndexes().HasUnbound()) {
+        table_info.BindIndexes(context, GraphIndex::TYPE_NAME);
+    }
+    auto &index_list = table_info.GetIndexes();
+    GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
         if (!index.IsBound()) {
             continue;
@@ -190,11 +299,22 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
         if (bound.GetIndexType() != GraphIndex::TYPE_NAME) {
             continue;
         }
-        if (!bound.GetColumnIds().empty() && bound.GetColumnIds()[0] == physical_col_id) {
-            match.graph_idx = &bound.Cast<GraphIndex>();
+        if (bound.GetColumnIds().empty() || bound.GetColumnIds()[0] != physical_col_id) {
+            continue;
+        }
+        auto &candidate = bound.Cast<GraphIndex>();
+        if (DistanceFunctionMatchesMetric(distance_func, candidate.GetMetric())) {
+            match.graph_idx = &candidate;
             return true;
         }
+        if (!fallback) {
+            fallback = &candidate;
+        }
     }
+    // No metric-matching index; fall back to any column-matching index only if no
+    // distance function was specified (shouldn't normally happen, but keeps backward
+    // compat for the legacy single-index code path).
+    (void)fallback;
     return false;
 }
 
@@ -215,9 +335,22 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         return false;
     }
 
+    // If WHERE predicates have been pushed into the LogicalGet (table_filters /
+    // dynamic_filters), the rewrite would silently drop them: VEX_INDEX_SCAN reads
+    // by row_id and does not honor LogicalGet's pushdown filters. Fall back to the
+    // default plan (seq scan + sort), which produces correct results (just without
+    // the index acceleration for the filter case).
+    if (!get->table_filters.filters.empty()) {
+        return false;
+    }
+    if (get->dynamic_filters && get->dynamic_filters->HasFilters()) {
+        return false;
+    }
+
     auto &column_ids = get->GetColumnIds();
     IndexMatch match;
-    if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index, match)) {
+    if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index,
+                              dist_info.func_expr->function.name, match)) {
         return false;
     }
 
@@ -226,8 +359,18 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     for (idx_t i = 0; i < column_ids.size(); i++) {
         fetch_output_positions.push_back(i);
     }
+
+    idx_t k_scan = k;
+    if (get_info.filter) {
+        idx_t get_card = get->has_estimated_cardinality ? get->estimated_cardinality : 0;
+        idx_t filter_card = get_info.filter->has_estimated_cardinality
+                                ? get_info.filter->estimated_cardinality
+                                : 0;
+        k_scan = ComputeScanK(k, get_card, filter_card);
+    }
+
     auto scan = make_uniq<LogicalVexIndexScan>(get->table_index, GetOutputTypes(get), duck_table, *match.graph_idx,
-                                               dist_info.query_vec_expr->Copy(), k, column_ids,
+                                               dist_info.query_vec_expr->Copy(), k_scan, column_ids,
                                                std::move(fetch_output_positions), optional_idx(),
                                                get->returned_types);
     scan->SetEstimatedCardinality(k);

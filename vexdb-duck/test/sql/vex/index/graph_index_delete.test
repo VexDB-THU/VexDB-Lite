@@ -1,0 +1,62 @@
+# name: test/sql/vex/index/graph_index_delete.test
+# description: Test graph index delete and vacuum operations
+# group: [vex]
+
+require vex
+
+# Setup
+statement ok
+CREATE TABLE vecs (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO vecs VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (4, [1.0, 1.0, 0.0]::FLOAT[3]),
+  (5, [0.0, 1.0, 1.0]::FLOAT[3]),
+  (6, [1.0, 0.0, 1.0]::FLOAT[3]),
+  (7, [0.5, 0.5, 0.5]::FLOAT[3]),
+  (8, [0.2, 0.2, 0.2]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx ON vecs USING GRAPH_INDEX (vec);
+
+# Verify initial search works
+query I
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+8
+
+# Delete a row
+statement ok
+DELETE FROM vecs WHERE id = 8;
+
+# After delete, next closest should be found
+query I
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+7
+
+# Delete more rows
+statement ok
+DELETE FROM vecs WHERE id IN (1, 2, 3);
+
+# Remaining rows should still be searchable
+query I
+SELECT count(*) FROM vecs;
+----
+4
+
+# Insert new data after delete
+statement ok
+INSERT INTO vecs VALUES (9, [0.1, 0.1, 0.1]::FLOAT[3]);
+
+query I
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+9
+
+# Cleanup
+statement ok
+DROP TABLE vecs;

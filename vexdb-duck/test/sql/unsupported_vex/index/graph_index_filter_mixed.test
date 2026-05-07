@@ -1,0 +1,371 @@
+# name: test/sql/vex/index/graph_index_filter_mixed.test
+# description: Mixed filter predicates with metadata columns — multi-AND, IN, range
+#              merging, and partial push-down where some expressions fall back to
+#              post-filter. Ensures the optimizer no longer drops the index when a
+#              WHERE clause contains an unrecognized predicate.
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE prod (
+    id INTEGER,
+    vec FLOAT[4],
+    category VARCHAR,
+    price FLOAT,
+    rating INTEGER
+);
+
+statement ok
+INSERT INTO prod VALUES
+    (1,  [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 'a', 10.0, 1),
+    (2,  [0.9, 0.1, 0.0, 0.0]::FLOAT[4], 'a', 20.0, 2),
+    (3,  [0.8, 0.2, 0.0, 0.0]::FLOAT[4], 'a', 30.0, 3),
+    (4,  [0.7, 0.3, 0.0, 0.0]::FLOAT[4], 'b', 40.0, 4),
+    (5,  [0.6, 0.4, 0.0, 0.0]::FLOAT[4], 'b', 50.0, 5),
+    (6,  [0.0, 1.0, 0.0, 0.0]::FLOAT[4], 'b', 60.0, 1),
+    (7,  [0.0, 0.9, 0.1, 0.0]::FLOAT[4], 'c', 70.0, 2),
+    (8,  [0.0, 0.8, 0.2, 0.0]::FLOAT[4], 'c', 80.0, 3),
+    (9,  [0.0, 0.0, 1.0, 0.0]::FLOAT[4], 'c', 90.0, 4),
+    (10, [0.0, 0.0, 0.9, 0.1]::FLOAT[4], 'a', 15.0, 5),
+    (11, [0.5, 0.5, 0.0, 0.0]::FLOAT[4], 'b', 25.0, 1),
+    (12, [0.0, 0.5, 0.5, 0.0]::FLOAT[4], 'c', 35.0, 2);
+
+statement ok
+CREATE INDEX idx ON prod USING GRAPH_INDEX (vec, category, price, rating);
+
+# ============================================================
+# Test 1: multi-AND on metadata columns — both push-down
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM prod
+WHERE category = 'a' AND price >= 20
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+2	20
+3	30
+
+# ============================================================
+# Test 2: BETWEEN — gets split into col>=a AND col<=b, both push-down
+# ============================================================
+query II
+SELECT id, rating FROM prod
+WHERE rating BETWEEN 2 AND 4
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+2	2
+3	3
+4	4
+
+# ============================================================
+# Test 3: IN list on VARCHAR metadata — uses FNV hash equality set
+# ============================================================
+query II
+SELECT id, category FROM prod
+WHERE category IN ('a', 'c')
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1	a
+2	a
+3	a
+
+# ============================================================
+# Test 4: IN list on INTEGER metadata
+# ============================================================
+query II
+SELECT id, rating FROM prod
+WHERE rating IN (1, 5)
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 4;
+----
+1	1
+5	5
+11	1
+10	5
+
+# ============================================================
+# Test 5: Partial push-down — rating >= 2 goes in-graph, LIKE residual post-filter.
+# Previously the optimizer would drop the index entirely here (cliff). Now the
+# in-graph portion runs and LIKE filters the survivors.
+# ============================================================
+query II
+SELECT id, category FROM prod
+WHERE rating >= 2 AND category LIKE 'a%'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+2	a
+3	a
+10	a
+
+# ============================================================
+# Test 6: Strict inequality (<) stays as residual — RangeFilter is inclusive,
+# so strict comparisons would give wrong boundary behavior if pushed down.
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM prod
+WHERE price < 30
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1	10
+2	20
+11	25
+
+# ============================================================
+# Test 7: Range merge — x >= 20 AND x <= 60 merges into one RangeFilter
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM prod
+WHERE price >= 20 AND price <= 60
+ORDER BY l2_distance(vec, [0.5, 0.5, 0.0, 0.0]::FLOAT[4])
+LIMIT 4;
+----
+11	25
+5	50
+4	40
+3	30
+
+# ============================================================
+# Test 8: No-metadata index still works — filters stay as post-filter
+# ============================================================
+statement ok
+CREATE TABLE plain (id INTEGER, vec FLOAT[4], tag VARCHAR);
+
+statement ok
+INSERT INTO plain SELECT id, vec, category FROM prod;
+
+statement ok
+CREATE INDEX pidx ON plain USING GRAPH_INDEX (vec);
+
+query II
+SELECT id, tag FROM plain
+WHERE tag = 'a'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1	a
+2	a
+3	a
+
+# ============================================================
+# Test 9: Const-on-left comparison — `20 <= price` — handled by side-swap logic
+# ============================================================
+query II
+SELECT id, price::INTEGER FROM prod
+WHERE 20 <= price AND price <= 40
+ORDER BY l2_distance(vec, [0.8, 0.2, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+3	30
+2	20
+4	40
+
+
+# ============================================================
+# Test 10: Cliff regression — index must produce same results as brute-force.
+# Before the fix, these forms dropped the index (correct result via scan, slow).
+# Now the index is used + residual post-filter; results must still match scan.
+# ============================================================
+
+# OR predicate on metadata — fully residual, still uses index for ANN
+query I
+WITH idx_result AS (
+    SELECT id FROM prod
+    WHERE category = 'a' OR rating = 5
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+    LIMIT 5
+),
+scan_result AS (
+    SELECT id FROM prod
+    WHERE (category = 'a' OR rating = 5) AND NOT EXISTS (SELECT 1 WHERE false)
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+    LIMIT 5
+)
+SELECT COUNT(*) FROM idx_result i JOIN scan_result s USING (id);
+----
+5
+
+# LIKE alone on metadata column — fully residual
+query I
+WITH idx_result AS (
+    SELECT id FROM prod
+    WHERE category LIKE 'a%'
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+    LIMIT 4
+)
+SELECT COUNT(*) FROM idx_result WHERE id IN (1, 2, 3, 10);
+----
+4
+
+# ============================================================
+# Test 11: Empty result — filter matches zero rows
+# ============================================================
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM prod
+    WHERE category = 'zzz'
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+    LIMIT 5
+);
+----
+0
+
+# ============================================================
+# Test 12: Range on BIGINT metadata column
+# ============================================================
+statement ok
+CREATE TABLE big_t (id INTEGER, vec FLOAT[3], bigcol BIGINT);
+
+statement ok
+INSERT INTO big_t VALUES
+    (1, [1.0, 0.0, 0.0]::FLOAT[3], 1000000000000),
+    (2, [0.9, 0.1, 0.0]::FLOAT[3], 2000000000000),
+    (3, [0.8, 0.2, 0.0]::FLOAT[3], 3000000000000),
+    (4, [0.7, 0.3, 0.0]::FLOAT[3], 4000000000000);
+
+statement ok
+CREATE INDEX big_idx ON big_t USING GRAPH_INDEX (vec, bigcol);
+
+query II
+SELECT id, bigcol FROM big_t
+WHERE bigcol >= 2000000000000 AND bigcol <= 3000000000000
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 2;
+----
+2	2000000000000
+3	3000000000000
+
+# ============================================================
+# Test 13: Range on DOUBLE metadata column
+# ============================================================
+statement ok
+CREATE TABLE dbl_t (id INTEGER, vec FLOAT[3], dblcol DOUBLE);
+
+statement ok
+INSERT INTO dbl_t VALUES
+    (1, [1.0, 0.0, 0.0]::FLOAT[3], 1.5),
+    (2, [0.9, 0.1, 0.0]::FLOAT[3], 2.75),
+    (3, [0.8, 0.2, 0.0]::FLOAT[3], 3.125),
+    (4, [0.7, 0.3, 0.0]::FLOAT[3], 4.0);
+
+statement ok
+CREATE INDEX dbl_idx ON dbl_t USING GRAPH_INDEX (vec, dblcol);
+
+query II
+SELECT id, dblcol FROM dbl_t
+WHERE dblcol >= 2.0 AND dblcol <= 3.5
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 2;
+----
+2	2.75
+3	3.125
+
+# ============================================================
+# Test 14: PQ + metadata filter — cross-feature regression.
+# Confirms bug 1078231 fix (PQ restart) doesn't interact badly with the
+# filter overhaul, and that PQ search path also honors the in-graph filter.
+# ============================================================
+statement ok
+CREATE TABLE pq_meta (id INTEGER, vec FLOAT[16], bucket INTEGER);
+
+statement ok
+INSERT INTO pq_meta SELECT i,
+    list_value(
+        sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
+        sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT,
+        sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.6)::FLOAT,
+        sin(i*0.7)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.8)::FLOAT
+    )::FLOAT[16],
+    i % 4
+FROM range(1, 501) t(i);
+
+statement ok
+CREATE INDEX pq_meta_idx ON pq_meta USING GRAPH_INDEX (vec, bucket)
+WITH (quantizer='pq', pq_m=4, metric='l2');
+
+# Every result must satisfy the filter
+query I
+SELECT COUNT(*) FROM (
+    SELECT id, bucket FROM pq_meta
+    WHERE bucket = 2
+    ORDER BY l2_distance(vec, [0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]::FLOAT[16])
+    LIMIT 10
+) WHERE bucket <> 2;
+----
+0
+
+# ============================================================
+# Test 15: EXPLAIN-level assertions — confirm the plan, not just the results.
+# These pin down the optimizer's behaviour so a cliff regression
+# (returning full-table scan instead of VEX_INDEX_SCAN) fails the test
+# even though the result set would still be correct.
+# ============================================================
+
+# OR still uses the index (previously dropped to SEQ_SCAN)
+query II
+EXPLAIN SELECT id FROM prod WHERE category = 'a' OR rating = 5
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# LIKE still uses the index
+query II
+EXPLAIN SELECT id FROM prod WHERE category LIKE 'a%'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 4;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# Strict < (residual) still uses the index
+query II
+EXPLAIN SELECT id FROM prod WHERE price < 30
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# Mixed in-graph + residual uses the index
+query II
+EXPLAIN SELECT id FROM prod WHERE rating >= 2 AND category LIKE 'a%'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# Pure in-graph (cat=a AND price>=20) — both predicates consumed by the index,
+# so the residual FILTER expression for these columns must not appear in the plan.
+query II
+EXPLAIN SELECT id FROM prod WHERE category = 'a' AND price >= 20
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<!REGEX>:.*FILTER.*\(category.*=.*'a'\).*
+
+# IN on INTEGER column pushes fully in-graph — FILTER expression must not refer to `rating`
+query II
+EXPLAIN SELECT id FROM prod WHERE rating IN (1, 5)
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 4;
+----
+physical_plan	<!REGEX>:.*FILTER.*rating.*IN.*
+
+# Partial case — FILTER above the scan must contain the LIKE residual
+query II
+EXPLAIN SELECT id FROM prod WHERE rating >= 2 AND category LIKE 'a%'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*prefix\(category.*
+
+statement ok
+DROP TABLE prod;
+
+statement ok
+DROP TABLE plain;
+
+statement ok
+DROP TABLE big_t;
+
+statement ok
+DROP TABLE dbl_t;
+
+statement ok
+DROP TABLE pq_meta;

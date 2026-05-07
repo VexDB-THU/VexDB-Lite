@@ -1,0 +1,357 @@
+# name: test/sql/vex/index/graph_index_metric_cosine.test
+# description: Cosine metric — non-normalized vectors, edge cases, mutations
+# group: [vex]
+#
+# Cosine metric normalizes vectors on insert. These tests specifically target:
+# - Non-normalized vectors with extreme magnitudes
+# - Zero/near-zero vectors
+# - Antipodal vectors (opposite directions)
+# - Self-search correctness
+# - DELETE/UPDATE/INSERT cycles with cosine metric
+# - Recall quality vs brute-force
+
+require vex
+
+# ============================================================
+# Test 1: Non-normalized vectors with extreme magnitude differences
+# Cosine should rank by DIRECTION only, ignoring magnitude
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_mag (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t_cos_mag VALUES
+  (1, [1000.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.001, 0.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 1000.0, 0.0]::FLOAT[3]),
+  (4, [0.0, 0.001, 0.0]::FLOAT[3]),
+  (5, [500.0, 500.0, 0.0]::FLOAT[3]),
+  (6, [0.001, 0.001, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_cos_mag ON t_cos_mag USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+# id=1 and id=2 point in exact same direction [1,0,0], so both are cosine-dist=0 from query [1,0,0]
+# id=5 and id=6 also point in same direction [1,1,0] (cos_dist ≈ 0.293)
+# id=3 and id=4 point in [0,1,0] (cos_dist = 1.0)
+# Use rowsort since id=1 and id=2 have identical cosine distance (tie-breaking may vary)
+query I rowsort
+SELECT id FROM t_cos_mag ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
+----
+1
+2
+
+# Verify invariant
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_mag';
+----
+true
+
+statement ok
+DROP TABLE t_cos_mag;
+
+# ============================================================
+# Test 2: Antipodal vectors (opposite directions)
+# cosine_distance([1,0,0], [-1,0,0]) = 2.0 (maximum)
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_anti (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t_cos_anti VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [-1.0, 0.0, 0.0]::FLOAT[3]),
+  (3, [0.707, 0.707, 0.0]::FLOAT[3]),
+  (4, [-0.707, -0.707, 0.0]::FLOAT[3]),
+  (5, [0.0, 1.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_cos_anti ON t_cos_anti USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+# Query [1,0,0]: id=1 (dist=0), id=3 (dist≈0.29), id=5 (dist=1), id=4 (dist≈1.71), id=2 (dist=2)
+query I
+SELECT id FROM t_cos_anti ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# The farthest should be id=2 (antipodal)
+query I
+SELECT id FROM t_cos_anti ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 1;
+----
+2
+
+statement ok
+DROP TABLE t_cos_anti;
+
+# ============================================================
+# Test 3: Near-zero vectors with cosine metric
+# NormalizeVector should handle near-zero gracefully (no NaN/Inf)
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_zero (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t_cos_zero VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [1e-20, 1e-20, 1e-20]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_cos_zero ON t_cos_zero USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+# Should not crash — near-zero vector normalization guard should prevent NaN
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_zero
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+  LIMIT 3
+);
+----
+3
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_zero';
+----
+true
+
+statement ok
+DROP TABLE t_cos_zero;
+
+# ============================================================
+# Test 4: Cosine self-search with non-normalized vectors (200 rows)
+# Even though vectors are non-normalized, each row should find itself
+# because normalization preserves direction identity
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_self (id INTEGER, vec FLOAT[4]);
+
+# Vectors with varying magnitudes — magnitude = i, direction varies
+statement ok
+INSERT INTO t_cos_self SELECT i, list_value(
+  (i * cos(i * 0.3))::FLOAT,
+  (i * sin(i * 0.3))::FLOAT,
+  (i * cos(i * 0.7))::FLOAT,
+  (i * sin(i * 0.7))::FLOAT
+)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_cos_self ON t_cos_self USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_self';
+----
+true
+
+# Self-search: every row must find itself as top-1
+# cosine_distance to itself = 0 regardless of magnitude
+query I
+SELECT count(*) FROM (
+  SELECT t.id, (
+    SELECT s.id FROM t_cos_self s
+    ORDER BY cosine_distance(s.vec, t.vec)
+    LIMIT 1
+  ) as found_id
+  FROM t_cos_self t
+) sub
+WHERE sub.id = sub.found_id;
+----
+200
+
+statement ok
+DROP TABLE t_cos_self;
+
+# ============================================================
+# Test 5: Cosine metric — DELETE + UPDATE + INSERT cycle
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_mut (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_cos_mut SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_mut ON t_cos_mut USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_mut';
+----
+true
+
+# DELETE 30 rows
+statement ok
+DELETE FROM t_cos_mut WHERE id <= 30;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_mut';
+----
+true
+
+# UPDATE 20 rows — vectors get re-normalized on re-insert
+statement ok
+UPDATE t_cos_mut SET vec = [0.0, 0.0, 0.0, 1.0]::FLOAT[4] WHERE id BETWEEN 31 AND 50;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_mut';
+----
+true
+
+# INSERT 50 new rows with different magnitudes
+statement ok
+INSERT INTO t_cos_mut SELECT i, list_value(
+  (i * 10.0 * cos(i))::FLOAT, (i * 10.0 * sin(i))::FLOAT, 0.0, 0.0
+)::FLOAT[4]
+FROM range(101, 151) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_mut';
+----
+true
+
+# Search still works
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_mut
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+  LIMIT 15
+);
+----
+15
+
+# Verify updated rows are searchable with their new vector
+# ids 31-50 all have [0,0,0,1] — any of them is a valid nearest result
+query I
+SELECT id BETWEEN 31 AND 50 FROM t_cos_mut ORDER BY cosine_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOAT[4]) LIMIT 1;
+----
+true
+
+statement ok
+DROP TABLE t_cos_mut;
+
+# ============================================================
+# Test 6: Cosine recall@10 with non-normalized vectors
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_recall (id INTEGER, vec FLOAT[8]);
+
+# Non-normalized: magnitude = sqrt(i)
+statement ok
+INSERT INTO t_cos_recall SELECT i, list_value(
+  (sqrt(i) * sin(i*0.1))::FLOAT, (sqrt(i) * cos(i*0.1))::FLOAT,
+  (sqrt(i) * sin(i*0.2))::FLOAT, (sqrt(i) * cos(i*0.2))::FLOAT,
+  (sqrt(i) * sin(i*0.3))::FLOAT, (sqrt(i) * cos(i*0.3))::FLOAT,
+  (sqrt(i) * sin(i*0.4))::FLOAT, (sqrt(i) * cos(i*0.4))::FLOAT
+)::FLOAT[8]
+FROM range(1, 301) t(i);
+
+# Brute-force top-10 (no index)
+statement ok
+CREATE TABLE t_cos_bf AS
+SELECT id FROM t_cos_recall
+ORDER BY cosine_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8])
+LIMIT 10;
+
+statement ok
+CREATE INDEX idx_cos_recall ON t_cos_recall USING GRAPH_INDEX (vec) WITH (metric='cosine', ef_construction=200);
+
+# Use high ef_search for stable recall
+statement ok
+SET vex_ef_search = 200;
+
+# Index top-10
+statement ok
+CREATE TABLE t_cos_idx AS
+SELECT id FROM t_cos_recall
+ORDER BY cosine_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8])
+LIMIT 10;
+
+# Recall >= 80%
+query I
+SELECT count(*) >= 8 FROM t_cos_bf WHERE id IN (SELECT id FROM t_cos_idx);
+----
+true
+
+statement ok
+DROP TABLE t_cos_bf;
+
+statement ok
+DROP TABLE t_cos_idx;
+
+statement ok
+DROP TABLE t_cos_recall;
+
+# ============================================================
+# Test 7: Cosine metric restart + mutations
+# ============================================================
+
+load __TEST_DIR__/cosine_metric_restart.db
+
+statement ok
+CREATE TABLE t_cos_r (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_cos_r SELECT i, list_value(
+  (i * sin(i))::FLOAT, (i * cos(i))::FLOAT, 0.1, 0.2
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_r ON t_cos_r USING GRAPH_INDEX (vec) WITH (metric='cosine');
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# INSERT non-normalized vectors after restart
+statement ok
+INSERT INTO t_cos_r SELECT i, list_value(
+  (i * 100.0)::FLOAT, 0.0, 0.0, 0.0
+)::FLOAT[4]
+FROM range(101, 151) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_r';
+----
+true
+
+# DELETE after restart
+statement ok
+DELETE FROM t_cos_r WHERE id <= 20;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_r';
+----
+true
+
+# UPDATE after restart
+statement ok
+UPDATE t_cos_r SET vec = [0.0, 0.0, 1.0, 0.0]::FLOAT[4] WHERE id BETWEEN 21 AND 30;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_r';
+----
+true
+
+# Search works
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_r
+  ORDER BY cosine_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4])
+  LIMIT 10
+);
+----
+10
+
+statement ok
+DROP TABLE t_cos_r;

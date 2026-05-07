@@ -1,10 +1,14 @@
 #include "vex_graph_index.hpp"
 
+#include <set>
+#include <limits>
+
 #include "graph_index/graph_index_algorithm.h"
 #include "distance/core/distance_dispatcher.h"
 
 #include "vex/vex_disk_block_store.hpp"
 #include "vex_distance.hpp"
+#include "vex_hnsw_node.hpp"
 #include "vex_physical_create_index.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -68,9 +72,11 @@ VexMetric ParseMetric(const string &metric_name) {
 
 GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
                        TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
-                       AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric)
+                       AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
+                       idx_t vec_column_index)
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
       dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
+      vec_column_index_(vec_column_index),
       runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)) {
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
 }
@@ -80,9 +86,35 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         throw InvalidInputException("GRAPH_INDEX requires at least one indexed expression");
     }
 
-    auto &vec_type = input.unbound_expressions[0]->return_type;
-    if (vec_type.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(vec_type).id() != LogicalTypeId::FLOAT) {
-        throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s", vec_type.ToString());
+    // Locate the FLOAT[N] column the user listed in CREATE INDEX. The column list
+    // may have scalar columns mixed in (e.g. for filtered ANN with metadata), so we
+    // pick the vector by type rather than assuming position 0.
+    optional_idx vec_pos;
+    for (idx_t i = 0; i < input.unbound_expressions.size(); i++) {
+        auto &t = input.unbound_expressions[i]->return_type;
+        if (t.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(t).id() != LogicalTypeId::FLOAT) {
+            continue;
+        }
+        if (vec_pos.IsValid()) {
+            throw InvalidInputException(
+                "GRAPH_INDEX accepts at most one FLOAT[N] vector column "
+                "(got vectors at positions %llu and %llu)",
+                static_cast<unsigned long long>(vec_pos.GetIndex()),
+                static_cast<unsigned long long>(i));
+        }
+        vec_pos = optional_idx(i);
+    }
+    if (!vec_pos.IsValid()) {
+        throw InvalidInputException("GRAPH_INDEX requires one FLOAT[N] vector column");
+    }
+    auto &vec_type = input.unbound_expressions[vec_pos.GetIndex()]->return_type;
+    // Reject duplicate columns. DuckDB collapses duplicates in `column_ids`, so the
+    // mismatch between unbound_expressions size and column_ids size is the signal.
+    if (input.unbound_expressions.size() > input.column_ids.size()) {
+        throw InvalidInputException(
+            "GRAPH_INDEX rejects duplicate column in expression list (%llu expressions, %llu unique columns)",
+            static_cast<unsigned long long>(input.unbound_expressions.size()),
+            static_cast<unsigned long long>(input.column_ids.size()));
     }
 
     idx_t dimension = ArrayType::GetSize(vec_type);
@@ -92,27 +124,84 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto m_it = input.options.find("m");
     if (m_it != input.options.end()) {
-        m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        try {
+            m = m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'm' must be a valid integer");
+        }
+        if (m < 2 || m > 128) {
+            throw InvalidInputException("GRAPH_INDEX option 'm' must be in [2, 128], got %d", m);
+        }
     }
     auto ef_it = input.options.find("ef_construction");
     if (ef_it != input.options.end()) {
-        ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        try {
+            ef_construction = ef_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'ef_construction' must be a valid integer");
+        }
+        if (ef_construction < 1 || ef_construction > 10000) {
+            throw InvalidInputException(
+                "GRAPH_INDEX option 'ef_construction' must be in [1, 10000], got %d", ef_construction);
+        }
     }
     auto metric_it = input.options.find("metric");
     if (metric_it != input.options.end()) {
         metric = ParseMetric(metric_it->second.GetValue<string>());
     }
+    auto threads_it = input.options.find("threads");
+    if (threads_it != input.options.end()) {
+        int threads_val = 0;
+        try {
+            threads_val = threads_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'threads' must be a valid integer in [1, 1024]");
+        }
+        if (threads_val < 1 || threads_val > 1024) {
+            throw InvalidInputException("GRAPH_INDEX option 'threads' must be in [1, 1024], got %d", threads_val);
+        }
+        // vexdb-duck currently builds single-threaded; the option is accepted but ignored.
+    }
+    auto pq_m_it = input.options.find("pq_m");
+    if (pq_m_it != input.options.end()) {
+        int pq_m_val = 0;
+        try {
+            pq_m_val = pq_m_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'pq_m' must be a valid integer");
+        }
+        if (pq_m_val < 0) {
+            throw InvalidInputException("GRAPH_INDEX option 'pq_m' must be >= 0, got %d", pq_m_val);
+        }
+        // vexdb-duck does not yet implement PQ; option is accepted for compatibility but ignored.
+    }
+    // Reject unknown options.
+    static const char *known_options[] = {"m", "ef_construction", "metric", "threads", "quantizer", "pq_m"};
+    for (auto &kv : input.options) {
+        bool ok = false;
+        for (auto *known : known_options) {
+            if (StringUtil::CIEquals(kv.first, known)) { ok = true; break; }
+        }
+        if (!ok) {
+            throw InvalidInputException("GRAPH_INDEX got unknown option '%s'", kv.first);
+        }
+    }
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
-                                             metric);
-    graph_index->runtime_->store.InitAllocators(input.table_io_manager.GetIndexBlockManager());
+                                             metric, vec_pos.GetIndex());
 
     if (input.storage_info.allocator_infos.size() >= 3) {
+        // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
+        // bitmask already has slot 0 reserved from the original InitAllocators().
+        // Reserving it again would corrupt buffers_with_free_space tracking.
+        graph_index->runtime_->store.CreateAllocators(input.table_io_manager.GetIndexBlockManager());
         graph_index->DeserializeFromStorage(input.storage_info);
         graph_index->runtime_->store.normalize_vectors_ = (graph_index->metric_ == VexMetric::COSINE);
         return std::move(graph_index);
     }
+
+    graph_index->runtime_->store.InitAllocators(input.table_io_manager.GetIndexBlockManager());
 
     auto manifest_it = input.storage_info.options.find("vex_graph_manifest");
     if (manifest_it != input.storage_info.options.end()) {
@@ -161,13 +250,7 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
     return create_idx;
 }
 
-void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids, idx_t dimension) {
-    if (dimension_ != dimension) {
-        throw InvalidInputException("GRAPH_INDEX dimension mismatch: expected %llu, got %llu",
-                                    static_cast<unsigned long long>(dimension_),
-                                    static_cast<unsigned long long>(dimension));
-    }
-
+void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids) {
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
@@ -194,12 +277,23 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     }
     auto &store = runtime_->store;
     PointExtensionContext point_ctx;
-    auto search_k = uint_fast16_t(std::max<idx_t>(k, ef));
+    idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
+    if (!deleted_rids_.empty()) {
+        needed += deleted_rids_.size();
+    }
+    auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
 
+    bool has_deleted = !deleted_rids_.empty();
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
         auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
-        for (auto &tid : res.first) row_ids.push_back(tid.row_id);
-        for (auto &dist : res.second) distances.push_back(dist);
+        for (idx_t i = 0; i < res.first.size() && row_ids.size() < k; i++) {
+            row_t rid = res.first[i].row_id;
+            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
+                continue;
+            }
+            row_ids.push_back(rid);
+            distances.push_back(res.second[i]);
+        }
     });
 }
 
@@ -221,7 +315,10 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     if (column_ids.empty()) {
         return ErrorData(ExceptionType::INTERNAL, "GRAPH_INDEX has no indexed columns");
     }
-    auto vec_col_idx = static_cast<idx_t>(column_ids[0]);
+    if (vec_column_index_ >= column_ids.size()) {
+        return ErrorData(ExceptionType::INTERNAL, "GRAPH_INDEX vec column index out of range");
+    }
+    auto vec_col_idx = static_cast<idx_t>(column_ids[vec_column_index_]);
     if (vec_col_idx >= chunk.ColumnCount()) {
         return ErrorData(ExceptionType::INTERNAL,
                          StringUtil::Format("GRAPH_INDEX column index out of range: %llu (chunk columns=%llu)",
@@ -262,6 +359,9 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
             PointExtensionContext point_ctx;
             ItemPointerData tid;
             tid.row_id = row_id_data[i];
+            if (!deleted_rids_.empty()) {
+                deleted_rids_.erase(tid.row_id);
+            }
             const char *query = reinterpret_cast<const char *>(vec_data + i * dim);
             typename AlgoT::InsertContextBase insert_ctx(point_ctx, query, &tid);
             algo.insert(insert_ctx);
@@ -289,8 +389,20 @@ void GraphIndex::VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, Confl
 
 void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) {
     (void)state;
-    (void)entries;
-    (void)row_identifiers;
+    auto count = entries.size();
+    if (count == 0) {
+        return;
+    }
+    UnifiedVectorFormat rid_format;
+    row_identifiers.ToUnifiedFormat(count, rid_format);
+    auto rid_data = UnifiedVectorFormat::GetData<row_t>(rid_format);
+    for (idx_t i = 0; i < count; i++) {
+        auto idx = rid_format.sel->get_index(i);
+        if (!rid_format.validity.RowIsValid(idx)) {
+            continue;
+        }
+        deleted_rids_.insert(rid_data[idx]);
+    }
 }
 
 void GraphIndex::CommitDrop(IndexLock &index_lock) {
@@ -325,6 +437,13 @@ bool GraphIndex::MergeIndexes(IndexLock &state, BoundIndex &other_index) {
 
 void GraphIndex::Vacuum(IndexLock &l) {
     (void)l;
+}
+
+idx_t GraphIndex::GetNodeCount() const {
+    if (!runtime_) {
+        return 0;
+    }
+    return runtime_->store.elems.size();
 }
 
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
@@ -387,23 +506,19 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         store.upper_alloc_->Init(info.allocator_infos[2]);
     }
 
+    size_t node_count = 0;
+    size_t upper_count = 0;
     auto nc_it = info.options.find("node_count");
     if (nc_it != info.options.end()) {
-        size_t node_count = nc_it->second.GetValue<uint64_t>();
-        store.elems.resize(node_count);
-        store.base_points.resize(node_count);
-        store.vectors.resize(node_count);
-        store.id_to_node_ptr_.resize(node_count);
-        store.base_layer.current_size = node_count;
+        node_count = nc_it->second.GetValue<uint64_t>();
     }
-
     auto uc_it = info.options.find("upper_count");
     if (uc_it != info.options.end()) {
-        size_t upper_count = uc_it->second.GetValue<uint64_t>();
-        store.upper_points.resize(upper_count);
-        store.upper_idx_to_ptr_.resize(upper_count);
-        store.upper_layer.current_size = upper_count;
+        upper_count = uc_it->second.GetValue<uint64_t>();
     }
+    store.ResizeForReload(node_count, upper_count);
+    store.id_to_node_ptr_.resize(node_count);
+    store.upper_idx_to_ptr_.resize(upper_count);
 
     auto eid_it = info.options.find("entry_id");
     auto ec_it = info.options.find("entry_cur_layer_idx");
@@ -433,6 +548,49 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 store.node_ptr_to_id_[ptr_val] = static_cast<uint32_t>(i);
             }
         }
+    }
+
+    auto del_it = info.options.find("deleted_rids");
+    if (del_it != info.options.end()) {
+        auto blob = StringValue::Get(del_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        deleted_rids_.clear();
+        if (ptr + sizeof(uint64_t) <= end) {
+            uint64_t num_deleted;
+            std::memcpy(&num_deleted, ptr, sizeof(num_deleted));
+            ptr += sizeof(num_deleted);
+            for (uint64_t i = 0; i < num_deleted && ptr + sizeof(int64_t) <= end; i++) {
+                int64_t rid_val;
+                std::memcpy(&rid_val, ptr, sizeof(rid_val));
+                ptr += sizeof(rid_val);
+                deleted_rids_.insert(static_cast<row_t>(rid_val));
+            }
+        }
+    }
+
+    // Repopulate elems[id].tids from disk-backed HNSWNodeHeader.row_id.
+    // get_itempointer / get_tids read from elems[id], not from node_alloc_, so without
+    // this step search returns empty result sets after restart. Skip nodes whose
+    // header->deleted flag was set by a prior Delete() — restoring their tids would
+    // resurrect rows the table no longer has.
+    for (size_t i = 0; i < store.id_to_node_ptr_.size() && i < store.elems.size(); i++) {
+        auto ptr = store.id_to_node_ptr_[i];
+        if (!ptr.Get() || !store.node_alloc_) {
+            continue;
+        }
+        auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<uint32_t> *>(store.node_alloc_->Get(ptr));
+        if (!header || header->deleted) {
+            continue;
+        }
+        if (deleted_rids_.find(header->row_id) != deleted_rids_.end()) {
+            continue;
+        }
+        auto &elem = store.elems[i];
+        elem.tids.clear();
+        ItemPointerData tid;
+        tid.row_id = header->row_id;
+        elem.tids.push_back(tid);
     }
 
     auto upper_ptr_it = info.options.find("upper_ptr_map");

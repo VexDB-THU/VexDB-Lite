@@ -1,0 +1,592 @@
+# name: test/sql/vex/index/graph_index_stability.test_slow
+# description: Long-running stability test for GRAPH_INDEX
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: Create table with graph index
+# ============================================================
+statement ok
+CREATE TABLE vectors (id INTEGER PRIMARY KEY, vec FLOAT[8]);
+
+statement ok
+CREATE INDEX idx_stable ON vectors USING GRAPH_INDEX (vec);
+
+# ============================================================
+# Phase 1: Incremental insert - 500 rows in batches
+# ============================================================
+
+# Batch 1: rows 1-100
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(1, 101) t(i);
+
+# Verify count and search after batch 1
+query I
+SELECT count(*) FROM vectors;
+----
+100
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 1);
+----
+1
+
+# Batch 2: rows 101-200
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(101, 201) t(i);
+
+# Batch 3: rows 201-300
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(201, 301) t(i);
+
+# Batch 4: rows 301-400
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(301, 401) t(i);
+
+# Batch 5: rows 401-500
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(401, 501) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+500
+
+# Search should still work after 500 inserts
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 2: Delete-then-search cycles (stress the delete+repair path)
+# ============================================================
+
+# Delete 50 rows (10% of data)
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 1 AND 50;
+
+query I
+SELECT count(*) FROM vectors;
+----
+450
+
+# Search after delete
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# Delete another 50 rows
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 51 AND 100;
+
+query I
+SELECT count(*) FROM vectors;
+----
+400
+
+# Search after second delete
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# ============================================================
+# Phase 3: Checkpoint after deletes, then continue
+# ============================================================
+statement ok
+CHECKPOINT;
+
+# Search after checkpoint
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# Insert new rows after checkpoint
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.2)::FLOAT, cos(i * 0.3)::FLOAT, sin(i * 0.4)::FLOAT, cos(i * 0.5)::FLOAT,
+    sin(i * 0.6)::FLOAT, cos(i * 0.7)::FLOAT, sin(i * 0.8)::FLOAT, cos(i * 0.9)::FLOAT
+)::FLOAT[8] FROM range(501, 601) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+500
+
+# ============================================================
+# Phase 4: Large batch delete (50% of remaining data)
+# ============================================================
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 101 AND 350;
+
+query I
+SELECT count(*) FROM vectors;
+----
+250
+
+# ANN search must not crash after massive delete
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 20);
+----
+20
+
+# ============================================================
+# Phase 5: Reinsert into gaps
+# ============================================================
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    cos(i * 0.15)::FLOAT, sin(i * 0.25)::FLOAT, cos(i * 0.35)::FLOAT, sin(i * 0.45)::FLOAT,
+    cos(i * 0.55)::FLOAT, sin(i * 0.65)::FLOAT, cos(i * 0.75)::FLOAT, sin(i * 0.85)::FLOAT
+)::FLOAT[8] FROM range(601, 901) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+550
+
+# Search after reinsert
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, -0.5, 0.5, -0.5, 0.5, -0.5, 0.5, -0.5]::FLOAT[8]) LIMIT 15);
+----
+15
+
+# ============================================================
+# Phase 6: Checkpoint + more operations (test deserialized index)
+# ============================================================
+statement ok
+CHECKPOINT;
+
+# Delete from the reinserted batch
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 601 AND 700;
+
+query I
+SELECT count(*) FROM vectors;
+----
+450
+
+# Search the deserialized + modified index
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 7: Repeated insert-delete-search cycles (10 rounds)
+# ============================================================
+
+# Round 1
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(901, 951) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 351 AND 375;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 2
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(951, 1001) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 376 AND 400;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 3
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1001, 1051) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 701 AND 725;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 4
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1051, 1101) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 726 AND 750;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 5
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1101, 1151) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 751 AND 775;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 6 - checkpoint in the middle
+statement ok
+CHECKPOINT;
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1151, 1201) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 776 AND 800;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-1.0, 0.0, -1.0, 0.0, -1.0, 0.0, -1.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 7
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1201, 1251) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 801 AND 825;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 8
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1251, 1301) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 826 AND 850;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 9
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1301, 1351) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 851 AND 875;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# Round 10
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT,
+    sin(i*3)::FLOAT, cos(i*3)::FLOAT, sin(i*4)::FLOAT, cos(i*4)::FLOAT
+)::FLOAT[8] FROM range(1351, 1401) t(i);
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 876 AND 900;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 5);
+----
+5
+
+# ============================================================
+# Phase 8: Delete all and rebuild from scratch
+# ============================================================
+statement ok
+DELETE FROM vectors;
+
+query I
+SELECT count(*) FROM vectors;
+----
+0
+
+# Rebuild index from empty
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(1, 201) t(i);
+
+query I
+SELECT count(*) FROM vectors;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 9: Multiple checkpoints with interleaved operations
+# ============================================================
+statement ok
+CHECKPOINT;
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(201, 301) t(i);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+DELETE FROM vectors WHERE id BETWEEN 50 AND 100;
+
+statement ok
+CHECKPOINT;
+
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(301, 401) t(i);
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT count(*) FROM vectors;
+----
+349
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 20);
+----
+20
+
+# ============================================================
+# Phase 10: Edge case - delete down to 1 row, then rebuild
+# ============================================================
+statement ok
+DELETE FROM vectors WHERE id > 1;
+
+query I
+SELECT count(*) FROM vectors;
+----
+1
+
+# Single row search
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 1);
+----
+1
+
+# Delete last row
+statement ok
+DELETE FROM vectors WHERE id = 1;
+
+query I
+SELECT count(*) FROM vectors;
+----
+0
+
+# Search empty index should return 0 rows
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+0
+
+# Rebuild after full empty
+statement ok
+INSERT INTO vectors SELECT i, list_value(
+    sin(i * 0.1)::FLOAT, cos(i * 0.2)::FLOAT, sin(i * 0.3)::FLOAT, cos(i * 0.4)::FLOAT,
+    sin(i * 0.5)::FLOAT, cos(i * 0.6)::FLOAT, sin(i * 0.7)::FLOAT, cos(i * 0.8)::FLOAT
+)::FLOAT[8] FROM range(1, 101) t(i);
+
+statement ok
+CHECKPOINT;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 11: High-dimension stress (recreate with 128-dim)
+# ============================================================
+statement ok
+DROP INDEX idx_stable;
+
+statement ok
+DROP TABLE vectors;
+
+statement ok
+CREATE TABLE vectors_hd (id INTEGER PRIMARY KEY, vec FLOAT[128]);
+
+statement ok
+CREATE INDEX idx_hd ON vectors_hd USING GRAPH_INDEX (vec);
+
+# Insert 300 rows of 128-dim vectors
+statement ok
+INSERT INTO vectors_hd
+SELECT i,
+    list_value(
+        sin(i*0.01)::FLOAT, cos(i*0.02)::FLOAT, sin(i*0.03)::FLOAT, cos(i*0.04)::FLOAT,
+        sin(i*0.05)::FLOAT, cos(i*0.06)::FLOAT, sin(i*0.07)::FLOAT, cos(i*0.08)::FLOAT,
+        sin(i*0.09)::FLOAT, cos(i*0.10)::FLOAT, sin(i*0.11)::FLOAT, cos(i*0.12)::FLOAT,
+        sin(i*0.13)::FLOAT, cos(i*0.14)::FLOAT, sin(i*0.15)::FLOAT, cos(i*0.16)::FLOAT,
+        sin(i*0.17)::FLOAT, cos(i*0.18)::FLOAT, sin(i*0.19)::FLOAT, cos(i*0.20)::FLOAT,
+        sin(i*0.21)::FLOAT, cos(i*0.22)::FLOAT, sin(i*0.23)::FLOAT, cos(i*0.24)::FLOAT,
+        sin(i*0.25)::FLOAT, cos(i*0.26)::FLOAT, sin(i*0.27)::FLOAT, cos(i*0.28)::FLOAT,
+        sin(i*0.29)::FLOAT, cos(i*0.30)::FLOAT, sin(i*0.31)::FLOAT, cos(i*0.32)::FLOAT,
+        sin(i*0.33)::FLOAT, cos(i*0.34)::FLOAT, sin(i*0.35)::FLOAT, cos(i*0.36)::FLOAT,
+        sin(i*0.37)::FLOAT, cos(i*0.38)::FLOAT, sin(i*0.39)::FLOAT, cos(i*0.40)::FLOAT,
+        sin(i*0.41)::FLOAT, cos(i*0.42)::FLOAT, sin(i*0.43)::FLOAT, cos(i*0.44)::FLOAT,
+        sin(i*0.45)::FLOAT, cos(i*0.46)::FLOAT, sin(i*0.47)::FLOAT, cos(i*0.48)::FLOAT,
+        sin(i*0.49)::FLOAT, cos(i*0.50)::FLOAT, sin(i*0.51)::FLOAT, cos(i*0.52)::FLOAT,
+        sin(i*0.53)::FLOAT, cos(i*0.54)::FLOAT, sin(i*0.55)::FLOAT, cos(i*0.56)::FLOAT,
+        sin(i*0.57)::FLOAT, cos(i*0.58)::FLOAT, sin(i*0.59)::FLOAT, cos(i*0.60)::FLOAT,
+        sin(i*0.61)::FLOAT, cos(i*0.62)::FLOAT, sin(i*0.63)::FLOAT, cos(i*0.64)::FLOAT,
+        sin(i*0.65)::FLOAT, cos(i*0.66)::FLOAT, sin(i*0.67)::FLOAT, cos(i*0.68)::FLOAT,
+        sin(i*0.69)::FLOAT, cos(i*0.70)::FLOAT, sin(i*0.71)::FLOAT, cos(i*0.72)::FLOAT,
+        sin(i*0.73)::FLOAT, cos(i*0.74)::FLOAT, sin(i*0.75)::FLOAT, cos(i*0.76)::FLOAT,
+        sin(i*0.77)::FLOAT, cos(i*0.78)::FLOAT, sin(i*0.79)::FLOAT, cos(i*0.80)::FLOAT,
+        sin(i*0.81)::FLOAT, cos(i*0.82)::FLOAT, sin(i*0.83)::FLOAT, cos(i*0.84)::FLOAT,
+        sin(i*0.85)::FLOAT, cos(i*0.86)::FLOAT, sin(i*0.87)::FLOAT, cos(i*0.88)::FLOAT,
+        sin(i*0.89)::FLOAT, cos(i*0.90)::FLOAT, sin(i*0.91)::FLOAT, cos(i*0.92)::FLOAT,
+        sin(i*0.93)::FLOAT, cos(i*0.94)::FLOAT, sin(i*0.95)::FLOAT, cos(i*0.96)::FLOAT,
+        sin(i*0.97)::FLOAT, cos(i*0.98)::FLOAT, sin(i*0.99)::FLOAT, cos(i*1.00)::FLOAT,
+        sin(i*1.01)::FLOAT, cos(i*1.02)::FLOAT, sin(i*1.03)::FLOAT, cos(i*1.04)::FLOAT,
+        sin(i*1.05)::FLOAT, cos(i*1.06)::FLOAT, sin(i*1.07)::FLOAT, cos(i*1.08)::FLOAT,
+        sin(i*1.09)::FLOAT, cos(i*1.10)::FLOAT, sin(i*1.11)::FLOAT, cos(i*1.12)::FLOAT,
+        sin(i*1.13)::FLOAT, cos(i*1.14)::FLOAT, sin(i*1.15)::FLOAT, cos(i*1.16)::FLOAT,
+        sin(i*1.17)::FLOAT, cos(i*1.18)::FLOAT, sin(i*1.19)::FLOAT, cos(i*1.20)::FLOAT,
+        sin(i*1.21)::FLOAT, cos(i*1.22)::FLOAT, sin(i*1.23)::FLOAT, cos(i*1.24)::FLOAT,
+        sin(i*1.25)::FLOAT, cos(i*1.26)::FLOAT, sin(i*1.27)::FLOAT, cos(i*1.28)::FLOAT
+    )::FLOAT[128]
+FROM range(1, 301) t(i);
+
+query I
+SELECT count(*) FROM vectors_hd;
+----
+300
+
+# Delete 40% of high-dim data
+statement ok
+DELETE FROM vectors_hd WHERE id % 5 IN (0, 1);
+
+query I
+SELECT count(*) FROM vectors_hd;
+----
+180
+
+# Search after large delete on high-dim index
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 2)) LIMIT 10);
+----
+10
+
+statement ok
+CHECKPOINT;
+
+# Search after checkpoint
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 3)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 12: Drop and recreate index on existing data
+# ============================================================
+statement ok
+DROP INDEX idx_hd;
+
+statement ok
+CREATE INDEX idx_hd2 ON vectors_hd USING GRAPH_INDEX (vec);
+
+# Search on recreated index
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 4)) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 13: Varied LIMIT sizes
+# ============================================================
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 7)) LIMIT 1);
+----
+1
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 7)) LIMIT 50);
+----
+50
+
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 7)) LIMIT 100);
+----
+100
+
+# LIMIT larger than table size — should return all rows
+query I
+SELECT count(*) FROM (SELECT id FROM vectors_hd ORDER BY l2_distance(vec, (SELECT vec FROM vectors_hd WHERE id = 7)) LIMIT 500);
+----
+180
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE vectors_hd;

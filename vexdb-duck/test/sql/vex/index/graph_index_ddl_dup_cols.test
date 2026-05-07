@@ -1,0 +1,45 @@
+# name: test/sql/vex/index/graph_index_ddl_dup_cols.test
+# description: Reject invalid column lists at CREATE INDEX time
+#              (TAPD #1078244). Duplicate metadata columns and multiple
+#              vector columns previously succeeded silently, which corrupted
+#              the metadata segment layout.
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t (c1 INTEGER, v FLOAT[4], v2 FLOAT[4]);
+
+statement ok
+INSERT INTO t VALUES (1, [1.0, 0.0, 0.0, 0.0]::FLOAT[4], [0.0, 0.0, 0.0, 1.0]::FLOAT[4]);
+
+# Duplicate metadata column must error.
+statement error
+CREATE INDEX i1 ON t USING GRAPH_INDEX(v, c1, c1);
+----
+duplicate column
+
+# A second vector column must error (only the first column may be a vector).
+statement error
+CREATE INDEX i2 ON t USING GRAPH_INDEX(v, v2);
+----
+only the first column may be a vector
+
+# Reusing the vector column by name must error for the same reason.
+statement error
+CREATE INDEX i3 ON t USING GRAPH_INDEX(v, v);
+----
+only the first column may be a vector
+
+# Vector column showing up later in the list is still rejected.
+statement error
+CREATE INDEX i4 ON t USING GRAPH_INDEX(v, c1, v);
+----
+only the first column may be a vector
+
+# Legitimate form still works.
+statement ok
+CREATE INDEX ok_idx ON t USING GRAPH_INDEX(v, c1);
+
+statement ok
+DROP TABLE t;

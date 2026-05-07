@@ -1,0 +1,145 @@
+# name: test/sql/vex/index/graph_index_vacuum_serialize.test
+# description: Test Delete -> Vacuum -> Checkpoint -> Restart chain
+# group: [vex]
+
+require vex
+
+load __TEST_DIR__/vacuum_serialize.db
+
+# ============================================================
+# Phase 1: Setup
+# ============================================================
+statement ok
+CREATE TABLE vac_test (id INTEGER PRIMARY KEY, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx ON vac_test USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO vac_test SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+query I
+SELECT count(*) FROM vac_test;
+----
+200
+
+query I
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 2: Delete 50%, checkpoint (triggers serialize with deleted nodes), restart
+# ============================================================
+statement ok
+DELETE FROM vac_test WHERE id % 2 = 0;
+
+query I
+SELECT count(*) FROM vac_test;
+----
+100
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM vac_test;
+----
+100
+
+query I
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 3: Delete more, insert new, checkpoint, restart
+# ============================================================
+statement ok
+DELETE FROM vac_test WHERE id % 3 = 0;
+
+statement ok
+INSERT INTO vac_test SELECT i, list_value(cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT)::FLOAT[4]
+FROM range(201, 301) t(i);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SELECT count(*) FROM vac_test;
+
+query I
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 4: Delete all, checkpoint, restart, rebuild
+# ============================================================
+statement ok
+DELETE FROM vac_test;
+
+query I
+SELECT count(*) FROM vac_test;
+----
+0
+
+statement ok
+CHECKPOINT;
+
+restart
+
+query I
+SELECT count(*) FROM vac_test;
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+0
+
+# Insert fresh data into empty index
+statement ok
+INSERT INTO vac_test SELECT i, list_value(sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT)::FLOAT[4]
+FROM range(1, 151) t(i);
+
+query I
+SELECT count(*) FROM vac_test;
+----
+150
+
+query I
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Phase 5: Multiple delete-checkpoint-restart cycles
+# ============================================================
+
+loop cycle 0 5
+
+statement ok
+DELETE FROM vac_test WHERE id % (2 + ${cycle}) = 0;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM vac_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
+
+endloop
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE vac_test;

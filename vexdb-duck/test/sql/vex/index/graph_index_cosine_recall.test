@@ -1,0 +1,244 @@
+# name: test/sql/vex/index/graph_index_cosine_recall.test
+# description: Cosine recall quality — verify index results match brute-force
+# group: [vex]
+#
+# This test compares index-accelerated cosine search against brute-force
+# to measure recall quality. It also checks that the optimizer path
+# correctly handles cosine_distance ordering.
+
+require vex
+
+# ============================================================
+# Test 1: Recall@10 — index top-10 vs brute-force top-10
+# Uses normalized vectors where L2 ≡ cosine ranking
+# ============================================================
+
+statement ok
+CREATE TABLE t_recall (id INTEGER, vec FLOAT[8]);
+
+# Generate 300 vectors with trig-based components (pseudo-normalized)
+statement ok
+INSERT INTO t_recall SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
+  sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,
+  sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[8]
+FROM range(1, 301) t(i);
+
+# Brute-force cosine top-10 (no index)
+statement ok
+CREATE TABLE t_bf_result AS
+SELECT id FROM t_recall
+ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[8])
+LIMIT 10;
+
+# Now create the index
+statement ok
+CREATE INDEX idx_recall ON t_recall USING GRAPH_INDEX (vec);
+
+# Index-accelerated cosine top-10
+statement ok
+CREATE TABLE t_idx_result AS
+SELECT id FROM t_recall
+ORDER BY cosine_distance(vec, [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]::FLOAT[8])
+LIMIT 10;
+
+# Count overlap between brute-force and index results
+# For HNSW with sufficient ef, recall@10 should be high (>=8/10)
+query I
+SELECT count(*) >= 8 FROM t_bf_result WHERE id IN (SELECT id FROM t_idx_result);
+----
+true
+
+statement ok
+DROP TABLE t_bf_result;
+
+statement ok
+DROP TABLE t_idx_result;
+
+statement ok
+DROP TABLE t_recall;
+
+# ============================================================
+# Test 2: Cosine self-search at scale — 300 rows
+# Every row must find itself (cosine_distance = 0)
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_self (id INTEGER, vec FLOAT[4]);
+
+# Well-separated vectors: each row has a unique dominant dimension direction
+statement ok
+INSERT INTO t_cos_self SELECT i, list_value(
+  (i * 1000.0)::FLOAT, 0.0, 0.0, 0.0
+)::FLOAT[4]
+FROM range(1, 301) t(i);
+
+statement ok
+CREATE INDEX idx_cos_self ON t_cos_self USING GRAPH_INDEX (vec);
+
+# With cosine distance, all vectors [k, 0, 0, 0] point in the same direction
+# So cosine_distance between any two is 0. Use l2_distance for self-search instead.
+# For cosine self-search, we need vectors pointing in DIFFERENT directions.
+statement ok
+DROP TABLE t_cos_self;
+
+# Use well-separated angular directions
+statement ok
+CREATE TABLE t_cos_self2 (id INTEGER, vec FLOAT[4]);
+
+# Each vector points in a distinct angular direction
+statement ok
+INSERT INTO t_cos_self2 SELECT i, list_value(
+  cos(i * 0.1)::FLOAT,
+  sin(i * 0.1)::FLOAT,
+  cos(i * 0.3)::FLOAT,
+  sin(i * 0.3)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_self2 ON t_cos_self2 USING GRAPH_INDEX (vec);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_self2';
+----
+true
+
+# Each row should find itself — cosine_distance to itself = 0
+# Even if other rows have similar direction, the exact match must be top-1
+query I
+SELECT count(*) FROM (
+  SELECT t.id, (
+    SELECT s.id FROM t_cos_self2 s
+    ORDER BY cosine_distance(s.vec, t.vec)
+    LIMIT 1
+  ) as found_id
+  FROM t_cos_self2 t
+) sub
+WHERE sub.id = sub.found_id;
+----
+100
+
+statement ok
+DROP TABLE t_cos_self2;
+
+# ============================================================
+# Test 3: Mixed distance functions on same index
+# Same index can serve both l2_distance and cosine_distance queries
+# ============================================================
+
+statement ok
+CREATE TABLE t_mixed (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_mixed SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_mixed ON t_mixed USING GRAPH_INDEX (vec);
+
+# L2 search
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_mixed
+  ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
+  LIMIT 10
+);
+----
+10
+
+# Cosine search on the SAME index
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_mixed
+  ORDER BY cosine_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4])
+  LIMIT 10
+);
+----
+10
+
+# <=> operator on the SAME index
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_mixed
+  ORDER BY vec <=> [0.5, 0.5, 0.5, 0.5]::FLOAT[4]
+  LIMIT 10
+);
+----
+10
+
+# <-> operator (l2) on the SAME index
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_mixed
+  ORDER BY vec <-> [0.5, 0.5, 0.5, 0.5]::FLOAT[4]
+  LIMIT 10
+);
+----
+10
+
+statement ok
+DROP TABLE t_mixed;
+
+# ============================================================
+# Test 4: Cosine with DELETE + INSERT cycle
+# ============================================================
+
+statement ok
+CREATE TABLE t_cos_cycle (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_cos_cycle SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_cos_cycle ON t_cos_cycle USING GRAPH_INDEX (vec);
+
+# Delete half
+statement ok
+DELETE FROM t_cos_cycle WHERE id <= 50;
+
+# Insert new vectors
+statement ok
+INSERT INTO t_cos_cycle SELECT i, list_value(
+  cos(i*0.1)::FLOAT, sin(i*0.1)::FLOAT,
+  cos(i*0.2)::FLOAT, sin(i*0.2)::FLOAT
+)::FLOAT[4]
+FROM range(101, 151) t(i);
+
+# Cosine search should work correctly after mutations
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_cycle
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+  LIMIT 10
+);
+----
+10
+
+# Verify no deleted rows appear
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_cos_cycle
+  ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+  LIMIT 100
+) sub
+WHERE sub.id <= 50;
+----
+0
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_cos_cycle';
+----
+true
+
+statement ok
+DROP TABLE t_cos_cycle;

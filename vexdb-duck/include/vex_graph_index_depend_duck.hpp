@@ -441,17 +441,34 @@ public:
         return elems.size();
     }
 
-    void InitAllocators(duckdb::BlockManager &block_manager) {
+    void ResizeForReload(size_t base_n, size_t upper_n) {
+        elems.resize(base_n);
+        vectors.resize(base_n);
+        base_points.resize(base_n, MakeBasePoint());
+        base_layer.current_size = base_n;
+        upper_points.resize(upper_n, MakeUpperPoint());
+        upper_layer.current_size = upper_n;
+    }
+
+    void CreateAllocators(duckdb::BlockManager &block_manager) {
         using namespace duckdb;
         node_alloc_ = make_uniq<FixedSizeAllocator>(vex::HNSWNodeHeader<T>::SegmentSize(m), block_manager);
         vector_alloc_ = make_uniq<FixedSizeAllocator>(static_cast<idx_t>(dim) * sizeof(float), block_manager);
         upper_alloc_ = make_uniq<FixedSizeAllocator>(vex::HNSWUpperLevel<T>::SegmentSize(m), block_manager);
+    }
+
+    void ReserveSentinelSlot() {
         auto p0 = node_alloc_->New();
         auto p1 = vector_alloc_->New();
         auto p2 = upper_alloc_->New();
         node_alloc_->Get(p0);
         vector_alloc_->Get(p1);
         upper_alloc_->Get(p2);
+    }
+
+    void InitAllocators(duckdb::BlockManager &block_manager) {
+        CreateAllocators(block_manager);
+        ReserveSentinelSlot();
     }
 
     duckdb::IndexPointer GetNodePtr(T id) const {

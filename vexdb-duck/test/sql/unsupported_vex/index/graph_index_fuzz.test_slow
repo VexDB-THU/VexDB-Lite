@@ -1,0 +1,240 @@
+# name: test/sql/vex/index/graph_index_fuzz.test_slow
+# description: Fuzzing test - random-like operations on GRAPH_INDEX
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup
+# ============================================================
+statement ok
+CREATE TABLE fuzz (id INTEGER PRIMARY KEY, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_fuzz ON fuzz USING GRAPH_INDEX (vec);
+
+# ============================================================
+# Fuzz 1: Rapid insert with varied vector patterns
+# ============================================================
+
+# Pattern A: sin/cos based
+statement ok
+INSERT INTO fuzz SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, sin(i*3)::FLOAT, cos(i*5)::FLOAT)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+# Pattern B: linear
+statement ok
+INSERT INTO fuzz SELECT i, list_value((i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT)::FLOAT[4]
+FROM range(101, 201) t(i);
+
+# Pattern C: constant (all same vector - edge case)
+statement ok
+INSERT INTO fuzz SELECT i, list_value(1.0, 1.0, 1.0, 1.0)::FLOAT[4]
+FROM range(201, 251) t(i);
+
+# Pattern D: very large values
+statement ok
+INSERT INTO fuzz SELECT i, list_value((i*1000.0)::FLOAT, (i*-1000.0)::FLOAT, (i*999.0)::FLOAT, (i*-999.0)::FLOAT)::FLOAT[4]
+FROM range(251, 301) t(i);
+
+# Pattern E: very small values (near zero)
+statement ok
+INSERT INTO fuzz SELECT i, list_value((i*0.0001)::FLOAT, (i*0.0002)::FLOAT, (i*0.0003)::FLOAT, (i*0.0004)::FLOAT)::FLOAT[4]
+FROM range(301, 351) t(i);
+
+# Pattern F: negative values
+statement ok
+INSERT INTO fuzz SELECT i, list_value((-i*0.1)::FLOAT, (-i*0.2)::FLOAT, (-i*0.3)::FLOAT, (-i*0.4)::FLOAT)::FLOAT[4]
+FROM range(351, 401) t(i);
+
+query I
+SELECT count(*) FROM fuzz;
+----
+400
+
+# ============================================================
+# Fuzz 2: Search with diverse query vectors
+# ============================================================
+
+# Zero vector
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# Large positive
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [99999.0, 99999.0, 99999.0, 99999.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Large negative
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [-99999.0, -99999.0, -99999.0, -99999.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Mixed signs
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [100.0, -100.0, 100.0, -100.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# Query = existing vector (distance 0 case)
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [1.0, 1.0, 1.0, 1.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+# ============================================================
+# Fuzz 3: Delete patterns - scattered, sequential, random-like
+# ============================================================
+
+# Delete every 3rd element
+statement ok
+DELETE FROM fuzz WHERE id % 3 = 0;
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# Delete every 5th of remaining
+statement ok
+DELETE FROM fuzz WHERE id % 5 = 0;
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# Delete a contiguous block
+statement ok
+DELETE FROM fuzz WHERE id BETWEEN 101 AND 150;
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.5, 0.5, 0.5, 0.5]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Fuzz 4: Reinsert into gaps with different vectors
+# ============================================================
+statement ok
+INSERT INTO fuzz SELECT i, list_value(cos(i*7)::FLOAT, sin(i*11)::FLOAT, cos(i*13)::FLOAT, sin(i*17)::FLOAT)::FLOAT[4]
+FROM range(401, 501) t(i);
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 20);
+----
+20
+
+# ============================================================
+# Fuzz 5: Varied LIMIT values (1 to 100)
+# ============================================================
+
+foreach limit_val 1 2 3 5 7 10 15 20 30 50 75 100
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT ${limit_val});
+
+endloop
+
+# ============================================================
+# Fuzz 6: Diverse query vectors in a loop
+# ============================================================
+
+loop qi 1 51
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, list_value(sin(${qi})::FLOAT, cos(${qi})::FLOAT, sin(${qi}*2)::FLOAT, cos(${qi}*2)::FLOAT)::FLOAT[4]) LIMIT 5);
+
+endloop
+
+# ============================================================
+# Fuzz 7: Alternating insert-delete-checkpoint cycles
+# ============================================================
+
+loop cycle 0 10
+
+statement ok
+INSERT INTO fuzz SELECT 501 + ${cycle} * 10 + i, list_value(sin(i + ${cycle})::FLOAT, cos(i + ${cycle})::FLOAT, sin(i*2 + ${cycle})::FLOAT, cos(i*2 + ${cycle})::FLOAT)::FLOAT[4]
+FROM range(0, 10) t(i);
+
+statement ok
+DELETE FROM fuzz WHERE id BETWEEN 501 + ${cycle} * 10 AND 501 + ${cycle} * 10 + 4;
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 5);
+
+endloop
+
+statement ok
+CHECKPOINT;
+
+# ============================================================
+# Fuzz 8: UPDATE fuzz - change vectors randomly
+# ============================================================
+
+loop uid 401 420
+
+statement ok
+UPDATE fuzz SET vec = list_value(sin(${uid}*3.14)::FLOAT, cos(${uid}*2.71)::FLOAT, sin(${uid}*1.41)::FLOAT, cos(${uid}*1.73)::FLOAT)::FLOAT[4] WHERE id = ${uid};
+
+endloop
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Fuzz 9: Delete almost everything, search on remnants
+# ============================================================
+
+statement ok
+DELETE FROM fuzz WHERE id > 5;
+
+statement ok
+SELECT count(*) FROM fuzz;
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 100);
+
+# ============================================================
+# Fuzz 10: Rebuild from empty
+# ============================================================
+statement ok
+DELETE FROM fuzz;
+
+statement ok
+INSERT INTO fuzz SELECT i, list_value(sin(i*0.7)::FLOAT, cos(i*0.7)::FLOAT, sin(i*1.4)::FLOAT, cos(i*1.4)::FLOAT)::FLOAT[4]
+FROM range(1, 1001) t(i);
+
+query I
+SELECT count(*) FROM fuzz;
+----
+1000
+
+# Stress search on 1000-row index
+loop sq 1 21
+
+statement ok
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, list_value(sin(${sq}*0.5)::FLOAT, cos(${sq}*0.5)::FLOAT, sin(${sq})::FLOAT, cos(${sq})::FLOAT)::FLOAT[4]) LIMIT 10);
+
+endloop
+
+# Final checkpoint
+statement ok
+CHECKPOINT;
+
+query I
+SELECT count(*) FROM (SELECT id FROM fuzz ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE fuzz;

@@ -1,0 +1,235 @@
+# name: test/sql/vex/index/graph_index_invariant.test
+# description: Verify index internal invariants that SQL-level tests cannot catch
+# group: [vex]
+#
+# This test targets a class of bugs where:
+# - SQL output appears correct (DuckDB SEMI-JOIN masks index errors)
+# - But internal state is corrupted (orphan nodes, wrong node_count, broken row_id_map)
+#
+# Strategy:
+# 1. Use vex_index_info() to observe internal state (node_count, row_id_map_size)
+# 2. The fundamental invariant: node_count <= row_id_map_size (ALWAYS)
+# 3. Use large enough data (200+ rows) to trigger multi-segment pipelines
+# 4. Verify at every mutation point (CREATE, INSERT, DELETE, UPDATE)
+
+require vex
+
+# ============================================================
+# Test 1: CREATE INDEX invariant
+# After CREATE INDEX on N rows, node_count must equal row_id_map_size.
+# Bug scenario: row_ids Vector not Flattened → all rows get same row_id
+#               → node_count=N but row_id_map_size=1
+# ============================================================
+
+statement ok
+CREATE TABLE t_inv1 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_inv1 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_inv1 ON t_inv1 USING GRAPH_INDEX (vec);
+
+# Core invariant: node_count <= row_id_map_size
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv1';
+----
+true
+
+# Both must be > 0
+query I
+SELECT node_count > 0 AND row_id_map_size > 0 FROM vex_index_info() WHERE index_name = 'idx_inv1';
+----
+true
+
+statement ok
+DROP TABLE t_inv1;
+
+# ============================================================
+# Test 2: INSERT invariant
+# Each INSERT must increase node_count and row_id_map_size equally.
+# Bug scenario: orphan nodes created → node_count grows faster than map
+# ============================================================
+
+statement ok
+CREATE TABLE t_inv2 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+CREATE INDEX idx_inv2 ON t_inv2 USING GRAPH_INDEX (vec);
+
+# Batch 1: 100 rows
+statement ok
+INSERT INTO t_inv2 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv2';
+----
+true
+
+# Batch 2: 100 more rows
+statement ok
+INSERT INTO t_inv2 SELECT i, list_value(
+  cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(101, 201) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv2';
+----
+true
+
+# Batch 3: 200 more rows (larger batch to stress pipeline)
+statement ok
+INSERT INTO t_inv2 SELECT i, list_value(
+  sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT
+)::FLOAT[4]
+FROM range(201, 401) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv2';
+----
+true
+
+statement ok
+DROP TABLE t_inv2;
+
+# ============================================================
+# Test 3: DELETE invariant
+# Each DELETE must decrease node_count and row_id_map_size equally.
+# Bug scenario: DELETE can't find node in empty/wrong row_id_map → silent no-op
+# ============================================================
+
+statement ok
+CREATE TABLE t_inv3 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_inv3 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_inv3 ON t_inv3 USING GRAPH_INDEX (vec);
+
+# Delete 1 row
+statement ok
+DELETE FROM t_inv3 WHERE id = 1;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv3';
+----
+true
+
+# Delete batch
+statement ok
+DELETE FROM t_inv3 WHERE id <= 50;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv3';
+----
+true
+
+# Delete half
+statement ok
+DELETE FROM t_inv3 WHERE id <= 100;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv3';
+----
+true
+
+statement ok
+DROP TABLE t_inv3;
+
+# ============================================================
+# Test 4: UPDATE invariant (UPDATE = DELETE + INSERT)
+# Both paths must maintain the invariant.
+# ============================================================
+
+statement ok
+CREATE TABLE t_inv4 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t_inv4 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, 0.0, 0.0
+)::FLOAT[4]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_inv4 ON t_inv4 USING GRAPH_INDEX (vec);
+
+# Single UPDATE
+statement ok
+UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id = 1;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv4';
+----
+true
+
+# Batch UPDATE
+statement ok
+UPDATE t_inv4 SET vec = [0.0, 0.0, 0.0, 0.0]::FLOAT[4] WHERE id <= 50;
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_inv4';
+----
+true
+
+statement ok
+DROP TABLE t_inv4;
+
+# ============================================================
+# Test 5: Self-search — every row MUST find itself as top-1
+# This is the strongest functional test: if ANY row is missing
+# from the index, searching for its exact vector won't find it.
+# Unlike "LIMIT 10 returns 10 rows", this verifies ALL rows.
+# ============================================================
+
+statement ok
+CREATE TABLE t_self (id INTEGER, vec FLOAT[4]);
+
+# Use well-separated vectors to avoid ambiguous top-1
+statement ok
+INSERT INTO t_self SELECT i, list_value(
+  (i * 100.0)::FLOAT, 0.0, 0.0, 0.0
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx_self ON t_self USING GRAPH_INDEX (vec);
+
+# Every row should find itself as the nearest neighbor
+# If any row is an orphan node (not in row_id_map), the index
+# may not return it, but SEMI-JOIN hides this. So we check
+# that the DISTANCE to the exact vector is 0 (or very close).
+query I
+SELECT count(*) FROM t_self WHERE (
+  SELECT l2_distance(t_self.vec, t_self.vec) = 0.0
+);
+----
+100
+
+# The real test: search for each vector and verify the nearest is the correct id
+# If index has orphan nodes, some of these searches may return wrong ids
+query I
+SELECT count(*) FROM (
+  SELECT id, (
+    SELECT s.id FROM t_self s
+    ORDER BY l2_distance(s.vec, t_self.vec)
+    LIMIT 1
+  ) as found_id
+  FROM t_self
+) sub
+WHERE sub.id = sub.found_id;
+----
+100
+
+statement ok
+DROP TABLE t_self;

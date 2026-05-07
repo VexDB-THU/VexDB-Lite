@@ -66,40 +66,43 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
     }
 }
 
-static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
-        MetricList<Metric::L2>,
+// The shared distance core has `ann_helper::get_general_distance_func(Metric)` but
+// only ships with the PG build target. For vexdb-duck we instantiate the dispatcher
+// once per metric here. Same template parameters across all three calls — only the
+// runtime Metric value differs.
+static ann_helper::distance_func GetRawDistanceFunc(Metric metric) {
+    return DispatchRunner<false,
+        MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>,
         DistPrecisionTypeList<DistPrecisionType::FLOAT>,
         DispatcherMode::NO_QUANT>::call(
-            Metric::L2, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
+            metric, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
             [](auto &d) -> ann_helper::distance_func {
                 return std::decay_t<decltype(d)>::get_distance_single;
             });
-    DistanceFunctionImpl(args, state, result, func);
+}
+
+static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    static const auto squared_func = GetRawDistanceFunc(Metric::L2);
+    auto sqrt_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return std::sqrt(squared_func(xx, yy, dim));
+    };
+    DistanceFunctionImpl(args, state, result, sqrt_func);
 }
 
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
-        MetricList<Metric::INNER_PRODUCT>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(
-            Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
-            [](auto &d) -> ann_helper::distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
-    DistanceFunctionImpl(args, state, result, func);
+    static const auto neg_ip_func = GetRawDistanceFunc(Metric::INNER_PRODUCT);
+    auto ip_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return -neg_ip_func(xx, yy, dim);
+    };
+    DistanceFunctionImpl(args, state, result, ip_func);
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto func = DispatchRunner<false,
-        MetricList<Metric::COSINE>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(
-            Metric::COSINE, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
-            [](auto &d) -> ann_helper::distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
-    DistanceFunctionImpl(args, state, result, func);
+    static const auto neg_cos_func = GetRawDistanceFunc(Metric::COSINE);
+    auto cos_dist_func = [](const void *xx, const void *yy, uint16 dim) -> float {
+        return 1.0f + neg_cos_func(xx, yy, dim);
+    };
+    DistanceFunctionImpl(args, state, result, cos_dist_func);
 }
 
 static void VexTestVec3Function(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -160,16 +163,39 @@ ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
     return set;
 }
 
+ScalarFunctionSet VexFunctions::GetCosineDistanceOperator() {
+    ScalarFunctionSet set("<~>");
+    AddDistanceOverloads(set, CosineDistanceFunction);
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetCosineDistanceOperatorAlt() {
+    ScalarFunctionSet set("<=>");
+    AddDistanceOverloads(set, CosineDistanceFunction);
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetInnerProductOperator() {
+    ScalarFunctionSet set("<#>");
+    AddDistanceOverloads(set, InnerProductFunction);
+    return set;
+}
+
 void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2DistanceFunction());
     loader.RegisterFunction(GetL2DistanceOperator());
     loader.RegisterFunction(GetL2DistanceArrayAlias());
     loader.RegisterFunction(GetL2DistanceListAlias());
     loader.RegisterFunction(GetInnerProductFunction());
+    loader.RegisterFunction(GetInnerProductOperator());
     loader.RegisterFunction(GetCosineDistanceFunction());
+    loader.RegisterFunction(GetCosineDistanceOperator());
+    loader.RegisterFunction(GetCosineDistanceOperatorAlt());
     loader.RegisterFunction(GetVectorDimsFunction());
+    loader.RegisterFunction(GetL2NormalizeFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));
+    RegisterIndexInfoFunction(loader);
 }
 
 } // namespace duckdb

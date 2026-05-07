@@ -1,0 +1,225 @@
+# name: test/sql/vex/index/graph_index_restart_insert.test
+# description: Verify row_id_map consistency after restart → INSERT operations
+# group: [vex]
+#
+# INSERT after restart must correctly add entries to the restored row_id_map.
+# Also tests INSERT → DELETE of newly inserted rows after restart.
+
+require vex
+
+# ============================================================
+# Test 1: restart → INSERT → verify node_count <= row_id_map_size
+# ============================================================
+
+load __TEST_DIR__/restart_insert1.db
+
+statement ok
+CREATE TABLE t1 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t1 SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Trigger binding
+statement ok
+DELETE FROM t1 WHERE id = -999;
+
+# Baseline
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# INSERT new rows after restart
+statement ok
+INSERT INTO t1 SELECT i, list_value(
+  cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT
+)::FLOAT[4]
+FROM range(101, 151) t(i);
+
+# Verify new rows are searchable
+query I
+SELECT count(*) FROM t1;
+----
+150
+
+query I
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 20);
+----
+20
+
+# node_count and row_id_map_size should match after INSERT
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx1';
+----
+true
+
+# ============================================================
+# Test 2: restart → INSERT → DELETE newly inserted rows
+# Exercises: restored row_id_map + new entries + removal of new entries
+# ============================================================
+
+# DELETE the rows we just inserted
+statement ok
+DELETE FROM t1 WHERE id > 100;
+
+query I
+SELECT count(*) FROM t1;
+----
+100
+
+# Search still works
+query I
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [1.0,1.0,1.0,1.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t1;
+
+# ============================================================
+# Test 3: restart → INSERT → CHECKPOINT → restart → verify persistence
+# Ensures newly added row_id_map entries survive a second serialization cycle
+# ============================================================
+
+load __TEST_DIR__/restart_insert2.db
+
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
+FROM range(1, 51) t(i);
+
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# INSERT after first restart
+statement ok
+INSERT INTO t2 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
+FROM range(51, 101) t(i);
+
+query I
+SELECT count(*) FROM t2;
+----
+100
+
+# Checkpoint with the enlarged row_id_map
+statement ok
+CHECKPOINT;
+
+restart
+
+# After second restart, verify consistency
+statement ok
+DELETE FROM t2 WHERE id = -999;
+
+query I
+SELECT node_count > 0 FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+# Delete some of the originally inserted rows and some newly inserted rows
+statement ok
+DELETE FROM t2 WHERE id IN (1, 25, 50, 75, 100);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+query I
+SELECT count(*) FROM t2;
+----
+95
+
+query I
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t2;
+
+# ============================================================
+# Test 4: restart → mixed INSERT + DELETE interleaving
+# Stress test the row_id_map with alternating operations
+# ============================================================
+
+load __TEST_DIR__/restart_insert3.db
+
+statement ok
+CREATE TABLE t3 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t3 SELECT i, list_value(sin(i*0.5)::FLOAT, cos(i*0.5)::FLOAT, 0.1, 0.2)::FLOAT[4]
+FROM range(1, 81) t(i);
+
+statement ok
+CREATE INDEX idx3 ON t3 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Round 1: DELETE some, INSERT some
+statement ok
+DELETE FROM t3 WHERE id <= 20;
+
+statement ok
+INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.3, 0.4)::FLOAT[4]
+FROM range(81, 101) t(i);
+
+# After mixed DELETE+INSERT, node_count should match row_id_map_size
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx3';
+----
+true
+
+# Round 2: DELETE more, INSERT more
+statement ok
+DELETE FROM t3 WHERE id BETWEEN 21 AND 40;
+
+statement ok
+INSERT INTO t3 SELECT i, list_value(cos(i)::FLOAT, sin(i)::FLOAT, 0.5, 0.6)::FLOAT[4]
+FROM range(101, 121) t(i);
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx3';
+----
+true
+
+# Verify count: started 80, deleted 40, inserted 40 → 80
+query I
+SELECT count(*) FROM t3;
+----
+80
+
+query I
+SELECT count(*) FROM (SELECT id FROM t3 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 15);
+----
+15
+
+statement ok
+DROP TABLE t3;

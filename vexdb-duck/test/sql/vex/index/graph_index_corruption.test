@@ -1,0 +1,138 @@
+# name: test/sql/vex/index/graph_index_corruption.test
+# description: Test index robustness with corrupted/edge-case serialization
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Empty table with index - serialize/deserialize
+# ============================================================
+statement ok
+CREATE TABLE t_empty (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_empty ON t_empty USING GRAPH_INDEX (vec);
+
+# Checkpoint empty index
+statement ok
+CHECKPOINT;
+
+# Verify empty table still works
+query I
+SELECT count(*) FROM t_empty;
+----
+0
+
+# Insert after checkpoint of empty index
+statement ok
+INSERT INTO t_empty VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
+
+query I
+SELECT id FROM t_empty ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_empty;
+
+# ============================================================
+# Test 2: Single element index - serialize/deserialize
+# ============================================================
+statement ok
+CREATE TABLE t_single (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_single ON t_single USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_single VALUES (1, [0.5, 0.5, 0.5]::FLOAT[3]);
+
+statement ok
+CHECKPOINT;
+
+# Search on single-element index
+query I
+SELECT id FROM t_single ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_single;
+
+# ============================================================
+# Test 3: Multiple checkpoint cycles
+# ============================================================
+statement ok
+CREATE TABLE t_multi_ckpt (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_mc ON t_multi_ckpt USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_multi_ckpt VALUES (1, [1.0, 0.0, 0.0]::FLOAT[3]);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+INSERT INTO t_multi_ckpt VALUES (2, [0.0, 1.0, 0.0]::FLOAT[3]);
+
+statement ok
+CHECKPOINT;
+
+statement ok
+INSERT INTO t_multi_ckpt VALUES (3, [0.0, 0.0, 1.0]::FLOAT[3]);
+
+statement ok
+CHECKPOINT;
+
+# All data should be present after multiple checkpoints
+query I
+SELECT count(*) FROM t_multi_ckpt;
+----
+3
+
+query I
+SELECT id FROM t_multi_ckpt ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE t_multi_ckpt;
+
+# ============================================================
+# Test 4: Delete all then re-insert
+# ============================================================
+statement ok
+CREATE TABLE t_delall (id INTEGER, vec FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_delall ON t_delall USING GRAPH_INDEX (vec);
+
+statement ok
+INSERT INTO t_delall VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
+
+statement ok
+DELETE FROM t_delall;
+
+query I
+SELECT count(*) FROM t_delall;
+----
+0
+
+# Re-insert after full delete
+statement ok
+INSERT INTO t_delall VALUES
+  (4, [0.5, 0.5, 0.0]::FLOAT[3]),
+  (5, [0.0, 0.5, 0.5]::FLOAT[3]);
+
+query I
+SELECT id FROM t_delall ORDER BY l2_distance(vec, [0.5, 0.5, 0.0]::FLOAT[3]) LIMIT 1;
+----
+4
+
+statement ok
+DROP TABLE t_delall;

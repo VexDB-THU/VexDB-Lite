@@ -1,0 +1,277 @@
+# name: test/sql/vex/index/graph_index_filtered_basic.test
+# description: Test GRAPH_INDEX with metadata columns — equality filtering, EXPLAIN, NULL handling
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: table with vector + VARCHAR metadata
+# ============================================================
+statement ok
+CREATE TABLE products (id INTEGER, vec FLOAT[4], category VARCHAR);
+
+statement ok
+INSERT INTO products VALUES
+    (1,  [1.0, 0.0, 0.0, 0.0]::FLOAT[4], 'electronics'),
+    (2,  [0.9, 0.1, 0.0, 0.0]::FLOAT[4], 'electronics'),
+    (3,  [0.8, 0.2, 0.0, 0.0]::FLOAT[4], 'electronics'),
+    (4,  [0.0, 1.0, 0.0, 0.0]::FLOAT[4], 'clothing'),
+    (5,  [0.0, 0.9, 0.1, 0.0]::FLOAT[4], 'clothing'),
+    (6,  [0.0, 0.8, 0.2, 0.0]::FLOAT[4], 'clothing'),
+    (7,  [0.0, 0.0, 1.0, 0.0]::FLOAT[4], 'food'),
+    (8,  [0.0, 0.0, 0.9, 0.1]::FLOAT[4], 'food'),
+    (9,  [0.0, 0.0, 0.8, 0.2]::FLOAT[4], 'food'),
+    (10, [0.5, 0.5, 0.0, 0.0]::FLOAT[4], 'electronics'),
+    (11, [0.0, 0.5, 0.5, 0.0]::FLOAT[4], 'clothing'),
+    (12, [0.0, 0.0, 0.5, 0.5]::FLOAT[4], 'food');
+
+# Create GRAPH_INDEX with metadata column
+statement ok
+CREATE INDEX idx ON products USING GRAPH_INDEX (vec, category);
+
+# ============================================================
+# Test 1: Verify index was created
+# ============================================================
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx';
+----
+1
+
+# ============================================================
+# Test 2: Filtered search — category = 'electronics'
+# ============================================================
+query II
+SELECT id, category FROM products
+WHERE category = 'electronics'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1	electronics
+2	electronics
+3	electronics
+
+# ============================================================
+# Test 3: Filtered search — category = 'clothing'
+# ============================================================
+query II
+SELECT id, category FROM products
+WHERE category = 'clothing'
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 2;
+----
+4	clothing
+5	clothing
+
+# ============================================================
+# Test 4: Filtered search — category = 'food'
+# ============================================================
+query II
+SELECT id, category FROM products
+WHERE category = 'food'
+ORDER BY l2_distance(vec, [0.0, 0.0, 1.0, 0.0]::FLOAT[4])
+LIMIT 2;
+----
+7	food
+8	food
+
+# ============================================================
+# Test 5: Unfiltered search — no WHERE clause
+# ============================================================
+query I
+SELECT id FROM products
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+1
+2
+3
+
+# ============================================================
+# Test 6: EXPLAIN — filtered query should use index (VEX_INDEX_SCAN)
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products
+WHERE category = 'electronics'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# Test 7: EXPLAIN — unfiltered query should also use index
+# ============================================================
+query II
+EXPLAIN SELECT id FROM products
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# Test 8: Filter on non-existent category — returns empty
+# ============================================================
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM products
+    WHERE category = 'toys'
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+    LIMIT 5
+);
+----
+0
+
+# ============================================================
+# Test 9: INTEGER metadata column
+# ============================================================
+statement ok
+CREATE TABLE items_int (id INTEGER, vec FLOAT[3], tier INTEGER);
+
+statement ok
+INSERT INTO items_int VALUES
+    (1, [1.0, 0.0, 0.0]::FLOAT[3], 1),
+    (2, [0.9, 0.1, 0.0]::FLOAT[3], 1),
+    (3, [0.0, 1.0, 0.0]::FLOAT[3], 2),
+    (4, [0.0, 0.9, 0.1]::FLOAT[3], 2),
+    (5, [0.0, 0.0, 1.0]::FLOAT[3], 3),
+    (6, [0.0, 0.0, 0.9]::FLOAT[3], 3);
+
+statement ok
+CREATE INDEX idx_int ON items_int USING GRAPH_INDEX (vec, tier);
+
+query II
+SELECT id, tier FROM items_int
+WHERE tier = 2
+ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3])
+LIMIT 2;
+----
+3	2
+4	2
+
+# ============================================================
+# Test 10: NULL metadata values — rows with NULL should be indexed
+#           but not matched by equality filter
+# ============================================================
+statement ok
+CREATE TABLE items_null (id INTEGER, vec FLOAT[3], label VARCHAR);
+
+statement ok
+INSERT INTO items_null VALUES
+    (1, [1.0, 0.0, 0.0]::FLOAT[3], 'red'),
+    (2, [0.9, 0.1, 0.0]::FLOAT[3], 'red'),
+    (3, [0.0, 1.0, 0.0]::FLOAT[3], NULL),
+    (4, [0.0, 0.0, 1.0]::FLOAT[3], NULL),
+    (5, [0.5, 0.5, 0.0]::FLOAT[3], 'blue');
+
+statement ok
+CREATE INDEX idx_null ON items_null USING GRAPH_INDEX (vec, label);
+
+# Filtered search for 'red' — should NOT return NULLs
+query II
+SELECT id, label FROM items_null
+WHERE label = 'red'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 3;
+----
+1	red
+2	red
+
+# Unfiltered search — should return all rows including NULLs
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM items_null
+    ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+    LIMIT 5
+);
+----
+5
+
+# ============================================================
+# Test 11: Insert after index creation — new rows should be filterable
+# ============================================================
+statement ok
+INSERT INTO products VALUES
+    (13, [0.0, 0.0, 0.0, 1.0]::FLOAT[4], 'electronics'),
+    (14, [0.0, 0.0, 0.1, 0.9]::FLOAT[4], 'clothing');
+
+query II
+SELECT id, category FROM products
+WHERE category = 'electronics'
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 1.0]::FLOAT[4])
+LIMIT 1;
+----
+13	electronics
+
+# ============================================================
+# Test 12: Delete and re-search — filtered results should update
+# ============================================================
+statement ok
+DELETE FROM products WHERE id = 1;
+
+query I
+SELECT id FROM products
+WHERE category = 'electronics'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0, 0.0]::FLOAT[4])
+LIMIT 1;
+----
+2
+
+# ============================================================
+# Test 13: Multiple indexes on same column — filtered query
+# should pick the index with metadata columns
+# ============================================================
+statement ok
+CREATE TABLE t_multi_idx (id INTEGER, cat VARCHAR, vec FLOAT[3]);
+
+statement ok
+INSERT INTO t_multi_idx VALUES
+    (1, 'X', [1.0, 0.0, 0.0]),
+    (2, 'Y', [0.0, 1.0, 0.0]),
+    (3, 'X', [0.5, 0.5, 0.0]),
+    (4, 'Y', [0.0, 0.5, 0.5]),
+    (5, 'X', [0.9, 0.1, 0.0]);
+
+statement ok
+CREATE INDEX idx_plain ON t_multi_idx USING GRAPH_INDEX (vec);
+
+statement ok
+CREATE INDEX idx_meta ON t_multi_idx USING GRAPH_INDEX (vec, cat);
+
+# Filtered query must use idx_meta (with metadata), not idx_plain
+query II
+EXPLAIN SELECT id FROM t_multi_idx
+WHERE cat = 'X'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# Result correctness — only cat='X' rows
+query I
+SELECT id FROM t_multi_idx
+WHERE cat = 'X'
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+1
+5
+3
+
+# Unfiltered query should also work (can use either index)
+query II
+EXPLAIN SELECT id FROM t_multi_idx
+ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE products;
+
+statement ok
+DROP TABLE items_int;
+
+statement ok
+DROP TABLE items_null;
+
+statement ok
+DROP TABLE t_multi_idx;

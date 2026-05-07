@@ -73,6 +73,7 @@ public:
     vector<idx_t> fetch_output_positions;
     optional_idx distance_output_index;
     vector<LogicalType> returned_types;
+    string algorithm_used;
 };
 
 } // namespace duckdb

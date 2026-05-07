@@ -259,6 +259,17 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
         info.options["id_ptr_map"] = Value::BLOB(const_data_ptr_cast(id_ptr_blob.data()), id_ptr_blob.size());
     }
 
+    if (!deleted_rids_.empty()) {
+        string deleted_blob;
+        uint64_t num_deleted = deleted_rids_.size();
+        deleted_blob.append(reinterpret_cast<const char *>(&num_deleted), sizeof(num_deleted));
+        for (auto &rid : deleted_rids_) {
+            int64_t rid_val = static_cast<int64_t>(rid);
+            deleted_blob.append(reinterpret_cast<const char *>(&rid_val), sizeof(rid_val));
+        }
+        info.options["deleted_rids"] = Value::BLOB(const_data_ptr_cast(deleted_blob.data()), deleted_blob.size());
+    }
+
     if (!store.upper_idx_to_ptr_.empty()) {
         string upper_ptr_blob;
         uint64_t num_entries = store.upper_idx_to_ptr_.size();
@@ -280,10 +291,8 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
         return ExportStorageInfo();
     }
 
-    auto info = ExportStorageInfo();
-
     if (!context.Valid()) {
-        return info;
+        return ExportStorageInfo();
     }
 
     auto &block_manager = table_io_manager.GetIndexBlockManager();
@@ -292,8 +301,9 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
     runtime_->store.node_alloc_->SerializeBuffers(partial_block_manager);
     runtime_->store.vector_alloc_->SerializeBuffers(partial_block_manager);
     runtime_->store.upper_alloc_->SerializeBuffers(partial_block_manager);
+    partial_block_manager.FlushPartialBlocks();
 
-    return info;
+    return ExportStorageInfo();
 }
 
 IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {

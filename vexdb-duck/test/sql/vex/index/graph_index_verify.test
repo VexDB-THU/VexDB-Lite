@@ -1,0 +1,33 @@
+# name: test/sql/vex/index/graph_index_verify.test
+# description: Verify vex extension and index registration
+# group: [vex]
+
+require vex
+
+# Verify FLOAT[N] vector type exists
+statement ok
+CREATE TABLE test (vec FLOAT[3]);
+
+statement ok
+INSERT INTO test VALUES ([1.0, 2.0, 3.0]::FLOAT[3]);
+
+# Verify vector functions work
+query I
+SELECT vector_dims(vec) FROM test;
+----
+3
+
+# Verify distance functions work
+query R
+SELECT l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) FROM test;
+----
+3.7416573867739413
+
+# Verify GRAPH_INDEX is registered and works
+statement ok
+CREATE INDEX test_idx ON test USING GRAPH_INDEX (vec);
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'test_idx';
+----
+1

@@ -1,0 +1,190 @@
+# name: test/sql/vex/index/graph_index_query_patterns.test
+# description: Test various SQL query patterns with graph index
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Setup: shared table for all query pattern tests
+# ============================================================
+statement ok
+CREATE TABLE items (id INTEGER, name VARCHAR, category INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO items VALUES
+  (1, 'alpha',   1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, 'beta',    1, [0.9, 0.1, 0.0]::FLOAT[3]),
+  (3, 'gamma',   2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (4, 'delta',   2, [0.0, 0.9, 0.1]::FLOAT[3]),
+  (5, 'epsilon', 3, [0.0, 0.0, 1.0]::FLOAT[3]),
+  (6, 'zeta',    3, [0.1, 0.0, 0.9]::FLOAT[3]),
+  (7, 'eta',     1, [0.5, 0.5, 0.0]::FLOAT[3]),
+  (8, 'theta',   2, [0.0, 0.5, 0.5]::FLOAT[3]),
+  (9, 'iota',    3, [0.5, 0.0, 0.5]::FLOAT[3]),
+  (10, 'kappa',  1, [0.3, 0.3, 0.3]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_items ON items USING GRAPH_INDEX (vec);
+
+# ============================================================
+# Test 1: SELECT * with ORDER BY distance LIMIT k
+# ============================================================
+query ITIIR
+SELECT *, l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) as dist FROM items ORDER BY dist, id LIMIT 3;
+----
+1	alpha	1	[1.0, 0.0, 0.0]	0
+2	beta	1	[0.9, 0.1, 0.0]	0.14142136275768282
+7	eta	1	[0.5, 0.5, 0.0]	0.7071067811865476
+
+# ============================================================
+# Test 2: SELECT with specific columns
+# ============================================================
+query IT
+SELECT id, name FROM items ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]) LIMIT 3;
+----
+3	gamma
+4	delta
+7	eta
+
+# ============================================================
+# Test 3: Subquery - filter on inner ANN result
+# ============================================================
+query I
+SELECT id FROM (
+  SELECT id, l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) as dist
+  FROM items
+  ORDER BY dist
+  LIMIT 10
+) sub
+WHERE id > 5
+ORDER BY id;
+----
+6
+7
+8
+9
+10
+
+# ============================================================
+# Test 4: CTE with nearest neighbors
+# ============================================================
+query IT
+WITH nearest AS (
+  SELECT id, name
+  FROM items
+  ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3])
+  LIMIT 5
+)
+SELECT id, name FROM nearest ORDER BY id;
+----
+1	alpha
+2	beta
+7	eta
+9	iota
+10	kappa
+
+# ============================================================
+# Test 5: COUNT of nearest neighbors
+# ============================================================
+query I
+SELECT count(*) FROM (
+  SELECT id FROM items ORDER BY l2_distance(vec, [0.5, 0.5, 0.5]::FLOAT[3]) LIMIT 5
+);
+----
+5
+
+# ============================================================
+# Test 6: DISTINCT on nearest results
+# ============================================================
+query I
+SELECT count(DISTINCT category) FROM (
+  SELECT category FROM items ORDER BY l2_distance(vec, [0.3, 0.3, 0.3]::FLOAT[3]) LIMIT 5
+);
+----
+3
+
+# ============================================================
+# Test 7: Different distance functions with same index
+# ============================================================
+
+# L2 distance - nearest to [1,0,0]
+query I
+SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
+----
+1
+2
+
+# Cosine distance - nearest to [1,0,0]
+query I
+SELECT id FROM items ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) LIMIT 2;
+----
+1
+2
+
+# Inner product - ORDER BY descending (largest inner product = most similar)
+query I
+SELECT id FROM items ORDER BY inner_product(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 2;
+----
+1
+2
+
+# ============================================================
+# Test 8: ORDER BY distance DESC (reverse order, farthest first)
+# ============================================================
+query I
+SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]) DESC LIMIT 3;
+----
+3
+5
+4
+
+# ============================================================
+# Test 9: Multiple ORDER BY columns (distance + tiebreak by id)
+# ============================================================
+query IR
+SELECT id, l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) as dist
+FROM items
+ORDER BY dist, id
+LIMIT 5;
+----
+10	0.5196152422706632
+7	0.7071067811865476
+8	0.7071067811865476
+9	0.7071067811865476
+2	0.9055385138137417
+
+# ============================================================
+# Test 10: WHERE clause + ORDER BY distance (filter on non-vector column)
+# ============================================================
+query IT
+SELECT id, name FROM items
+WHERE category = 1
+ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3])
+LIMIT 3;
+----
+10	kappa
+7	eta
+2	beta
+
+# ============================================================
+# Test 11: UNION of two ANN queries
+# ============================================================
+query I
+SELECT id FROM (
+  (SELECT id FROM items ORDER BY l2_distance(vec, [1.0, 0.0, 0.0]::FLOAT[3]), id LIMIT 3)
+  UNION
+  (SELECT id FROM items ORDER BY l2_distance(vec, [0.0, 1.0, 0.0]::FLOAT[3]), id LIMIT 3)
+) combined
+ORDER BY id;
+----
+1
+2
+3
+4
+7
+
+# ============================================================
+# Cleanup
+# ============================================================
+statement ok
+DROP TABLE items;

@@ -1,0 +1,40 @@
+# name: test/sql/vex/pq_bytes.test
+# description: vex_index_info exposes pq_codes_bytes / pq_codebook_bytes
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE t_a (c1 INT, c2 FLOAT[128]);
+
+statement ok
+INSERT INTO t_a SELECT i, [i::FLOAT, i::FLOAT, i::FLOAT, i::FLOAT] || [1.0::FLOAT FOR _ IN range(124)] FROM range(5000) AS s(i);
+
+statement ok
+CREATE INDEX idx_full ON t_a USING graph_INDEX(c2) WITH (memory_mode='full');
+
+# full index: PQ disabled → both fields zero
+query II
+SELECT pq_codes_bytes, pq_codebook_bytes FROM vex_index_info() WHERE index_name='idx_full';
+----
+0	0
+
+statement ok
+CREATE TABLE t_b (c1 INT, c2 FLOAT[128]);
+
+statement ok
+INSERT INTO t_b SELECT i, [i::FLOAT, i::FLOAT, i::FLOAT, i::FLOAT] || [1.0::FLOAT FOR _ IN range(124)] FROM range(5000) AS s(i);
+
+statement ok
+CREATE INDEX idx_pq ON t_b USING graph_INDEX(c2) WITH (quantizer='pq', pq_m=8);
+
+# Trigger PQ training by running one search (PQ is trained lazily on first L2 search).
+statement ok
+WITH q AS (SELECT [1.0::FLOAT FOR _ IN range(128)]::FLOAT[128] AS vec)
+SELECT c1 FROM t_b ORDER BY array_distance(c2, (SELECT vec FROM q)) LIMIT 5;
+
+# pq index: codes = 5000 * 8 = 40000 bytes; codebook = 8 * 256 * (128/8) * 4 = 131072 bytes
+query II
+SELECT pq_codes_bytes, pq_codebook_bytes FROM vex_index_info() WHERE index_name='idx_pq';
+----
+40000	131072

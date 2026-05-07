@@ -7,6 +7,8 @@
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
 
+#include <unordered_set>
+
 namespace duckdb {
 
 class PhysicalOperator;
@@ -39,9 +41,10 @@ public:
     GraphIndex(const string &name, IndexConstraintType constraint_type,
                const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                const vector<unique_ptr<Expression>> &unbound_expressions,
-               AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric);
+               AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
+               idx_t vec_column_index);
 
-    void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids, idx_t dimension);
+    void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
 
@@ -57,6 +60,8 @@ public:
     VexMetric GetMetric() const {
         return metric_;
     }
+
+    idx_t GetNodeCount() const;
 
 public:
     ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -89,8 +94,10 @@ private:
     int m_;
     int ef_construction_;
     VexMetric metric_;
+    idx_t vec_column_index_;
 
     std::unique_ptr<GraphIndexRuntimeState> runtime_;
+    std::unordered_set<row_t> deleted_rids_;
 };
 
 } // namespace duckdb

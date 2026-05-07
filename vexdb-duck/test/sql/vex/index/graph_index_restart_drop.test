@@ -1,0 +1,162 @@
+# name: test/sql/vex/index/graph_index_restart_drop.test
+# description: Test DROP INDEX after restart (lazy binding + destroy interaction)
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: CHECKPOINT → restart → DROP INDEX → no error
+# ============================================================
+
+load __TEST_DIR__/restart_drop1.db
+
+statement ok
+CREATE TABLE t1 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t1 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::FLOAT[4]
+FROM range(1, 101) t(i);
+
+statement ok
+CREATE INDEX idx1 ON t1 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# DROP without triggering bind first
+statement ok
+DROP INDEX idx1;
+
+# Index should be gone
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx1';
+----
+0
+
+# Table data still intact
+query I
+SELECT count(*) FROM t1;
+----
+100
+
+# Search without index (scan fallback)
+query I
+SELECT count(*) FROM (SELECT id FROM t1 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 10);
+----
+10
+
+statement ok
+DROP TABLE t1;
+
+# ============================================================
+# Test 2: restart → DROP INDEX → CREATE INDEX same name → works
+# ============================================================
+
+load __TEST_DIR__/restart_drop2.db
+
+statement ok
+CREATE TABLE t2 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t2 SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, 0.0, 0.0)::FLOAT[4]
+FROM range(1, 51) t(i);
+
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+DROP INDEX idx2;
+
+# Recreate with same name
+statement ok
+CREATE INDEX idx2 ON t2 USING GRAPH_INDEX (vec);
+
+# New index should work
+query I
+SELECT count(*) FROM (SELECT id FROM t2 ORDER BY l2_distance(vec, [0.0,0.0,0.0,0.0]::FLOAT[4]) LIMIT 5);
+----
+5
+
+query I
+SELECT COUNT(*) FROM duckdb_indexes() WHERE index_name = 'idx2';
+----
+1
+
+# Persist and restart again
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+DELETE FROM t2 WHERE id = -999;
+
+query I
+SELECT node_count > 0 FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx2';
+----
+true
+
+statement ok
+DROP TABLE t2;
+
+# ============================================================
+# Test 3: restart → trigger bind → DROP INDEX → verify cleanup
+# ============================================================
+
+load __TEST_DIR__/restart_drop3.db
+
+statement ok
+CREATE TABLE t3 (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO t3 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.1, 0.2)::FLOAT[4]
+FROM range(1, 81) t(i);
+
+statement ok
+CREATE INDEX idx3 ON t3 USING GRAPH_INDEX (vec);
+
+statement ok
+CHECKPOINT;
+
+restart
+
+# Trigger binding via a DELETE
+statement ok
+DELETE FROM t3 WHERE id = -999;
+
+# Verify index is bound and has data
+query I
+SELECT node_count > 0 FROM vex_index_info() WHERE index_name = 'idx3';
+----
+true
+
+# Now DROP the bound index
+statement ok
+DROP INDEX idx3;
+
+# vex_index_info should no longer list it
+query I
+SELECT COUNT(*) FROM vex_index_info() WHERE index_name = 'idx3';
+----
+0
+
+# Table still works
+query I
+SELECT count(*) FROM t3;
+----
+80
+
+statement ok
+DROP TABLE t3;

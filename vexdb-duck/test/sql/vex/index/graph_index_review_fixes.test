@@ -1,0 +1,90 @@
+# name: test/sql/vex/index/graph_index_review_fixes.test
+# description: Tests for code review fixes — edge cases previously uncovered
+# group: [vex]
+#
+# Why existing tests didn't catch these:
+# - Tests only verified row_id ordering, never checked distance values
+# - No PQ + cosine/IP combination tests
+# - HybridIndex GlobalSearch (cross-partition merge) never exercised
+# - Small data sizes never triggered high HNSW levels
+# - Single-threaded unittest didn't expose lock issues
+
+require vex
+
+# ============================================================
+# Test 1: PQ + cosine metric should fall back to exact search
+# (Previously PQ hardcoded L2, producing wrong results for cosine)
+# ============================================================
+
+statement ok
+CREATE TABLE t_pq_cos (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO t_pq_cos SELECT i, list_value(
+  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
+  sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,
+  sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT
+)::FLOAT[8]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_pq_cos ON t_pq_cos USING GRAPH_INDEX (vec)
+    WITH (metric='cosine', quantizer='pq', pq_m=4);
+
+# Self-search: cosine distance to itself = 0, should find itself as top-1
+query I
+SELECT count(*) FROM (
+  SELECT t.id, (
+    SELECT s.id FROM t_pq_cos s
+    ORDER BY cosine_distance(s.vec, t.vec)
+    LIMIT 1
+  ) as found_id
+  FROM t_pq_cos t
+  WHERE t.id <= 20
+) sub
+WHERE sub.id = sub.found_id;
+----
+20
+
+query I
+SELECT node_count <= row_id_map_size FROM vex_index_info() WHERE index_name = 'idx_pq_cos';
+----
+true
+
+statement ok
+DROP TABLE t_pq_cos;
+
+# ============================================================
+# Test 2: PQ + inner product should fall back to exact search
+# ============================================================
+
+statement ok
+CREATE TABLE t_pq_ip (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO t_pq_ip SELECT i, list_value(
+  (i * sin(i*0.1))::FLOAT, (i * cos(i*0.1))::FLOAT,
+  (i * sin(i*0.2))::FLOAT, (i * cos(i*0.2))::FLOAT,
+  (i * sin(i*0.3))::FLOAT, (i * cos(i*0.3))::FLOAT,
+  (i * sin(i*0.4))::FLOAT, (i * cos(i*0.4))::FLOAT
+)::FLOAT[8]
+FROM range(1, 201) t(i);
+
+statement ok
+CREATE INDEX idx_pq_ip ON t_pq_ip USING GRAPH_INDEX (vec)
+    WITH (metric='ip', quantizer='pq', pq_m=4);
+
+# Search should work correctly (PQ skipped, exact search used)
+query I
+SELECT count(*) FROM (
+  SELECT id FROM t_pq_ip
+  ORDER BY inner_product(vec, [1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0]::FLOAT[8]) DESC
+  LIMIT 10
+);
+----
+10
+
+statement ok
+DROP TABLE t_pq_ip;
+

@@ -1,0 +1,342 @@
+# name: test/sql/vex/index/graph_index_boundary.test
+# description: Test graph index with float boundary conditions and edge-case queries
+# group: [vex]
+
+require vex
+
+# ============================================================
+# Test 1: Very large float values
+# ============================================================
+statement ok
+CREATE TABLE large_vals (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO large_vals VALUES
+  (1, [1e30, 1e30, 1e30]::FLOAT[3]),
+  (2, [-1e30, -1e30, -1e30]::FLOAT[3]),
+  (3, [1e30, -1e30, 0.0]::FLOAT[3]),
+  (4, [0.0, 0.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_large ON large_vals USING GRAPH_INDEX (vec);
+
+# Origin is closest to the zero vector
+query I
+SELECT id FROM large_vals ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+4
+
+# Search near a large positive vector
+query I
+SELECT id FROM large_vals ORDER BY l2_distance(vec, [1e30, 1e30, 1e30]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# Search near a large negative vector
+query I
+SELECT id FROM large_vals ORDER BY l2_distance(vec, [-1e30, -1e30, -1e30]::FLOAT[3]) LIMIT 1;
+----
+2
+
+statement ok
+DROP TABLE large_vals;
+
+# ============================================================
+# Test 2: Very small float values
+# ============================================================
+statement ok
+CREATE TABLE small_vals (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO small_vals VALUES
+  (1, [1e-6, 1e-6, 1e-6]::FLOAT[3]),
+  (2, [2e-6, 2e-6, 2e-6]::FLOAT[3]),
+  (3, [0.0, 0.0, 0.0]::FLOAT[3]),
+  (4, [1.0, 1.0, 1.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_small ON small_vals USING GRAPH_INDEX (vec);
+
+# Zero vector is closest to origin
+query I
+SELECT id FROM small_vals ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+3
+
+# Very small values should be distinguishable from zero
+query I
+SELECT id FROM small_vals ORDER BY l2_distance(vec, [1e-6, 1e-6, 1e-6]::FLOAT[3]) LIMIT 1;
+----
+1
+
+statement ok
+DROP TABLE small_vals;
+
+# ============================================================
+# Test 3: Negative values
+# ============================================================
+statement ok
+CREATE TABLE neg_vals (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO neg_vals VALUES
+  (1, [-1.0, -2.0, -3.0]::FLOAT[3]),
+  (2, [-0.5, -0.5, -0.5]::FLOAT[3]),
+  (3, [-10.0, -10.0, -10.0]::FLOAT[3]),
+  (4, [0.0, 0.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_neg ON neg_vals USING GRAPH_INDEX (vec);
+
+# Nearest to a negative query
+query I
+SELECT id FROM neg_vals ORDER BY l2_distance(vec, [-1.0, -2.0, -3.0]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# Nearest to origin
+query I
+SELECT id FROM neg_vals ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+4
+
+statement ok
+DROP TABLE neg_vals;
+
+# ============================================================
+# Test 4: All-zero vectors (distance to self should be 0)
+# ============================================================
+statement ok
+CREATE TABLE zero_vecs (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO zero_vecs VALUES
+  (1, [0.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [1.0, 1.0, 1.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_zero ON zero_vecs USING GRAPH_INDEX (vec);
+
+# L2 distance from zero vector to itself is 0
+query IR
+SELECT id, l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) as dist FROM zero_vecs ORDER BY dist LIMIT 1;
+----
+1	0
+
+statement ok
+DROP TABLE zero_vecs;
+
+# ============================================================
+# Test 5: Duplicate/identical vectors
+# ============================================================
+statement ok
+CREATE TABLE dupes (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO dupes VALUES
+  (1, [1.0, 2.0, 3.0]::FLOAT[3]),
+  (2, [1.0, 2.0, 3.0]::FLOAT[3]),
+  (3, [1.0, 2.0, 3.0]::FLOAT[3]),
+  (4, [9.0, 9.0, 9.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_dupes ON dupes USING GRAPH_INDEX (vec);
+
+# All three duplicates should be returned when searching with LIMIT >= 3
+query I
+SELECT count(*) FROM (SELECT id FROM dupes ORDER BY l2_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 3);
+----
+3
+
+# All three duplicates have distance 0
+query I
+SELECT count(*) FROM dupes WHERE l2_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) = 0;
+----
+3
+
+# Searching for all 4 should include the distant one
+query I
+SELECT count(*) FROM (SELECT id FROM dupes ORDER BY l2_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3]) LIMIT 4);
+----
+4
+
+statement ok
+DROP TABLE dupes;
+
+# ============================================================
+# Test 6: Mixed positive/negative vectors
+# ============================================================
+statement ok
+CREATE TABLE mixed (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO mixed VALUES
+  (1, [1.0, -1.0, 0.5]::FLOAT[3]),
+  (2, [-1.0, 1.0, -0.5]::FLOAT[3]),
+  (3, [0.5, 0.5, -0.5]::FLOAT[3]),
+  (4, [-0.5, -0.5, 0.5]::FLOAT[3]),
+  (5, [0.0, 0.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_mixed ON mixed USING GRAPH_INDEX (vec);
+
+# Search with a mixed query vector
+query I
+SELECT id FROM mixed ORDER BY l2_distance(vec, [1.0, -1.0, 0.5]::FLOAT[3]) LIMIT 1;
+----
+1
+
+# Origin nearest neighbor
+query I
+SELECT id FROM mixed ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1;
+----
+5
+
+statement ok
+DROP TABLE mixed;
+
+# ============================================================
+# Test 7: Vectors where all components are the same value
+# ============================================================
+statement ok
+CREATE TABLE uniform (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO uniform VALUES
+  (1, [0.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [1.0, 1.0, 1.0]::FLOAT[3]),
+  (3, [2.0, 2.0, 2.0]::FLOAT[3]),
+  (4, [5.0, 5.0, 5.0]::FLOAT[3]),
+  (5, [-1.0, -1.0, -1.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_uniform ON uniform USING GRAPH_INDEX (vec);
+
+query I
+SELECT id FROM uniform ORDER BY l2_distance(vec, [1.5, 1.5, 1.5]::FLOAT[3]) LIMIT 2;
+----
+2
+3
+
+query I
+SELECT id FROM uniform ORDER BY l2_distance(vec, [-1.1, -1.1, -1.1]::FLOAT[3]) LIMIT 2;
+----
+5
+1
+
+statement ok
+DROP TABLE uniform;
+
+# ============================================================
+# Test 8: Search with k > total rows (should return all rows)
+# ============================================================
+statement ok
+CREATE TABLE few_rows (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO few_rows VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_few ON few_rows USING GRAPH_INDEX (vec);
+
+# LIMIT 100 but only 3 rows - should return all 3 without error
+query I
+SELECT count(*) FROM (SELECT id FROM few_rows ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 100);
+----
+3
+
+# LIMIT 1000 should also work
+query I
+SELECT count(*) FROM (SELECT id FROM few_rows ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 1000);
+----
+3
+
+statement ok
+DROP TABLE few_rows;
+
+# ============================================================
+# Test 9: LIMIT 0 (should return empty result)
+# ============================================================
+statement ok
+CREATE TABLE limit_zero (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO limit_zero VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_lz ON limit_zero USING GRAPH_INDEX (vec);
+
+query I
+SELECT count(*) FROM (SELECT id FROM limit_zero ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 0);
+----
+0
+
+statement ok
+DROP TABLE limit_zero;
+
+# ============================================================
+# Test 10: Large OFFSET beyond result count
+# ============================================================
+statement ok
+CREATE TABLE offset_test (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO offset_test VALUES
+  (1, [1.0, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.0, 1.0, 0.0]::FLOAT[3]),
+  (3, [0.0, 0.0, 1.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_off ON offset_test USING GRAPH_INDEX (vec);
+
+# OFFSET beyond total rows should return empty
+query I
+SELECT count(*) FROM (SELECT id FROM offset_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 10 OFFSET 100);
+----
+0
+
+# OFFSET = total rows should return empty
+query I
+SELECT count(*) FROM (SELECT id FROM offset_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 10 OFFSET 3);
+----
+0
+
+statement ok
+DROP TABLE offset_test;
+
+# ============================================================
+# Test 11: LIMIT + OFFSET where offset+limit > total rows
+# ============================================================
+statement ok
+CREATE TABLE lo_test (id INTEGER, vec FLOAT[3]);
+
+statement ok
+INSERT INTO lo_test VALUES
+  (1, [0.1, 0.0, 0.0]::FLOAT[3]),
+  (2, [0.2, 0.0, 0.0]::FLOAT[3]),
+  (3, [0.3, 0.0, 0.0]::FLOAT[3]),
+  (4, [0.4, 0.0, 0.0]::FLOAT[3]),
+  (5, [0.5, 0.0, 0.0]::FLOAT[3]);
+
+statement ok
+CREATE INDEX idx_lo ON lo_test USING GRAPH_INDEX (vec);
+
+# OFFSET 3, LIMIT 10: only 2 rows left after offset
+query I
+SELECT count(*) FROM (SELECT id FROM lo_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 10 OFFSET 3);
+----
+2
+
+# OFFSET 4, LIMIT 5: only 1 row left after offset
+query I
+SELECT count(*) FROM (SELECT id FROM lo_test ORDER BY l2_distance(vec, [0.0, 0.0, 0.0]::FLOAT[3]) LIMIT 5 OFFSET 4);
+----
+1
+
+statement ok
+DROP TABLE lo_test;

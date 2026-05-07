@@ -2,11 +2,18 @@ cmake_minimum_required(VERSION 2.8.12...3.29)
 
 project(VexdbDuckExtension)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+find_package(Boost REQUIRED)
+
 include_directories(
     include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    ${Boost_INCLUDE_DIRS}
 )
 
 execute_process(
@@ -45,6 +52,9 @@ set(VEXDB_DUCK_EXTENSION_FILES
 build_static_extension(vex ${VEXDB_DUCK_EXTENSION_FILES})
 set(PARAMETERS "-warnings")
 build_loadable_extension(vex ${PARAMETERS} ${VEXDB_DUCK_EXTENSION_FILES})
+
+target_compile_features(vex_extension PRIVATE cxx_std_17)
+target_compile_features(vex_loadable_extension PRIVATE cxx_std_17)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set_source_files_properties(

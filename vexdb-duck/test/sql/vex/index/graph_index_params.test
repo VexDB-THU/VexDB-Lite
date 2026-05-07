@@ -1,0 +1,57 @@
+# name: test/sql/vex/index/graph_index_params.test
+# description: Test graph index creation with custom parameters
+# group: [vex]
+
+require vex
+
+# Create test table
+statement ok
+CREATE TABLE vecs (id INTEGER, vec FLOAT[4]);
+
+statement ok
+INSERT INTO vecs SELECT i, [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4] FROM range(200) t(i);
+
+# Default parameters
+statement ok
+CREATE INDEX idx_default ON vecs USING GRAPH_INDEX (vec);
+
+# Custom M parameter
+statement ok
+DROP INDEX idx_default;
+
+statement ok
+CREATE INDEX idx_m8 ON vecs USING GRAPH_INDEX (vec) WITH (m = 8);
+
+# Custom ef_construction
+statement ok
+DROP INDEX idx_m8;
+
+statement ok
+CREATE INDEX idx_ef ON vecs USING GRAPH_INDEX (vec) WITH (ef_construction = 128);
+
+# Both custom
+statement ok
+DROP INDEX idx_ef;
+
+statement ok
+CREATE INDEX idx_both ON vecs USING GRAPH_INDEX (vec) WITH (m = 32, ef_construction = 200);
+
+# Verify search still works with custom params
+query I
+SELECT id FROM vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT[4]) LIMIT 1;
+----
+0
+
+# Invalid M (too small)
+statement error
+CREATE INDEX idx_bad ON vecs USING GRAPH_INDEX (vec) WITH (m = 1);
+----
+
+# Invalid M (too large)
+statement error
+CREATE INDEX idx_bad2 ON vecs USING GRAPH_INDEX (vec) WITH (m = 200);
+----
+
+# Cleanup
+statement ok
+DROP TABLE vecs;
