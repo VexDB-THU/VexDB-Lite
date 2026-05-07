@@ -246,6 +246,48 @@ struct IndexMatch {
     GraphIndex *graph_idx = nullptr;
 };
 
+// After DB reopen indexes are lazy-deserialized; IsBound() returns false until
+// someone calls Bind(). Trigger Bind() once if any GRAPH_INDEX on this column
+// is unbound — otherwise the matching loop in TryFindMatchingIndex skips every
+// index and ANN queries silently fall back to sequential scan.
+static void EnsureGraphIndexesBoundForColumn(ClientContext &context, DataTable &storage,
+                                             TableIndexList &index_list, column_t physical_col_id) {
+    for (auto &index : index_list.Indexes()) {
+        if (index.IsBound() || index.GetIndexType() != GraphIndex::TYPE_NAME) {
+            continue;
+        }
+        for (auto idx_col : index.GetColumnIds()) {
+            if (idx_col == physical_col_id) {
+                index_list.Bind(context, *storage.GetDataTableInfo());
+                return;
+            }
+        }
+    }
+}
+
+// Default over-sample factor when the planner can't estimate filter selectivity.
+// Picked so a moderately selective filter (~25%) still produces k results without
+// burning budget on filters that are barely selective at all.
+static constexpr idx_t kDefaultOversampleFactor = 4;
+
+// Decide how many rows VEX_INDEX_SCAN should produce so that, after the post-filter
+// trims, the outer TOPN still has at least k rows. When cardinality estimates are
+// unavailable or the filter isn't selective, fall back to k * factor; clamp to the
+// table's row count so we never ask for more than exists.
+static idx_t ComputeScanK(idx_t k, idx_t get_card, idx_t filter_card) {
+    idx_t k_scan;
+    if (get_card > 0 && filter_card > 0 && filter_card < get_card) {
+        double selectivity = static_cast<double>(filter_card) / static_cast<double>(get_card);
+        k_scan = static_cast<idx_t>(std::ceil(static_cast<double>(k) / selectivity));
+    } else {
+        k_scan = k * kDefaultOversampleFactor;
+    }
+    if (get_card > 0) {
+        k_scan = MinValue<idx_t>(k_scan, get_card);
+    }
+    return MaxValue<idx_t>(k_scan, k);
+}
+
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, const vector<ColumnIndex> &column_ids,
                                  idx_t col_index, const string &distance_func, IndexMatch &match) {
     column_t physical_col_id = DConstants::INVALID_INDEX;
@@ -257,28 +299,7 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
     }
 
     auto &index_list = storage.GetDataTableInfo()->GetIndexes();
-
-    // After DB reopen indexes are lazy-deserialized; IsBound() returns false until
-    // someone calls Bind(). Without this trigger, ANN queries silently fall back to
-    // sequential scan because the loop below skips every index.
-    bool needs_bind = false;
-    for (auto &index : index_list.Indexes()) {
-        if (index.IsBound() || index.GetIndexType() != GraphIndex::TYPE_NAME) {
-            continue;
-        }
-        for (auto idx_col : index.GetColumnIds()) {
-            if (idx_col == physical_col_id) {
-                needs_bind = true;
-                break;
-            }
-        }
-        if (needs_bind) {
-            break;
-        }
-    }
-    if (needs_bind) {
-        index_list.Bind(context, *storage.GetDataTableInfo());
-    }
+    EnsureGraphIndexesBoundForColumn(context, storage, index_list, physical_col_id);
 
     GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
@@ -350,29 +371,13 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         fetch_output_positions.push_back(i);
     }
 
-    // Post-filter over-sampling: when a LogicalFilter survives above VEX_INDEX_SCAN,
-    // its predicate trims the row set after the index returns its top-k. Without
-    // compensation, a selective filter (e.g. 10%) would leave only ~k/10 rows
-    // before the outer TOPN, producing fewer than k results. Estimate selectivity
-    // from cardinality hints and inflate k_scan to keep ~k rows after filtering.
     idx_t k_scan = k;
     if (get_info.filter) {
         idx_t get_card = get->has_estimated_cardinality ? get->estimated_cardinality : 0;
         idx_t filter_card = get_info.filter->has_estimated_cardinality
                                 ? get_info.filter->estimated_cardinality
                                 : 0;
-        if (get_card > 0 && filter_card > 0 && filter_card < get_card) {
-            double selectivity = static_cast<double>(filter_card) / static_cast<double>(get_card);
-            if (selectivity > 0.0) {
-                k_scan = static_cast<idx_t>(std::ceil(static_cast<double>(k) / selectivity));
-            }
-        } else {
-            k_scan = k * 4;
-        }
-        if (get_card > 0) {
-            k_scan = MinValue<idx_t>(k_scan, get_card);
-        }
-        k_scan = MaxValue<idx_t>(k_scan, k);
+        k_scan = ComputeScanK(k, get_card, filter_card);
     }
 
     auto scan = make_uniq<LogicalVexIndexScan>(get->table_index, GetOutputTypes(get), duck_table, *match.graph_idx,
