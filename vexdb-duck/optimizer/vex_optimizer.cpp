@@ -1,5 +1,7 @@
 #include "vex_optimizer.hpp"
 
+#include <cmath>
+
 #include "vex_fetch_utils.hpp"
 #include "vex_graph_index.hpp"
 #include "vex_physical_index_scan.hpp"
@@ -347,8 +349,34 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     for (idx_t i = 0; i < column_ids.size(); i++) {
         fetch_output_positions.push_back(i);
     }
+
+    // Post-filter over-sampling: when a LogicalFilter survives above VEX_INDEX_SCAN,
+    // its predicate trims the row set after the index returns its top-k. Without
+    // compensation, a selective filter (e.g. 10%) would leave only ~k/10 rows
+    // before the outer TOPN, producing fewer than k results. Estimate selectivity
+    // from cardinality hints and inflate k_scan to keep ~k rows after filtering.
+    idx_t k_scan = k;
+    if (get_info.filter) {
+        idx_t get_card = get->has_estimated_cardinality ? get->estimated_cardinality : 0;
+        idx_t filter_card = get_info.filter->has_estimated_cardinality
+                                ? get_info.filter->estimated_cardinality
+                                : 0;
+        if (get_card > 0 && filter_card > 0 && filter_card < get_card) {
+            double selectivity = static_cast<double>(filter_card) / static_cast<double>(get_card);
+            if (selectivity > 0.0) {
+                k_scan = static_cast<idx_t>(std::ceil(static_cast<double>(k) / selectivity));
+            }
+        } else {
+            k_scan = k * 4;
+        }
+        if (get_card > 0) {
+            k_scan = MinValue<idx_t>(k_scan, get_card);
+        }
+        k_scan = MaxValue<idx_t>(k_scan, k);
+    }
+
     auto scan = make_uniq<LogicalVexIndexScan>(get->table_index, GetOutputTypes(get), duck_table, *match.graph_idx,
-                                               dist_info.query_vec_expr->Copy(), k, column_ids,
+                                               dist_info.query_vec_expr->Copy(), k_scan, column_ids,
                                                std::move(fetch_output_positions), optional_idx(),
                                                get->returned_types);
     scan->SetEstimatedCardinality(k);
