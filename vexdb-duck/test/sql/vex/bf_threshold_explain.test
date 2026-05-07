@@ -13,16 +13,17 @@ INSERT INTO t_bf SELECT i, [(i*0.1)::FLOAT, (i*0.2)::FLOAT, (i*0.3)::FLOAT, (i*0
 statement ok
 CREATE INDEX idx_bf ON t_bf USING GRAPH_INDEX(v) WITH (metric='cosine');
 
-# With threshold >> node_count, the operator should report brute-force.
+# With threshold >> node_count, the optimizer skips the index rewrite entirely
+# so DuckDB runs the natural SEQ_SCAN+TOP_N plan (true brute force).
 statement ok
 SET vex_brute_force_threshold = 100000;
 
 query II
 EXPLAIN ANALYZE WITH tmp AS (SELECT [0.1,0.2,0.3,0.4]::FLOAT[4] AS vec) SELECT id FROM t_bf ORDER BY v <=> (SELECT vec FROM tmp) LIMIT 5;
 ----
-analyzed_plan	<REGEX>:.*Algorithm.*brute-force.*
+analyzed_plan	<!REGEX>:.*VEX_INDEX_SCAN.*
 
-# With threshold << node_count, the operator should report hnsw.
+# With threshold << node_count, ANN goes through VEX_INDEX_SCAN with Algorithm: hnsw.
 statement ok
 SET vex_brute_force_threshold = 10;
 

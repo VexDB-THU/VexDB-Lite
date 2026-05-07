@@ -4,6 +4,12 @@
 
 require vex
 
+# This file exercises optimizer rewrites; force HNSW path regardless of table
+# size by disabling the brute-force threshold (small test tables would otherwise
+# fall under the default threshold and skip the rewrite entirely).
+statement ok
+SET vex_brute_force_threshold = 0;
+
 # ============================================================
 # Setup: L2 metric (default)
 # ============================================================

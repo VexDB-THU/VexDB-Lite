@@ -6,6 +6,11 @@ require vex
 
 load __TEST_DIR__/graph_index_reopen_optimizer.db
 
+# Force HNSW path regardless of node count (default brute-force threshold = 64
+# would skip the rewrite for this 6-row test table).
+statement ok
+SET vex_brute_force_threshold = 0;
+
 statement ok
 CREATE TABLE items (id INTEGER, vec FLOAT[3]);
 
