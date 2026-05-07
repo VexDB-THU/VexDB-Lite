@@ -86,35 +86,41 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         throw InvalidInputException("GRAPH_INDEX requires at least one indexed expression");
     }
 
-    // Locate the FLOAT[N] column the user listed in CREATE INDEX. The column list
-    // may have scalar columns mixed in (e.g. for filtered ANN with metadata), so we
-    // pick the vector by type rather than assuming position 0.
-    optional_idx vec_pos;
-    for (idx_t i = 0; i < input.unbound_expressions.size(); i++) {
-        auto &t = input.unbound_expressions[i]->return_type;
-        if (t.id() != LogicalTypeId::ARRAY || ArrayType::GetChildType(t).id() != LogicalTypeId::FLOAT) {
-            continue;
-        }
-        if (vec_pos.IsValid()) {
-            throw InvalidInputException(
-                "GRAPH_INDEX accepts at most one FLOAT[N] vector column "
-                "(got vectors at positions %llu and %llu)",
-                static_cast<unsigned long long>(vec_pos.GetIndex()),
-                static_cast<unsigned long long>(i));
-        }
-        vec_pos = optional_idx(i);
+    // CREATE INDEX syntax requires the vector column to be the first listed, e.g.
+    // GRAPH_INDEX(vec, scalar1, scalar2). Reject any other layout up-front: silently
+    // accepting duplicate or extra-vector columns corrupts the per-node metadata
+    // segment layout, which assumes a fixed schema with one vector at slot 0.
+    auto &first_type = input.unbound_expressions[0]->return_type;
+    if (first_type.id() != LogicalTypeId::ARRAY ||
+        ArrayType::GetChildType(first_type).id() != LogicalTypeId::FLOAT) {
+        throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s",
+                                    first_type.ToString());
     }
-    if (!vec_pos.IsValid()) {
-        throw InvalidInputException("GRAPH_INDEX requires one FLOAT[N] vector column");
-    }
-    auto &vec_type = input.unbound_expressions[vec_pos.GetIndex()]->return_type;
-    // Reject duplicate columns. DuckDB collapses duplicates in `column_ids`, so the
-    // mismatch between unbound_expressions size and column_ids size is the signal.
-    if (input.unbound_expressions.size() > input.column_ids.size()) {
-        throw InvalidInputException(
-            "GRAPH_INDEX rejects duplicate column in expression list (%llu expressions, %llu unique columns)",
-            static_cast<unsigned long long>(input.unbound_expressions.size()),
-            static_cast<unsigned long long>(input.column_ids.size()));
+    auto &vec_type = first_type;
+    // DuckDB dedups `column_ids` at bind time but keeps one unbound_expression per
+    // user-written reference, so `GRAPH_INDEX(v, c1, c1)` arrives as 3 expressions
+    // with 2 unique column_ids. Walk expressions to catch both duplicates and any
+    // sneaky second vector column past slot 0.
+    if (input.unbound_expressions.size() > 1) {
+        unordered_set<string> seen_expr_sigs;
+        seen_expr_sigs.insert(input.unbound_expressions[0]->ToString());
+        for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
+            auto &expr = *input.unbound_expressions[i];
+            auto &col_type = expr.return_type;
+            if (col_type.id() == LogicalTypeId::ARRAY &&
+                ArrayType::GetChildType(col_type).id() == LogicalTypeId::FLOAT) {
+                throw InvalidInputException(
+                    "GRAPH_INDEX: only the first column may be a vector (FLOAT[N]); "
+                    "column at position %llu has type %s",
+                    static_cast<unsigned long long>(i + 1), col_type.ToString());
+            }
+            auto sig = expr.ToString();
+            if (!seen_expr_sigs.insert(sig).second) {
+                throw InvalidInputException(
+                    "GRAPH_INDEX: duplicate column at position %llu (%s)",
+                    static_cast<unsigned long long>(i + 1), sig);
+            }
+        }
     }
 
     idx_t dimension = ArrayType::GetSize(vec_type);
@@ -189,7 +195,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
-                                             metric, vec_pos.GetIndex());
+                                             metric, 0);
 
     if (input.storage_info.allocator_infos.size() >= 3) {
         // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
