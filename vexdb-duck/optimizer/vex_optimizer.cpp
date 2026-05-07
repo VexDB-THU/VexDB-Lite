@@ -172,6 +172,7 @@ struct GetChildInfo {
     LogicalFilter *filter = nullptr;
     LogicalOperator *cross_product = nullptr;
     idx_t subquery_child_idx = 0;
+    bool filter_inside_cross_product = false;
 };
 
 static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
@@ -194,10 +195,24 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 
     if (cur->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT && cur->children.size() == 2) {
         for (idx_t i = 0; i < 2; i++) {
-            if (cur->children[i]->type == LogicalOperatorType::LOGICAL_GET) {
-                info.get = &cur->children[i]->Cast<LogicalGet>();
+            auto *cp_child = cur->children[i].get();
+            if (cp_child->type == LogicalOperatorType::LOGICAL_GET) {
+                info.get = &cp_child->Cast<LogicalGet>();
                 info.cross_product = cur;
                 info.subquery_child_idx = 1 - i;
+                return true;
+            }
+            // CROSS_PRODUCT -> [FILTER -> GET, subquery]: WHERE clause + scalar
+            // subquery query vector. Rewrite the GET; FILTER stays where it is and
+            // post-filters VEX_INDEX_SCAN's row_id-fetched output.
+            if (cp_child->type == LogicalOperatorType::LOGICAL_FILTER &&
+                cp_child->children.size() == 1 &&
+                cp_child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
+                info.filter = &cp_child->Cast<LogicalFilter>();
+                info.get = &cp_child->children[0]->Cast<LogicalGet>();
+                info.cross_product = cur;
+                info.subquery_child_idx = 1 - i;
+                info.filter_inside_cross_product = true;
                 return true;
             }
         }
