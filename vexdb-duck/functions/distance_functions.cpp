@@ -66,15 +66,23 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
     }
 }
 
-static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto squared_func = DispatchRunner<false,
-        MetricList<Metric::L2>,
+// The shared distance core has `ann_helper::get_general_distance_func(Metric)` but
+// only ships with the PG build target. For vexdb-duck we instantiate the dispatcher
+// once per metric here. Same template parameters across all three calls — only the
+// runtime Metric value differs.
+static ann_helper::distance_func GetRawDistanceFunc(Metric metric) {
+    return DispatchRunner<false,
+        MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>,
         DistPrecisionTypeList<DistPrecisionType::FLOAT>,
         DispatcherMode::NO_QUANT>::call(
-            Metric::L2, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
+            metric, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
             [](auto &d) -> ann_helper::distance_func {
                 return std::decay_t<decltype(d)>::get_distance_single;
             });
+}
+
+static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    static const auto squared_func = GetRawDistanceFunc(Metric::L2);
     auto sqrt_func = [](const void *xx, const void *yy, uint16 dim) -> float {
         return std::sqrt(squared_func(xx, yy, dim));
     };
@@ -82,14 +90,7 @@ static void L2DistanceFunction(DataChunk &args, ExpressionState &state, Vector &
 }
 
 static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto neg_ip_func = DispatchRunner<false,
-        MetricList<Metric::INNER_PRODUCT>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(
-            Metric::INNER_PRODUCT, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
-            [](auto &d) -> ann_helper::distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
+    static const auto neg_ip_func = GetRawDistanceFunc(Metric::INNER_PRODUCT);
     auto ip_func = [](const void *xx, const void *yy, uint16 dim) -> float {
         return -neg_ip_func(xx, yy, dim);
     };
@@ -97,14 +98,7 @@ static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector
 }
 
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-    static const auto neg_cos_func = DispatchRunner<false,
-        MetricList<Metric::COSINE>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(
-            Metric::COSINE, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
-            [](auto &d) -> ann_helper::distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
+    static const auto neg_cos_func = GetRawDistanceFunc(Metric::COSINE);
     auto cos_dist_func = [](const void *xx, const void *yy, uint16 dim) -> float {
         return 1.0f + neg_cos_func(xx, yy, dim);
     };
