@@ -246,25 +246,6 @@ struct IndexMatch {
     GraphIndex *graph_idx = nullptr;
 };
 
-// After DB reopen indexes are lazy-deserialized; IsBound() returns false until
-// someone calls Bind(). Trigger Bind() once if any GRAPH_INDEX on this column
-// is unbound — otherwise the matching loop in TryFindMatchingIndex skips every
-// index and ANN queries silently fall back to sequential scan.
-static void EnsureGraphIndexesBoundForColumn(ClientContext &context, DataTable &storage,
-                                             TableIndexList &index_list, column_t physical_col_id) {
-    for (auto &index : index_list.Indexes()) {
-        if (index.IsBound() || index.GetIndexType() != GraphIndex::TYPE_NAME) {
-            continue;
-        }
-        for (auto idx_col : index.GetColumnIds()) {
-            if (idx_col == physical_col_id) {
-                index_list.Bind(context, *storage.GetDataTableInfo());
-                return;
-            }
-        }
-    }
-}
-
 // Default over-sample factor when the planner can't estimate filter selectivity.
 // Picked so a moderately selective filter (~25%) still produces k results without
 // burning budget on filters that are barely selective at all.
@@ -299,8 +280,6 @@ static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, con
     }
 
     auto &index_list = storage.GetDataTableInfo()->GetIndexes();
-    EnsureGraphIndexesBoundForColumn(context, storage, index_list, physical_col_id);
-
     GraphIndex *fallback = nullptr;
     for (auto &index : index_list.Indexes()) {
         if (!index.IsBound()) {
