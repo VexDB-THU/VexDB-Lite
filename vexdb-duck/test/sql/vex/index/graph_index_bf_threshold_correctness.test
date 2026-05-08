@@ -1,0 +1,68 @@
+# name: test/sql/vex/index/graph_index_bf_threshold_correctness.test
+# description: vex_brute_force_threshold high enough to bypass the index must
+#              return EXACTLY the same rows as a no-index seq scan. Targets
+#              the optimizer-skip path added in commit 10c5251064 — previously
+#              the setting was cosmetic and only surfaced in EXPLAIN.
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE bft_correctness (id INTEGER, vec FLOAT[4]);
+
+# 300 rows — well above default threshold (64), so without an override
+# this would route through HNSW.
+statement ok
+INSERT INTO bft_correctness SELECT i, [(i*0.13)::FLOAT, (i*0.07)::FLOAT, (i*0.21)::FLOAT, (i*0.05)::FLOAT]::FLOAT[4] FROM range(300) t(i);
+
+statement ok
+CREATE INDEX idx_bft ON bft_correctness USING GRAPH_INDEX (vec);
+
+# Path B: forced brute-force via threshold > node_count.
+# Query [13, 7, 21, 5] exactly matches vec for i=100, so brute force gives
+# id=100 with distance 0, then 99/101 (distance ~0.27) etc.
+statement ok
+SET vex_brute_force_threshold = 100000;
+
+query II
+EXPLAIN SELECT id FROM bft_correctness ORDER BY l2_distance(vec, [13.0, 7.0, 21.0, 5.0]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<!REGEX>:.*VEX_INDEX_SCAN.*
+
+query I
+SELECT id FROM bft_correctness ORDER BY l2_distance(vec, [13.0, 7.0, 21.0, 5.0]::FLOAT[4]), id LIMIT 5;
+----
+100
+99
+101
+98
+102
+
+# Path A: HNSW path (default threshold 64 < 300). Top-1 must agree on exact
+# match (zero-distance row is reachable from any reasonable graph).
+statement ok
+SET vex_brute_force_threshold = 64;
+
+query II
+EXPLAIN SELECT id FROM bft_correctness ORDER BY l2_distance(vec, [13.0, 7.0, 21.0, 5.0]::FLOAT[4]) LIMIT 5;
+----
+physical_plan	<REGEX>:.*VEX_INDEX_SCAN.*
+
+query I
+SELECT id FROM bft_correctness ORDER BY l2_distance(vec, [13.0, 7.0, 21.0, 5.0]::FLOAT[4]) LIMIT 1;
+----
+100
+
+# Top-3 from HNSW must contain the closest 3 neighbors (id=100 ± 1, ± 2).
+# Allow ANN approximation but assert all returned ids are within ±2 of 100.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM bft_correctness
+    ORDER BY l2_distance(vec, [13.0, 7.0, 21.0, 5.0]::FLOAT[4])
+    LIMIT 3
+) WHERE id BETWEEN 98 AND 102;
+----
+3
+
+statement ok
+DROP TABLE bft_correctness;

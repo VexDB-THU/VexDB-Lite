@@ -1,0 +1,113 @@
+# name: test/sql/vex/index/graph_index_recall_vs_brute.test
+# description: ANN top-k must agree with exact brute-force top-k on a synthetic
+#              workload exercising the multi-level HNSW path enabled in commit
+#              4ba3f22a33. Run multiple delete batches between queries so the
+#              repair_entry path (commit 6ebc7832fa) is exercised across more
+#              than one entry-node migration.
+# group: [vex]
+
+require vex
+
+statement ok
+CREATE TABLE recall_test (id INTEGER, vec FLOAT[4]);
+
+# 500 rows on a deterministic line; vec[i] = (i*0.1, i*0.2, i*0.3, i*0.4)
+statement ok
+INSERT INTO recall_test SELECT i,
+    [(i * 0.1)::FLOAT, (i * 0.2)::FLOAT, (i * 0.3)::FLOAT, (i * 0.4)::FLOAT]::FLOAT[4]
+    FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_recall ON recall_test USING GRAPH_INDEX (vec);
+
+# Sanity: with 500 nodes and m=16, multi-level HNSW must produce upper-layer
+# entries. (Indirect — vex_index_info doesn't expose level histogram, but if
+# the build crashed without our MemStore upper-layer fix we wouldn't get here.)
+query I
+SELECT COUNT(*) FROM recall_test;
+----
+500
+
+# Round 1: ANN top-3 should be the exact 3 nearest neighbors of the query.
+# Query is the exact vec for i=200, so id=200 has distance 0 and 199/201
+# tie at distance ~0.5477 (sqrt of (0.1²+0.2²+0.3²+0.4²)).
+query I
+SELECT id FROM recall_test
+ORDER BY l2_distance(vec, [20.0, 40.0, 60.0, 80.0]::FLOAT[4]) LIMIT 1;
+----
+200
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM recall_test
+    ORDER BY l2_distance(vec, [20.0, 40.0, 60.0, 80.0]::FLOAT[4])
+    LIMIT 3
+) WHERE id BETWEEN 199 AND 201;
+----
+3
+
+# Round 2: delete a chunk near the query and re-search. The closest survivor
+# must be returned, NOT a stale neighbor pointing to a now-deleted node.
+statement ok
+DELETE FROM recall_test WHERE id BETWEEN 195 AND 205;
+
+query I
+SELECT COUNT(*) FROM recall_test;
+----
+489
+
+# Closest surviving rows are 194 (below) and 206 (above), tied in distance.
+# Either is valid for ANN top-1; check id is one of them.
+query I
+SELECT id IN (194, 206) FROM recall_test
+ORDER BY l2_distance(vec, [20.0, 40.0, 60.0, 80.0]::FLOAT[4]) LIMIT 1;
+----
+true
+
+# Top-3 surviving: 194, 206, 193 or 207 (the next two in either direction).
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM recall_test
+    ORDER BY l2_distance(vec, [20.0, 40.0, 60.0, 80.0]::FLOAT[4])
+    LIMIT 3
+) WHERE id IN (193, 194, 206, 207);
+----
+3
+
+# Round 3: delete another chunk, this one likely covering a high-level node
+# (random levels mean ids 0..50 contain several upper-layer nodes that are
+# entry candidates after Phase 4 inserts). Forces repair_entry to fire again
+# if the previous repair pointed somewhere within this batch.
+statement ok
+DELETE FROM recall_test WHERE id < 50;
+
+query I
+SELECT COUNT(*) FROM recall_test;
+----
+439
+
+# Same query — closest surviving still around 194 / 206, unaffected by deleting
+# id<50. Recall must still hold.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM recall_test
+    ORDER BY l2_distance(vec, [20.0, 40.0, 60.0, 80.0]::FLOAT[4])
+    LIMIT 3
+) WHERE id IN (193, 194, 206, 207);
+----
+3
+
+# Far-away query that previously failed before the multi-level fix — closest
+# surviving id is 480 (or 479/481 if level fluctuation). Without multi-level,
+# greedy descent from a small-vector entry would never reach this region.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM recall_test
+    ORDER BY l2_distance(vec, [48.0, 96.0, 144.0, 192.0]::FLOAT[4])
+    LIMIT 3
+) WHERE id BETWEEN 478 AND 482;
+----
+3
+
+statement ok
+DROP TABLE recall_test;
