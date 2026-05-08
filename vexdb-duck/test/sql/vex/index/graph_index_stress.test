@@ -102,13 +102,16 @@ SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT
 # Phase 5: Multiple sequential searches with different query vectors
 # =============================================================================
 #
-# After bulk delete+insert (Phase 3+4) the HNSW graph's connectivity gets
-# fragmented — search from the new entry point only reaches ~500 of the 2000
-# kept nodes for far-away queries. Bumping ef_search doesn't help because the
-# unreachable component is unreachable. Until the algorithm grows a graph-
-# repair pass, exercise the brute-force fallback (vex_brute_force_threshold
-# >= node_count makes the optimizer skip the index rewrite and DuckDB runs
-# the natural SEQ_SCAN+ORDER_BY+LIMIT plan, which is exact).
+# vexdb-duck currently runs HNSW as a flat (level=0) graph (see
+# get_insert_level() guard for PG_VEXDB_TARGET_DUCK in
+# include/graph_index/graph_index_algorithm.h). After bulk delete + reinsert
+# the flat graph's connectivity fragments — search from the entry point only
+# reaches a fraction of the kept nodes for far queries. ef_search doesn't
+# help because the unreachable component stays unreachable.
+#
+# Until multi-level HNSW is wired up on the duck adapter (MemStore upper-
+# layer paths need stabilization), bypass the index for this assertion via
+# SEQ_SCAN+ORDER_BY+LIMIT, which is exact.
 
 statement ok
 SET vex_brute_force_threshold = 100000;
