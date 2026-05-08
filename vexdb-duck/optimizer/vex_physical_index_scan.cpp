@@ -11,7 +11,6 @@
 
 namespace duckdb {
 
-static constexpr int64_t kDefaultBruteForceThreshold = 64;
 static constexpr const char *kAlgorithmBruteForce = "brute-force";
 static constexpr const char *kAlgorithmHnsw = "hnsw";
 
@@ -38,11 +37,7 @@ PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, Physic
 	                                                query_vec_expr->Copy(), k, column_ids, fetch_output_positions,
 	                                                distance_output_index, returned_types, output_types.size());
     {
-        int64_t bft = kDefaultBruteForceThreshold;
-        Value bft_val;
-        if (context.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
-            bft = bft_val.GetValue<int64_t>();
-        }
+        auto bft = GetBruteForceThreshold(context);
         auto &phys_scan = scan.Cast<PhysicalVexIndexScan>();
         phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
                                        ? kAlgorithmBruteForce
@@ -202,15 +197,8 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                     "vex_ef_search must be in [1, 65535], got %d", ef);
             }
         }
-        Value bft_val;
-        if (context.client.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
-            int64_t bft = bft_val.GetValue<int64_t>();
-            if (bft < 0 || bft > 1000000) {
-                throw InvalidInputException(
-                    "vex_brute_force_threshold must be in [0, 1000000], got %lld",
-                    static_cast<long long>(bft));
-            }
-        }
+        // bft is validated up front in TryOptimizeANN; by the time we run, the
+        // optimizer has already routed sub-threshold queries to SEQ_SCAN.
         if (static_cast<int>(k) > ef) {
             ef = static_cast<int>(k) * 2;
         }

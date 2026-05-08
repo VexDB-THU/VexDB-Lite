@@ -354,26 +354,12 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         return false;
     }
 
-    // Honor vex_brute_force_threshold: when node_count <= threshold, skip the index
-    // rewrite and let DuckDB run the natural plan (SEQ_SCAN + ORDER_BY + LIMIT). That
-    // path returns the exact top-k, which is what users expect when they explicitly
-    // raised the threshold to bypass HNSW (e.g., to avoid recall degradation after
-    // bulk delete + reinsert). The setting was previously cosmetic — only surfaced
-    // in EXPLAIN — so users who set it saw no behavior change.
-    {
-        int64_t bft = 64;
-        Value bft_val;
-        if (context.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
-            bft = bft_val.GetValue<int64_t>();
-            if (bft < 0 || bft > 1000000) {
-                throw InvalidInputException(
-                    "vex_brute_force_threshold must be in [0, 1000000], got %lld",
-                    static_cast<long long>(bft));
-            }
-        }
-        if (static_cast<int64_t>(match.graph_idx->GetNodeCount()) <= bft) {
-            return false;
-        }
+    // Honor vex_brute_force_threshold: when node_count <= threshold, skip the rewrite
+    // and let DuckDB run the natural SEQ_SCAN+ORDER_BY+LIMIT plan, which returns the
+    // exact top-k. Users raise this to bypass HNSW (e.g., recall degradation after
+    // bulk delete + reinsert).
+    if (static_cast<int64_t>(match.graph_idx->GetNodeCount()) <= GetBruteForceThreshold(context)) {
+        return false;
     }
 
     idx_t k = limit + offset;
