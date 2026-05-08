@@ -52,6 +52,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
     )
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    list(APPEND VEXDB_DUCK_EXTENSION_FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/neon_dispatcher.cpp
+    )
 endif()
 
 build_static_extension(vex ${VEXDB_DUCK_EXTENSION_FILES})
@@ -71,4 +75,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
         PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512vl -mf16c -Wno-ignored-attributes")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set_source_files_properties(
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/neon_dispatcher.cpp
+        PROPERTIES COMPILE_FLAGS "-Wno-ignored-attributes")
 endif()

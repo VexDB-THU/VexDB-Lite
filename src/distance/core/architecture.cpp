@@ -50,6 +50,17 @@ static bool supports_avx512() {
 }
 #endif /* x86_64 */
 
+#if COMPILER_TARGET_ARM
+static bool supports_neonv8()
+{
+#if COMPILER_SUPPORT_NEONV8
+    return true;
+#else
+    return false;
+#endif
+}
+#endif /* arm */
+
 Arch get_best_arch(Metric m, DistPrecisionType dt, uint16 dim)
 {
     (void)m;
@@ -67,6 +78,12 @@ Arch get_best_arch(Metric m, DistPrecisionType dt, uint16 dim)
         return Arch::SSE;
     }
 #endif /* x86_64 */
+
+#if COMPILER_TARGET_ARM
+    if (supports_neonv8()) {
+        return Arch::NEONV8;
+    }
+#endif
 
     return Arch::GENERAL;
 }
@@ -86,6 +103,10 @@ bool ann_helper::is_arch_available(Arch arch, Metric m, DistPrecisionType dt)
             return supports_avx();
         case Arch::AVX512:
             return supports_avx512();
+#endif
+#if COMPILER_TARGET_ARM
+        case Arch::NEONV8:
+            return supports_neonv8();
 #endif
         default:
             return false;

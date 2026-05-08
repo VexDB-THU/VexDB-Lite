@@ -118,6 +118,11 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
         src/distance/pg/avx.cpp
         src/distance/pg/avx512.cpp
     )
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    list(APPEND DISTANCE_SRCS
+        src/distance/core/neon_dispatcher.cpp
+        src/distance/pg/neon.cpp
+    )
 endif()
 
 add_library(pg_vexdb SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS})
