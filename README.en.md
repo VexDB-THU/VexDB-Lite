@@ -1,445 +1,376 @@
-# pg_vexdb - HNSW Graph Index Extension for PostgreSQL
+# VexDB-Lite
 
-**[English](README.en.md)** | **[中文](README.md)**
+**English** | **[中文](README.md)**
 
-A high-performance vector similarity search extension for PostgreSQL, providing HNSW (Hierarchical Navigable Small World) graph index for approximate nearest neighbor search. Ported from vexdb with maximum code identity for maintainability.
+`VexDB-Lite` currently contains two vector-index integrations that share the same core graph algorithm and distance stack:
 
-## Features
+- `vexdb-pg`: PostgreSQL extension `pg_vexdb`
+- `vexdb-duck`: DuckDB extension `vex`
 
-### Vector Types
-- **floatvector** - Single-precision floating-point vectors (up to 16,384 dimensions)
-- **halfvector** - Half-precision floating-point vectors (up to 16,384 dimensions)
-- Support for NULL values, TOAST compression, and typmod
+Shared core directories:
 
-### Distance Functions
-- **L2 distance** (`<->`) - Euclidean distance
-- **Inner product** (`<#>`) - Negative inner product
-- **Cosine distance** (`<=>`) - Cosine distance
-
-### SIMD Acceleration
-- Auto-detects CPU capabilities (SSE, AVX, AVX512)
-- Runtime architecture selection via GUC parameter
-- Supports x86_64 and ARM architectures
-
-### Index Access Method
-- HNSW graph-based approximate nearest neighbor search
-- Configurable M (neighbors per node) and ef_construction
-- Support for parallel index build
-- Efficient search with configurable ef_search
-
-### GUC Parameters
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `pg_vexdb.ef_search` | int | 64 | HNSW search ef parameter |
-| `pg_vexdb.enable_vec_buffer_manager` | bool | true | Enable vector buffer caching |
-| `pg_vexdb.vector_buffers` | int | 262144 | Number of 8KB vector buffers |
-| `pg_vexdb.vec_architecture` | string | "" | SIMD architecture selection |
+- `include/graph_index/`: graph index headers and shared HNSW logic
+- `distance/`, `src/distance/`: distance functions, ISA dispatch, transform templates
+- `vtl/`: shared template/container layer
+- `vexdb-duck/`: DuckDB integration layer
+- `src/`, `include/`, `sql/`: PostgreSQL integration layer
 
 ---
 
-## Requirements
+## 1. Components
 
-### Build Dependencies
-- **PostgreSQL 19** (developed against 19devel)
-- **C++17** compiler (GCC 8+, Clang 7+)
-- **CMake** 3.10+
-- **Boost** (for preprocessor macros only)
+### 1.1 PostgreSQL: `pg_vexdb`
 
-### Runtime
-- PostgreSQL 19
-- Linux (x86_64 or ARM64)
+Current functionality:
+
+- `floatvector(N)` and `halfvector(N)` types
+- Distance operators/functions:
+  - L2: `<->`
+  - Inner product: `<#>`
+  - Cosine: `<=>`
+- `CREATE INDEX ... USING vexdb_graph`
+- HNSW options such as `m`, `ef_construction`, `parallel_workers`
+- runtime settings such as `pg_vexdb.ef_search`, `pg_vexdb.vec_architecture`
+- optimizer/executor ANN index scan path
+- shared-memory vector buffer manager and parallel build support
+
+### 1.2 DuckDB: `vexdb-duck`
+
+Current functionality:
+
+- `GRAPH_INDEX` on `FLOAT[N]` vector columns
+- Vector distance functions/operators:
+  - `l2_distance`, `<->`
+  - `inner_product`, `<#>`
+  - `cosine_distance`, `<=>`, `<~>`
+- `vector_dims()`, `l2_normalize()`, `vex_version()`, `vex_index_info()`
+- `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])`
+- optimizer rewrite into `VEX_INDEX_SCAN`
+- filtered vector index syntax with metadata columns
+
+Duck runtime settings:
+
+- `vex_ef_search`
+- `vex_brute_force_threshold`
 
 ---
 
-## Compilation
+## 2. PostgreSQL Syntax Examples
 
-### 1. Build PostgreSQL (if not already installed)
+### 2.1 Install and Create Table
+
+```sql
+CREATE EXTENSION pg_vexdb;
+
+CREATE TABLE items (
+    id  BIGSERIAL PRIMARY KEY,
+    vec floatvector(128)
+);
+
+INSERT INTO items (vec) VALUES
+    ('[0.10, 0.20, 0.30]'),
+    ('[0.40, 0.50, 0.60]');
+```
+
+### 2.2 Build Index
+
+```sql
+CREATE INDEX idx_items_vec
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (
+    m = 16,
+    ef_construction = 64
+);
+```
+
+### 2.3 ANN Query
+
+```sql
+SET pg_vexdb.ef_search = 100;
+SET enable_seqscan = off;
+
+SELECT id, vec <-> '[0.15, 0.25, 0.35]' AS dist
+FROM items
+ORDER BY vec <-> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+```
+
+### 2.4 Other Metrics
+
+```sql
+SELECT id
+FROM items
+ORDER BY vec <#> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+
+SELECT id
+FROM items
+ORDER BY vec <=> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+```
+
+### 2.5 `halfvector` Example
+
+```sql
+CREATE TABLE half_items (
+    id  BIGSERIAL PRIMARY KEY,
+    vec halfvector(128)
+);
+
+CREATE INDEX idx_half_items_vec
+ON half_items
+USING vexdb_graph (vec halfvector_l2_ops);
+```
+
+---
+
+## 3. DuckDB Syntax Examples
+
+### 3.1 Load Extension
+
+```sql
+LOAD '/path/to/vex.duckdb_extension';
+SELECT vex_version();
+```
+
+Typical Python usage:
+
+```python
+import duckdb
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD '/path/to/vex.duckdb_extension'")
+```
+
+### 3.2 Create Table and Index
+
+```sql
+CREATE TABLE items (
+    id       INTEGER,
+    category VARCHAR,
+    vec      FLOAT[128]
+);
+
+CREATE INDEX idx_items_vec
+ON items
+USING GRAPH_INDEX (vec)
+WITH (
+    metric = 'l2',
+    m = 16,
+    ef_construction = 64
+);
+```
+
+### 3.3 ANN Query
+
+```sql
+SET vex_ef_search = 100;
+
+SELECT id
+FROM items
+ORDER BY l2_distance(vec, [0.15, 0.25, 0.35]::FLOAT[3])
+LIMIT 10;
+```
+
+### 3.4 Filtered Index Example
+
+```sql
+CREATE INDEX idx_items_vec_meta
+ON items
+USING GRAPH_INDEX (vec, category);
+
+SELECT id
+FROM items
+WHERE category = 'book'
+ORDER BY l2_distance(vec, [0.15, 0.25, 0.35]::FLOAT[3])
+LIMIT 10;
+```
+
+### 3.5 Other Functions
+
+```sql
+SELECT inner_product([1.0, 0.0]::FLOAT[2], [0.5, 0.5]::FLOAT[2]);
+SELECT cosine_distance([1.0, 0.0]::FLOAT[2], [0.5, 0.5]::FLOAT[2]);
+SELECT vector_dims([1.0, 2.0, 3.0]::FLOAT[3]);
+SELECT l2_normalize([3.0, 4.0]::FLOAT[2]);
+SELECT * FROM vex_index_info();
+```
+
+---
+
+## 4. Build
+
+## 4.1 Build the PostgreSQL Variant
+
+### Dependencies
+
+- PostgreSQL 19 (currently aligned to `19devel`)
+- CMake
+- C++17 compiler
+- Boost headers
+
+### Build PostgreSQL (release example)
 
 ```bash
-./configure --prefix=/path/to/pg-install --enable-debug --enable-cassert \
-    --without-icu --without-readline --without-zlib CFLAGS="-O0 -g"
+cd /path/to/postgresql-19-source
+./configure \
+  --prefix=/opt/postgresql-19rel-install \
+  --without-icu \
+  --without-readline \
+  --without-zlib \
+  CFLAGS="-O3 -DNDEBUG"
 make -j$(nproc)
 make install
 ```
 
-### 2. Build pg_vexdb
+### Build `pg_vexdb`
 
 ```bash
-cd pg_vexdb
-mkdir build && cd build
+cd /path/to/VexDB-Lite
+mkdir -p build-pg19rel-release
+cd build-pg19rel-release
+
+export PG_CONFIG=/opt/postgresql-19rel-install/bin/pg_config
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 make install
 ```
 
-### 3. Configure PostgreSQL
+### PostgreSQL Configuration
 
-Add to `postgresql.conf`:
-```
+At minimum:
+
+```conf
 shared_preload_libraries = 'pg_vexdb'
 ```
 
-Restart PostgreSQL:
-```bash
-pg_ctl restart -D $PGDATA
-```
-
----
-
-## Usage
-
-### Basic Usage
+Then restart PostgreSQL and run:
 
 ```sql
--- Create extension
 CREATE EXTENSION pg_vexdb;
-
--- Create table with vector column
-CREATE TABLE items (
-    id serial PRIMARY KEY,
-    embedding floatvector(128)
-);
-
--- Insert vectors
-INSERT INTO items (embedding) VALUES 
-    ('[0.1, 0.2, 0.3, ...]'),
-    ('[0.4, 0.5, 0.6, ...]');
-
--- Create HNSW index
-CREATE INDEX ON items USING vexdb_graph (embedding floatvector_l2_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- Query with index
-SELECT * FROM items 
-ORDER BY embedding <-> '[0.2, 0.3, 0.4]' 
-LIMIT 10;
-```
-
-### Index Options
-
-```sql
-CREATE INDEX ON items USING vexdb_graph (embedding floatvector_l2_ops)
-    WITH (
-        m = 32,                    -- Number of neighbors per node (default: 16)
-        ef_construction = 128,     -- Build-time search list size (default: 64)
-        parallel_workers = 4       -- Parallel build workers (default: 0 = auto)
-    );
-```
-
-### Query Tuning
-
-```sql
--- Increase ef_search for better recall (higher cost)
-SET pg_vexdb.ef_search = 256;
-
--- Force index scan
-SET enable_seqscan = false;
-
--- Query with distance
-SELECT id, embedding <-> '[0.2, 0.3, 0.4]' AS distance
-FROM items
-ORDER BY embedding <-> '[0.2, 0.3, 0.4]'
-LIMIT 10;
-```
-
-### SIMD Architecture Selection
-
-```sql
--- Use AVX for all operations
-SET pg_vexdb.vec_architecture = 'all:avx';
-
--- Use AVX512 for float vectors, SSE for half vectors
-SET pg_vexdb.vec_architecture = 'float:avx512, half:sse';
-
--- Reset to auto-detect
-SET pg_vexdb.vec_architecture = '';
 ```
 
 ---
 
-## Framework and Code Structure
+## 4.2 Build the DuckDB Variant
 
-### Directory Layout
+`vexdb-duck` is built as an out-of-tree DuckDB extension.
 
-```
-pg_vexdb/
-├── distance/              # Distance function headers
-│   ├── distance.h         # Core distance function declarations
-│   ├── distance_dispatcher.h
-│   ├── architecture_macro.h
-│   └── pq/               # Product quantization
-├── include/
-│   ├── graph_index/       # Graph index headers
-│   ├── floatvector.h      # Float vector type
-│   ├── halfvec.h          # Half vector type
-│   ├── pg_compat.h        # PostgreSQL compatibility layer
-│   └── ...
-├── knl/                   # vexdb compatibility layer
-│   ├── knl_alloc.cpp     # Memory allocation, _PG_init
-│   ├── knl_instance.h    # Global instance structure
-│   └── knl_variable.h    # Global variable stubs
-├── module/               # Utility modules
-│   ├── timer.h          # Timing utilities
-│   └── parallel_counter.h
-├── quantizer/            # Quantizer headers (stubbed)
-├── rabitq/               # RaBitQ headers
-├── src/
-│   ├── distance/         # Distance implementations
-│   ├── graph_index_*.cpp # Graph index implementation
-│   └── ...
-└── vtl/                  # Vector Template Library
-    ├── vector
-    ├── hashtable
-    ├── disk_container/
-    └── ...
+### Dependencies
+
+- DuckDB source tree
+- CMake
+- C++17 compiler
+- Boost headers
+
+### Register the Local Extension in DuckDB
+
+Add this to DuckDB's `extension/extension_config_local.cmake`:
+
+```cmake
+duckdb_extension_load(vex
+    SOURCE_DIR "/path/to/VexDB-Lite/vexdb-duck"
+    INCLUDE_DIR "/path/to/VexDB-Lite/vexdb-duck/include"
+)
 ```
 
-### Key Components
+### Build the Loadable Extension
 
-#### 1. Compatibility Layer (`include/pg_compat.h`)
-
-Provides abstractions for vexdb-specific features:
-- Wraps all PostgreSQL headers in `extern "C"`
-- Defines `u_sess` → `pg_vexdb_session` for session attributes
-- Provides `VECTOR_FORKNUM`, `RM_GRAPH_INDEX_ID` macros
-
-#### 2. Vector Template Library (`vtl/`)
-
-Custom template library compatible with PostgreSQL's memory management:
-- Uses PostgreSQL memory contexts (palloc/pfree)
-- No STL (incompatible with setjmp/longjmp)
-- Provides Vector, HashSet, PriorityQueue, etc.
-
-#### 3. Graph Index (`include/graph_index/`, `src/graph_index*.cpp`)
-
-HNSW implementation:
-- `graph_index.h` - Main interface
-- `graph_index_algorithm.h` - HNSW algorithm
-- `graph_index_storage.h` - Disk storage
-- `graph_index_cluster.h` - Clustering support
-
-#### 4. Distance Functions (`distance/`, `src/distance/`)
-
-SIMD-accelerated distance calculations:
-- Runtime dispatcher based on CPU capabilities
-- SSE, AVX, AVX512 implementations
-- Template-based for type flexibility
-
----
-
-## Implementation Showcase
-
-### 1. Vector Type Implementation
-
-**File:** `src/floatvector.cpp`
-
-The `floatvector` type is a varlena structure stored directly in PostgreSQL:
-
-```cpp
-struct FloatVector {
-    int32 vl_len_;  /* varlena header */
-    int16 dim;      /* number of dimensions */
-    int16 unused;   /* reserved */
-    float4 x[FLEXIBLE_ARRAY_MEMBER];
-};
+```bash
+cd /path/to/duckdb/build
+cmake .. -DOVERRIDE_GIT_DESCRIBE=v1.5.2
+cmake --build . --target vex_loadable_extension -j$(nproc)
 ```
 
-Key functions:
-- `floatvector_in()` - Parse text representation `[1,2,3]`
-- `floatvector_out()` - Convert to text
-- `l2_distance()` - Compute Euclidean distance
-- Operators use PostgreSQL's FMGR interface wrapped in `extern "C"`:
+The artifact is typically:
 
-```cpp
-extern "C" {
-PG_FUNCTION_INFO_V1(l2_distance);
-Datum l2_distance(PG_FUNCTION_ARGS) {
-    FloatVector *a = PG_GETARG_FLOATVECTOR_P(0);
-    FloatVector *b = PG_GETARG_FLOATVECTOR_P(1);
-    float dist = l2_distance_impl(a, b);
-    PG_RETURN_FLOAT4(dist);
-}
-}
+```bash
+/path/to/duckdb/build/extension/vex/vex.duckdb_extension
 ```
 
-### 2. Index Access Method
+### Smoke / Benchmark
 
-**File:** `src/graph_index_am.cpp`
+```bash
+cd /path/to/VexDB-Lite
+vexdb-duck/test/run_extension_function_smoke.sh /path/to/duckdb/build
 
-PostgreSQL 19's `IndexAmRoutine` requires specific function signatures. We create wrapper functions:
-
-```cpp
-// Handler function registered in SQL
-PG_FUNCTION_INFO_V1(graph_index_amhandler);
-Datum graph_index_amhandler(PG_FUNCTION_ARGS) {
-    PG_RETURN_POINTER(graph_index_amroutine());
-}
-
-// Build the IndexAmRoutine structure
-static IndexAmRoutine *graph_index_amroutine(void) {
-    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
-    
-    amroutine->ambuild = graph_index_ambuild;
-    amroutine->aminsert = graph_index_aminsert;
-    amroutine->ambeginscan = graph_index_ambeginscan;
-    amroutine->amgettuple = graph_index_amgettuple;
-    // ... more function pointers
-    return amroutine;
-}
-
-// Wrapper with correct signature for IndexAmRoutine
-static IndexBuildResult *graph_index_ambuild(
-    Relation heap, Relation index, IndexInfo *indexInfo) {
-    return graph_index_build_internal(heap, index, indexInfo);
-}
-```
-
-### 3. HNSW Search Algorithm
-
-**File:** `include/graph_index/graph_index_algorithm.h`
-
-The search algorithm uses a priority queue for beam search:
-
-```cpp
-template<typename T>
-Vector<Cand<T>> search(float *query, size_t ef) {
-    MaxHeap<Cand<T>> candidates;
-    MinHeap<Cand<T>> results;
-    UnorderedSet<T> visited;
-    
-    // Start from entry point
-    T ep = get_entry_point();
-    float dist = distance(query, get_vector(ep));
-    candidates.emplace(ep, dist);
-    visited.insert(ep);
-    
-    while (!candidates.empty()) {
-        Cand<T> cur = candidates.top();
-        candidates.pop();
-        
-        if (results.size() >= ef && cur.dist > results.top().dist)
-            break;
-        
-        results.emplace(cur);
-        
-        // Explore neighbors
-        for (T neighbor : get_neighbors(cur.id)) {
-            if (visited.insert(neighbor).second) {
-                float d = distance(query, get_vector(neighbor));
-                candidates.emplace(neighbor, d);
-            }
-        }
-    }
-    
-    return results.to_vector();
-}
-```
-
-### 4. SIMD Dispatch
-
-**File:** `src/distance/architecture.cpp`
-
-Runtime CPU feature detection:
-
-```cpp
-static Arch detect_best_arch() {
-#if COMPILER_TARGET_X86_64
-    unsigned int eax, ebx, ecx, edx;
-    
-    // Check AVX512
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        if (ebx & bit_AVX512F)
-            return Arch::AVX512;
-    }
-    
-    // Check AVX
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        if (ecx & bit_AVX)
-            return Arch::AVX;
-        if (edx & bit_SSE2)
-            return Arch::SSE;
-    }
-#endif
-    return Arch::SCALAR;
-}
-```
-
-### 5. Memory Management
-
-**File:** `knl/knl_alloc.cpp`
-
-All memory uses PostgreSQL contexts:
-
-```cpp
-void* mem_align_alloc(size_t alignment, size_t size) {
-    return palloc_aligned(size, alignment, 0);
-}
-
-// Custom allocator for VTL
-template<typename T>
-class CtxAllocator {
-    MemoryContext ctx;
-public:
-    T* allocate(size_t n) {
-        return (T*)MemoryContextAlloc(ctx, n * sizeof(T));
-    }
-    void deallocate(T* p) { pfree(p); }
-};
-```
-
-### 6. GUC Registration
-
-**File:** `src/guc_config.cpp`
-
-Custom GUC parameters with assign hooks:
-
-```cpp
-static void assign_ef_search(int newval, void *extra) {
-    pg_vexdb_session.attr_storage.ef_search = newval;
-}
-
-void pg_vexdb_init_guc(void) {
-    DefineCustomIntVariable("pg_vexdb.ef_search",
-        "Search list size for HNSW index search.",
-        NULL, &pg_vexdb_ef_search, 64, 1, 65535,
-        PGC_USERSET, 0, NULL, assign_ef_search, NULL);
-}
+vexdb-duck/test/run_sift_sql_benchmark.sh \
+  /path/to/duckdb/build \
+  10k \
+  /path/to/VexDB-Lite/vexdb-duck/test/benchmark/data
 ```
 
 ---
 
-## Performance Tips
+## 5. Benchmark Results
 
-1. **Index Build**
-   - Use higher `ef_construction` for better recall (128-256)
-   - Use `parallel_workers` for large datasets
-   - Increase `maintenance_work_mem` if possible
+Detailed reports:
 
-2. **Query**
-   - Tune `ef_search` based on recall requirements
-   - Higher `ef_search` = better recall, slower query
-   - Typical values: 64-256
+- [x86 PostgreSQL report](docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL report](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [DuckDB v1.5.2 report](docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md)
 
-3. **Memory**
-   - Adjust `pg_vexdb.vector_buffers` for cache size
-   - Default: 262144 buffers = 2GB
+### 5.1 PostgreSQL on x86_64 / Intel Xeon E5-2696 v4 / 62 GiB
+
+| Scale | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 454.730 | 2319.690 | 4707.020 | 42.4897 | 0.999500 | 0.995050 |
+| 100k | 4499.110 | 29849.700 | 35467.700 | 5.63894 | 0.997500 | 0.974600 |
+| 1M cold | 49720.795 | 440295.289 | 118939.861 | 1.682 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 421.385 | 474.626 | 0.986000 | 0.940750 |
+
+### 5.2 PostgreSQL on ARM64 / Kirin 9000C / 15 GiB
+
+| Scale | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 653.710 | 3343.997 | 4221.737 | 47.374 | 0.999500 | 0.995050 |
+| 100k | 7190.675 | 50600.905 | 36256.395 | 5.516 | 0.997500 | 0.974600 |
+| 1M cold | 80249.436 | 727355.502 | 117733.467 | 1.699 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 565.444 | 353.705 | 0.986000 | 0.940750 |
+
+Notes:
+
+- The ARM PostgreSQL run currently forces `GENERAL` distance dispatch to keep the current codebase buildable/runnable on ARM.
+- So these numbers represent the current runnable ARM state, not the final fully-enabled ARM SIMD ceiling.
+
+### 5.3 DuckDB on Apple M3 Max / 128 GiB / Darwin arm64
+
+Tested against a DuckDB source build with `OVERRIDE_GIT_DESCRIBE=v1.5.2`.
+
+| Scale | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 79.1983 | 4061.74 | 323.747 | 617.767 | 1.000000 | 0.999550 |
+| 100k | 715.33 | 59281.3 | 382.046 | 523.498 | 1.000000 | 0.995650 |
+
+Notes:
+
+- Test machine: `MacBook Pro`, `Model Identifier: Mac15,9`, `Chip: Apple M3 Max`, `Memory: 128 GB`
+- The Duck arm64 build also ran with `GENERAL` distance dispatch for the current repository state
 
 ---
 
-## Limitations
+## 6. Known Limitations
 
-1. **WAL** - Vector data changes not WAL-logged (deferred)
-2. **Quantization** - PQ and RaBitQ not yet implemented
-3. **Platform** - Linux only (x86_64, ARM64)
+### PostgreSQL
+
+- Primary validation target is PostgreSQL 19
+- ARM PG SIMD is not fully wired back yet; current state prioritizes correctness/buildability
+- WAL/quantizer work is still incomplete compared to the full roadmap
+
+### DuckDB
+
+- Current focus is `GRAPH_INDEX`, optimizer integration, and shared-algorithm alignment
+- Some accepted options such as `threads` and `pq_m` are currently compatibility placeholders on parts of the path
+- ARM Duck builds also currently rely on `GENERAL` distance dispatch
 
 ---
 
-## License
+## 7. Where To Look Next
 
-Same license as vexdb.
-
----
-
-## Credits
-
-Ported from vexdb vector index implementation.
+- PostgreSQL implementation: `src/`, `include/`, `sql/`
+- DuckDB implementation: [vexdb-duck/README.md](vexdb-duck/README.md) and `vexdb-duck/`
+- Benchmark/environment records:
+  - `docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md`
+  - `docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md`
+  - `docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md`

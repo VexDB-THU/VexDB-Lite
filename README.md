@@ -1,445 +1,380 @@
-# pg_vexdb - PostgreSQL HNSW 图索引扩展
+# VexDB-Lite
 
-**[English](README.en.md)** | **[中文](README.md)**
+**[English](README.en.md)** | **中文**
 
-高性能向量相似度搜索 PostgreSQL 扩展，提供 HNSW（分层可导航小世界）图索引用于近似最近邻搜索。从 vexdb 移植，保持最大代码一致性以利于维护。
+`VexDB-Lite` 当前包含两条共享算法内核的向量索引实现：
 
-## 特性
+- `vexdb-pg`：PostgreSQL `pg_vexdb` 扩展，提供 `floatvector/halfvector`、距离运算符、`vexdb_graph` HNSW 索引访问方法
+- `vexdb-duck`：DuckDB `vex` 扩展，提供 `GRAPH_INDEX`、向量距离函数、优化器 `VEX_INDEX_SCAN` 计划生成
 
-### 向量类型
-- **floatvector** - 单精度浮点向量（最高 16,384 维）
-- **halfvector** - 半精度浮点向量（最高 16,384 维）
-- 支持 NULL 值、TOAST 压缩和 typmod
+两者尽量复用同一套图索引算法、距离分发和底层模板库，重点目录包括：
 
-### 距离函数
-- **L2 距离** (`<->`) - 欧几里得距离
-- **内积** (`<#>`) - 负内积
-- **余弦距离** (`<=>`) - 余弦距离
-
-### SIMD 加速
-- 自动检测 CPU 能力（SSE、AVX、AVX512）
-- 通过 GUC 参数运行时选择架构
-- 支持 x86_64 和 ARM 架构
-
-### 索引访问方法
-- 基于 HNSW 图的近似最近邻搜索
-- 可配置 M（每节点邻居数）和 ef_construction
-- 支持并行索引构建
-- 可配置 ef_search 高效搜索
-
-### GUC 参数
-| 参数 | 类型 | 默认值 | 描述 |
-|------|------|--------|------|
-| `pg_vexdb.ef_search` | int | 64 | HNSW 搜索 ef 参数 |
-| `pg_vexdb.enable_vec_buffer_manager` | bool | true | 启用向量缓冲缓存 |
-| `pg_vexdb.vector_buffers` | int | 262144 | 8KB 向量缓冲区数量 |
-| `pg_vexdb.vec_architecture` | string | "" | SIMD 架构选择 |
+- `include/graph_index/`：图索引头文件与共享算法入口
+- `distance/`、`src/distance/`：距离函数、ISA 分发、变换模板
+- `vtl/`：共享模板容器
+- `vexdb-duck/`：DuckDB 扩展层
+- `src/`、`include/`、`sql/`：PostgreSQL 扩展层
 
 ---
 
-## 环境要求
+## 1. 组件概览
 
-### 编译依赖
-- **PostgreSQL 19**（基于 19devel 开发）
-- **C++17** 编译器（GCC 8+、Clang 7+）
-- **CMake** 3.10+
-- **Boost**（仅用于预处理器宏）
+### 1.1 PostgreSQL：`pg_vexdb`
 
-### 运行环境
-- PostgreSQL 19
-- Linux（x86_64 或 ARM64）
+当前能力：
+
+- `floatvector(N)`、`halfvector(N)` 向量类型
+- 距离函数与运算符：
+  - L2：`<->`
+  - Inner Product：`<#>`
+  - Cosine：`<=>`
+- `CREATE INDEX ... USING vexdb_graph`
+- `m`、`ef_construction`、`parallel_workers` 等索引参数
+- `pg_vexdb.ef_search`、`pg_vexdb.vec_architecture` 等运行参数
+- 优化器生成 Index Scan，执行器走 ANN 索引检索
+- 共享内存向量缓存、并行建索引
+
+### 1.2 DuckDB：`vexdb-duck`
+
+当前能力：
+
+- `FLOAT[N]` 向量列上的 `GRAPH_INDEX`
+- 向量距离函数与运算符：
+  - `l2_distance`、`<->`
+  - `inner_product`、`<#>`
+  - `cosine_distance`、`<=>`、`<~>`
+- `vector_dims()`、`l2_normalize()`、`vex_version()`、`vex_index_info()`
+- `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])`
+- DuckDB 优化器生成 `VEX_INDEX_SCAN`
+- 支持带 metadata 列的过滤索引语法
+
+当前 Duck 侧运行参数：
+
+- `vex_ef_search`
+- `vex_brute_force_threshold`
 
 ---
 
-## 编译
+## 2. PostgreSQL 语法示例
 
-### 1. 编译 PostgreSQL（如未安装）
+### 2.1 安装与建表
+
+```sql
+CREATE EXTENSION pg_vexdb;
+
+CREATE TABLE items (
+    id  BIGSERIAL PRIMARY KEY,
+    vec floatvector(128)
+);
+
+INSERT INTO items (vec) VALUES
+    ('[0.10, 0.20, 0.30]'),
+    ('[0.40, 0.50, 0.60]');
+```
+
+### 2.2 建索引
+
+```sql
+CREATE INDEX idx_items_vec
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (
+    m = 16,
+    ef_construction = 64
+);
+```
+
+### 2.3 ANN 查询
+
+```sql
+SET pg_vexdb.ef_search = 100;
+SET enable_seqscan = off;
+
+SELECT id, vec <-> '[0.15, 0.25, 0.35]' AS dist
+FROM items
+ORDER BY vec <-> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+```
+
+### 2.4 其他距离
+
+```sql
+SELECT id
+FROM items
+ORDER BY vec <#> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+
+SELECT id
+FROM items
+ORDER BY vec <=> '[0.15, 0.25, 0.35]'
+LIMIT 10;
+```
+
+### 2.5 halfvector 示例
+
+```sql
+CREATE TABLE half_items (
+    id  BIGSERIAL PRIMARY KEY,
+    vec halfvector(128)
+);
+
+CREATE INDEX idx_half_items_vec
+ON half_items
+USING vexdb_graph (vec halfvector_l2_ops);
+```
+
+---
+
+## 3. DuckDB 语法示例
+
+### 3.1 加载扩展
+
+```sql
+LOAD '/path/to/vex.duckdb_extension';
+SELECT vex_version();
+```
+
+Python 侧常见用法：
+
+```python
+import duckdb
+
+con = duckdb.connect(config={"allow_unsigned_extensions": "true"})
+con.execute("LOAD '/path/to/vex.duckdb_extension'")
+```
+
+### 3.2 建表与建索引
+
+```sql
+CREATE TABLE items (
+    id       INTEGER,
+    category VARCHAR,
+    vec      FLOAT[128]
+);
+
+CREATE INDEX idx_items_vec
+ON items
+USING GRAPH_INDEX (vec)
+WITH (
+    metric = 'l2',
+    m = 16,
+    ef_construction = 64
+);
+```
+
+### 3.3 ANN 查询
+
+```sql
+SET vex_ef_search = 100;
+
+SELECT id
+FROM items
+ORDER BY l2_distance(vec, [0.15, 0.25, 0.35]::FLOAT[3])
+LIMIT 10;
+```
+
+### 3.4 过滤索引示例
+
+```sql
+CREATE INDEX idx_items_vec_meta
+ON items
+USING GRAPH_INDEX (vec, category);
+
+SELECT id
+FROM items
+WHERE category = 'book'
+ORDER BY l2_distance(vec, [0.15, 0.25, 0.35]::FLOAT[3])
+LIMIT 10;
+```
+
+### 3.5 其他距离函数
+
+```sql
+SELECT inner_product([1.0, 0.0]::FLOAT[2], [0.5, 0.5]::FLOAT[2]);
+SELECT cosine_distance([1.0, 0.0]::FLOAT[2], [0.5, 0.5]::FLOAT[2]);
+SELECT vector_dims([1.0, 2.0, 3.0]::FLOAT[3]);
+SELECT l2_normalize([3.0, 4.0]::FLOAT[2]);
+SELECT * FROM vex_index_info();
+```
+
+---
+
+## 4. 构建方法
+
+## 4.1 构建 PostgreSQL 版本
+
+### 依赖
+
+- PostgreSQL 19（当前按 `19devel` 适配）
+- CMake
+- C++17 编译器
+- Boost（头文件）
+
+### 编译 PostgreSQL（release 示例）
 
 ```bash
-./configure --prefix=/path/to/pg-install --enable-debug --enable-cassert \
-    --without-icu --without-readline --without-zlib CFLAGS="-O0 -g"
+cd /path/to/postgresql-19-source
+./configure \
+  --prefix=/opt/postgresql-19rel-install \
+  --without-icu \
+  --without-readline \
+  --without-zlib \
+  CFLAGS="-O3 -DNDEBUG"
 make -j$(nproc)
 make install
 ```
 
-### 2. 编译 pg_vexdb
+### 编译 `pg_vexdb`
 
 ```bash
-cd pg_vexdb
-mkdir build && cd build
+cd /path/to/VexDB-Lite
+mkdir -p build-pg19rel-release
+cd build-pg19rel-release
+
+export PG_CONFIG=/opt/postgresql-19rel-install/bin/pg_config
 cmake -DCMAKE_BUILD_TYPE=Release ..
 make -j$(nproc)
 make install
 ```
 
-### 3. 配置 PostgreSQL
+### 启动前配置
 
-在 `postgresql.conf` 中添加：
-```
+`postgresql.conf` 至少需要：
+
+```conf
 shared_preload_libraries = 'pg_vexdb'
 ```
 
-重启 PostgreSQL：
-```bash
-pg_ctl restart -D $PGDATA
-```
-
----
-
-## 使用
-
-### 基本用法
+重启实例后：
 
 ```sql
--- 创建扩展
 CREATE EXTENSION pg_vexdb;
-
--- 创建带向量列的表
-CREATE TABLE items (
-    id serial PRIMARY KEY,
-    embedding floatvector(128)
-);
-
--- 插入向量
-INSERT INTO items (embedding) VALUES 
-    ('[0.1, 0.2, 0.3, ...]'),
-    ('[0.4, 0.5, 0.6, ...]');
-
--- 创建 HNSW 索引
-CREATE INDEX ON items USING vexdb_graph (embedding floatvector_l2_ops)
-    WITH (m = 16, ef_construction = 64);
-
--- 使用索引查询
-SELECT * FROM items 
-ORDER BY embedding <-> '[0.2, 0.3, 0.4]' 
-LIMIT 10;
-```
-
-### 索引选项
-
-```sql
-CREATE INDEX ON items USING vexdb_graph (embedding floatvector_l2_ops)
-    WITH (
-        m = 32,                    -- 每节点邻居数（默认：16）
-        ef_construction = 128,     -- 构建时搜索列表大小（默认：64）
-        parallel_workers = 4       -- 并行构建工作进程数（默认：0=自动）
-    );
-```
-
-### 查询调优
-
-```sql
--- 增加 ef_search 提高召回率（成本更高）
-SET pg_vexdb.ef_search = 256;
-
--- 强制索引扫描
-SET enable_seqscan = false;
-
--- 带距离的查询
-SELECT id, embedding <-> '[0.2, 0.3, 0.4]' AS distance
-FROM items
-ORDER BY embedding <-> '[0.2, 0.3, 0.4]'
-LIMIT 10;
-```
-
-### SIMD 架构选择
-
-```sql
--- 所有操作使用 AVX
-SET pg_vexdb.vec_architecture = 'all:avx';
-
--- float 向量用 AVX512，half 向量用 SSE
-SET pg_vexdb.vec_architecture = 'float:avx512, half:sse';
-
--- 重置为自动检测
-SET pg_vexdb.vec_architecture = '';
 ```
 
 ---
 
-## 框架与代码结构
+## 4.2 构建 DuckDB 版本
 
-### 目录布局
+`vexdb-duck` 按 DuckDB out-of-tree extension 方式构建。
 
-```
-pg_vexdb/
-├── distance/              # 距离函数头文件
-│   ├── distance.h         # 核心距离函数声明
-│   ├── distance_dispatcher.h
-│   ├── architecture_macro.h
-│   └── pq/               # 乘积量化
-├── include/
-│   ├── graph_index/       # 图索引头文件
-│   ├── floatvector.h      # 浮点向量类型
-│   ├── halfvec.h          # 半精度向量类型
-│   ├── pg_compat.h        # PostgreSQL 兼容层
-│   └── ...
-├── knl/                   # vexdb 兼容层
-│   ├── knl_alloc.cpp     # 内存分配、_PG_init
-│   ├── knl_instance.h    # 全局实例结构
-│   └── knl_variable.h    # 全局变量存根
-├── module/               # 工具模块
-│   ├── timer.h          # 计时工具
-│   └── parallel_counter.h
-├── quantizer/            # 量化器头文件（存根）
-├── rabitq/               # RaBitQ 头文件
-├── src/
-│   ├── distance/         # 距离实现
-│   ├── graph_index_*.cpp # 图索引实现
-│   └── ...
-└── vtl/                  # 向量模板库
-    ├── vector
-    ├── hashtable
-    ├── disk_container/
-    └── ...
+### 依赖
+
+- DuckDB 源码树
+- CMake
+- C++17 编译器
+- Boost（头文件）
+
+### 在 DuckDB 中注册本地扩展
+
+在 DuckDB 源码目录的 `extension/extension_config_local.cmake` 中加入：
+
+```cmake
+duckdb_extension_load(vex
+    SOURCE_DIR "/path/to/VexDB-Lite/vexdb-duck"
+    INCLUDE_DIR "/path/to/VexDB-Lite/vexdb-duck/include"
+)
 ```
 
-### 核心组件
+### 构建 loadable extension
 
-#### 1. 兼容层（`include/pg_compat.h`）
-
-提供 vexdb 特性的抽象：
-- 将所有 PostgreSQL 头文件包裹在 `extern "C"` 中
-- 定义 `u_sess` → `pg_vexdb_session` 用于会话属性
-- 提供 `VECTOR_FORKNUM`、`RM_GRAPH_INDEX_ID` 宏
-
-#### 2. 向量模板库（`vtl/`）
-
-兼容 PostgreSQL 内存管理的自定义模板库：
-- 使用 PostgreSQL 内存上下文（palloc/pfree）
-- 不使用 STL（与 setjmp/longjmp 不兼容）
-- 提供 Vector、HashSet、PriorityQueue 等
-
-#### 3. 图索引（`include/graph_index/`、`src/graph_index*.cpp`）
-
-HNSW 实现：
-- `graph_index.h` - 主接口
-- `graph_index_algorithm.h` - HNSW 算法
-- `graph_index_storage.h` - 磁盘存储
-- `graph_index_cluster.h` - 聚类支持
-
-#### 4. 距离函数（`distance/`、`src/distance/`）
-
-SIMD 加速的距离计算：
-- 基于 CPU 能力的运行时分发
-- SSE、AVX、AVX512 实现
-- 基于模板的类型灵活性
-
----
-
-## 实现详解
-
-### 1. 向量类型实现
-
-**文件：** `src/floatvector.cpp`
-
-`floatvector` 类型是直接存储在 PostgreSQL 中的 varlena 结构：
-
-```cpp
-struct FloatVector {
-    int32 vl_len_;  /* varlena 头 */
-    int16 dim;      /* 维度数 */
-    int16 unused;   /* 保留 */
-    float4 x[FLEXIBLE_ARRAY_MEMBER];
-};
+```bash
+cd /path/to/duckdb/build
+cmake .. -DOVERRIDE_GIT_DESCRIBE=v1.5.2
+cmake --build . --target vex_loadable_extension -j$(nproc)
 ```
 
-关键函数：
-- `floatvector_in()` - 解析文本表示 `[1,2,3]`
-- `floatvector_out()` - 转换为文本
-- `l2_distance()` - 计算欧几里得距离
-- 运算符使用包裹在 `extern "C"` 中的 PostgreSQL FMGR 接口：
+生成物通常位于：
 
-```cpp
-extern "C" {
-PG_FUNCTION_INFO_V1(l2_distance);
-Datum l2_distance(PG_FUNCTION_ARGS) {
-    FloatVector *a = PG_GETARG_FLOATVECTOR_P(0);
-    FloatVector *b = PG_GETARG_FLOATVECTOR_P(1);
-    float dist = l2_distance_impl(a, b);
-    PG_RETURN_FLOAT4(dist);
-}
-}
+```bash
+/path/to/duckdb/build/extension/vex/vex.duckdb_extension
 ```
 
-### 2. 索引访问方法
+### Smoke / Benchmark
 
-**文件：** `src/graph_index_am.cpp`
+```bash
+cd /path/to/VexDB-Lite
+vexdb-duck/test/run_extension_function_smoke.sh /path/to/duckdb/build
 
-PostgreSQL 19 的 `IndexAmRoutine` 需要特定函数签名。我们创建包装函数：
-
-```cpp
-// 在 SQL 中注册的处理函数
-PG_FUNCTION_INFO_V1(graph_index_amhandler);
-Datum graph_index_amhandler(PG_FUNCTION_ARGS) {
-    PG_RETURN_POINTER(graph_index_amroutine());
-}
-
-// 构建 IndexAmRoutine 结构
-static IndexAmRoutine *graph_index_amroutine(void) {
-    IndexAmRoutine *amroutine = makeNode(IndexAmRoutine);
-    
-    amroutine->ambuild = graph_index_ambuild;
-    amroutine->aminsert = graph_index_aminsert;
-    amroutine->ambeginscan = graph_index_ambeginscan;
-    amroutine->amgettuple = graph_index_amgettuple;
-    // ... 更多函数指针
-    return amroutine;
-}
-
-// IndexAmRoutine 签名的包装器
-static IndexBuildResult *graph_index_ambuild(
-    Relation heap, Relation index, IndexInfo *indexInfo) {
-    return graph_index_build_internal(heap, index, indexInfo);
-}
-```
-
-### 3. HNSW 搜索算法
-
-**文件：** `include/graph_index/graph_index_algorithm.h`
-
-搜索算法使用优先队列进行束搜索：
-
-```cpp
-template<typename T>
-Vector<Cand<T>> search(float *query, size_t ef) {
-    MaxHeap<Cand<T>> candidates;
-    MinHeap<Cand<T>> results;
-    UnorderedSet<T> visited;
-    
-    // 从入口点开始
-    T ep = get_entry_point();
-    float dist = distance(query, get_vector(ep));
-    candidates.emplace(ep, dist);
-    visited.insert(ep);
-    
-    while (!candidates.empty()) {
-        Cand<T> cur = candidates.top();
-        candidates.pop();
-        
-        if (results.size() >= ef && cur.dist > results.top().dist)
-            break;
-        
-        results.emplace(cur);
-        
-        // 探索邻居
-        for (T neighbor : get_neighbors(cur.id)) {
-            if (visited.insert(neighbor).second) {
-                float d = distance(query, get_vector(neighbor));
-                candidates.emplace(neighbor, d);
-            }
-        }
-    }
-    
-    return results.to_vector();
-}
-```
-
-### 4. SIMD 分发
-
-**文件：** `src/distance/architecture.cpp`
-
-运行时 CPU 特性检测：
-
-```cpp
-static Arch detect_best_arch() {
-#if COMPILER_TARGET_X86_64
-    unsigned int eax, ebx, ecx, edx;
-    
-    // 检查 AVX512
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        if (ebx & bit_AVX512F)
-            return Arch::AVX512;
-    }
-    
-    // 检查 AVX
-    if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) {
-        if (ecx & bit_AVX)
-            return Arch::AVX;
-        if (edx & bit_SSE2)
-            return Arch::SSE;
-    }
-#endif
-    return Arch::SCALAR;
-}
-```
-
-### 5. 内存管理
-
-**文件：** `knl/knl_alloc.cpp`
-
-所有内存使用 PostgreSQL 上下文：
-
-```cpp
-void* mem_align_alloc(size_t alignment, size_t size) {
-    return palloc_aligned(size, alignment, 0);
-}
-
-// VTL 的自定义分配器
-template<typename T>
-class CtxAllocator {
-    MemoryContext ctx;
-public:
-    T* allocate(size_t n) {
-        return (T*)MemoryContextAlloc(ctx, n * sizeof(T));
-    }
-    void deallocate(T* p) { pfree(p); }
-};
-```
-
-### 6. GUC 注册
-
-**文件：** `src/guc_config.cpp`
-
-带赋值钩子的自定义 GUC 参数：
-
-```cpp
-static void assign_ef_search(int newval, void *extra) {
-    pg_vexdb_session.attr_storage.ef_search = newval;
-}
-
-void pg_vexdb_init_guc(void) {
-    DefineCustomIntVariable("pg_vexdb.ef_search",
-        "HNSW 索引搜索的搜索列表大小。",
-        NULL, &pg_vexdb_ef_search, 64, 1, 65535,
-        PGC_USERSET, 0, NULL, assign_ef_search, NULL);
-}
+vexdb-duck/test/run_sift_sql_benchmark.sh \
+  /path/to/duckdb/build \
+  10k \
+  /path/to/VexDB-Lite/vexdb-duck/test/benchmark/data
 ```
 
 ---
 
-## 性能调优
+## 5. 测试结果
 
-1. **索引构建**
-   - 使用更高的 `ef_construction` 获得更好的召回率（128-256）
-   - 大数据集使用 `parallel_workers`
-   - 如果可能，增加 `maintenance_work_mem`
+下面只汇总当前已经落报告的基准结果，详细环境见：
 
-2. **查询**
-   - 根据召回率要求调整 `ef_search`
-   - 更高的 `ef_search` = 更好的召回率，更慢的查询
-   - 典型值：64-256
+- [x86 PostgreSQL 报告](docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL 报告](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [DuckDB v1.5.2 报告](docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md)
 
-3. **内存**
-   - 调整 `pg_vexdb.vector_buffers` 控制缓存大小
-   - 默认：262144 个缓冲区 = 2GB
+### 5.1 PostgreSQL：x86_64 / Intel Xeon E5-2696 v4 / 62 GiB
+
+| 规模 | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 454.730 | 2319.690 | 4707.020 | 42.4897 | 0.999500 | 0.995050 |
+| 100k | 4499.110 | 29849.700 | 35467.700 | 5.63894 | 0.997500 | 0.974600 |
+| 1M cold | 49720.795 | 440295.289 | 118939.861 | 1.682 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 421.385 | 474.626 | 0.986000 | 0.940750 |
+
+### 5.2 PostgreSQL：ARM64 / Kirin 9000C / 15 GiB
+
+| 规模 | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 653.710 | 3343.997 | 4221.737 | 47.374 | 0.999500 | 0.995050 |
+| 100k | 7190.675 | 50600.905 | 36256.395 | 5.516 | 0.997500 | 0.974600 |
+| 1M cold | 80249.436 | 727355.502 | 117733.467 | 1.699 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 565.444 | 353.705 | 0.986000 | 0.940750 |
+
+说明：
+
+- ARM 测试为了完成当前仓库状态下的 PG 编译，临时关闭了 PG 侧 ARM `NEON/SVE` 距离派发，改走 `GENERAL` 路径。
+- 因此 ARM 报告代表“当前源码可运行版本”的性能，不代表 ARM SIMD fully enabled 的上限。
+
+### 5.3 DuckDB：Apple M3 Max / 128 GiB / Darwin arm64
+
+测试版本：DuckDB 源码树构建，`OVERRIDE_GIT_DESCRIBE=v1.5.2`
+
+| 规模 | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
+|---|---:|---:|---:|---:|---:|---:|
+| 10k | 79.1983 | 4061.74 | 323.747 | 617.767 | 1.000000 | 0.999550 |
+| 100k | 715.33 | 59281.3 | 382.046 | 523.498 | 1.000000 | 0.995650 |
+
+说明：
+
+- 当时的 DuckDB 构建环境为 Apple Silicon，本机 `Model Identifier: Mac15,9`，`Chip: Apple M3 Max`，`Memory: 128 GB`
+- Duck arm64 测试同样为了当前仓库可编译，走了 `GENERAL` 距离派发
 
 ---
 
-## 限制
+## 6. 当前已知限制
 
-1. **WAL** - 向量数据变更未记录 WAL（延迟）
-2. **量化** - PQ 和 RaBitQ 尚未实现
-3. **平台** - 仅 Linux（x86_64、ARM64）
+### PostgreSQL
+
+- 当前主验证平台是 PostgreSQL 19
+- ARM PG 侧 SIMD 还没有完全接回；当前是可运行优先
+- 向量存储、buffer/cache、并行构建都已经接通，但 WAL 与量化器仍有待继续完善
+
+### DuckDB
+
+- Duck 扩展当前重点是 `GRAPH_INDEX`、优化器接入和共享算法对齐
+- `threads`、`pq_m` 选项目前接受但部分路径仍是兼容保留/未完全实现
+- ARM Duck 构建当前也走 `GENERAL` 距离派发
 
 ---
 
-## 许可证
+## 7. 仓库说明
 
-与 vexdb 相同的许可证。
+如果你只关心某一部分：
 
----
+- PostgreSQL 版本：直接看当前目录下的 `src/`、`include/`、`sql/`
+- DuckDB 版本：直接看 [vexdb-duck/README.md](vexdb-duck/README.md) 和 `vexdb-duck/`
 
-## 致谢
+如果你关心最近的测试与环境记录：
 
-从 vexdb 向量索引实现移植到 PostgreSQL。
+- `docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md`
+- `docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md`
+- `docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md`
