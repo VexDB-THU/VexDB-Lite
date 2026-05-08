@@ -105,15 +105,20 @@ set(GRAPH_INDEX_SRCS
 set(DISTANCE_SRCS
     src/distance/core/architecture.cpp
     src/distance/core/general_dispatcher.cpp
-    src/distance/core/sse_dispatcher.cpp
-    src/distance/core/avx_dispatcher.cpp
-    src/distance/core/avx512_dispatcher.cpp
     src/distance/pg/distance.cpp
     src/distance/pg/general.cpp
-    src/distance/pg/sse.cpp
-    src/distance/pg/avx.cpp
-    src/distance/pg/avx512.cpp
 )
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+    list(APPEND DISTANCE_SRCS
+        src/distance/core/sse_dispatcher.cpp
+        src/distance/core/avx_dispatcher.cpp
+        src/distance/core/avx512_dispatcher.cpp
+        src/distance/pg/sse.cpp
+        src/distance/pg/avx.cpp
+        src/distance/pg/avx512.cpp
+    )
+endif()
 
 add_library(pg_vexdb SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS})
 set_target_properties(pg_vexdb PROPERTIES OUTPUT_NAME "pg_vexdb" PREFIX "")

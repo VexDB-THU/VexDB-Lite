@@ -2,6 +2,7 @@
 #define HALFUTILS_H
 
 #include <cmath>
+#include <cstring>
 #include <vtl/expr_helper>
 #ifdef F16C_SUPPORT
 #include <immintrin.h>
@@ -12,12 +13,25 @@
 #include "knl/knl_instance.h"
 #include "distance/core/halfutils_core.h"
 
+inline uint16 HalfRawBits(half num)
+{
+#if defined(__aarch64__) || defined(_M_ARM64)
+    uint16 bits = 0;
+    static_assert(sizeof(bits) == sizeof(num), "half/raw bit size mismatch");
+    std::memcpy(&bits, &num, sizeof(bits));
+    return bits;
+#else
+    return num;
+#endif
+}
+
 inline bool HalfIsNan(half num)
 {
 #ifdef FLT16_SUPPORT
     return std::isnan((float)num);
 #else
-    return (num & 0x7C00) == 0x7C00 && (num & 0x7FFF) != 0x7C00;
+    const uint16 bits = HalfRawBits(num);
+    return (bits & 0x7C00) == 0x7C00 && (bits & 0x7FFF) != 0x7C00;
 #endif
 }
 
@@ -26,7 +40,7 @@ inline bool HalfIsInf(half num)
 #ifdef FLT16_SUPPORT
     return std::isinf((float)num);
 #else
-    return (num & 0x7FFF) == 0x7C00;
+    return (HalfRawBits(num) & 0x7FFF) == 0x7C00;
 #endif
 }
 
@@ -35,7 +49,7 @@ inline bool HalfIsZero(half num)
 #ifdef FLT16_SUPPORT
     return num == 0;
 #else
-    return (num & 0x7FFF) == 0x0000;
+    return (HalfRawBits(num) & 0x7FFF) == 0x0000;
 #endif
 }
 

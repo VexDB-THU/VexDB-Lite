@@ -752,8 +752,8 @@ private:
                 uint16 dim = store.get_dim();
                 memset(center, 0, buf_size);
                 // TD: handle int8
-                typename Distancer::transform_type<TransformOp::ADD> adder;
-                typename Distancer::transform_type<TransformOp::MUL_SCALAR> muler;
+                typename Distancer::template transform_type<TransformOp::ADD> adder;
+                typename Distancer::template transform_type<TransformOp::MUL_SCALAR> muler;
                 constexpr uint32 nstep = 250; /* prevent overflow */
                 uint32 i = 0;
                 for (; i + nstep < ndata; i += nstep) {
@@ -770,7 +770,7 @@ private:
                 }
                 muler.transform_single(temp_center, transform_scalar_to_ptr(1.0f / ndata), temp_center, dim);
                 adder.transform_single(temp_center, center, center, dim);
-                typename Distancer::transform_type<TransformOp::ADD> suber;
+                typename Distancer::template transform_type<TransformOp::ADD> suber;
                 float *dists = alloc_floatvector(1, ndata);
                 // TD: use batch version
                 for (uint32 i = 0; i < ndata; ++i) {
