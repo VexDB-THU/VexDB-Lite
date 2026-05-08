@@ -617,6 +617,43 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
             }
         }
     }
+
+    auto upper_data_it = info.options.find("upper_points_data");
+    if (upper_data_it != info.options.end()) {
+        auto blob = StringValue::Get(upper_data_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        if (ptr + sizeof(uint64_t) <= end) {
+            uint64_t num_entries;
+            std::memcpy(&num_entries, ptr, sizeof(num_entries));
+            ptr += sizeof(num_entries);
+            if (num_entries > store.upper_points.size()) {
+                store.upper_points.resize(num_entries);
+            }
+            for (uint64_t i = 0; i < num_entries; i++) {
+                if (ptr + sizeof(uint32_t) * 2 + sizeof(uint64_t) > end) {
+                    break;
+                }
+                uint32_t id_val;
+                uint32_t lower_val;
+                uint64_t nbr_size;
+                std::memcpy(&id_val, ptr, sizeof(id_val)); ptr += sizeof(id_val);
+                std::memcpy(&lower_val, ptr, sizeof(lower_val)); ptr += sizeof(lower_val);
+                std::memcpy(&nbr_size, ptr, sizeof(nbr_size)); ptr += sizeof(nbr_size);
+                if (ptr + nbr_size * sizeof(uint32_t) > end) {
+                    break;
+                }
+                auto &up = store.upper_points[i];
+                up.id = id_val;
+                up.lower_layer_idx = lower_val;
+                up.neighbors_info.resize(nbr_size);
+                if (nbr_size) {
+                    std::memcpy(up.neighbors_info.data(), ptr, nbr_size * sizeof(uint32_t));
+                    ptr += nbr_size * sizeof(uint32_t);
+                }
+            }
+        }
+    }
 }
 
 } // namespace duckdb

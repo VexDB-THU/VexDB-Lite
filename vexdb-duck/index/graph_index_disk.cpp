@@ -281,6 +281,30 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
         info.options["upper_ptr_map"] = Value::BLOB(const_data_ptr_cast(upper_ptr_blob.data()), upper_ptr_blob.size());
     }
 
+    // Persist UpperPointRec fields. HNSWUpperLevel's segment only stores
+    // neighbor IDs per slot — cur_layer_idxs (the second half of neighbors_info)
+    // live exclusively in the in-memory copy and are needed for upper-layer
+    // descent, so we write them out alongside lower_layer_idx and id.
+    if (!store.upper_points.empty()) {
+        string upper_data_blob;
+        uint64_t num_entries = store.upper_points.size();
+        upper_data_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
+        for (auto &up : store.upper_points) {
+            uint32_t id_val = static_cast<uint32_t>(up.id);
+            uint32_t lower_val = static_cast<uint32_t>(up.lower_layer_idx);
+            upper_data_blob.append(reinterpret_cast<const char *>(&id_val), sizeof(id_val));
+            upper_data_blob.append(reinterpret_cast<const char *>(&lower_val), sizeof(lower_val));
+            uint64_t nbr_size = up.neighbors_info.size();
+            upper_data_blob.append(reinterpret_cast<const char *>(&nbr_size), sizeof(nbr_size));
+            if (nbr_size) {
+                upper_data_blob.append(reinterpret_cast<const char *>(up.neighbors_info.data()),
+                                       nbr_size * sizeof(uint32_t));
+            }
+        }
+        info.options["upper_points_data"] = Value::BLOB(const_data_ptr_cast(upper_data_blob.data()),
+                                                        upper_data_blob.size());
+    }
+
     return info;
 }
 

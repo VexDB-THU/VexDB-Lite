@@ -596,17 +596,7 @@ private:
     bool is_valid(T id) { return likely(id != (T)INVALID_VECTOR_ID); }
     int_fast8_t get_insert_level()
     {
-#if defined(PG_VEXDB_TARGET_DUCK)
-        // TODO: enabling true multi-level HNSW for the duck adapter exposes an
-        // assertion in select_neighbors<false> during BuildBulk — MemStore's
-        // upper-layer paths haven't been exercised yet. Until that's fixed,
-        // duck stays on the flat (level=0 only) graph. Recall after bulk
-        // delete + reinsert is mitigated by routing such workloads through
-        // SEQ_SCAN via vex_brute_force_threshold (see vex_optimizer.cpp).
-        return 0;
-#else
         return std::min<int_fast8_t>((-log(RandomDouble()) * (1 / log(m))), (GRAPH_INDEX_MAX_LEVEL - 1));
-#endif
     }
     template <bool is_base_layer> uint_fast16_t get_nbr_num() { return is_base_layer ? m * 2 : m; }
     bool check_insertable(const Cand &ep, const char *query)

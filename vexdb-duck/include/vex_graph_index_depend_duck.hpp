@@ -574,13 +574,10 @@ public:
             auto &bp = base_points[idx];
             return std::make_tuple(bp.neighbors.data(), idx, idx);
         } else {
-            if (upper_alloc_ && idx < upper_idx_to_ptr_.size()) {
-                auto ptr = upper_idx_to_ptr_[idx];
-                if (ptr.Get()) {
-                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
-                    return std::make_tuple(upper->GetNeighbors(0, m), upper->lower_layer_idx, upper->id);
-                }
-            }
+            // Same caveat as get_neighbors<false>: HNSWUpperLevel's on-disk segment
+            // only stores neighbor IDs (no cur_layer_idxs), but the algorithm reads
+            // `neighbors + m` as cur_layer_idxs. up.neighbors_info has the full
+            // [IDs | cur_layer_idxs] layout the algorithm expects, so read there.
             auto &up = upper_points[idx];
             return std::make_tuple(up.neighbors_info.data(), up.lower_layer_idx, up.id);
         }
@@ -617,26 +614,18 @@ public:
                 out.emplace_back(id, id, dists[i]);
             }
         } else {
-            T *neighbors = nullptr;
-            T *cur_layer_idxs = nullptr;
-            float *dists = nullptr;
-            
-            if (upper_alloc_ && cand.cur_layer_idx < upper_idx_to_ptr_.size()) {
-                auto ptr = upper_idx_to_ptr_[cand.cur_layer_idx];
-                if (ptr.Get()) {
-                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(ptr));
-                    neighbors = upper->GetNeighbors(0, m);
-                    cur_layer_idxs = neighbors + m;
-                }
-            }
-            
+            // HNSWUpperLevel's on-disk segment only stores neighbor IDs per layer
+            // slot (no cur_layer_idxs); cur_layer_idxs live exclusively in the
+            // in-memory up.neighbors_info second half. Reading from upper_alloc_
+            // and treating "neighbors + m" as cur_layer_idxs would land in the
+            // *next* layer's id array — bogus values that may collide with
+            // self.id and trip Assert(nbr.id != self.id) downstream. Always read
+            // from the in-memory authoritative copy.
             auto &up = upper_points[cand.cur_layer_idx];
-            if (!neighbors) {
-                neighbors = up.neighbors_info.data();
-                cur_layer_idxs = neighbors + m;
-            }
-            dists = up.dists.data();
-            
+            const T *neighbors = up.neighbors_info.data();
+            const T *cur_layer_idxs = neighbors + m;
+            const float *dists = up.dists.data();
+
             out.reserve(m);
             for (size_t i = 0; i < size_t(m); ++i) {
                 if (neighbors[i] == T(INVALID_VECTOR_ID)) {

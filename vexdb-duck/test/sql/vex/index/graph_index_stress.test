@@ -101,20 +101,6 @@ SELECT id FROM stress_vecs ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0]::FLOAT
 # =============================================================================
 # Phase 5: Multiple sequential searches with different query vectors
 # =============================================================================
-#
-# vexdb-duck currently runs HNSW as a flat (level=0) graph (see
-# get_insert_level() guard for PG_VEXDB_TARGET_DUCK in
-# include/graph_index/graph_index_algorithm.h). After bulk delete + reinsert
-# the flat graph's connectivity fragments — search from the entry point only
-# reaches a fraction of the kept nodes for far queries. ef_search doesn't
-# help because the unreachable component stays unreachable.
-#
-# Until multi-level HNSW is wired up on the duck adapter (MemStore upper-
-# layer paths need stabilization), bypass the index for this assertion via
-# SEQ_SCAN+ORDER_BY+LIMIT, which is exact.
-
-statement ok
-SET vex_brute_force_threshold = 100000;
 
 # Search 1: Near [10, 20, 30, 40] - should find id=1000
 query I
