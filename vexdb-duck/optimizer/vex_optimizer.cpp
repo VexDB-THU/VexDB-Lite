@@ -40,13 +40,13 @@ static const DistanceFuncEntry kDistanceFuncs[] = {
 
     {"inner_product", VexMetric::INNER_PRODUCT, false},
     {"<#>", VexMetric::INNER_PRODUCT, false},
+    {"<~>", VexMetric::INNER_PRODUCT, true},
     {"array_inner_product", VexMetric::INNER_PRODUCT, false},
     {"list_inner_product", VexMetric::INNER_PRODUCT, false},
     {"array_negative_inner_product", VexMetric::INNER_PRODUCT, true},
     {"list_negative_inner_product", VexMetric::INNER_PRODUCT, true},
 
     {"cosine_distance", VexMetric::COSINE, true},
-    {"<~>", VexMetric::COSINE, true},
     {"<=>", VexMetric::COSINE, true},
     {"array_cosine_distance", VexMetric::COSINE, true},
     {"list_cosine_distance", VexMetric::COSINE, true},

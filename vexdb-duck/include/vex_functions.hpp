@@ -17,11 +17,14 @@ struct VexFunctions {
     static ScalarFunctionSet GetL2DistanceListAlias();
     static ScalarFunctionSet GetInnerProductFunction();
     static ScalarFunctionSet GetInnerProductOperator();
+    static ScalarFunctionSet GetNegativeInnerProductOperator();
     static ScalarFunctionSet GetCosineDistanceFunction();
     static ScalarFunctionSet GetCosineDistanceOperator();
-    static ScalarFunctionSet GetCosineDistanceOperatorAlt();
 
     static ScalarFunctionSet GetVectorDimsFunction();
+    static ScalarFunctionSet GetVectorNormFunction();
+    static ScalarFunctionSet GetVectorAddFunction();
+    static ScalarFunctionSet GetVectorSubFunction();
     static ScalarFunctionSet GetL2NormalizeFunction();
 
     static void RegisterIndexInfoFunction(ExtensionLoader &loader);

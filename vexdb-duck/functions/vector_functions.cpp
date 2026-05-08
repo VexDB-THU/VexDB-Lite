@@ -143,6 +143,95 @@ static unique_ptr<FunctionData> BindL2Normalize(ClientContext &context, ScalarFu
     return nullptr;
 }
 
+static unique_ptr<FunctionData> BindBinaryArrayReturn(ClientContext &context, ScalarFunction &bound_function,
+                                                     vector<unique_ptr<Expression>> &arguments) {
+    if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN ||
+        arguments[1]->return_type.id() == LogicalTypeId::UNKNOWN) {
+        throw ParameterNotResolvedException();
+    }
+    auto &primary = arguments[0]->return_type.id() != LogicalTypeId::UNKNOWN ? *arguments[0] : *arguments[1];
+    auto resolved = ResolveToFloatArray(context, primary);
+    bound_function.arguments[0] = resolved;
+    bound_function.arguments[1] = resolved;
+    bound_function.return_type = resolved;
+    return nullptr;
+}
+
+static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    (void)state;
+    auto &vec = args.data[0];
+    auto count = args.size();
+    auto dim = ArrayType::GetSize(vec.GetType());
+
+    bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
+    vec.Flatten(count);
+    auto &child = ArrayVector::GetEntry(vec);
+    child.Flatten(count * dim);
+    auto data = FlatVector::GetData<float>(child);
+    auto &validity = FlatVector::Validity(vec);
+    auto result_data = FlatVector::GetData<double>(result);
+
+    for (idx_t i = 0; i < count; i++) {
+        if (!validity.RowIsValid(i)) {
+            FlatVector::SetNull(result, i, true);
+            continue;
+        }
+        const float *v = data + i * dim;
+        double sumsq = 0.0;
+        for (idx_t j = 0; j < dim; j++) {
+            sumsq += static_cast<double>(v[j]) * static_cast<double>(v[j]);
+        }
+        result_data[i] = std::sqrt(sumsq);
+    }
+    if (is_constant) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    }
+}
+
+template <bool subtract>
+static void VectorAddSubFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    (void)state;
+    auto &vec_a = args.data[0];
+    auto &vec_b = args.data[1];
+    auto count = args.size();
+    auto dim_a = ArrayType::GetSize(vec_a.GetType());
+    auto dim_b = ArrayType::GetSize(vec_b.GetType());
+    if (dim_a != dim_b) {
+        throw InvalidInputException("Vector dimension mismatch: %d vs %d", dim_a, dim_b);
+    }
+
+    bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
+                        vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
+    vec_a.Flatten(count);
+    vec_b.Flatten(count);
+    auto &child_a = ArrayVector::GetEntry(vec_a);
+    auto &child_b = ArrayVector::GetEntry(vec_b);
+    child_a.Flatten(count * dim_a);
+    child_b.Flatten(count * dim_b);
+    auto data_a = FlatVector::GetData<float>(child_a);
+    auto data_b = FlatVector::GetData<float>(child_b);
+    auto &validity_a = FlatVector::Validity(vec_a);
+    auto &validity_b = FlatVector::Validity(vec_b);
+    auto &child_out = ArrayVector::GetEntry(result);
+    auto data_out = FlatVector::GetData<float>(child_out);
+
+    for (idx_t i = 0; i < count; i++) {
+        if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {
+            FlatVector::SetNull(result, i, true);
+            continue;
+        }
+        const float *a = data_a + i * dim_a;
+        const float *b = data_b + i * dim_a;
+        float *out = data_out + i * dim_a;
+        for (idx_t j = 0; j < dim_a; j++) {
+            out[j] = subtract ? (a[j] - b[j]) : (a[j] + b[j]);
+        }
+    }
+    if (all_constant) {
+        result.SetVectorType(VectorType::CONSTANT_VECTOR);
+    }
+}
+
 ScalarFunctionSet VexFunctions::GetL2NormalizeFunction() {
     ScalarFunctionSet set("l2_normalize");
     set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::ARRAY(LogicalType::FLOAT, 1),
@@ -156,6 +245,39 @@ ScalarFunctionSet VexFunctions::GetVectorDimsFunction() {
     ScalarFunctionSet set("vector_dims");
     set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput));
     set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::INTEGER, VectorDimsFunction, BindResolveInput));
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetVectorNormFunction() {
+    ScalarFunctionSet set("vector_norm");
+    set.AddFunction(ScalarFunction({LogicalType::ANY}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput));
+    set.AddFunction(ScalarFunction({LogicalType::VARCHAR}, LogicalType::DOUBLE, VectorNormFunction, BindResolveInput));
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetVectorAddFunction() {
+    ScalarFunctionSet set("vector_add");
+    set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY,
+                                   VectorAddSubFunction<false>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
+                                   VectorAddSubFunction<false>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
+                                   VectorAddSubFunction<false>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY,
+                                   VectorAddSubFunction<false>, BindBinaryArrayReturn));
+    return set;
+}
+
+ScalarFunctionSet VexFunctions::GetVectorSubFunction() {
+    ScalarFunctionSet set("vector_sub");
+    set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::ANY,
+                                   VectorAddSubFunction<true>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
+                                   VectorAddSubFunction<true>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::ANY,
+                                   VectorAddSubFunction<true>, BindBinaryArrayReturn));
+    set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::ANY,
+                                   VectorAddSubFunction<true>, BindBinaryArrayReturn));
     return set;
 }
 

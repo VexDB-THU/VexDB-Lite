@@ -181,8 +181,26 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         }
         // vexdb-duck does not yet implement PQ; option is accepted for compatibility but ignored.
     }
-    // Reject unknown options.
-    static const char *known_options[] = {"m", "ef_construction", "metric", "threads", "quantizer", "pq_m"};
+    auto max_dedup_it = input.options.find("max_dedup");
+    if (max_dedup_it != input.options.end()) {
+        int max_dedup_val = 0;
+        try {
+            max_dedup_val = max_dedup_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+        } catch (...) {
+            throw InvalidInputException("GRAPH_INDEX option 'max_dedup' must be a valid integer");
+        }
+        if (max_dedup_val < 1) {
+            throw InvalidInputException("GRAPH_INDEX option 'max_dedup' must be >= 1, got %d", max_dedup_val);
+        }
+        // The duck adapter's insert_tid path already coalesces identical vectors;
+        // the per-node tids cap implied by max_dedup is accepted but not yet enforced.
+    }
+    // Reject unknown options. max_dedup is accepted for compatibility — the duck
+    // adapter's insert_tid path already coalesces identical vectors into one graph
+    // node (dedup), but the per-node tids cap implied by the option is not yet
+    // enforced (see project_multi_backend.md follow-ups).
+    static const char *known_options[] = {"m", "ef_construction", "metric", "threads",
+                                          "quantizer", "pq_m", "max_dedup"};
     for (auto &kv : input.options) {
         bool ok = false;
         for (auto *known : known_options) {
@@ -256,10 +274,42 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
     return create_idx;
 }
 
+// Normalize a single vector in-place to unit L2 length. Used for cosine indexes
+// so that the algorithm's apply_arrangement byte-equality check (used to detect
+// duplicate vectors for dedup) sees the same form as what MemStore::add_vector
+// stores — without this, raw input bytes never match the stored normalized bytes
+// and dedup fails for cosine metric.
+static void NormalizeInPlace(float *vec, idx_t dim) {
+    float norm2 = 0.0f;
+    for (idx_t i = 0; i < dim; i++) {
+        norm2 += vec[i] * vec[i];
+    }
+    if (norm2 > 0.0f) {
+        float inv = 1.0f / std::sqrt(norm2);
+        for (idx_t i = 0; i < dim; i++) {
+            vec[i] *= inv;
+        }
+    }
+}
+
 void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids) {
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_);
-    runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
+
+    // For cosine: normalize once at the adapter, then tell store NOT to normalize
+    // again. Double-normalizing causes float-precision drift in the rounding of
+    // sqrt(sum-of-squares) back through float32, so already-unit input ends up
+    // byte-different from its second-pass copy. apply_arrangement's memcmp-based
+    // dedup needs ctx.query and the stored vector to be byte-identical.
+    std::vector<float> normalized;
+    if (metric_ == VexMetric::COSINE) {
+        runtime_->store.normalize_vectors_ = false;
+        normalized = vectors;
+        for (idx_t i = 0; i < row_ids.size(); i++) {
+            NormalizeInPlace(normalized.data() + i * dimension_, dimension_);
+        }
+    }
+    const float *src = (metric_ == VexMetric::COSINE) ? normalized.data() : vectors.data();
 
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, runtime_->store, [&](auto &algo) {
         using AlgoT = std::decay_t<decltype(algo)>;
@@ -267,7 +317,7 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
             PointExtensionContext point_ctx;
             ItemPointerData tid;
             tid.row_id = row_ids[i];
-            const char *query = reinterpret_cast<const char *>(vectors.data() + i * dimension_);
+            const char *query = reinterpret_cast<const char *>(src + i * dimension_);
             typename AlgoT::InsertContextBase insert_ctx(point_ctx, query, &tid);
             algo.insert(insert_ctx);
         }
@@ -480,7 +530,37 @@ idx_t GraphIndex::GetNodeCount() const {
     if (!runtime_) {
         return 0;
     }
-    return runtime_->store.elems.size();
+    if (deleted_rids_.empty()) {
+        return runtime_->store.elems.size();
+    }
+    // A node is "live" if at least one of its tracked row_ids has not been deleted.
+    // Without dedup this collapses to "node_count == row_id_count"; with dedup a
+    // node may carry many row_ids and survives until the last one is deleted.
+    idx_t live = 0;
+    for (auto &elem : runtime_->store.elems) {
+        for (auto &tid : elem.tids) {
+            if (deleted_rids_.find(tid.row_id) == deleted_rids_.end()) {
+                live++;
+                break;
+            }
+        }
+    }
+    return live;
+}
+
+idx_t GraphIndex::GetRowIdCount() const {
+    if (!runtime_) {
+        return 0;
+    }
+    idx_t total = 0;
+    for (auto &elem : runtime_->store.elems) {
+        for (auto &tid : elem.tids) {
+            if (deleted_rids_.find(tid.row_id) == deleted_rids_.end()) {
+                total++;
+            }
+        }
+    }
+    return total;
 }
 
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {

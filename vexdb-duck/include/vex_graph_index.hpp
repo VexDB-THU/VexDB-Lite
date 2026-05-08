@@ -62,6 +62,7 @@ public:
     }
 
     idx_t GetNodeCount() const;
+    idx_t GetRowIdCount() const;
 
 public:
     ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;

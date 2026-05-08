@@ -97,6 +97,14 @@ static void InnerProductFunction(DataChunk &args, ExpressionState &state, Vector
     DistanceFunctionImpl(args, state, result, ip_func);
 }
 
+// `<~>` returns -dot, matching pgvector-style "lower = more similar" so that
+// ORDER BY a <~> b ASC sorts most-similar first. Alias of the negative-inner-
+// product metric, mirrors the operator main exposes for vexdb users.
+static void NegativeInnerProductFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    static const auto neg_ip_func = GetRawDistanceFunc(Metric::INNER_PRODUCT);
+    DistanceFunctionImpl(args, state, result, neg_ip_func);
+}
+
 static void CosineDistanceFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     static const auto neg_cos_func = GetRawDistanceFunc(Metric::COSINE);
     auto cos_dist_func = [](const void *xx, const void *yy, uint16 dim) -> float {
@@ -164,12 +172,6 @@ ScalarFunctionSet VexFunctions::GetCosineDistanceFunction() {
 }
 
 ScalarFunctionSet VexFunctions::GetCosineDistanceOperator() {
-    ScalarFunctionSet set("<~>");
-    AddDistanceOverloads(set, CosineDistanceFunction);
-    return set;
-}
-
-ScalarFunctionSet VexFunctions::GetCosineDistanceOperatorAlt() {
     ScalarFunctionSet set("<=>");
     AddDistanceOverloads(set, CosineDistanceFunction);
     return set;
@@ -181,6 +183,12 @@ ScalarFunctionSet VexFunctions::GetInnerProductOperator() {
     return set;
 }
 
+ScalarFunctionSet VexFunctions::GetNegativeInnerProductOperator() {
+    ScalarFunctionSet set("<~>");
+    AddDistanceOverloads(set, NegativeInnerProductFunction);
+    return set;
+}
+
 void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2DistanceFunction());
     loader.RegisterFunction(GetL2DistanceOperator());
@@ -188,10 +196,13 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2DistanceListAlias());
     loader.RegisterFunction(GetInnerProductFunction());
     loader.RegisterFunction(GetInnerProductOperator());
+    loader.RegisterFunction(GetNegativeInnerProductOperator());
     loader.RegisterFunction(GetCosineDistanceFunction());
     loader.RegisterFunction(GetCosineDistanceOperator());
-    loader.RegisterFunction(GetCosineDistanceOperatorAlt());
     loader.RegisterFunction(GetVectorDimsFunction());
+    loader.RegisterFunction(GetVectorNormFunction());
+    loader.RegisterFunction(GetVectorAddFunction());
+    loader.RegisterFunction(GetVectorSubFunction());
     loader.RegisterFunction(GetL2NormalizeFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));

@@ -139,7 +139,7 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
             e.node_count      = static_cast<int64_t>(graph_idx.GetNodeCount());
             e.max_level       = 0;
             e.dimension       = static_cast<int32_t>(graph_idx.GetDimension());
-            e.row_id_map_size = e.node_count;
+            e.row_id_map_size = static_cast<int64_t>(graph_idx.GetRowIdCount());
             e.m               = graph_idx.GetM();
             e.ef_construction = graph_idx.GetEfConstruction();
             e.metric          = MetricToString(graph_idx.GetMetric());
