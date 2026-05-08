@@ -1,9 +1,7 @@
 # name: test/sql/vex/index/graph_index_recall_vs_brute.test
-# description: ANN top-k must agree with exact brute-force top-k on a synthetic
-#              workload exercising the multi-level HNSW path enabled in commit
-#              4ba3f22a33. Run multiple delete batches between queries so the
-#              repair_entry path (commit 6ebc7832fa) is exercised across more
-#              than one entry-node migration.
+# description: ANN top-k must agree with exact brute-force top-k across multiple
+#              delete batches — exercises multi-level HNSW navigation and entry
+#              re-election after the row backing the entry node is deleted.
 # group: [vex]
 
 require vex

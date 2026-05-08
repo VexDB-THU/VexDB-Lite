@@ -1,8 +1,6 @@
 # name: test/sql/vex/index/graph_index_bf_threshold_correctness.test
 # description: vex_brute_force_threshold high enough to bypass the index must
-#              return EXACTLY the same rows as a no-index seq scan. Targets
-#              the optimizer-skip path added in commit 10c5251064 — previously
-#              the setting was cosmetic and only surfaced in EXPLAIN.
+#              return EXACTLY the same rows as a no-index seq scan.
 # group: [vex]
 
 require vex
