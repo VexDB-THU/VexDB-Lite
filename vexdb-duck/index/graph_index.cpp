@@ -290,6 +290,37 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
 
     bool has_deleted = !deleted_rids_.empty();
+
+    // If the graph entry node has been deleted, search starting from it can wander
+    // into a stale subgraph (its neighbor links may all point to other deleted
+    // nodes). Detect that case and let the algorithm pick a fresh entry from the
+    // upper layers before searching. Building the internal-id deleted set is O(N)
+    // so we only do it when the entry is actually deleted, which is rare.
+    if (has_deleted && store.entry_info.id != INVALID_VECTOR_ID &&
+        store.entry_info.id < store.elems.size()) {
+        bool entry_deleted = false;
+        for (auto &tid : store.elems[store.entry_info.id].tids) {
+            if (deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
+                entry_deleted = true;
+                break;
+            }
+        }
+        if (entry_deleted) {
+            UnorderedSet<size_t> deleted_internal;
+            for (size_t id = 0; id < store.elems.size(); id++) {
+                for (auto &tid : store.elems[id].tids) {
+                    if (deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
+                        deleted_internal.insert(id);
+                        break;
+                    }
+                }
+            }
+            RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
+                algo.repair_entry(deleted_internal);
+            });
+        }
+    }
+
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
         auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
         for (idx_t i = 0; i < res.first.size() && row_ids.size() < k; i++) {

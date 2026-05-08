@@ -464,7 +464,6 @@ retry:
         }
     }
 
-#if !defined(PG_VEXDB_TARGET_DUCK)
     void repair_entry(const UnorderedSet<size_t> &deleted)
     {
         /* acquire exclusive lock forcefully */
@@ -508,6 +507,7 @@ retry:
         store.release_entry_lock(shared_lock);
     }
 
+#if !defined(PG_VEXDB_TARGET_DUCK)
     void repair_graph_parallel(RepairGraphSharedState &ss)
     {
         CONSTEXPR_IF (use_dist_cache) {
