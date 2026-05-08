@@ -305,6 +305,39 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
                                                         upper_data_blob.size());
     }
 
+    if (pq_use_) {
+        info.options["pq_m"] = Value::UINTEGER(pq_quantizer_.m);
+        info.options["pq_dim"] = Value::UINTEGER(pq_quantizer_.d);
+
+        // Codebook: m * KSUB * dsub floats. Pin layout in case future versions
+        // change the in-memory shape — write dimensions inline so reload doesn't
+        // have to reconstruct from pq_m alone.
+        string codebook_blob;
+        uint64_t centroids_n = pq_quantizer_.centroids.size();
+        codebook_blob.append(reinterpret_cast<const char *>(&centroids_n), sizeof(centroids_n));
+        codebook_blob.append(reinterpret_cast<const char *>(pq_quantizer_.centroids.data()),
+                             centroids_n * sizeof(float));
+        info.options["pq_codebook"] = Value::BLOB(const_data_ptr_cast(codebook_blob.data()),
+                                                  codebook_blob.size());
+
+        // Codes are indexed by row_id sort order; persist the order alongside the
+        // bytes so reload can reconstruct the row → code-slot mapping.
+        string codes_blob;
+        uint64_t codes_n = pq_codes_.size();
+        codes_blob.append(reinterpret_cast<const char *>(&codes_n), sizeof(codes_n));
+        codes_blob.append(reinterpret_cast<const char *>(pq_codes_.data()), codes_n);
+        info.options["pq_codes"] = Value::BLOB(const_data_ptr_cast(codes_blob.data()), codes_blob.size());
+
+        string order_blob;
+        uint64_t order_n = pq_row_id_order_.size();
+        order_blob.append(reinterpret_cast<const char *>(&order_n), sizeof(order_n));
+        for (auto &rid : pq_row_id_order_) {
+            int64_t v = static_cast<int64_t>(rid);
+            order_blob.append(reinterpret_cast<const char *>(&v), sizeof(v));
+        }
+        info.options["pq_row_order"] = Value::BLOB(const_data_ptr_cast(order_blob.data()), order_blob.size());
+    }
+
     return info;
 }
 

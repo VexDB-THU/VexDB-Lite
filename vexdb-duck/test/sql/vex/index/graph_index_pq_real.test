@@ -1,0 +1,107 @@
+# name: test/sql/vex/index/graph_index_pq_real.test
+# description: Verify PQ is actually wired up — vex_index_info() reflects training,
+#              codebook + codes consume real bytes, and PQ state survives restart.
+# group: [vex]
+
+require vex
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+load __TEST_DIR__/pq_real.db
+
+statement ok
+CREATE TABLE pq_t (id INTEGER, vec FLOAT[8]);
+
+# 500 rows — well above ProductQuantizer::MIN_TRAINING_POINTS (256).
+statement ok
+INSERT INTO pq_t SELECT i,
+    [(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,
+     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_plain ON pq_t USING GRAPH_INDEX (vec);
+
+statement ok
+CREATE INDEX idx_pq ON pq_t USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# 1) PQ index reports use_pq = true; plain reports false.
+query I
+SELECT use_pq FROM vex_index_info() WHERE index_name = 'idx_plain';
+----
+false
+
+query I
+SELECT use_pq FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+true
+
+# 2) pq_m round-trips through CREATE INDEX.
+query I
+SELECT pq_m FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+4
+
+# 3) Codebook size = m * 256 * dsub * 4 bytes = 4 * 256 * 2 * 4 = 8192.
+query I
+SELECT pq_codebook_bytes FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+8192
+
+# 4) Codes size = node_count * m bytes = 500 * 4 = 2000.
+query I
+SELECT pq_codes_bytes FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+2000
+
+# 5) Plain index has zero PQ overhead.
+query II
+SELECT pq_codebook_bytes, pq_codes_bytes FROM vex_index_info() WHERE index_name = 'idx_plain';
+----
+0	0
+
+# 6) Search must still produce correct top-1 with PQ index. Query is the
+#    exact vec for i=100, so id=100 wins regardless of PQ approximation.
+query I
+SELECT id FROM pq_t ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+100
+
+# 7) Persistence — codebook + codes must survive restart.
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+query I
+SELECT use_pq FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+true
+
+query I
+SELECT pq_m FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+4
+
+query I
+SELECT pq_codebook_bytes FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+8192
+
+query I
+SELECT pq_codes_bytes FROM vex_index_info() WHERE index_name = 'idx_pq';
+----
+2000
+
+# 8) Search still works after restart.
+query I
+SELECT id FROM pq_t ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+100
+
+statement ok
+DROP TABLE pq_t;

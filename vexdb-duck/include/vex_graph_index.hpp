@@ -6,6 +6,7 @@
 
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
+#include "vex_quantizer.hpp"
 
 #include <unordered_set>
 
@@ -42,7 +43,7 @@ public:
                const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
-               idx_t vec_column_index);
+               idx_t vec_column_index, uint32_t pq_m = 0);
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
@@ -63,6 +64,10 @@ public:
 
     idx_t GetNodeCount() const;
     idx_t GetRowIdCount() const;
+    bool UsesPQ() const { return pq_use_; }
+    uint32_t GetPQM() const { return pq_use_ ? pq_quantizer_.m : 0; }
+    idx_t GetPQCodesBytes() const { return pq_codes_.size(); }
+    idx_t GetPQCodebookBytes() const { return pq_quantizer_.centroids.size() * sizeof(float); }
 
 public:
     ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -90,6 +95,7 @@ private:
     std::string BuildDiskImage() const;
     void LoadFromDiskImage(const std::string &blob);
     void DeserializeFromStorage(const IndexStorageInfo &info);
+    void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
 
     idx_t dimension_;
     int m_;
@@ -99,6 +105,16 @@ private:
 
     std::unique_ptr<GraphIndexRuntimeState> runtime_;
     std::unordered_set<row_t> deleted_rids_;
+
+    // Product Quantization state. pq_m_ = 0 / pq_use_ = false means PQ disabled.
+    // Once Train() runs (after BuildBulk completes), pq_quantizer_.trained = true
+    // and pq_codes_ holds m bytes per row, indexed by row_id sort order so reload
+    // can restore the alignment.
+    uint32_t pq_m_ = 0;
+    bool pq_use_ = false;
+    vex::ProductQuantizer pq_quantizer_;
+    std::vector<uint8_t> pq_codes_;
+    std::vector<row_t> pq_row_id_order_;
 };
 
 } // namespace duckdb

@@ -140,18 +140,18 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
             e.max_level       = 0;
             e.dimension       = static_cast<int32_t>(graph_idx.GetDimension());
             e.row_id_map_size = static_cast<int64_t>(graph_idx.GetRowIdCount());
+            e.use_pq          = graph_idx.UsesPQ();
+            e.pq_m            = static_cast<int32_t>(graph_idx.GetPQM());
+            e.pq_codes_bytes  = static_cast<int64_t>(graph_idx.GetPQCodesBytes());
+            e.pq_codebook_bytes = static_cast<int64_t>(graph_idx.GetPQCodebookBytes());
             e.m               = graph_idx.GetM();
             e.ef_construction = graph_idx.GetEfConstruction();
             e.metric          = MetricToString(graph_idx.GetMetric());
-            e.use_pq          = false;
-            e.pq_m            = 0;
             {
                 IndexLock mem_lock;
                 graph_idx.InitializeLock(mem_lock);
                 e.memory_bytes = static_cast<int64_t>(graph_idx.GetInMemorySize(mem_lock));
             }
-            e.pq_codes_bytes    = 0;
-            e.pq_codebook_bytes = 0;
             e.memory_mode       = "memory";
             state->entries.push_back(std::move(e));
             break;

@@ -73,10 +73,10 @@ VexMetric ParseMetric(const string &metric_name) {
 GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
                        TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
                        AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
-                       idx_t vec_column_index)
+                       idx_t vec_column_index, uint32_t pq_m)
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
       dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
-      vec_column_index_(vec_column_index),
+      vec_column_index_(vec_column_index), pq_m_(pq_m),
       runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)) {
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
 }
@@ -168,6 +168,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         }
         // vexdb-duck currently builds single-threaded; the option is accepted but ignored.
     }
+    uint32_t pq_m = 0;
     auto pq_m_it = input.options.find("pq_m");
     if (pq_m_it != input.options.end()) {
         int pq_m_val = 0;
@@ -179,7 +180,25 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         if (pq_m_val < 0) {
             throw InvalidInputException("GRAPH_INDEX option 'pq_m' must be >= 0, got %d", pq_m_val);
         }
-        // vexdb-duck does not yet implement PQ; option is accepted for compatibility but ignored.
+        pq_m = static_cast<uint32_t>(pq_m_val);
+    }
+    auto quantizer_it = input.options.find("quantizer");
+    if (quantizer_it != input.options.end()) {
+        auto qstr = StringUtil::Lower(quantizer_it->second.ToString());
+        if (qstr == "pq") {
+            if (pq_m == 0) {
+                pq_m = vex::ProductQuantizer::AutoSelectM(static_cast<uint32_t>(dimension));
+            }
+        } else if (qstr == "none" || qstr.empty()) {
+            pq_m = 0;
+        } else {
+            throw InvalidInputException("GRAPH_INDEX got unknown quantizer '%s' (expected 'pq' or 'none')",
+                                        quantizer_it->second.ToString());
+        }
+    }
+    if (pq_m > 0 && dimension % pq_m != 0) {
+        throw InvalidInputException("GRAPH_INDEX: pq_m (%u) must divide dimension (%llu)",
+                                    pq_m, static_cast<unsigned long long>(dimension));
     }
     auto max_dedup_it = input.options.find("max_dedup");
     if (max_dedup_it != input.options.end()) {
@@ -213,7 +232,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
-                                             metric, 0);
+                                             metric, 0, pq_m);
 
     if (input.storage_info.allocator_infos.size() >= 3) {
         // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
@@ -322,6 +341,37 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
             algo.insert(insert_ctx);
         }
     });
+
+    if (pq_m_ > 0 && row_ids.size() >= vex::ProductQuantizer::MIN_TRAINING_POINTS) {
+        TrainAndEncodePQ(src, row_ids);
+    }
+}
+
+void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids) {
+    pq_quantizer_.Init(static_cast<uint32_t>(dimension_), pq_m_);
+    pq_quantizer_.Train(vec_data, static_cast<uint32_t>(row_ids.size()));
+    if (!pq_quantizer_.trained) {
+        return;
+    }
+    pq_use_ = true;
+
+    // Index codes by ascending row_id so the layout is stable across reloads.
+    pq_row_id_order_ = row_ids;
+    std::sort(pq_row_id_order_.begin(), pq_row_id_order_.end());
+
+    // Build row_id → original index map so we can fetch the right source vector.
+    std::unordered_map<row_t, idx_t> rid_to_idx;
+    rid_to_idx.reserve(row_ids.size());
+    for (idx_t i = 0; i < row_ids.size(); i++) {
+        rid_to_idx[row_ids[i]] = i;
+    }
+
+    auto code_size = pq_quantizer_.CodeSize();
+    pq_codes_.assign(pq_row_id_order_.size() * code_size, 0);
+    for (idx_t i = 0; i < pq_row_id_order_.size(); i++) {
+        auto src_idx = rid_to_idx[pq_row_id_order_[i]];
+        pq_quantizer_.Encode(vec_data + src_idx * dimension_, pq_codes_.data() + i * code_size);
+    }
 }
 
 void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
@@ -764,6 +814,56 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 }
             }
         }
+    }
+
+    auto pq_m_it = info.options.find("pq_m");
+    auto pq_dim_it = info.options.find("pq_dim");
+    auto pq_codebook_it = info.options.find("pq_codebook");
+    auto pq_codes_it = info.options.find("pq_codes");
+    auto pq_order_it = info.options.find("pq_row_order");
+    if (pq_m_it != info.options.end() && pq_dim_it != info.options.end() &&
+        pq_codebook_it != info.options.end() && pq_codes_it != info.options.end() &&
+        pq_order_it != info.options.end()) {
+        pq_m_ = pq_m_it->second.GetValue<uint32_t>();
+        pq_quantizer_.Init(pq_dim_it->second.GetValue<uint32_t>(), pq_m_);
+
+        auto cb_blob = StringValue::Get(pq_codebook_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *p = cb_blob.data();
+        const char *end = p + cb_blob.size();
+        if (p + sizeof(uint64_t) <= end) {
+            uint64_t cn;
+            std::memcpy(&cn, p, sizeof(cn)); p += sizeof(cn);
+            if (cn == pq_quantizer_.centroids.size() && p + cn * sizeof(float) <= end) {
+                std::memcpy(pq_quantizer_.centroids.data(), p, cn * sizeof(float));
+                pq_quantizer_.trained = true;
+            }
+        }
+
+        auto codes_blob = StringValue::Get(pq_codes_it->second.DefaultCastAs(LogicalType::BLOB));
+        p = codes_blob.data(); end = p + codes_blob.size();
+        if (p + sizeof(uint64_t) <= end) {
+            uint64_t n;
+            std::memcpy(&n, p, sizeof(n)); p += sizeof(n);
+            if (p + n <= end) {
+                pq_codes_.assign(p, p + n);
+            }
+        }
+
+        auto order_blob = StringValue::Get(pq_order_it->second.DefaultCastAs(LogicalType::BLOB));
+        p = order_blob.data(); end = p + order_blob.size();
+        if (p + sizeof(uint64_t) <= end) {
+            uint64_t n;
+            std::memcpy(&n, p, sizeof(n)); p += sizeof(n);
+            pq_row_id_order_.clear();
+            pq_row_id_order_.reserve(n);
+            for (uint64_t i = 0; i < n && p + sizeof(int64_t) <= end; i++) {
+                int64_t v;
+                std::memcpy(&v, p, sizeof(v)); p += sizeof(v);
+                pq_row_id_order_.push_back(static_cast<row_t>(v));
+            }
+        }
+
+        pq_use_ = pq_quantizer_.trained && !pq_codes_.empty();
     }
 }
 

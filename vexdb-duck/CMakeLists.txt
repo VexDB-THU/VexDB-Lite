@@ -42,6 +42,7 @@ set(VEXDB_DUCK_EXTENSION_FILES
     optimizer/vex_optimizer.cpp
     optimizer/vex_physical_create_index.cpp
     optimizer/vex_physical_index_scan.cpp
+    quantizer/product_quantizer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/architecture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/general_dispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
