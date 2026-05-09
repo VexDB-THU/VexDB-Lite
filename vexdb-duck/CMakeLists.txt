@@ -42,12 +42,22 @@ set(VEXDB_DUCK_EXTENSION_FILES
     optimizer/vex_optimizer.cpp
     optimizer/vex_physical_create_index.cpp
     optimizer/vex_physical_index_scan.cpp
-    quantizer/product_quantizer.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../quantizer/pq_alloc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../quantizer/annkmeans.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../quantizer/product_quantizer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/architecture.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/general_dispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
+    # PQ-specific SIMD primitives (fvec_L2sqr_ny / distance_*_code_*) — needed
+    # by the dispatchers in pq_dispatcher.cpp. Each file instantiates the
+    # backend-neutral templates with a different DISTANCE_FUNC_NAME prefix.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/general.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/sse.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/avx.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/avx512.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/pq_dispatcher.cpp
 )
 
 build_static_extension(vex ${VEXDB_DUCK_EXTENSION_FILES})
@@ -60,11 +70,14 @@ target_compile_features(vex_loadable_extension PRIVATE cxx_std_17)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/sse.cpp
         PROPERTIES COMPILE_FLAGS "-msse4.1 -msse4.2 -mfma -mf16c -Wno-ignored-attributes")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/avx.cpp
         PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -mf16c -Wno-ignored-attributes")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/duck/avx512.cpp
         PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512vl -mf16c -Wno-ignored-attributes")
 endif()

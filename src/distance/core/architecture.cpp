@@ -94,5 +94,6 @@ bool ann_helper::is_arch_available(Arch arch, Metric m, DistPrecisionType dt)
 
 Arch ann_helper::get_best_arch()
 {
-    return get_best_arch(Metric::L2, DistPrecisionType::FLOAT, 0);
+    static const Arch cached = get_best_arch(Metric::L2, DistPrecisionType::FLOAT, 0);
+    return cached;
 }
