@@ -6,7 +6,7 @@
 
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
-#include "vex_quantizer.hpp"
+#include "quantizer/product_quantizer.h"
 
 #include <unordered_set>
 
@@ -43,11 +43,19 @@ public:
                const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
-               idx_t vec_column_index, uint32_t pq_m = 0);
+               idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false);
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
+    // Brute-force scan over PQ codes using a precomputed distance table. Skips
+    // the HNSW graph entirely; result is approximate but the per-row cost is
+    // an M-byte lookup vs a dim-float dot product, so this is faster than a
+    // raw seq_scan for indexes that fit in memory.
+    // refine_factor > 1.0 takes top k*factor by PQ distance then re-ranks via
+    // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
+    void SearchPQ(const float *query_vec, idx_t k, std::vector<row_t> &row_ids,
+                  std::vector<float> &distances, double refine_factor = 1.0) const;
 
     idx_t GetDimension() const {
         return dimension_;
@@ -65,9 +73,12 @@ public:
     idx_t GetNodeCount() const;
     idx_t GetRowIdCount() const;
     bool UsesPQ() const { return pq_use_; }
-    uint32_t GetPQM() const { return pq_use_ ? pq_quantizer_.m : 0; }
+    uint32_t GetPQM() const { return pq_use_ ? static_cast<uint32_t>(pq_quantizer_.M) : 0u; }
     idx_t GetPQCodesBytes() const { return pq_codes_.size(); }
-    idx_t GetPQCodebookBytes() const { return pq_quantizer_.centroids.size() * sizeof(float); }
+    idx_t GetPQCodebookBytes() const {
+        return pq_use_ ? pq_quantizer_.get_centroids_size() * sizeof(float) : 0u;
+    }
+    bool IsCompactMode() const { return compact_mode_; }
 
 public:
     ErrorData Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
@@ -112,9 +123,23 @@ private:
     // can restore the alignment.
     uint32_t pq_m_ = 0;
     bool pq_use_ = false;
-    vex::ProductQuantizer pq_quantizer_;
+    ::vex::quantizer::ProductQuantizer pq_quantizer_;
     std::vector<uint8_t> pq_codes_;
     std::vector<row_t> pq_row_id_order_;
+
+    // memory_mode='compact' (PQ-only). After BuildBulk + TrainAndEncodePQ
+    // releases the raw vector tier, SearchANN refuses to run and post-build
+    // INSERTs encode into pq_codes_ without traversing the (now-broken) HNSW
+    // graph. Persisted across CommitDrop / Vacuum / Reload.
+    bool compact_mode_ = false;
+
+    // Lazy row_id → store_id index used by SearchPQ refine. Built on first
+    // refine query, invalidated on Append / Delete / CommitDrop.
+    mutable std::unordered_map<row_t, uint32_t> pq_refine_rid_map_;
+    mutable bool pq_refine_rid_map_dirty_ = true;
+
+    // Free the raw vector tier and clear the in-memory copy. Idempotent.
+    void ReleaseRawVectors();
 };
 
 } // namespace duckdb

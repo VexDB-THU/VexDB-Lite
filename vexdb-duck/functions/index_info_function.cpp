@@ -152,7 +152,7 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
                 graph_idx.InitializeLock(mem_lock);
                 e.memory_bytes = static_cast<int64_t>(graph_idx.GetInMemorySize(mem_lock));
             }
-            e.memory_mode       = "memory";
+            e.memory_mode       = graph_idx.IsCompactMode() ? "compact" : "full";
             state->entries.push_back(std::move(e));
             break;
         }

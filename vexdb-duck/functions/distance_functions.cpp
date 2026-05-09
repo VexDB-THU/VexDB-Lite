@@ -2,6 +2,7 @@
 
 #include "distance/core/distance.h"
 #include "distance/core/distance_dispatcher.h"
+#include "distance/core/distance_utils_core.h"
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types/vector.hpp"
@@ -124,7 +125,50 @@ static void VexTestVec3Function(DataChunk &args, ExpressionState &state, Vector 
     result.SetVectorType(VectorType::CONSTANT_VECTOR);
 }
 
+static const char *ArchToName(Arch arch) {
+    switch (arch) {
+#if COMPILER_SUPPORT_SSE
+        case Arch::SSE: return "SSE";
+#endif
+#if COMPILER_SUPPORT_AVX
+        case Arch::AVX: return "AVX";
+#endif
+#if COMPILER_SUPPORT_AVX512
+        case Arch::AVX512: return "AVX512";
+#endif
+#if COMPILER_SUPPORT_NEON
+        case Arch::NEONV8: return "NEONV8";
+#endif
+#if COMPILER_SUPPORT_SVE
+        case Arch::SVEV8: return "SVEV8";
+#endif
+#if COMPILER_SUPPORT_SVE2
+        case Arch::SVE2V8: return "SVE2V8";
+#endif
+        case Arch::GENERAL: return "GENERAL";
+        default: return "UNKNOWN";
+    }
+}
+
+static void VexSimdArchFunction(DataChunk &args, ExpressionState &state, Vector &result) {
+    (void)args;
+    (void)state;
+    static const Value cached(ArchToName(ann_helper::get_best_arch()));
+    result.SetValue(0, cached);
+    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
+
 static void AddDistanceOverloads(ScalarFunctionSet &set, scalar_function_t func) {
+    // Explicit ARRAY(FLOAT, ANY) overload wins binder precedence over both
+    // upstream's array_distance and the ARRAY→LIST implicit cast that
+    // routes `<->` to list_distance — both upstream paths reject column-
+    // level NULL rows (their child-validity scan flags the flattened NULL
+    // children of a NULL parent). Our DistanceFunctionImpl checks parent
+    // validity per-row and emits NULL output, which is the SQL-correct
+    // behavior.
+    const auto array_any = LogicalType::ARRAY(LogicalType::FLOAT, optional_idx());
+    set.AddFunction(ScalarFunction({array_any, array_any}, LogicalType::FLOAT, func,
+                                   BindDistanceFunction));
     set.AddFunction(ScalarFunction({LogicalType::ANY, LogicalType::ANY}, LogicalType::FLOAT, func,
                                    BindDistanceFunction));
     set.AddFunction(ScalarFunction({LogicalType::VARCHAR, LogicalType::VARCHAR}, LogicalType::FLOAT, func,
@@ -206,6 +250,8 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(GetL2NormalizeFunction());
     loader.RegisterFunction(ScalarFunction("vex_testvec3", {}, LogicalType::ARRAY(LogicalType::FLOAT, 3),
                                            VexTestVec3Function));
+    loader.RegisterFunction(ScalarFunction("vex_simd_arch", {}, LogicalType::VARCHAR,
+                                           VexSimdArchFunction));
     RegisterIndexInfoFunction(loader);
 }
 

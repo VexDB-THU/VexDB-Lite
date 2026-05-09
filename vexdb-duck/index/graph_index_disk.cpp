@@ -306,16 +306,16 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     }
 
     if (pq_use_) {
-        info.options["pq_m"] = Value::UINTEGER(pq_quantizer_.m);
-        info.options["pq_dim"] = Value::UINTEGER(pq_quantizer_.d);
+        info.options["pq_m"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.M));
+        info.options["pq_dim"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.d));
 
-        // Codebook: m * KSUB * dsub floats. Pin layout in case future versions
+        // Codebook: M * ksub * dsub floats. Pin layout in case future versions
         // change the in-memory shape — write dimensions inline so reload doesn't
         // have to reconstruct from pq_m alone.
         string codebook_blob;
-        uint64_t centroids_n = pq_quantizer_.centroids.size();
+        uint64_t centroids_n = pq_quantizer_.get_centroids_size();
         codebook_blob.append(reinterpret_cast<const char *>(&centroids_n), sizeof(centroids_n));
-        codebook_blob.append(reinterpret_cast<const char *>(pq_quantizer_.centroids.data()),
+        codebook_blob.append(reinterpret_cast<const char *>(pq_quantizer_.centroids),
                              centroids_n * sizeof(float));
         info.options["pq_codebook"] = Value::BLOB(const_data_ptr_cast(codebook_blob.data()),
                                                   codebook_blob.size());
@@ -336,6 +336,10 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
             order_blob.append(reinterpret_cast<const char *>(&v), sizeof(v));
         }
         info.options["pq_row_order"] = Value::BLOB(const_data_ptr_cast(order_blob.data()), order_blob.size());
+    }
+
+    if (compact_mode_) {
+        info.options["compact_mode"] = Value::BOOLEAN(true);
     }
 
     return info;
