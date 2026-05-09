@@ -1,0 +1,102 @@
+# name: test/sql/vex/index/graph_index_pq_compact_reload.test
+# description: compact_mode flag must persist across restart (it's written
+#              into IndexStorageInfo.options and read back at index Create
+#              time). Without persistence, a reloaded compact index would
+#              re-enable SearchANN with no raw vectors and crash on first
+#              ORDER BY query.
+# group: [vex]
+
+require vex
+
+load __TEST_DIR__/pq_compact_reload.db
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+statement ok
+CREATE TABLE pq_compact_r (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_compact_r SELECT i,
+    [(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,
+     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_pq_compact_r ON pq_compact_r USING GRAPH_INDEX (vec)
+WITH (quantizer = 'pq', pq_m = 4, memory_mode = 'compact');
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+# After reload the compact_mode flag must still be observed: SearchANN
+# stays unavailable.
+statement error
+SELECT id FROM pq_compact_r ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+SearchANN is unavailable
+
+# pq_only path works post-reload — codebook + codes survived serialize.
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+query I
+SELECT id FROM pq_compact_r
+ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 1;
+----
+100
+
+statement ok
+RESET vex_pq_search_mode;
+
+# ============================================================
+# Compact + DELETE + checkpoint + restart: deleted_rids_ persists
+# alongside compact_mode. SearchPQ must filter deleted ids both
+# before and after restart — without persistence the deleted rows
+# resurrect because pq_codes_ still has their entries.
+# ============================================================
+statement ok
+DELETE FROM pq_compact_r WHERE id BETWEEN 50 AND 99;
+
+statement ok
+CHECKPOINT;
+
+restart
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+# 500 - 50 = 450 visible rows after delete + reload.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_compact_r
+    ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+    LIMIT 10000
+) t;
+----
+450
+
+# None of the deleted ids should appear in the result.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_compact_r
+    ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+    LIMIT 10000
+) WHERE id BETWEEN 50 AND 99;
+----
+0
+
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP TABLE pq_compact_r;

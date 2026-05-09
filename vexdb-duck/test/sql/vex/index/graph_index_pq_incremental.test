@@ -1,0 +1,173 @@
+# name: test/sql/vex/index/graph_index_pq_incremental.test
+# description: Rows INSERTed after the PQ index is built must be encoded into
+#              pq_codes_ on the fly. Without Stage 6 wiring, vex_pq_search_mode=
+#              'pq_only' silently drops post-build inserts.
+# group: [vex]
+
+require vex
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+statement ok
+CREATE TABLE pq_inc (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_inc SELECT i,
+    [(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,
+     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_pq_inc ON pq_inc USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# Add a single row after the index is built. Without Stage 6, pq_only sees
+# only the 500 build-time rows.
+statement ok
+INSERT INTO pq_inc VALUES (501,
+    [5.01::FLOAT, 10.02::FLOAT, 15.03::FLOAT, 20.04::FLOAT,
+     25.05::FLOAT, 30.06::FLOAT, 35.07::FLOAT, 40.08::FLOAT]::FLOAT[8]);
+
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+# pq_only must now see 501 rows, not 500. Use LIMIT > total so SearchPQ
+# returns every encoded row; the post-INSERT row is in the set iff Stage 6
+# encoded it on the way in.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_inc
+    ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+    LIMIT 1000
+) t;
+----
+501
+
+# The post-INSERT row must be retrievable by id (proves it's in pq_codes_,
+# not just in the HNSW graph — pq_only never touches the graph).
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_inc
+    ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+    LIMIT 1000
+) WHERE id = 501;
+----
+1
+
+# Sanity: in-distribution top-1 (id=100) still wins over the new row, whose
+# code is far from the query in PQ space.
+query I
+SELECT id FROM pq_inc
+ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+LIMIT 1;
+----
+100
+
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP TABLE pq_inc;
+
+# ============================================================
+# Multi-row chunk INSERT — exercises the pq_codes_.reserve path.
+# Stage 6 reserves up front based on chunk count; without it 50 rows
+# triggers ~6 vector regrowths instead of one allocation. Correctness
+# is the same either way; we assert all 50 land in pq_codes_.
+# ============================================================
+statement ok
+CREATE TABLE pq_chunk (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_chunk SELECT i,
+    [(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,
+     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_pq_chunk ON pq_chunk USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# Insert 50 rows in a single statement (single chunk in duckdb's executor).
+statement ok
+INSERT INTO pq_chunk SELECT 1000 + i,
+    [(i*0.11)::FLOAT, (i*0.12)::FLOAT, (i*0.13)::FLOAT, (i*0.14)::FLOAT,
+     (i*0.15)::FLOAT, (i*0.16)::FLOAT, (i*0.17)::FLOAT, (i*0.18)::FLOAT]::FLOAT[8]
+FROM range(50) t(i);
+
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+# Total visible to pq_only must now be 550 (500 build + 50 chunk insert).
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_chunk
+    ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+    LIMIT 10000
+) t;
+----
+550
+
+# Spot-check a chunk-inserted id ends up in result set.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_chunk
+    ORDER BY l2_distance(vec, [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+    LIMIT 10000
+) WHERE id = 1025;
+----
+1
+
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP TABLE pq_chunk;
+
+# ============================================================
+# Cosine PQ + post-build INSERT — exercises Stage 6's pq_normalize
+# branch (NormalizeInPlace into pq_norm_buf before compute_code).
+# Without that branch the new row's code is computed on the un-
+# normalized vector and SearchPQ approximates wrong distance.
+# ============================================================
+statement ok
+CREATE TABLE pq_cos (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_cos SELECT i,
+    [sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,
+     sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,
+     sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,
+     sin(i*0.4)::FLOAT, cos(i*0.4)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_pq_cos ON pq_cos USING GRAPH_INDEX (vec)
+WITH (quantizer = 'pq', pq_m = 4, metric = 'cosine');
+
+# Pre-normalized post-build insert. Vec magnitude ~10 so unit-norm
+# version differs significantly from raw — Stage 6's NormalizeInPlace
+# is what makes this row match the cosine codebook.
+statement ok
+INSERT INTO pq_cos VALUES (777,
+    [10.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+     0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT]::FLOAT[8]);
+
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+# Row 777 must be reachable in pq_only — codes_ alignment with
+# pq_row_id_order_ requires the cosine encode path to have run.
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_cos
+    ORDER BY cosine_distance(vec, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]::FLOAT[8])
+    LIMIT 10000
+) WHERE id = 777;
+----
+1
+
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP TABLE pq_cos;

@@ -1,0 +1,85 @@
+# name: test/sql/vex/index/graph_index_pq_search.test
+# description: vex_pq_search_mode='pq_only' must drive search through the PQ
+#              distance table built at CREATE INDEX time. Default 'off' keeps
+#              raw-vector search untouched, and asking for pq_only on a non-PQ
+#              index must error rather than silently fall back.
+# group: [vex]
+
+require vex
+
+statement ok
+SET vex_brute_force_threshold = 0;
+
+statement ok
+CREATE TABLE pq_search (id INTEGER, vec FLOAT[8]);
+
+statement ok
+INSERT INTO pq_search SELECT i,
+    [(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,
+     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT]::FLOAT[8]
+FROM range(500) t(i);
+
+statement ok
+CREATE INDEX idx_pq ON pq_search USING GRAPH_INDEX (vec) WITH (quantizer = 'pq', pq_m = 4);
+
+# Default mode 'off' — raw-vector path, top-1 of an exact-match query is id=100.
+query I
+SELECT id FROM pq_search ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+100
+
+# Switch to pq_only — query must now go through SearchPQ.
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+# Top-1 of an exact-match query: PQ distance for id=100 is 0 (its own code
+# is the closest centroid in every subspace), wins regardless of quantization
+# error on neighbors.
+query I
+SELECT id FROM pq_search ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+100
+
+# Top-3 should stay near id=100 (PQ approximation; allow ±2 either side).
+query I
+SELECT COUNT(*) FROM (
+    SELECT id FROM pq_search
+    ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8])
+    LIMIT 3
+) WHERE id BETWEEN 98 AND 102;
+----
+3
+
+# pq_only on a plain (non-PQ) index must fail loudly rather than silently
+# fall back to raw-vector search.
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP INDEX idx_pq;
+
+statement ok
+CREATE INDEX idx_plain ON pq_search USING GRAPH_INDEX (vec);
+
+statement ok
+SET vex_pq_search_mode = 'pq_only';
+
+statement error
+SELECT id FROM pq_search ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+pq_only
+
+# Bogus mode strings must be rejected.
+statement ok
+SET vex_pq_search_mode = 'bogus';
+
+statement error
+SELECT id FROM pq_search ORDER BY l2_distance(vec, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]::FLOAT[8]) LIMIT 1;
+----
+must be 'off' or 'pq_only'
+
+statement ok
+RESET vex_pq_search_mode;
+
+statement ok
+DROP TABLE pq_search;
