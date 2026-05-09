@@ -65,18 +65,26 @@ build_loadable_extension(vex ${PARAMETERS} ${VEXDB_DUCK_EXTENSION_FILES})
 target_compile_features(vex_extension PRIVATE cxx_std_17)
 target_compile_features(vex_loadable_extension PRIVATE cxx_std_17)
 
+set(SIMD_COMMON_FLAGS "-ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -floop-interchange -fno-exceptions -g1")
+set(SIMD_WARN_FLAGS "-Wno-ignored-attributes")
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/sse_dispatcher.cpp
-        PROPERTIES COMPILE_FLAGS "-msse4.1 -msse4.2 -mfma -mf16c -Wno-ignored-attributes")
+        PROPERTIES COMPILE_FLAGS "${SIMD_COMMON_FLAGS} -msse3 -msse4.1 -msse4.2 -mfma ${SIMD_WARN_FLAGS}")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx_dispatcher.cpp
-        PROPERTIES COMPILE_FLAGS "-mavx2 -mfma -mf16c -Wno-ignored-attributes")
+        PROPERTIES COMPILE_FLAGS "${SIMD_COMMON_FLAGS} -mavx -mavx2 -mfma -mf16c ${SIMD_WARN_FLAGS}")
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/avx512_dispatcher.cpp
-        PROPERTIES COMPILE_FLAGS "-mavx512f -mavx512dq -mavx512bw -mavx512vl -mf16c -Wno-ignored-attributes")
+        PROPERTIES COMPILE_FLAGS "${SIMD_COMMON_FLAGS} -mavx512f -mavx512dq -mavx512bw -mavx512vl -mavx -mavx2 -mfma -mf16c ${SIMD_WARN_FLAGS}")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL "8.0")
+        set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+simd+fp16+dotprod ${SIMD_WARN_FLAGS}")
+    else()
+        set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+simd+fp16 ${SIMD_WARN_FLAGS}")
+    endif()
     set_source_files_properties(
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/distance/core/neon_dispatcher.cpp
-        PROPERTIES COMPILE_FLAGS "-Wno-ignored-attributes")
+        PROPERTIES COMPILE_FLAGS "${NEON_FLAGS}")
 endif()
