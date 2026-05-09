@@ -455,22 +455,25 @@ private:
                                     "skipping PQ training", samples->length, ksub)));
             return false;
         }
-        quantizer.emplace();
-        quantizer.value().template emplace<PQDistancer>();
-        PQDistancer &pq_dist = quantizer.value().template get<PQDistancer>();
-        pq_dist.train(index, samples, dimension, metric, /*need_norm*/ false,
+        // Train on a stack-local PQDistancer so the in-memory `quantizer`
+        // Variant stays empty — the build/scan path keys off Variant
+        // presence, not the metapage flag, and would otherwise try to
+        // encode through an un-prepare()d PQ. train() stash_to_cache()s
+        // into the process-local cache for future scan/insert wiring.
+        {
+            PQDistancer tmp;
+            tmp.train(index, samples, dimension, metric, /*need_norm*/ false,
                       parallel_workers, maintenance_work_mem_kb);
+        }
         FloatVectorArrayFree(samples);
-        // Flip graph_pq=true so quantizer_metainfo.get_type() returns PQ.
-        // Centroids are in the process-local cache via stash_to_cache().
-        Buffer mb = ReadBufferExtended(index, fork_num, metablkno, RBM_NORMAL, NULL);
-        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
-        GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
-        mp->quantizer_metainfo.set_enable();
-        MarkBufferDirty(mb);
-        LockBuffer(mb, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(mb);
-        return true;
+        // Centroids are stashed in the process-local cache via train()'s
+        // stash_to_cache(). The PG insert/scan path that would actually
+        // consume the trained PQ is not yet wired — returning false here
+        // signals the caller to flip qt_type back to NONE so build_graph
+        // takes the plain-HNSW path. WITH (quantizer='pq') is therefore
+        // accepted and trains a codebook, but the on-disk index is still
+        // plain HNSW until the encode/scan wiring lands.
+        return false;
     }
 
     template <typename D>

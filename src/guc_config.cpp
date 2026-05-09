@@ -13,6 +13,20 @@ static int pg_vexdb_vector_buffers = 2097152;  /* 2GB in KB */
 static int pg_vexdb_vector_buffer_workers = 1;
 static char *pg_vexdb_vec_architecture = NULL;
 
+/* duck-side parity GUCs. Tests translated from .test files SET
+ * vex_ef_search / vex_brute_force_threshold / vex_pq_search_mode.
+ * vex_ef_search aliases pg_vexdb.ef_search; the other two are accepted
+ * but currently no-ops on PG (search-side wiring is duck-only). */
+static int pg_vexdb_vex_ef_search = 64;
+static int pg_vexdb_vex_brute_force_threshold = 64;
+static int pg_vexdb_vex_pq_search_mode = 0;
+static const struct config_enum_entry pq_search_mode_options[] = {
+    {"default", 0, false},
+    {"pq_only", 1, false},
+    {"refine", 2, false},
+    {NULL, 0, false}
+};
+
 /* Reloption kind - initialized at startup */
 relopt_kind pg_vexdb_relopt_kind;
 
@@ -31,6 +45,14 @@ int pg_vexdb_get_vector_buffer_workers(void) { return pg_vexdb_vector_buffer_wor
 static void assign_ef_search(int newval, void *extra)
 {
     (void)extra;
+    pg_vexdb_session.attr_storage.ef_search = newval;
+}
+
+/* vex_ef_search aliases pg_vexdb.ef_search */
+static void assign_vex_ef_search(int newval, void *extra)
+{
+    (void)extra;
+    pg_vexdb_ef_search = newval;
     pg_vexdb_session.attr_storage.ef_search = newval;
 }
 
@@ -135,6 +157,33 @@ pg_vexdb_init_guc(void)
                                PGC_SUSET,
                                GUC_NOT_IN_SAMPLE,
                                check_vec_arch_str, assign_vec_arch, NULL);
+
+    /* duck-side parity GUCs */
+    DefineCustomIntVariable("vex_ef_search",
+                            "Alias for pg_vexdb.ef_search (duck-side parity).",
+                            NULL,
+                            &pg_vexdb_vex_ef_search,
+                            64, 1, 65535,
+                            PGC_USERSET, GUC_NOT_IN_SAMPLE,
+                            NULL, assign_vex_ef_search, NULL);
+
+    DefineCustomIntVariable("vex_brute_force_threshold",
+                            "Below this node count the search may fall back to brute force "
+                            "(duck-side; PG search wiring is a TODO and currently ignores this).",
+                            NULL,
+                            &pg_vexdb_vex_brute_force_threshold,
+                            64, 0, INT_MAX,
+                            PGC_USERSET, GUC_NOT_IN_SAMPLE,
+                            NULL, NULL, NULL);
+
+    DefineCustomEnumVariable("vex_pq_search_mode",
+                             "PQ search mode: 'default', 'pq_only', 'refine' "
+                             "(duck-side; PG search path currently ignores this).",
+                             NULL,
+                             &pg_vexdb_vex_pq_search_mode,
+                             0, pq_search_mode_options,
+                             PGC_USERSET, GUC_NOT_IN_SAMPLE,
+                             NULL, NULL, NULL);
 
     /* Initialize session struct from GUC defaults */
     pg_vexdb_session.attr_storage.ef_search = pg_vexdb_ef_search;
