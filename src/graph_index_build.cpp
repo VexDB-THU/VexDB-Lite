@@ -163,11 +163,11 @@ public:
         
         int temp_dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
         dimension = temp_dim > 0 ? (uint_fast16_t)temp_dim : 0;
-        
-        if (dimension == 0) {
-            elog(ERROR, "Could not determine vector dimension from index attribute");
-        }
-        
+        // dimension==0 means the indexed column is an untyped floatvector
+        // (CREATE TABLE AS or DDL without typmod). build_index() will
+        // sniff the first non-null tuple from heap and recompute
+        // vector_size; do not error out here.
+
         if (precision_type != DistPrecisionType::CUSTOM) {
             vector_size = dimension * get_dtype_size(precision_type);
         } else if (TupleDescAttr(index->rd_att, 0)->attbyval) {
@@ -239,6 +239,9 @@ public:
 
     BlockNumber build_index(Relation heap, Relation index, IndexInfo *index_info)
     {
+        if (dimension == 0) {
+            sniff_dimension_from_heap(heap, index);
+        }
         create_metapage(index);
         bool quant_trained = init_quantizer(heap, index);
         if (!quant_trained) {
@@ -247,6 +250,37 @@ public:
         build_graph(heap, index, index_info);
         log_index(index);
         return metablkno;
+    }
+
+    // For untyped floatvector columns (CREATE TABLE AS), the index
+    // attribute carries no typmod. Walk the heap until the first non-null
+    // vector and adopt its dimension. Errors only if the table is empty
+    // or has no non-null vectors.
+    void sniff_dimension_from_heap(Relation heap, Relation index)
+    {
+        Snapshot snap = GetActiveSnapshot();
+        TableScanDesc scan = table_beginscan(heap, snap, 0, NULL, 0);
+        TupleTableSlot *slot = table_slot_create(heap, NULL);
+        AttrNumber attno = index->rd_index->indkey.values[0];
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+            bool isnull;
+            Datum d = slot_getattr(slot, attno, &isnull);
+            if (isnull) continue;
+            FloatVector *fv = DatumGetFloatVector(d);
+            if (fv->dim > 0) {
+                dimension = (uint_fast16_t)fv->dim;
+                break;
+            }
+        }
+        ExecDropSingleTupleTableSlot(slot);
+        table_endscan(scan);
+        if (dimension == 0) {
+            elog(ERROR, "Could not determine vector dimension from index attribute "
+                        "(empty table or all-null vector column)");
+        }
+        if (precision_type != DistPrecisionType::CUSTOM) {
+            vector_size = dimension * get_dtype_size(precision_type);
+        }
     }
 
     void create_metapage(Relation index)

@@ -27,6 +27,9 @@ static const struct config_enum_entry pq_search_mode_options[] = {
     {NULL, 0, false}
 };
 
+// duck-side debug GUC; PG-side accepts SET but does not act on it.
+static char *pg_vexdb_disabled_optimizers = NULL;
+
 /* Reloption kind - initialized at startup */
 relopt_kind pg_vexdb_relopt_kind;
 
@@ -175,6 +178,14 @@ pg_vexdb_init_guc(void)
                             64, 0, INT_MAX,
                             PGC_USERSET, GUC_NOT_IN_SAMPLE,
                             NULL, NULL, NULL);
+
+    DefineCustomStringVariable("disabled_optimizers",
+                               "duck-side debug GUC; accepted but ignored on PG.",
+                               NULL,
+                               &pg_vexdb_disabled_optimizers,
+                               "",
+                               PGC_USERSET, GUC_NOT_IN_SAMPLE,
+                               NULL, NULL, NULL);
 
     DefineCustomEnumVariable("vex_pq_search_mode",
                              "PQ search mode: 'default', 'pq_only', 'refine' "
