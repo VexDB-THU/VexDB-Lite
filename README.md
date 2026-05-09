@@ -308,7 +308,8 @@ vexdb-duck/test/run_sift_sql_benchmark.sh \
 下面只汇总当前已经落报告的基准结果，详细环境见：
 
 - [x86 PostgreSQL 报告](docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md)
-- [ARM PostgreSQL 报告](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL GENERAL 报告](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL NEON 复测报告](docs/reports/2026-05-09-arm-pg19-neon-retest-report.md)
 - [DuckDB v1.5.2 报告](docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md)
 
 ### 5.1 PostgreSQL：x86_64 / Intel Xeon E5-2696 v4 / 62 GiB
@@ -320,19 +321,21 @@ vexdb-duck/test/run_sift_sql_benchmark.sh \
 | 1M cold | 49720.795 | 440295.289 | 118939.861 | 1.682 | 0.986000 | 0.940750 |
 | 1M warm | n/a | n/a | 421.385 | 474.626 | 0.986000 | 0.940750 |
 
-### 5.2 PostgreSQL：ARM64 / Kirin 9000C / 15 GiB
+### 5.2 PostgreSQL：ARM64 / Kirin 9000C / 15 GiB（NEONV8）
 
 | 规模 | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
 |---|---:|---:|---:|---:|---:|---:|
-| 10k | 653.710 | 3343.997 | 4221.737 | 47.374 | 0.999500 | 0.995050 |
-| 100k | 7190.675 | 50600.905 | 36256.395 | 5.516 | 0.997500 | 0.974600 |
-| 1M cold | 80249.436 | 727355.502 | 117733.467 | 1.699 | 0.986000 | 0.940750 |
-| 1M warm | n/a | n/a | 565.444 | 353.705 | 0.986000 | 0.940750 |
+| 10k | 675.492 | 3621.935 | 4012.295 | 49.847 | 0.999500 | 0.995050 |
+| 100k | 6036.217 | 51100.431 | 36182.889 | 5.527 | 0.997500 | 0.974600 |
+| 1M cold | 69513.162 | 711103.568 | 118598.167 | 1.686 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 487.352 | 410.381 | 0.986000 | 0.940750 |
 
 说明：
 
-- ARM 测试为了完成当前仓库状态下的 PG 编译，临时关闭了 PG 侧 ARM `NEON/SVE` 距离派发，改走 `GENERAL` 路径。
-- 因此 ARM 报告代表“当前源码可运行版本”的性能，不代表 ARM SIMD fully enabled 的上限。
+- 当前首页默认展示的是 `2026-05-09` 的 `NEONV8` 复测结果。
+- 这轮测试已通过 `index_inspect()` 明确确认 `Architecture Usage = NEONV8`。
+- 为了让当前分支在 PostgreSQL ARM 侧顺利 preload，仍然补了一层 `INT8 -> GENERAL` 的兼容桥接，详见 `2026-05-09-arm-pg19-neon-retest-report.md`。
+- 如果你要看上一轮纯 `GENERAL` 路径结果，请参考 `2026-05-08-arm-pg19-release-benchmark-report.md`。
 
 ### 5.3 DuckDB：Apple M3 Max / 128 GiB / Darwin arm64
 
@@ -377,4 +380,5 @@ vexdb-duck/test/run_sift_sql_benchmark.sh \
 
 - `docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md`
 - `docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md`
+- `docs/reports/2026-05-09-arm-pg19-neon-retest-report.md`
 - `docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md`

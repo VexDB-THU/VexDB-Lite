@@ -308,7 +308,8 @@ vexdb-duck/test/run_sift_sql_benchmark.sh \
 Detailed reports:
 
 - [x86 PostgreSQL report](docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md)
-- [ARM PostgreSQL report](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL GENERAL report](docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md)
+- [ARM PostgreSQL NEON retest report](docs/reports/2026-05-09-arm-pg19-neon-retest-report.md)
 - [DuckDB v1.5.2 report](docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md)
 
 ### 5.1 PostgreSQL on x86_64 / Intel Xeon E5-2696 v4 / 62 GiB
@@ -320,19 +321,21 @@ Detailed reports:
 | 1M cold | 49720.795 | 440295.289 | 118939.861 | 1.682 | 0.986000 | 0.940750 |
 | 1M warm | n/a | n/a | 421.385 | 474.626 | 0.986000 | 0.940750 |
 
-### 5.2 PostgreSQL on ARM64 / Kirin 9000C / 15 GiB
+### 5.2 PostgreSQL on ARM64 / Kirin 9000C / 15 GiB (NEONV8)
 
 | Scale | Load (ms) | Build (ms) | Query (ms) | QPS | Recall@10 | Recall@100 |
 |---|---:|---:|---:|---:|---:|---:|
-| 10k | 653.710 | 3343.997 | 4221.737 | 47.374 | 0.999500 | 0.995050 |
-| 100k | 7190.675 | 50600.905 | 36256.395 | 5.516 | 0.997500 | 0.974600 |
-| 1M cold | 80249.436 | 727355.502 | 117733.467 | 1.699 | 0.986000 | 0.940750 |
-| 1M warm | n/a | n/a | 565.444 | 353.705 | 0.986000 | 0.940750 |
+| 10k | 675.492 | 3621.935 | 4012.295 | 49.847 | 0.999500 | 0.995050 |
+| 100k | 6036.217 | 51100.431 | 36182.889 | 5.527 | 0.997500 | 0.974600 |
+| 1M cold | 69513.162 | 711103.568 | 118598.167 | 1.686 | 0.986000 | 0.940750 |
+| 1M warm | n/a | n/a | 487.352 | 410.381 | 0.986000 | 0.940750 |
 
 Notes:
 
-- The ARM PostgreSQL run currently forces `GENERAL` distance dispatch to keep the current codebase buildable/runnable on ARM.
-- So these numbers represent the current runnable ARM state, not the final fully-enabled ARM SIMD ceiling.
+- The default ARM numbers shown on the front page are now the `2026-05-09` `NEONV8` retest.
+- `index_inspect()` confirmed `Architecture Usage = NEONV8` on the tested indexes.
+- A small `INT8 -> GENERAL` compatibility bridge is still present so the current branch can preload cleanly on PostgreSQL ARM; see `2026-05-09-arm-pg19-neon-retest-report.md` for details.
+- For the earlier pure-`GENERAL` ARM run, see `2026-05-08-arm-pg19-release-benchmark-report.md`.
 
 ### 5.3 DuckDB on Apple M3 Max / 128 GiB / Darwin arm64
 
@@ -373,4 +376,5 @@ Notes:
 - Benchmark/environment records:
   - `docs/reports/2026-05-08-x86-pg19-release-benchmark-report.md`
   - `docs/reports/2026-05-08-arm-pg19-release-benchmark-report.md`
+  - `docs/reports/2026-05-09-arm-pg19-neon-retest-report.md`
   - `docs/reports/2026-04-30-duckdb-v1.5.2-build-and-benchmark-report.md`

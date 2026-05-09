@@ -404,7 +404,87 @@ public:
 };
 
 #define PatcherName NeonDistancePatcher
+#undef DIST_PRECISION_TYPE_SEQ
+#define DIST_PRECISION_TYPE_SEQ ((FLOAT, 4)) ((HALF, 2))
 #define CUR_ARCH Arch::NEONV8
 #include "distance/core/distance.templ"
 #undef CUR_ARCH
+#undef DIST_PRECISION_TYPE_SEQ
+#define DIST_PRECISION_TYPE_SEQ ((FLOAT, 4)) ((HALF, 2)) ((INT8, 1))
 #undef PatcherName
+
+#define DEFINE_NEON_INT8_TRANSFORM_FALLBACK(op, rs, aligned)                                      \
+template <>                                                                                        \
+void Transformer<Arch::NEONV8, op, DistPrecisionType::INT8, rs, aligned>::transform_single(       \
+    const void *x, const void *y, void *out, uint16 dim)                                           \
+{                                                                                                   \
+    Transformer<Arch::GENERAL, op, DistPrecisionType::INT8, RemainderSituation::Unknown, aligned>::transform_single( \
+        x, y, out, dim);                                                                            \
+}
+
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::Unknown, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::Unknown, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::NoPartial, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::NoPartial, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::NoTail, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::ADD, RemainderSituation::NoTail, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::Unknown, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::Unknown, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::NoPartial, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::NoPartial, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::NoTail, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::SUB, RemainderSituation::NoTail, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::Unknown, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::Unknown, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::NoPartial, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::NoPartial, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::NoTail, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::MUL_SCALAR, RemainderSituation::NoTail, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::Unknown, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::Unknown, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::NoPartial, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::NoPartial, false)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::NoTail, true)
+DEFINE_NEON_INT8_TRANSFORM_FALLBACK(TransformOp::NORMALIZE, RemainderSituation::NoTail, false)
+
+#undef DEFINE_NEON_INT8_TRANSFORM_FALLBACK
+
+#define DEFINE_NEON_INT8_DIST_FALLBACK(metric, rs, aligned)                                        \
+template <>                                                                                        \
+float Distancer<Arch::NEONV8, metric, DistPrecisionType::INT8, rs, aligned>::get_distance_single( \
+    const void *x, const void *y, uint16 dim)                                                      \
+{                                                                                                   \
+    return Distancer<Arch::GENERAL, metric, DistPrecisionType::INT8, RemainderSituation::Unknown, aligned>::get_distance_single( \
+        x, y, dim);                                                                                 \
+}                                                                                                   \
+template <>                                                                                        \
+void Distancer<Arch::NEONV8, metric, DistPrecisionType::INT8, rs, aligned>::get_distance_batch2(   \
+    const void *x, void *const *y, uint16 dim, uint16 y_size, float *out)                         \
+{                                                                                                   \
+    Distancer<Arch::GENERAL, metric, DistPrecisionType::INT8, RemainderSituation::Unknown, aligned>::get_distance_batch2(   \
+        x, y, dim, y_size, out);                                                                    \
+}
+
+#define DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(metric)                                        \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::Unknown, true)                    \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::Unknown, false)                   \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::NoPartial, true)                  \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::NoPartial, false)                 \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::NoTail, true)                     \
+DEFINE_NEON_INT8_DIST_FALLBACK(metric, RemainderSituation::NoTail, false)
+
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::L2)
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::INNER_PRODUCT)
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::COSINE)
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::SPHERICAL)
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::L2_SQRT)
+DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS(Metric::L2_NORM)
+
+#undef DEFINE_NEON_INT8_DIST_FALLBACK_ALL_RS
+#undef DEFINE_NEON_INT8_DIST_FALLBACK
+
+template <>
+RemainderSituation RemainderPatcher<Arch::NEONV8, DistPrecisionType::INT8>::get_remainder_situation(uint16)
+{
+    return RemainderSituation::Unknown;
+}
