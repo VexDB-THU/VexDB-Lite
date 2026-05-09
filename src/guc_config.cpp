@@ -63,6 +63,28 @@ pg_vexdb_init_guc(void)
                        "Enable asynchronous insert for index.",
                        false, AccessExclusiveLock);
 
+    /* Stage 4: duck-side parity reloptions. Accepted by amoptions; runtime
+     * usage may be partial — the goal here is that
+     *   CREATE INDEX ... WITH (m=, ef_construction=, metric=, quantizer=,
+     *                          pq_m=, memory_mode=, threads=)
+     * does not raise "unrecognized parameter". Semantics mirror duck-side
+     * GraphIndex::Create (vexdb-duck/index/graph_index.cpp). */
+    add_string_reloption(RELOPT_KIND_GRAPH_INDEX, "metric",
+                         "Distance metric: 'l2', 'cosine', or 'ip' (default 'l2'). "
+                         "Note: PG normally derives the metric from the operator class; "
+                         "this reloption is accepted for duck-side parity.",
+                         NULL, NULL, AccessExclusiveLock);
+    add_int_reloption(RELOPT_KIND_GRAPH_INDEX, "pq_m",
+                      "Number of PQ subspaces. 0 disables PQ; otherwise must divide dimension.",
+                      0, 0, INT_MAX, AccessExclusiveLock);
+    add_string_reloption(RELOPT_KIND_GRAPH_INDEX, "memory_mode",
+                         "'full' keeps raw vectors; 'compact' releases raw vectors after PQ "
+                         "training (auto-selects pq_m if 0).",
+                         NULL, NULL, AccessExclusiveLock);
+    add_int_reloption(RELOPT_KIND_GRAPH_INDEX, "threads",
+                      "Build-time worker count (duck-side name; alias of parallel_workers).",
+                      1, 1, 1024, AccessExclusiveLock);
+
     /* GUC parameters */
     DefineCustomIntVariable("pg_vexdb.ef_search",
                             "Search list size for HNSW index search.",

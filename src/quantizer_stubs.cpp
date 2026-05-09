@@ -3,10 +3,13 @@
 #include "annkmeans.h"
 #include "module/timer.h"
 #include "rabitq/estimator.h"
+#include "pq.h"
 
 QuantizerType extract_qt(const char *qt_type)
 {
-    (void)qt_type;
+    if (qt_type == nullptr) return QuantizerType::NONE;
+    if (strcmp(qt_type, "pq") == 0)     return QuantizerType::PQ;
+    if (strcmp(qt_type, "rabitq") == 0) return QuantizerType::RABITQ;
     return QuantizerType::NONE;
 }
 
@@ -75,8 +78,25 @@ void QtUpdateMgr::erase_timering(Oid)
 {
 }
 
-void QuantizerMetaInfo::init(QuantizerType, uint32)
+void QuantizerMetaInfo::init(QuantizerType qt_type, uint32 dimension)
 {
+    quantizer_type    = qt_type;
+    centroids_version = 0;
+    code_version      = 0;
+    num_new_data      = 0;
+    if (qt_type == QuantizerType::PQ) {
+        // graph_pq stays false until PQ is actually trained; get_type() then
+        // returns NONE so the build/search path falls back to plain HNSW.
+        // This keeps WITH (quantizer='pq', pq_m=N) DDL accepted without
+        // tripping the centroids/code version mismatch warning loop.
+        metainfo.pq_metainfo.graph_pq = false;
+        pq_set_param(dimension, metainfo.pq_metainfo.m, metainfo.pq_metainfo.k);
+    } else if (qt_type == QuantizerType::RABITQ) {
+        metainfo.rbq_meta.enabled               = false;
+        metainfo.rbq_meta.keep_vecs             = false;
+        metainfo.rbq_meta.quant_size            = 0;
+        metainfo.rbq_meta.query_rescaling_factor = 0.0;
+    }
 }
 
 namespace rabitq {
