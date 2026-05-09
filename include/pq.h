@@ -125,6 +125,12 @@ struct PQDistancer {
         }
     }
     void hnsw_read_pq_center(Relation index, ProductQuantizer &pq, BlockNumber qtcode_block);
+    // Cache the trained centroids in a process-local map keyed by the index
+    // OID so PQDistancer instances created later (in scan/insert paths) can
+    // reload them without re-training. Persistence to qtcode_block is a
+    // follow-up; for now PQ state is per-process and lost on restart.
+    void stash_to_cache(Relation index);
+    bool load_from_cache(Relation index, Metric metric);
 private:
     mutable ProductQuantizer pq;
     ann_helper::distance_func _get_distance_precise_func;

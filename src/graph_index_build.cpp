@@ -8,6 +8,8 @@
 #include <atomic>
 
 #include "pg_compat.h"
+#include "annkmeans.h"
+#include "pq.h"
 
 extern "C" {
 #include "access/parallel.h"
@@ -433,8 +435,42 @@ private:
 
     bool init_quantizer(Relation heap, Relation index)
     {
-        /* For now, skip quantizer initialization - return false to disable */
-        return false;
+        if (qt_type != QuantizerType::PQ) return false;
+        if (heap == NULL) return false;  // INIT_FORKNUM path has no heap
+        // Sample size: ksub gives K-means a chance to spread; cap at 50K to
+        // bound train cost. openGauss uses similar heuristic via
+        // GetSampleNumbers; here we use a simple constant tied to ksub.
+        constexpr int sample_cap = 50000;
+        const int ksub = 256; // nbits=8
+        int target = (int)std::min<int64>((int64)reltuples, (int64)sample_cap);
+        if (target < ksub) target = ksub;
+        FloatVectorArray samples = FloatVectorArrayInit(target, dimension);
+        ann_sample_rows(samples, heap, index, dimension, target,
+                        /*need_norm*/ false, DistPrecisionType::FLOAT);
+        if (samples->length < ksub) {
+            // Not enough rows yet to train a meaningful codebook; build the
+            // index without PQ and let CREATE INDEX after data load enable it.
+            FloatVectorArrayFree(samples);
+            ereport(NOTICE, (errmsg("vex PQ: only %d sample rows < ksub=%d, "
+                                    "skipping PQ training", samples->length, ksub)));
+            return false;
+        }
+        quantizer.emplace();
+        quantizer.value().template emplace<PQDistancer>();
+        PQDistancer &pq_dist = quantizer.value().template get<PQDistancer>();
+        pq_dist.train(index, samples, dimension, metric, /*need_norm*/ false,
+                      parallel_workers, maintenance_work_mem_kb);
+        FloatVectorArrayFree(samples);
+        // Flip graph_pq=true so quantizer_metainfo.get_type() returns PQ.
+        // Centroids are in the process-local cache via stash_to_cache().
+        Buffer mb = ReadBufferExtended(index, fork_num, metablkno, RBM_NORMAL, NULL);
+        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+        GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
+        mp->quantizer_metainfo.set_enable();
+        MarkBufferDirty(mb);
+        LockBuffer(mb, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(mb);
+        return true;
     }
 
     template <typename D>

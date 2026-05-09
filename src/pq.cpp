@@ -4,9 +4,11 @@
 #include "pq_pg_adapter.h"
 #include "quantizer/annkmeans.h"
 #include "quantizer/pq_endecode.h"
+#include "graph_index/graph_index_struct.h"
 
 #include <cstring>
 #include <vector>
+#include <unordered_map>
 
 void ProductQuantizer::set_basic_values(size_t dim, size_t m, size_t nbits_)
 {
@@ -229,14 +231,24 @@ void PQDistancer::train(Relation index, FloatVectorArray samples, size_t dimensi
     flag = (metric == Metric::INNER_PRODUCT) ? -1.0f : 1.0f;
     prepared = false;
     dist_table = nullptr;
+    // Push trained centroids to the process-local cache so later prepare()
+    // calls (in scan / insert paths) can reload without re-training.
+    stash_to_cache(index);
 }
 
 void PQDistancer::prepare(Relation index, void *metap)
 {
-    (void)index;
-    (void)metap;
+    GraphIndexMetaPage mp = (GraphIndexMetaPage)metap;
+    Metric m = mp ? mp->metric : Metric::L2;
+    // Hot path: PQ runtime data (centroids, code_size, M, dispatch fn ptrs)
+    // lives in the process-local cache from train()'s stash. If our `pq` is
+    // empty (M==0 — fresh distancer instance), pull from the cache.
+    if (pq.M == 0 && !load_from_cache(index, m)) {
+        ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+            errmsg("PQ centroids not in cache — index needs to be rebuilt "
+                   "after PG restart (PQ persistence not yet wired)")));
+    }
     if (dist_table == nullptr) {
-        // compute_distance_table writes every entry, so palloc (no zero) suffices.
         dist_table = (float *)palloc(pq.M * pq.ksub * sizeof(float));
     }
     prepared = true;
@@ -276,4 +288,53 @@ void PQDistancer::hnsw_read_pq_center(Relation index, ProductQuantizer &target,
     (void)index;
     (void)target;
     (void)qtcode_block;
+}
+
+// Process-local cache. Persistence to qtcode_block is a follow-up; until
+// then PQ centroids live only in this process's memory and are lost when
+// PG restarts. Concurrency: this map is shared between sessions of the
+// same backend process; PG's per-backend isolation makes that safe (no
+// cross-session contention) but in pooled connections two SET-up phases
+// could race — current backend usage trains during CREATE INDEX which
+// holds AccessExclusiveLock so the race is excluded by lock granularity.
+namespace {
+struct PQCachedCodebook {
+    size_t d, M, nbits, dsub, ksub;
+    Metric metric;
+    std::vector<float> centroids; // d * ksub floats
+};
+static std::unordered_map<Oid, PQCachedCodebook> g_pq_cache;
+} // namespace
+
+void PQDistancer::stash_to_cache(Relation index)
+{
+    if (index == NULL) return;
+    PQCachedCodebook entry;
+    entry.d      = pq.d;
+    entry.M      = pq.M;
+    entry.nbits  = pq.nbits;
+    entry.dsub   = pq.dsub;
+    entry.ksub   = pq.ksub;
+    entry.metric = (flag < 0) ? Metric::INNER_PRODUCT : Metric::L2;
+    entry.centroids.assign(pq.centroids,
+                           pq.centroids + pq.get_centroids_size());
+    g_pq_cache[RelationGetRelid(index)] = std::move(entry);
+}
+
+bool PQDistancer::load_from_cache(Relation index, Metric metric)
+{
+    if (index == NULL) return false;
+    auto it = g_pq_cache.find(RelationGetRelid(index));
+    if (it == g_pq_cache.end()) return false;
+    const auto &entry = it->second;
+    pq.set_basic_values(entry.d, entry.M, entry.nbits);
+    pq.set_derived_values();
+    pq.set_fvec_L2sqr_ny_nearest_func();
+    pq.set_fvec_ny_distance_func(metric);
+    pq.set_dist_code_func();
+    std::memcpy(pq.centroids, entry.centroids.data(),
+                entry.centroids.size() * sizeof(float));
+    _get_distance_precise_func = ann_helper::get_general_distance_func(metric);
+    flag = (metric == Metric::INNER_PRODUCT) ? -1.0f : 1.0f;
+    return true;
 }

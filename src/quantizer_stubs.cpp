@@ -22,13 +22,36 @@ void add_quantizer_update_task(Relation index, void *params)
 void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     int dimensions, int sample_nums, bool need_norm, DistPrecisionType dist_type)
 {
-    (void)samples;
-    (void)heap;
-    (void)index;
-    (void)dimensions;
-    (void)sample_nums;
-    (void)need_norm;
     (void)dist_type;
+    (void)need_norm;
+    if (heap == NULL || samples == NULL) return;
+
+    // Sequential scan, take first sample_nums non-null vectors. Not random
+    // sampling — fine for codebook training when the table is in roughly
+    // arbitrary insertion order. Random sampling can land here later.
+    samples->length = 0;
+    Snapshot snap = GetActiveSnapshot();
+    TableScanDesc scan = table_beginscan(heap, snap, 0, NULL, 0);
+    TupleTableSlot *slot = table_slot_create(heap, NULL);
+    int collected = 0;
+    while (collected < sample_nums &&
+           table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+        // Index relation has the indexed expressions. For our case the
+        // indexed column is column #1 of the underlying table at attno
+        // stored in index->rd_index->indkey.values[0].
+        AttrNumber attno = index->rd_index->indkey.values[0];
+        bool isnull;
+        Datum d = slot_getattr(slot, attno, &isnull);
+        if (isnull) continue;
+        FloatVector *fv = DatumGetFloatVector(d);
+        if (fv->dim != dimensions) continue;
+        std::memcpy(FloatVectorArrayGet(samples, collected), fv->x,
+                    sizeof(float) * dimensions);
+        collected++;
+        samples->length = collected;
+    }
+    ExecDropSingleTupleTableSlot(slot);
+    table_endscan(scan);
 }
 
 namespace ann_helper {
