@@ -131,6 +131,18 @@ CREATE OPERATOR <=> (
     COMMUTATOR = '<=>'
 );
 
+-- Duck-side parity: <~> aliases <=> for cosine distance.
+CREATE OPERATOR <~> (
+    LEFTARG = floatvector, RIGHTARG = floatvector, PROCEDURE = cosine_distance,
+    COMMUTATOR = '<~>'
+);
+
+-- Duck-side parity: vector_add/vector_sub alias floatvector_add/sub.
+CREATE FUNCTION vector_add(floatvector, floatvector) RETURNS floatvector
+    AS 'MODULE_PATHNAME', 'floatvector_add' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION vector_sub(floatvector, floatvector) RETURNS floatvector
+    AS 'MODULE_PATHNAME', 'floatvector_sub' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 CREATE OPERATOR + (
     LEFTARG = floatvector, RIGHTARG = floatvector, PROCEDURE = floatvector_add,
     COMMUTATOR = +
