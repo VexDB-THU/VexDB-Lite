@@ -2,7 +2,7 @@
 # 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
 # 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
 # 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
-name: index__graph_index_subquery_optimization
+name: graph_index_subquery_optimization
 tags:
 - vex
 - migrated
@@ -28,6 +28,7 @@ steps:
 
     SELECT id FROM t ORDER BY ${L2(v, (SELECT vec FROM tmp))} LIMIT 5;'
   _field_types: I
+  _sort: sort
   expect:
   - - 48
   - - 49
@@ -41,6 +42,7 @@ steps:
     - <REGEX>:.*VEX_INDEX_SCAN.*
 - query: SELECT id FROM t ORDER BY ${L2(v, (SELECT qvec FROM queries WHERE qid = 1))} LIMIT 5;
   _field_types: I
+  _sort: sort
   expect:
   - - 48
   - - 49
@@ -64,6 +66,7 @@ steps:
 
     SELECT id FROM t ORDER BY v <-> (SELECT v FROM q) LIMIT 5;'
   _field_types: I
+  _sort: sort
   expect:
   - - 48
   - - 49
@@ -77,6 +80,7 @@ steps:
     - <REGEX>:.*VEX_INDEX_SCAN.*
 - query: SELECT id FROM t ORDER BY ${L2(v, (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)}))} LIMIT 5;
   _field_types: I
+  _sort: sort
   expect:
   - - 48
   - - 49
@@ -90,6 +94,7 @@ steps:
     - <REGEX>:.*VEX_INDEX_SCAN.*
 - query: SELECT id FROM t ORDER BY ${L2(v, ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)})} LIMIT 5;
   _field_types: I
+  _sort: sort
   expect:
   - - 48
   - - 49

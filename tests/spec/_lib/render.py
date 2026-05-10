@@ -220,21 +220,23 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
     if spec.get("setup"):
         for stmt in split_sql(render_template(spec["setup"], dialect)):
             lines += ["statement ok", stmt, ""]
+    # onlyif/skipif 是 *modifier* directive (修饰紧邻下一条 statement/query),
+    # 它和被修饰的 SQL 之间不能有空行.
+    MODIFIER_DIRECTIVES = ("onlyif", "skipif")
+
     for step in spec.get("steps", []):
         if "raw_directive" in step:
             d = step["raw_directive"]
             body = step.get("raw_body", "").strip()
-            # raw_body 通常只是 sqllogictest block 间残留的注释 (如 `# 说明`),
-            # sqllogictest parser 不期望 directive 与下一个 statement 之间有非 #
-            # 内容. 跳过 body 让后续 step 自然紧接.
-            # 仅当 body 是非注释 SQL 时才输出 (rare, 几乎只见于 onlyif/skipif 后的 inline 语句).
-            if d == "restart":
-                lines += ["restart", ""]
+            head = d.split(maxsplit=1)[0] if d else ""
+            # raw_body 多数是 sqllogictest block 间残留的 # 注释, 应丢弃;
+            # 仅当 body 含真实非注释 SQL 才保留 (rare).
+            if head in MODIFIER_DIRECTIVES:
+                lines.append(d)  # 不加空行, 让下一个 statement/query 紧贴
             else:
                 lines += [d, ""]
-                if body and not all(ln.strip().startswith("#") or not ln.strip() for ln in body.splitlines()):
-                    # body 含真实 SQL (非全注释), 保留
-                    lines += [body, ""]
+            if body and not all(ln.strip().startswith("#") or not ln.strip() for ln in body.splitlines()):
+                lines += [body, ""]
             continue
         if "statement" in step and "expect_error" not in step:
             for stmt in split_sql(render_template(step["statement"], dialect)):
@@ -251,8 +253,10 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
         elif "query" in step:
             rows = step.get("expect", [])
             field_types = step.get("_field_types") or ("I" * (len(rows[0]) if rows else 1))
+            sort_mod = step.get("_sort", "")  # 'sort' / 'rowsort' / 'rowsort label'
+            header = f"query {field_types}" + (f" {sort_mod}" if sort_mod else "")
             lines += [
-                f"query {field_types}",
+                header,
                 render_template(step["query"], dialect),
                 "----",
             ]

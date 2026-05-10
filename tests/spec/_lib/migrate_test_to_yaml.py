@@ -295,14 +295,26 @@ def parse_test_file(text: str) -> dict:
             err = _strip_trailing_comments(err).strip()
             steps.append({"statement": templatize(sql), "expect_error": err})
         elif header.startswith("query"):
-            # header: "query III" / "query I rowsort" 等. 取第一个 token 后的字段类型串.
+            # header: "query I" / "query III rowsort" / "query I sort" / "query I rowsort label"
+            # 第一个 token 是字段类型串 (I=int / R=real / T=text 的组合);
+            # 余下是 sort modifier (sort/rowsort/valuesort/nosort) + 可选 label.
             parts_h = header.split(maxsplit=1)
-            field_types = parts_h[1].split()[0] if len(parts_h) > 1 else "I"
-            parts = rest.split("\n----\n", 1)
-            sql = _strip_block_trailing_blanks(parts[0])
-            expected_block = parts[1] if len(parts) > 1 else ""
+            args_after = parts_h[1] if len(parts_h) > 1 else "I"
+            tokens = args_after.split()
+            field_types = tokens[0] if tokens else "I"
+            sort_modifier = " ".join(tokens[1:])  # 例如 "sort" / "rowsort" / "rowsort label"
+            # ---- 后允许 trailing 空白 / EOF (block.rstrip 后可能只剩 '----' 末尾)
+            split_m = re.search(r"\n----[ \t]*(?:\n|\Z)", rest)
+            if split_m:
+                sql = _strip_block_trailing_blanks(rest[: split_m.start()])
+                expected_block = rest[split_m.end():]
+            else:
+                sql = _strip_block_trailing_blanks(rest)
+                expected_block = ""
             rows = _parse_expected_rows(expected_block, len(field_types))
             step: dict = {"query": templatize(sql), "_field_types": field_types}
+            if sort_modifier:
+                step["_sort"] = sort_modifier
             step["expect"] = rows
             steps.append(step)
 
