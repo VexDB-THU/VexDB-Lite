@@ -5,34 +5,25 @@
 
 extern "C" {
 #include "catalog/namespace.h"
+#include "catalog/pg_type.h"
+#include "utils/syscache.h"
 }
 
-Oid get_floatvector_oid(void)
+// TypenameGetTypid only searches pg_catalog. Our extension types live in
+// the schema where CREATE EXTENSION installed them; resolve "schema.name"
+// via search_path then SearchSysCache2 in (TYPENAMENSP).
+static Oid lookup_extension_type_oid(const char *name)
 {
-    static Oid cached_oid = InvalidOid;
-    if (cached_oid == InvalidOid) {
-        cached_oid = TypenameGetTypid("floatvector");
-    }
-    return cached_oid;
+    Oid nsp_oid = LookupExplicitNamespace("public", /*missing_ok*/ true);
+    if (!OidIsValid(nsp_oid)) return InvalidOid;
+    return GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
+                           PointerGetDatum(name),
+                           ObjectIdGetDatum(nsp_oid));
 }
 
-Oid get_halfvector_oid(void)
-{
-    static Oid cached_oid = InvalidOid;
-    if (cached_oid == InvalidOid) {
-        cached_oid = TypenameGetTypid("halfvector");
-    }
-    return cached_oid;
-}
-
-Oid get_int8vector_oid(void)
-{
-    static Oid cached_oid = InvalidOid;
-    if (cached_oid == InvalidOid) {
-        cached_oid = TypenameGetTypid("int8vector");
-    }
-    return cached_oid;
-}
+Oid get_floatvector_oid(void) { return lookup_extension_type_oid("floatvector"); }
+Oid get_halfvector_oid(void)  { return lookup_extension_type_oid("halfvector"); }
+Oid get_int8vector_oid(void)  { return lookup_extension_type_oid("int8vector"); }
 
 size_t get_relstats_reltuples(Relation rel)
 {
@@ -77,9 +68,10 @@ void check_ann_attributes(Relation index)
     Oid floatvector_oid = get_floatvector_oid();
     Oid halfvector_oid = get_halfvector_oid();
     int natts = RelationGetDescr(index)->natts;
+    Oid first_attr_oid = TupleDescAttr(RelationGetDescr(index), 0)->atttypid;
 
-    if (TupleDescAttr(RelationGetDescr(index), 0)->atttypid != floatvector_oid &&
-        TupleDescAttr(RelationGetDescr(index), 0)->atttypid != halfvector_oid) {
+    if (first_attr_oid != floatvector_oid &&
+        first_attr_oid != halfvector_oid) {
         ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                         errmsg("The first attribute of index must be floatvector or halfvector.")));
     }
