@@ -240,17 +240,17 @@ void PQDistancer::prepare(Relation index, void *metap)
 {
     GraphIndexMetaPage mp = (GraphIndexMetaPage)metap;
     Metric m = mp ? mp->metric : Metric::L2;
-    // Hot path: PQ runtime data (centroids, code_size, M, dispatch fn ptrs)
-    // lives in the process-local cache from train()'s stash. If our `pq` is
-    // empty (M==0 — fresh distancer instance), pull from the cache.
-    if (pq.M == 0 && !load_from_cache(index, m)) {
+    // PQDistancer can be constructed via Variant / placement new that
+    // bypasses our ctor's memset(&pq), so every member field — including
+    // `prepared` — may be stack garbage on first prepare(). Always force
+    // a cache load: it's a single unordered_map find by Oid (cheap), and
+    // it's the only way to get a known-good (M, ksub, centroids) state.
+    if (!load_from_cache(index, m)) {
         ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
             errmsg("PQ centroids not in cache — index needs to be rebuilt "
                    "after PG restart (PQ persistence not yet wired)")));
     }
-    if (dist_table == nullptr) {
-        dist_table = (float *)palloc(pq.M * pq.ksub * sizeof(float));
-    }
+    dist_table = (float *)palloc(pq.M * pq.ksub * sizeof(float));
     prepared = true;
 }
 

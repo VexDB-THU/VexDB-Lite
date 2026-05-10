@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <cstdint>
+#include <cstring>
 #include "postgres.h"
 #include "utils/relcache.h"
 #include "floatvector.h"
@@ -99,7 +100,11 @@ struct PQDistancer {
     static constexpr bool has_estimation_func = false;
     static constexpr bool need_refine = true;
 
-    PQDistancer() : dist_table(NULL), prepared(false) {}
+    // Zero pq so prepare()'s `pq.M == 0` cache-miss path fires for fresh
+    // instances. ProductQuantizer is a plain struct with size_t / float* /
+    // function-pointer members — memset to 0 leaves all fields safely null.
+    PQDistancer() : dist_table(NULL), flag(0.0f), prepared(false)
+    { std::memset(&pq, 0, sizeof(pq)); }
     void train(Relation index, FloatVectorArray samples, size_t dimension, Metric metric,
                bool need_norm, int parallel_workers, int maintenance_work_mem);
     void prepare(Relation index, void *metap);
