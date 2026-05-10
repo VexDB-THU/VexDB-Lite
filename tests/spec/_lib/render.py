@@ -207,6 +207,37 @@ def _find_paren_end(text: str, start: int) -> int:
 
 # ─────────────────────────── 各引擎 emitter ────────────────────────────
 
+# onlyif/skipif 修饰紧邻下一条 statement/query, 它和被修饰的 SQL 之间不能有空行.
+MODIFIER_DIRECTIVES = ("onlyif", "skipif")
+
+
+def _has_real_sql(body: str) -> bool:
+    """body 是否含非注释非空白行 (sqllogictest 视空行 + # 为分隔/注释)."""
+    return any(ln.strip() and not ln.lstrip().startswith("#") for ln in body.splitlines())
+
+
+def _query_header(field_types: str, sort_mod: str) -> str:
+    """sqllogictest query header: 'query I' / 'query I rowsort' / ..."""
+    return f"query {field_types}" + (f" {sort_mod}" if sort_mod else "")
+
+
+def _sort_rows(rows: list, sort_mod: str) -> list:
+    """按 sqllogictest sort 语义对 rows 重排.
+    - rowsort: 行级排序 (lexicographic on string repr of each row)
+    - sort / valuesort: 拍平所有 cell 后排序, 重新切回 row
+    - nosort / 空: 不动
+    """
+    head = (sort_mod or "").split()[:1]
+    head = head[0] if head else ""
+    if head == "rowsort":
+        return sorted(rows, key=lambda r: tuple(str(v) for v in r))
+    if head in ("sort", "valuesort"):
+        ncols = len(rows[0]) if rows else 1
+        flat = sorted((str(v) for r in rows for v in r))
+        return [flat[i:i + ncols] for i in range(0, len(flat), ncols)]
+    return rows
+
+
 def emit_duckdb(spec: dict, dialect: dict) -> str:
     """sqllogictest .test 格式."""
     lines = [
@@ -220,22 +251,16 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
     if spec.get("setup"):
         for stmt in split_sql(render_template(spec["setup"], dialect)):
             lines += ["statement ok", stmt, ""]
-    # onlyif/skipif 是 *modifier* directive (修饰紧邻下一条 statement/query),
-    # 它和被修饰的 SQL 之间不能有空行.
-    MODIFIER_DIRECTIVES = ("onlyif", "skipif")
-
     for step in spec.get("steps", []):
         if "raw_directive" in step:
             d = step["raw_directive"]
             body = step.get("raw_body", "").strip()
-            head = d.split(maxsplit=1)[0] if d else ""
-            # raw_body 多数是 sqllogictest block 间残留的 # 注释, 应丢弃;
-            # 仅当 body 含真实非注释 SQL 才保留 (rare).
+            head = d.split(maxsplit=1)[0]
             if head in MODIFIER_DIRECTIVES:
-                lines.append(d)  # 不加空行, 让下一个 statement/query 紧贴
+                lines.append(d)  # 紧贴下一行 (无空行)
             else:
                 lines += [d, ""]
-            if body and not all(ln.strip().startswith("#") or not ln.strip() for ln in body.splitlines()):
+            if _has_real_sql(body):
                 lines += [body, ""]
             continue
         if "statement" in step and "expect_error" not in step:
@@ -253,10 +278,8 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
         elif "query" in step:
             rows = step.get("expect", [])
             field_types = step.get("_field_types") or ("I" * (len(rows[0]) if rows else 1))
-            sort_mod = step.get("_sort", "")  # 'sort' / 'rowsort' / 'rowsort label'
-            header = f"query {field_types}" + (f" {sort_mod}" if sort_mod else "")
             lines += [
-                header,
+                _query_header(field_types, step.get("_sort", "")),
                 render_template(step["query"], dialect),
                 "----",
             ]
@@ -323,7 +346,11 @@ def emit_pg(spec: dict, dialect: dict) -> tuple[str, str]:
         elif "query" in step:
             rendered = render_template(step["query"], dialect).rstrip(";") + ";"
             sql_lines.append(rendered)
-            for row in step.get("expect", []):
+            # 标了 sort 的 query: PG runner 不会自动排序 actual, 这里也对 expected
+            # 按相同语义排序写出 → 跟 DuckDB sqllogictest sort 行为对齐 (避免 ANN
+            # 顺序不稳定造成假 fail; runner 那侧需要对 actual 也做相同排序).
+            rows = _sort_rows(step.get("expect", []), step.get("_sort", ""))
+            for row in rows:
                 # PG 多列用 '|' (不带空格, psql -A -F'|' 模式)
                 exp_lines.append("|".join(_pg_format_value(v) for v in row))
     if spec.get("teardown"):
@@ -361,11 +388,21 @@ def emit_python(spec: dict, dialect: dict) -> str:
             ]
         elif "query" in step:
             q = render_template(step["query"], dialect)
-            expected = step.get("expect", [])
-            lines += [
-                f"    rows = con.execute({q!r}).fetchall()",
-                f"    assert rows == {[tuple(r) for r in expected]!r}",
-            ]
+            sort_mod = step.get("_sort", "")
+            expected = _sort_rows(step.get("expect", []), sort_mod)
+            sort_op = ""
+            if sort_mod.split()[:1] == ["rowsort"]:
+                sort_op = "    rows = sorted(rows, key=lambda r: tuple(str(v) for v in r))"
+            elif sort_mod.split()[:1] in (["sort"], ["valuesort"]):
+                sort_op = (
+                    "    flat = sorted(str(v) for r in rows for v in r); "
+                    "ncols = len(rows[0]) if rows else 1; "
+                    "rows = [flat[i:i+ncols] for i in range(0, len(flat), ncols)]"
+                )
+            lines.append(f"    rows = con.execute({q!r}).fetchall()")
+            if sort_op:
+                lines.append(sort_op)
+            lines.append(f"    assert rows == {[tuple(r) for r in expected]!r}")
     if spec.get("teardown"):
         for stmt in split_sql(render_template(spec["teardown"], dialect)):
             lines.append(f"    con.execute({stmt!r})")

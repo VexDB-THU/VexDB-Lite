@@ -284,33 +284,16 @@ def parse_test_file(text: str) -> dict:
             if sql:
                 steps.append({"statement": templatize(sql)})
         elif header.startswith("statement error"):
-            # ---- 后允许直接 EOF 或 \n
-            split_m = re.search(r"\n----\s*(?:\n|\Z)", rest)
-            if split_m:
-                sql = _strip_block_trailing_blanks(rest[: split_m.start()])
-                err = rest[split_m.end():].strip()
-            else:
-                sql = _strip_block_trailing_blanks(rest)
-                err = ""
-            err = _strip_trailing_comments(err).strip()
+            sql, err = _split_sql_and_expected(rest)
+            err = _strip_block_trailing_blanks(err).strip()
             steps.append({"statement": templatize(sql), "expect_error": err})
         elif header.startswith("query"):
             # header: "query I" / "query III rowsort" / "query I sort" / "query I rowsort label"
-            # 第一个 token 是字段类型串 (I=int / R=real / T=text 的组合);
-            # 余下是 sort modifier (sort/rowsort/valuesort/nosort) + 可选 label.
-            parts_h = header.split(maxsplit=1)
-            args_after = parts_h[1] if len(parts_h) > 1 else "I"
-            tokens = args_after.split()
-            field_types = tokens[0] if tokens else "I"
-            sort_modifier = " ".join(tokens[1:])  # 例如 "sort" / "rowsort" / "rowsort label"
-            # ---- 后允许 trailing 空白 / EOF (block.rstrip 后可能只剩 '----' 末尾)
-            split_m = re.search(r"\n----[ \t]*(?:\n|\Z)", rest)
-            if split_m:
-                sql = _strip_block_trailing_blanks(rest[: split_m.start()])
-                expected_block = rest[split_m.end():]
-            else:
-                sql = _strip_block_trailing_blanks(rest)
-                expected_block = ""
+            # 首 token = 字段类型串 (I/R/T 组合); 余下 = sort modifier + 可选 label.
+            tokens = header.split()[1:] or ["I"]
+            field_types = tokens[0]
+            sort_modifier = " ".join(tokens[1:])
+            sql, expected_block = _split_sql_and_expected(rest)
             rows = _parse_expected_rows(expected_block, len(field_types))
             step: dict = {"query": templatize(sql), "_field_types": field_types}
             if sort_modifier:
@@ -321,16 +304,34 @@ def parse_test_file(text: str) -> dict:
     return {"description": description, "tags": tags, "steps": steps}
 
 
+def is_comment_or_blank(line: str) -> bool:
+    """sqllogictest 视空行 + # 注释行为 block 间隔."""
+    s = line.strip()
+    return not s or s.startswith("#")
+
+
 def _strip_block_trailing_blanks(s: str) -> str:
-    """去掉 block 末尾的空行 + # 注释行 (sqllogictest block 之间的注释会粘到上一个 block 末尾)."""
+    """去掉 block 末尾的空行 + # 注释行 (block 间的注释常粘到上一个 block 末尾)."""
     lines = s.splitlines()
-    while lines and (not lines[-1].strip() or lines[-1].lstrip().startswith("#")):
+    while lines and is_comment_or_blank(lines[-1]):
         lines.pop()
     return "\n".join(lines)
 
 
-# 别名 (历史名, 同义)
-_strip_trailing_comments = _strip_block_trailing_blanks
+_strip_trailing_comments = _strip_block_trailing_blanks  # 历史名别名
+
+
+# block.rstrip 后末尾的 ---- 可能没 trailing newline, 故允许 (\n|\Z); 用 [ \t]
+# 替代 \s 防 \s 跨行匹配.
+_EXPECTED_SEP_RE = re.compile(r"\n----[ \t]*(?:\n|\Z)")
+
+
+def _split_sql_and_expected(rest: str) -> tuple[str, str]:
+    """切 sqllogictest block 的 SQL 与 expected 区. 任一缺失返回空串."""
+    m = _EXPECTED_SEP_RE.search(rest)
+    if m:
+        return _strip_block_trailing_blanks(rest[: m.start()]), rest[m.end():]
+    return _strip_block_trailing_blanks(rest), ""
 
 
 def _parse_expected_rows(block: str, ncols: int) -> list[list]:
