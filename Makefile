@@ -16,6 +16,7 @@ SRCS = \
     src/ann_utils.cpp \
     src/vector_storage.cpp \
     src/vector_smgr.cpp \
+    src/vex_index_info.cpp \
     knl/knl_alloc.cpp \
     src/distance/architecture_minimal.cpp \
     src/distance/distance.cpp \
