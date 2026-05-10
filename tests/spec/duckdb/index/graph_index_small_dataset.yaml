@@ -1,0 +1,111 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_small_dataset
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test graph index with small datasets and single-thread scenarios
+steps:
+- statement: CREATE TABLE t1 (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t1 VALUES (1, ${VEC_LITERAL([1.0, 2.0, 3.0], 3)});
+- statement: CREATE INDEX idx1 ON t1 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t1 ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT id FROM t1 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- statement: DROP TABLE t1;
+- statement: CREATE TABLE t2 (id INTEGER, vec ${VECTOR(3)});
+- statement: "INSERT INTO t2 VALUES\n  (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)}),\n  (2, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)});"
+- statement: CREATE INDEX idx2 ON t2 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t2 ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT id FROM t2 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT id FROM t2 ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.0], 3)})} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 2
+- statement: DROP TABLE t2;
+- statement: CREATE TABLE t5 (id INTEGER, vec ${VECTOR(3)});
+- statement: "INSERT INTO t5 VALUES\n  (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)}),\n  (2, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)}),\n  (3, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)}),\n  (4, ${VEC_LITERAL([1.0, 1.0, 0.0],\
+    \ 3)}),\n  (5, ${VEC_LITERAL([0.0, 1.0, 1.0], 3)});"
+- statement: CREATE INDEX idx5 ON t5 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT count(*) FROM (SELECT id FROM t5 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 5);
+  _field_types: I
+  expect:
+  - - 5
+- statement: DROP TABLE t5;
+- statement: CREATE TABLE t10 (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t10 SELECT i, ${VEC_LITERAL([(i * 0.1)::FLOAT, 0.0, 0.0], 3)} FROM ${RANGE(10)} t(i);
+- statement: CREATE INDEX idx10 ON t10 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t10 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 0
+- query: SELECT id FROM t10 ORDER BY ${L2(vec, ${VEC_LITERAL([0.9, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 9
+- statement: DROP TABLE t10;
+- statement: CREATE TABLE t_dim2 (id INTEGER, vec ${VECTOR(2)});
+- statement: "INSERT INTO t_dim2 VALUES\n  (1, ${VEC_LITERAL([0.0, 0.0], 2)}),\n  (2, ${VEC_LITERAL([1.0, 0.0], 2)}),\n  (3, ${VEC_LITERAL([0.0, 1.0], 2)}),\n  (4, ${VEC_LITERAL([1.0, 1.0], 2)});"
+- statement: CREATE INDEX idx_dim2 ON t_dim2 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t_dim2 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0], 2)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT id FROM t_dim2 ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 1.0], 2)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 4
+- statement: DROP TABLE t_dim2;
+- statement: CREATE TABLE t_bf64 (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t_bf64 SELECT i, ${VEC_LITERAL([(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0], 3)} FROM ${RANGE(64)} t(i);
+- statement: CREATE INDEX idx_bf64 ON t_bf64 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t_bf64 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 0
+- statement: DROP TABLE t_bf64;
+- statement: CREATE TABLE t_bf65 (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t_bf65 SELECT i, ${VEC_LITERAL([(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, 0.0], 3)} FROM ${RANGE(65)} t(i);
+- statement: CREATE INDEX idx_bf65 ON t_bf65 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t_bf65 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 0
+- query: SELECT id FROM t_bf65 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 0
+  - - 1
+  - - 2
+- statement: DROP TABLE t_bf65;
+- statement: CREATE TABLE t_klarge (id INTEGER, vec ${VECTOR(3)});
+- statement: "INSERT INTO t_klarge VALUES\n  (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)}),\n  (2, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)}),\n  (3, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)});"
+- statement: CREATE INDEX idx_klarge ON t_klarge USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT count(*) FROM (SELECT id FROM t_klarge ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0], 3)})} LIMIT 100);
+  _field_types: I
+  expect:
+  - - 3
+- statement: DROP TABLE t_klarge;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_small_dataset.test

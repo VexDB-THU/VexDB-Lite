@@ -1,0 +1,39 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: ivfpq_basic_hnsw_adapted
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/opengauss_adapted/ivfpq_basic_hnsw_adapted.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: DROP TABLE IF EXISTS items;
+- statement: DROP TABLE IF EXISTS csv_to_query;
+- statement: CREATE TABLE items (id bigserial PRIMARY KEY, embedding floatvector(8));
+- statement: CREATE TABLE csv_to_query (id bigint PRIMARY KEY, embedding floatvector(8));
+- statement: "INSERT INTO items (embedding)\nSELECT ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n            || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ','\
+    \ || (i*0.08) || ']')::floatvector\nFROM generate_series(1, 500) AS t(i);"
+- statement: INSERT INTO items (embedding) SELECT embedding FROM items;
+- statement: INSERT INTO items (embedding) SELECT embedding FROM items;
+- query: SELECT COUNT(*) FROM items;
+  expect:
+  - - 2000 rows total
+- statement: "INSERT INTO csv_to_query (id, embedding)\nSELECT i, ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n                || (i*0.05) || ',' || (i*0.06) || ','\
+    \ || (i*0.07) || ',' || (i*0.08) || ']')::floatvector\nFROM generate_series(1, 10) AS t(i);"
+- statement: SET client_min_messages = warning;
+- statement: "CREATE INDEX items_embedding_idx ON items USING vexdb_graph (embedding)\n  WITH (quantizer = 'pq', pq_m = 4);"
+- statement: SET client_min_messages = notice;
+- statement: DELETE FROM items WHERE id = 1;
+- query: SELECT id FROM items WHERE id < 10 ORDER BY id;
+  expect: []
+- statement: DELETE FROM items;
+- query: SELECT COUNT(*) FROM items;
+  expect:
+  - - 0
+- statement: "INSERT INTO items (embedding)\nSELECT ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n            || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ','\
+    \ || (i*0.08) || ']')::floatvector\nFROM generate_series(1, 500) AS t(i);"
+- statement: SET enable_seqscan = off;
+- statement: RESET enable_seqscan;
+- statement: DROP TABLE items;
+- statement: DROP TABLE csv_to_query;

@@ -1,0 +1,64 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__distance_null
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test distance operators handle NULL values gracefully
+steps:
+- query: SELECT NULL <-> ${VEC_LITERAL([1.0, 2.0, 3.0], 3)};
+  _field_types: I
+  expect:
+  - - 'NULL'
+- query: SELECT ${VEC_LITERAL([1.0, 2.0, 3.0], 3)} <-> NULL;
+  _field_types: I
+  expect:
+  - - 'NULL'
+- query: SELECT NULL <=> ${VEC_LITERAL([1.0, 2.0, 3.0], 3)};
+  _field_types: I
+  expect:
+  - - 'NULL'
+- query: SELECT NULL <~> ${VEC_LITERAL([1.0, 2.0, 3.0], 3)};
+  _field_types: I
+  expect:
+  - - 'NULL'
+- statement: CREATE TABLE t_null (id INTEGER, v ${VECTOR(3)});
+- statement: INSERT INTO t_null VALUES (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)});
+- statement: INSERT INTO t_null VALUES (2, NULL);
+- statement: INSERT INTO t_null VALUES (3, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)});
+- query: SELECT id FROM t_null ORDER BY v <-> ${VEC_LITERAL([1.0, 0.0, 0.0], 3)} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+- query: SELECT id FROM t_null ORDER BY v <=> ${VEC_LITERAL([1.0, 0.0, 0.0], 3)} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+- query: SELECT id FROM t_null ORDER BY ${L2(v, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+- statement: CREATE TABLE t_null_idx (id INTEGER, v ${VECTOR(3)});
+- statement: INSERT INTO t_null_idx VALUES (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)});
+- statement: INSERT INTO t_null_idx VALUES (2, NULL);
+- statement: INSERT INTO t_null_idx VALUES (3, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)});
+- statement: INSERT INTO t_null_idx VALUES (4, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)});
+- statement: CREATE INDEX idx_null ON t_null_idx USING ${VEX_INDEX} (v${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT id FROM t_null_idx ORDER BY ${L2(v, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+  - - 4
+- statement: DROP TABLE t_null;
+- statement: DROP TABLE t_null_idx;
+_migrated_from: vexdb-duck/test/sql/vex/functions/distance_null.test

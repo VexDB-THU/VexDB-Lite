@@ -1,0 +1,44 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: graph_index_pq_persistence
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/index_pq/graph_index_pq_persistence.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: CREATE TABLE pq_p (id INTEGER PRIMARY KEY, vec floatvector(8));
+- statement: "INSERT INTO pq_p SELECT i,\n    ('[' || sin(i*0.1) || ',' || cos(i*0.2) || ',' || sin(i*0.3) || ',' || cos(i*0.4) || ','\n         || sin(i*0.5) || ',' || cos(i*0.6) || ',' || sin(i*0.7) ||\
+    \ ',' || cos(i*0.8) || ']')::floatvector\nFROM generate_series(1, 300) AS t(i);"
+- statement: CREATE INDEX idx ON pq_p USING vexdb_graph (vec) WITH (quantizer = 'pq', pq_m = 4);
+- query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
+  expect: []
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SELECT count(*) FROM pq_p;'
+- query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
+  expect: []
+- statement: DELETE FROM pq_p WHERE id BETWEEN 1 AND 50;
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SELECT count(*) FROM pq_p;'
+- query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
+  expect: []
+- statement: DELETE FROM pq_p WHERE id % 2 = 0;
+- statement: '\echo "TODO: pg_ctl restart here (no checkpoint)"
+
+    SELECT count(*) FROM pq_p;'
+- query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::floatvector) LIMIT 10) sub;
+  expect: []
+- statement: "INSERT INTO pq_p SELECT i,\n    ('[' || cos(i*0.3) || ',' || sin(i*0.4) || ',' || cos(i*0.5) || ',' || sin(i*0.6) || ','\n         || cos(i*0.7) || ',' || sin(i*0.8) || ',' || cos(i*0.9) ||\
+    \ ',' || sin(i*1.0) || ']')::floatvector\nFROM generate_series(301, 500) AS t(i);"
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SELECT count(*) FROM pq_p;'
+- query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
+  expect: []
+- statement: DROP TABLE pq_p;

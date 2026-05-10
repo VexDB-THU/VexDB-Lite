@@ -1,0 +1,31 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__distance_cosine
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test cosine_distance function
+steps:
+- query: SELECT ${COSINE(${VEC_LITERAL([1.0, 0.0], 2)}, ${VEC_LITERAL([0.0, 1.0], 2)})};
+  _field_types: R
+  expect:
+  - - 1.0
+- query: SELECT ${COSINE(${VEC_LITERAL([1.0, 2.0, 3.0], 3)}, ${VEC_LITERAL([2.0, 4.0, 6.0], 3)})};
+  _field_types: R
+  expect:
+  - - 0.0
+- query: SELECT ${COSINE(${VEC_LITERAL([1.0, 0.0], 2)}, ${VEC_LITERAL([-1.0, 0.0], 2)})};
+  _field_types: R
+  expect:
+  - - 2.0
+- query: SELECT ${COSINE(NULL::${VECTOR(2)}, ${VEC_LITERAL([1.0, 0.0], 2)})};
+  _field_types: R
+  expect:
+  - - 'NULL'
+_migrated_from: vexdb-duck/test/sql/vex/functions/distance_cosine.test

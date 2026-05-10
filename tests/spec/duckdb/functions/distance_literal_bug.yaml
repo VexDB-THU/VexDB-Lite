@@ -1,0 +1,39 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__distance_literal_bug
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test distance functions with uncast literal arrays
+steps:
+- statement: CREATE TABLE t_vec(c1 INTEGER, c2 ${VECTOR(3)});
+- statement: INSERT INTO t_vec VALUES(1, [1.0, 2.0, 3.0]);
+- query: SELECT ${L2(c2, [0.0, 0.0, 0.0])} FROM t_vec;
+  _field_types: R
+  expect:
+  - - 3.7416573867739413
+- query: SELECT ${COSINE(c2, [1.0, 0.0, 0.0])} FROM t_vec;
+  _field_types: R
+  expect:
+  - - 0.732738733291626
+- query: SELECT ${IP(c2, [1.0, 0.0, 0.0])} FROM t_vec;
+  _field_types: R
+  expect:
+  - - 1.0
+- query: SELECT c1, ${L2(c2, [0.0, 0.0, 0.0])} AS dist FROM t_vec ORDER BY dist LIMIT 1;
+  _field_types: IR
+  expect:
+  - - 1
+    - 3.7416573867739413
+- query: SELECT c1, ${COSINE(c2, [1.0, 0.0, 0.0])} AS dist FROM t_vec ORDER BY dist LIMIT 1;
+  _field_types: IR
+  expect:
+  - - 1
+    - 0.732738733291626
+_migrated_from: vexdb-duck/test/sql/vex/functions/distance_literal_bug.test

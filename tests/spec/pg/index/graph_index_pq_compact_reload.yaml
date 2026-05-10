@@ -1,0 +1,41 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: graph_index_pq_compact_reload
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/index_pq/graph_index_pq_compact_reload.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: SET vex_brute_force_threshold = 0;
+- statement: CREATE TABLE pq_compact_r (id INTEGER, vec floatvector(8));
+- statement: "INSERT INTO pq_compact_r SELECT i,\n    ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n         || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ','\
+    \ || (i*0.08) || ']')::floatvector\nFROM generate_series(0, 499) AS t(i);"
+- statement: "CREATE INDEX idx_pq_compact_r ON pq_compact_r USING vexdb_graph (vec)\n    WITH (quantizer = 'pq', pq_m = 4, memory_mode = 'compact');"
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SET vex_brute_force_threshold = 0;'
+- query: SELECT id FROM pq_compact_r ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
+  expect: []
+- statement: SET vex_pq_search_mode = 'pq_only';
+- query: 'SELECT id FROM pq_compact_r
+
+    ORDER BY l2_distance(vec, ''[1,2,3,4,5,6,7,8]''::floatvector)
+
+    LIMIT 1;'
+  expect: []
+- statement: RESET vex_pq_search_mode;
+- statement: DELETE FROM pq_compact_r WHERE id BETWEEN 50 AND 99;
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SET vex_brute_force_threshold = 0;'
+- statement: SET vex_pq_search_mode = 'pq_only';
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact_r\n    ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector)\n    LIMIT 10000\n) t;"
+  expect: []
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact_r\n    ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector)\n    LIMIT 10000\n) sub WHERE id BETWEEN 50 AND 99;"
+  expect: []
+- statement: RESET vex_pq_search_mode;
+- statement: DROP TABLE pq_compact_r;

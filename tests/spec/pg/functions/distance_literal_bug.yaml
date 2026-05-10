@@ -1,0 +1,30 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: distance_literal_bug
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/functions/distance_literal_bug.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: CREATE TABLE t_vec(c1 INTEGER, c2 floatvector(3));
+- statement: INSERT INTO t_vec VALUES(1, '[1, 2, 3]');
+- query: SELECT l2_distance(c2, '[0, 0, 0]'::floatvector) FROM t_vec;
+  expect:
+  - - 3.7416573867739413
+- query: SELECT cosine_distance(c2, '[1, 0, 0]'::floatvector) FROM t_vec;
+  expect:
+  - - 0.732738733291626
+- query: SELECT inner_product(c2, '[1, 0, 0]'::floatvector) FROM t_vec;
+  expect:
+  - - 1.0
+- query: SELECT c1, l2_distance(c2, '[0, 0, 0]'::floatvector) AS dist FROM t_vec ORDER BY dist LIMIT 1;
+  expect:
+  - - 1
+  - - 3.7416573867739413
+- query: SELECT c1, cosine_distance(c2, '[1, 0, 0]'::floatvector) AS dist FROM t_vec ORDER BY dist LIMIT 1;
+  expect:
+  - - 1
+  - - 0.732738733291626
+- statement: DROP TABLE t_vec;

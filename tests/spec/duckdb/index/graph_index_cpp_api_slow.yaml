@@ -1,0 +1,156 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_cpp_api_slow
+tags:
+- vex
+- migrated
+- slow
+engines:
+- duckdb
+- pg
+- opengauss
+description: C++ API level tests - transactions, rollback, concurrent connections
+steps:
+- statement: CREATE TABLE t_rollback (id INTEGER, vec ${VECTOR(4)});
+- statement: CREATE INDEX idx_rb ON t_rollback USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: INSERT INTO t_rollback VALUES (1, ${VEC_LITERAL([1.0, 0.0, 0.0, 0.0], 4)});
+- statement: INSERT INTO t_rollback VALUES (2, ${VEC_LITERAL([0.0, 1.0, 0.0, 0.0], 4)});
+- statement: BEGIN TRANSACTION;
+- statement: INSERT INTO t_rollback VALUES (3, ${VEC_LITERAL([0.0, 0.0, 1.0, 0.0], 4)});
+- statement: INSERT INTO t_rollback VALUES (4, ${VEC_LITERAL([0.0, 0.0, 0.0, 1.0], 4)});
+- statement: ROLLBACK;
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT count(*) FROM (SELECT id FROM t_rollback ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.0, 0.0, 0.0], 4)})} LIMIT 2);
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN TRANSACTION;
+- statement: DELETE FROM t_rollback WHERE id = 1;
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 1
+- statement: ROLLBACK;
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT count(*) FROM (SELECT id FROM t_rollback ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.0, 0.0, 0.0], 4)})} LIMIT 2);
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN TRANSACTION;
+- statement: INSERT INTO t_rollback VALUES (5, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)});
+- statement: COMMIT;
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT count(*) FROM (SELECT id FROM t_rollback ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 3);
+  _field_types: I
+  expect:
+  - - 3
+- raw_directive: loop i 10 30
+  raw_body: ''
+- statement: INSERT INTO t_rollback VALUES (${i}, ${VEC_LITERAL([${i}.0, 0.0, 0.0, 0.0], 4)});
+- raw_directive: endloop
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 23
+- raw_directive: loop i 10 20
+  raw_body: ''
+- statement: DELETE FROM t_rollback WHERE id = ${i};
+- raw_directive: endloop
+- query: SELECT count(*) FROM t_rollback;
+  _field_types: I
+  expect:
+  - - 13
+- query: SELECT count(*) FROM (SELECT id FROM t_rollback ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DROP TABLE t_rollback;
+- statement: CREATE TABLE t_interleave (id INTEGER, vec ${VECTOR(4)});
+- statement: CREATE INDEX idx_il ON t_interleave USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- raw_directive: loop i 1 21
+  raw_body: ''
+- statement: INSERT INTO t_interleave VALUES (${i}, ${VEC_LITERAL([${i}.0, 0.0, 0.0, 0.0], 4)});
+- statement: SELECT id FROM t_interleave ORDER BY ${L2(vec, ${VEC_LITERAL([${i}.0, 0.0, 0.0, 0.0], 4)})} LIMIT 5;
+- raw_directive: endloop
+- query: SELECT count(*) FROM t_interleave;
+  _field_types: I
+  expect:
+  - - 20
+- statement: DROP TABLE t_interleave;
+- statement: CREATE TABLE t_rapid (id INTEGER, vec ${VECTOR(4)});
+- statement: CREATE INDEX idx_rapid ON t_rapid USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: 'INSERT INTO t_rapid SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT)::${VECTOR(4)}
+
+    FROM ${RANGE2(1, 201)} t(i);'
+- raw_directive: loop i 1 51
+  raw_body: ''
+- statement: DELETE FROM t_rapid WHERE id = ${i};
+- statement: SELECT count(*) FROM (SELECT id FROM t_rapid ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 5);
+- raw_directive: endloop
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 150
+- query: SELECT count(*) FROM (SELECT id FROM t_rapid ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 20);
+  _field_types: I
+  expect:
+  - - 20
+- statement: BEGIN TRANSACTION;
+- statement: 'INSERT INTO t_rapid SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT)::${VECTOR(4)}
+
+    FROM ${RANGE2(201, 501)} t(i);'
+- statement: COMMIT;
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 450
+- query: SELECT count(*) FROM (SELECT id FROM t_rapid ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 50);
+  _field_types: I
+  expect:
+  - - 50
+- statement: BEGIN TRANSACTION;
+- statement: 'INSERT INTO t_rapid SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, sin(i*2)::FLOAT, cos(i*2)::FLOAT)::${VECTOR(4)}
+
+    FROM ${RANGE2(501, 1001)} t(i);'
+- statement: ROLLBACK;
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 450
+- query: SELECT count(*) FROM (SELECT id FROM t_rapid ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 20);
+  _field_types: I
+  expect:
+  - - 20
+- statement: BEGIN TRANSACTION;
+- statement: DELETE FROM t_rapid;
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 0
+- statement: ROLLBACK;
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 450
+- statement: UPDATE t_rapid SET vec = ${VEC_LITERAL([99.0, 99.0, 99.0, 99.0], 4)} WHERE id = 51;
+- query: SELECT count(*) FROM t_rapid;
+  _field_types: I
+  expect:
+  - - 450
+- query: SELECT count(*) FROM (SELECT id FROM t_rapid ORDER BY ${L2(vec, ${VEC_LITERAL([99.0, 99.0, 99.0, 99.0], 4)})} LIMIT 1);
+  _field_types: I
+  expect:
+  - - 1
+- statement: DROP TABLE t_rapid;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_cpp_api.test_slow
