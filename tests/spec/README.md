@@ -4,25 +4,24 @@
 
 ---
 
-## 项目目前的测试体系（**3 套**，规划只保留本框架）
+## 项目测试体系：**单一来源（spec yaml）**
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│ ① legacy DuckDB .test          109 个    vexdb-duck/test/sql/vex/       │
-│    bash build.sh test 跑的就是这个                                       │
-│    锁死 DuckDB sqllogictest, 无法服用 PG/SQLite                          │
-├─────────────────────────────────────────────────────────────────────────┤
-│ ② pg_tests/ 手写 SQL          59 个    ../pg_tests/  (vexdb_lite 外层) │
-│    "Translated from .test" 风格的 PG 翻译                               │
-│    跟 ① 大量重复 (16 个完全副本); 没有定期 runner                       │
-├─────────────────────────────────────────────────────────────────────────┤
-│ ③ spec DSL yaml (本框架)      106 个   tests/spec/                      │
-│    多引擎 SSOT, 路由 ENGINE_DIRS 加一行扩 SQLite/openGauss              │
-│    PG Docker 测试通过率 24/25 (96%)                                     │
+│ spec DSL yaml (本框架)        117 个   tests/spec/                      │
+│   多引擎 SSOT (DuckDB/PG/openGauss/...)                                 │
+│   - DuckDB runner: bash tests/spec/_lib/docker/run_duckdb.sh test       │
+│   - PG     runner: bash tests/spec/_lib/docker/run_pg.sh   test         │
+│   - 路由 ENGINE_DIRS, 加一行扩 SQLite                                   │
+│   通过率: DuckDB 105/105 (100%), PG 26/36 (72%, 余下是 PG_VEXDB 实现缺口) │
 └─────────────────────────────────────────────────────────────────────────┘
-```
 
-**目标**：完成迁移后 `rm -rf` ① ②，全部走 ③。详见 `docs/analysis/2026-05-09_pg-tests-vs-spec-shared-classification.md`。
+退役的旧体系 (已删除):
+- ❌ vexdb-duck/test/sql/vex/*.test       109 个 sqllogictest (反向迁入 spec)
+- ❌ ../pg_tests/*.sql                    59 个手写 PG (迁入 spec/pg/)
+保留:
+- ✅ vexdb-duck/test/sql/unsupported_vex/  3 个 quarantine 测试 (功能未实现)
+```
 
 ---
 
@@ -158,23 +157,23 @@ bash tests/spec/_lib/docker/run_pg.sh down   # 清理
 | `duckdb/` DuckDB-only yaml | 80 |
 | `pg/` PG-only yaml | 0（待迁 13 个） |
 | `opengauss/` openGauss-only yaml | 0（待迁 1 个） |
-| **PG Docker 通过率** | **24/25 (96%)** |
-| **DuckDB 接 `build.sh test`** | ❌ 未接通；仍跑 legacy `.test` |
-| `pg_tests/` 退役 | ❌ 待补迁后删 |
-| `vexdb-duck/test/sql/vex/` 退役 | ❌ 待 DuckDB 接通 + diff 后删 |
+| **DuckDB spec runner** | **105/105 (100%)** |
+| **PG Docker runner** | **26/36 (72%)** ← PG_VEXDB 真功能缺口 |
+| `pg_tests/` 退役 | ✅ 已删 |
+| `vexdb-duck/test/sql/vex/*.test` 退役 | ✅ 已删 (保留 unsupported_vex/) |
+| `build.sh test` 接 spec runner | 🟡 follow-up (build.sh 在工作区外层不在 git) |
 
 ---
 
-## 退役 ① ② 的依赖步骤（按顺序）
+## 历史 (整理过程)
 
 ```
-[✅] 1) spec 框架建立, 工具链就绪
-[✅] 2) PG Docker 测试跑通 (24/25)
-[ ] 3) 加 tests/spec/_lib/docker/run_duckdb.sh  ← spec 跑 DuckDB unittest 自带 runner
-[ ] 4) 跑一轮, 跟 legacy ① 字符级 diff, 列漂移清单
-[ ] 5) 修漂移 (改 yaml 或 dialects)
-[ ] 6) 迁 ② 中 13 个 PG 专属 → tests/spec/pg/
-[ ] 7) rm -rf vexdb-duck/test/sql/vex/ + ../pg_tests/
+[✅] 1) spec 框架 + 工具链
+[✅] 2) PG Docker runner 跑通
+[✅] 3) DuckDB spec runner (run_duckdb.sh) 接通
+[✅] 4) 修漂移 (DuckDB 102/105 → 105/105)
+[✅] 5) 迁 13 个 PG 专属 + 1 openGauss → tests/spec/{pg,opengauss}/
+[✅] 6) rm -rf 105 legacy .test + 59 pg_tests/  (本次操作)
 ```
 
 ---
