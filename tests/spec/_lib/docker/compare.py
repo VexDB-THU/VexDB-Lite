@@ -20,20 +20,13 @@ import math
 import sys
 from pathlib import Path
 
+# 共享 normalize: ../_normalize.py
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from _normalize import normalize_cell_str  # noqa: E402
+
 ATOL = 1e-4
 RTOL = 1e-3
-
-
-def normalize_cell(s: str) -> str:
-    s = s.strip()
-    if s in ("NULL", "(empty)", "(null)"):
-        return ""
-    # bool: PG=t/f, DuckDB=true/false, Python=True/False
-    if s.lower() in ("true", "t"):
-        return "t"
-    if s.lower() in ("false", "f"):
-        return "f"
-    return s
+normalize_cell = normalize_cell_str  # 历史名别名
 
 
 def try_float(s: str):

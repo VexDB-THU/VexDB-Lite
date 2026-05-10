@@ -22,106 +22,75 @@ from pathlib import Path
 
 import yaml
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _normalize import coerce_scalar  # noqa: E402
+
 
 # 拆 SQL 为 (注释行列表, sql 文本) 块
-def parse_pg_sql(text: str):
-    """从 .sql 解析出 step list. 每个 step 含 statement / query, 可选 expect/expect_error."""
-    lines = text.splitlines()
-    steps: list[dict] = []
+class _ParseState:
+    """parse_pg_sql 的累积状态. 替代之前 4 个 nonlocal + 闭包模式."""
+    __slots__ = ("expected", "skip", "buf")
 
-    # 收集 leading 注释 (含 -- expected:)
-    pending_comments: list[str] = []
-    pending_expected: list = []
-    pending_skip = False
+    def __init__(self) -> None:
+        self.expected: list = []
+        self.skip = False
+        self.buf: list[str] = []
 
-    sql_buf: list[str] = []
+    def reset_pending(self) -> None:
+        self.expected = []
+        self.skip = False
 
-    def flush_sql(force_query: bool = False):
-        nonlocal pending_comments, pending_expected, pending_skip, sql_buf
-        if not sql_buf:
-            return
-        sql = "\n".join(sql_buf).strip()
+    def flush(self, steps: list[dict]) -> None:
+        sql = "\n".join(self.buf).strip()
+        self.buf = []
         if not sql:
-            sql_buf = []
+            self.reset_pending()
             return
-
-        if pending_skip:
-            # SKIPPED 用例不入 yaml
-            sql_buf = []
-            pending_comments = []
-            pending_expected = []
-            pending_skip = False
+        if self.skip:
+            self.reset_pending()
             return
-
-        is_query = sql.lstrip().upper().startswith("SELECT") or force_query
-        step: dict = {}
-        if is_query and pending_expected:
-            step["query"] = sql
-            # expect 是 [[v1], [v2], ...] 形式 (单列, 1 列 = 1 个值/行)
-            step["expect"] = [[v] for v in pending_expected]
-        elif is_query:
-            step["query"] = sql
+        is_query = sql.lstrip().upper().startswith("SELECT")
+        step: dict = {"query": sql, "expect": [[v] for v in self.expected]} if is_query \
+            else {"statement": sql}
+        if is_query and not self.expected:
             step["expect"] = []
-        else:
-            step["statement"] = sql
         steps.append(step)
-        sql_buf = []
-        pending_comments = []
-        pending_expected = []
-        pending_skip = False
+        self.reset_pending()
 
-    for raw in lines:
+
+def parse_pg_sql(text: str):
+    """从 .sql 解析 step list. 每个 step 含 statement 或 query+expect."""
+    steps: list[dict] = []
+    st = _ParseState()
+
+    for raw in text.splitlines():
         ln = raw.rstrip("\r")
         stripped = ln.strip()
 
-        # 注释行
         if stripped.startswith("--"):
             content = stripped[2:].strip()
-            if content.lower().startswith("expected:"):
-                # -- expected: foo, bar
+            low = content.lower()
+            if low.startswith("expected:"):
                 val_str = content[len("expected:"):].strip()
-                # 多个 expected 用逗号分隔: "1, 3" 或者多行 "expected:" 累计
-                # 简化: 每个值单独一行 (这里允许逗号分隔)
-                if "," in val_str:
-                    vals = [v.strip() for v in val_str.split(",")]
-                else:
-                    vals = [val_str]
-                # 转 int/float, 失败保留原 string
-                for v in vals:
-                    if v in ("", "NULL", "(empty)"):
-                        pending_expected.append(None)
-                    else:
-                        try:
-                            pending_expected.append(int(v))
-                        except ValueError:
-                            try:
-                                pending_expected.append(float(v))
-                            except ValueError:
-                                pending_expected.append(v)
-            elif content.lower().startswith("skipped"):
-                pending_skip = True
-            else:
-                pending_comments.append(content)
+                vals = [v.strip() for v in val_str.split(",")] if "," in val_str else [val_str]
+                st.expected.extend(coerce_scalar(v) for v in vals)
+            elif low.startswith("skipped"):
+                st.skip = True
             continue
 
-        # 空行: 如果 buf 有 SQL 且以 ; 结尾, 视为 SQL 终止
         if stripped == "":
-            if sql_buf and sql_buf[-1].rstrip().endswith(";"):
-                flush_sql()
+            # buf 末尾有 ; 则当 SQL 结束; 否则重置 pending (SKIPPED 不跨空行污染)
+            if st.buf and st.buf[-1].rstrip().endswith(";"):
+                st.flush(steps)
             else:
-                # 空行也重置 pending_skip - SKIPPED 注释只影响紧邻的下一条 SQL
-                pending_skip = False
-                pending_expected = []
-                pending_comments = []
+                st.reset_pending()
             continue
 
-        sql_buf.append(ln)
-        # SQL 以 ; 结束 → flush
+        st.buf.append(ln)
         if stripped.endswith(";"):
-            flush_sql()
+            st.flush(steps)
 
-    # 末尾残留
-    flush_sql()
+    st.flush(steps)
     return steps
 
 

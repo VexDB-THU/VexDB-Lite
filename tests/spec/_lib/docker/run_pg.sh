@@ -149,14 +149,12 @@ END $$;
 EOF
         docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off \
             > "$actual" 2>&1 < "$sql_file" || true
-        # 过滤 psql 状态行 + NOTICE/WARNING/INFO 噪声
-        sed -i.bak \
-            -e '/^CREATE /d' -e '/^INSERT /d' -e '/^DROP /d' -e '/^DELETE /d' \
-            -e '/^UPDATE /d' -e '/^TRUNCATE/d' -e '/^SET$/d' -e '/^BEGIN$/d' \
-            -e '/^COMMIT$/d' -e '/^ROLLBACK$/d' -e '/^ALTER /d' -e '/^COPY /d' \
-            -e '/^EXPLAIN$/d' -e '/^SELECT /d' -e '/^Time: /d' \
-            -e '/^NOTICE:/d' -e '/^WARNING:/d' -e '/^INFO:/d' -e '/^DEBUG:/d' \
-            -e '/^HINT:/d' -e '/^DETAIL:/d' -e '/^CONTEXT:/d' \
+        # 过滤 psql 命令完成消息 + 服务端日志级别消息 + 报错位置标记 (^ / LINE).
+        # 单条 ERE 替代之前 23 个 -e 模式.
+        sed -i.bak -E \
+            -e '/^(CREATE|INSERT|DROP|DELETE|UPDATE|TRUNCATE|ALTER|COPY|SELECT|Time:|EXPLAIN) /d' \
+            -e '/^(SET|BEGIN|COMMIT|ROLLBACK|EXPLAIN)$/d' \
+            -e '/^(NOTICE|WARNING|INFO|DEBUG|HINT|DETAIL|CONTEXT):/d' \
             -e '/^LINE [0-9]/d' -e '/^[ \t]*\^[ \t]*$/d' \
             "$actual" 2>/dev/null
         rm -f "${actual}.bak"
@@ -201,5 +199,6 @@ case "${1:-}" in
     test)   shift; cmd_test "$@" ;;
     logs)   cmd_logs ;;
     status) cmd_status ;;
-    *) sed -n '2,16p' "$0" ;;
+    "" | -h | --help) sed -n '2,16p' "$0" ;;
+    *) fail "unknown command: ${1:-}; see -h for usage" ;;
 esac

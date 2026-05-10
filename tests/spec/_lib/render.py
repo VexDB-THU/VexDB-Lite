@@ -18,6 +18,8 @@ from typing import Any
 
 import yaml
 
+from _normalize import normalize_cell_str
+
 ROOT = Path(__file__).resolve().parents[1]
 DIALECTS_FILE = ROOT / "_lib" / "dialects.yaml"
 
@@ -293,24 +295,15 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
 
 
 def _pg_format_value(v) -> str:
-    """按 PG psql 默认输出规范规范化单值.
-    - None → '' (NULL 默认显示空)
-    - bool → 't' / 'f'
-    - float trailing 零去掉: 0.0 → '0', 5.0 → '5', 1.4142135 保留
-    - 字符串 'NULL' → '' (匹配 PG 默认)
-    """
+    """Python 值 → PG psql 默认输出规范字符串. None/bool/float 先按 Python 类型
+    处理 (保精度), 字符串走 _normalize.normalize_cell_str 兜底."""
     if v is None:
         return ""
     if isinstance(v, bool):
         return "t" if v else "f"
     if isinstance(v, float):
-        if v.is_integer():
-            return str(int(v))
-        return repr(v)  # 用 repr 保留精度
-    s = str(v)
-    if s in ("NULL", "(empty)"):
-        return ""
-    return s
+        return str(int(v)) if v.is_integer() else repr(v)
+    return normalize_cell_str(str(v))
 
 
 def emit_pg(spec: dict, dialect: dict) -> tuple[str, str]:
