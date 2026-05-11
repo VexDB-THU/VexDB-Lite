@@ -364,3 +364,7 @@ extension_external
 test/sql/pragma/output.json
 tools/pythonpkg/duckdb_build/
 vexdb-duck/test/sql/vex/spec_run/
+
+# Claude Code workspace (local-only, never commit)
+.claude/
+.local/

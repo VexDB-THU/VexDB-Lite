@@ -9,6 +9,7 @@
 #include "vex/vex_duck_memstore.hpp"
 #include "vex/vex_duckdb_compat.hpp"
 #include "vex_hnsw_node.hpp"
+#include "duck_pg_shim.hpp"
 
 #include <cfloat>
 #include <cstddef>
@@ -303,19 +304,62 @@ public:
     std::vector<std::vector<float>> upper_dists_;
     bool normalize_vectors_ = false;
 
-    MemStore() = default;
+    // 并发原语（P3' 加入）。主库 MemStore (graph_index_storage.h) 的双锁
+    // 协议在 duck 单进程线程模型下用 SimpleRWLock 实现。
+    //   entry_lock      : 保护 entry_info 的读写；HNSW search/insert 的 entry 点
+    //   entry_waitlock  : 防写者饥饿——升级前先抢 wait gate 阻拦后续 reader
+    //   elems_veclock   : 保护 elems / vectors / base_points / upper_points 的扩容
+    //   async_ids_lock  : 保护 async_ids 列表 push
+    mutable LWLock entry_lock;
+    mutable LWLock entry_waitlock;
+    mutable LWLock elems_veclock;
+    mutable LWLock async_ids_lock;
+
+    MemStore() {
+        // SimpleRWLock 是 default-constructible；显式 init 让语义跟主库对齐。
+        LWLockInitialize(&entry_lock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&entry_waitlock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&elems_veclock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&async_ids_lock, LWTRANCHE_EXTEND);
+    }
     MemStore(uint_fast16_t dim_in, uint_fast16_t m_in, uint_fast32_t vec_size_in)
         : dim(dim_in), m(m_in), vec_size(vec_size_in) {
         entry_info.set(INVALID_VECTOR_ID, INVALID_VECTOR_ID, -1);
+        LWLockInitialize(&entry_lock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&entry_waitlock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&elems_veclock, LWTRANCHE_EXTEND);
+        LWLockInitialize(&async_ids_lock, LWTRANCHE_EXTEND);
     }
 
+    // get_entry: 主库风格双锁协议（参考 graph_index_storage.h:434）。
+    //   - shared 路径：拿 entry_lock SHARED 读 entry_info；成功返回 shared=true
+    //   - 升级路径：当 caller 准备插入更高 level 时（new_level > entry.level）
+    //     或图为空 (entry.level < 0)，需要升级为 EXCLUSIVE。先抢 entry_waitlock
+    //     阻拦后续 reader（防饥饿），再 release shared、acquire exclusive。
+    //
+    // exclusive=true 表示 caller 跳过升级判断，强制 SHARED 模式（部分 query 路径）
     template <bool exclusive = false, bool bottom_only = false>
-    std::pair<GraphIndexEntryInfo, bool> get_entry(int_fast8_t = 0) {
-        (void)exclusive;
+    std::pair<GraphIndexEntryInfo, bool> get_entry(int_fast8_t insert_level = 0) {
         (void)bottom_only;
-        return {entry_info, false};
+        LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
+        LWLockRelease(&entry_waitlock);
+
+        LWLockAcquire(&entry_lock, LW_SHARED);
+        GraphIndexEntryInfo entry = entry_info;
+        bool shared = true;
+        if ((!exclusive && insert_level > entry.level) || entry.level < 0) {
+            LWLockRelease(&entry_lock);
+            LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
+            LWLockAcquire(&entry_lock, LW_EXCLUSIVE);
+            LWLockRelease(&entry_waitlock);
+            entry = entry_info;
+            shared = false;
+        }
+        return {entry, shared};
     }
-    void release_entry_lock(bool) {
+
+    void release_entry_lock(bool /*shared*/) {
+        LWLockRelease(&entry_lock);
     }
 
     template <bool is_base_layer>

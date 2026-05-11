@@ -495,24 +495,30 @@ private:
             return false;
         }
         // Stage-A: train into the persistent quantizer Variant so build
-        // / scan paths can call into PQDistancer. Keep stash_to_cache()
-        // for cross-process reuse after restart.
-        quantizer.emplace();
-        quantizer.value().template emplace<PQDistancer>();
-        PQDistancer &pq_dist = quantizer.value().template get<PQDistancer>();
-        pq_dist.train(index, samples, dimension, metric, /*need_norm*/ false,
+        // PQ encode-during-build is not wired (PQDistancer::compute_code
+        // has no caller in the insert path). If we flip set_enable() on
+        // the metapage, DiskStore advertises elem_size = code_size = 16
+        // but the actual build writes raw float vectors (512 B) into the
+        // 16 B slots, then scan reads back garbage that crashes the
+        // ADC dispatcher. Until Stage-A.2 (write codes to qtcode_block /
+        // leaf payload) is in, we train the codebook + stash it to the
+        // process cache and signal "PQ not wired" to the caller so
+        // qt_type falls back to NONE and the index is built as plain
+        // HNSW. WITH (quantizer='pq', pq_m=N) is therefore accepted but
+        // currently a no-op at the storage / scan level.
+        {
+            PQDistancer tmp;
+            tmp.train(index, samples, dimension, metric, /*need_norm*/ false,
                       parallel_workers, maintenance_work_mem_kb);
+        }
         FloatVectorArrayFree(samples);
-        // Flip metapage flag so quantizer_metainfo.get_type() returns PQ;
-        // build_callback's prepare_quantizer_disk_build() keys off this.
-        Buffer mb = ReadBufferExtended(index, fork_num, metablkno, RBM_NORMAL, NULL);
-        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
-        GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
-        mp->quantizer_metainfo.set_enable();
-        MarkBufferDirty(mb);
-        LockBuffer(mb, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(mb);
-        return true;
+        ereport(NOTICE,
+            (errmsg("vexdb_graph: PQ codebook trained but PQ codes are not "
+                    "yet written to storage; falling back to plain HNSW for "
+                    "build + scan."),
+             errhint("PQ encode-during-build wiring is a follow-up; this "
+                     "index will not use the trained codebook until then.")));
+        return false;
     }
 
     template <typename D>
@@ -671,6 +677,22 @@ private:
         local_timer.report("Start Graph Build");
         timer = &local_timer;
 
+        // Parallel build is gated off until the MemStore is reworked to
+        // live in a shared DSM segment (current MemPool's Vector<Chunk>
+        // is per-process; workers' inserted nodes are unreachable from
+        // the leader / other workers => SIGSEGV on cross-worker neighbor
+        // reads). The reloption is accepted for forward-compat, and we
+        // emit a NOTICE so users know why their parallel_workers > 0
+        // request silently fell back to single-thread.
+        if (parallel_workers > 0) {
+            ereport(NOTICE,
+                (errmsg("vexdb_graph parallel build is not yet implemented; "
+                        "falling back to single-thread"),
+                 errhint("Track this in the project follow-up: shared MemStore "
+                         "via DSM is required before parallel_workers > 0 "
+                         "can be enabled.")));
+            parallel_workers = 0;
+        }
         if (parallel_workers > 0) {
             if (begin_parallel(heap, index, index_info)) {
                 scan_and_insert(heap, index, index_info);
