@@ -115,18 +115,18 @@ struct PQDistancer {
     void compute_code(float *vec, char *code) { pq.compute_code(vec, (uint8 *)code); }
     float get_distance_precise(const void *x, const void *y, uint16 dim) const
         { return _get_distance_precise_func(x, y, dim); }
+    // PQ encode-at-build is not yet wired on PG: storage holds raw float
+    // vectors, not codes. The PQ ADC path would read those floats as
+    // uint8 codes, index dist_table with byte values up to 255, and SEGV
+    // on the OOB (dist_table is sized M*ksub = 16*256 = 4096 floats).
+    // Fall through to the precise raw-vector distance until the build-
+    // side encode + on-disk code storage lands.
     float get_distance_single(const void *x, const void *y, uint16 dim) const
-        { return flag * pq.distance_to_code((const uint8 *)y, dist_table); }
+        { return _get_distance_precise_func(x, y, dim); }
     void get_distance_batch2(const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) const
     {
-        const uint8 *const *code = (const uint8 * const *)y;
-        uint16 i = 0;
-        for (; i + 4 < y_size; i += 4) {
-            pq.distance_to_four_code(dist_table, code[i], code[i + 1], code[i + 2], code[i + 3],
-                                      out[i], out[i + 1], out[i + 2], out[i + 3]);
-        }
-        for (; i < y_size; ++i) {
-            out[i] = pq.distance_to_code(code[i], dist_table);
+        for (uint16 i = 0; i < y_size; ++i) {
+            out[i] = _get_distance_precise_func(x, y[i], dim);
         }
     }
     void hnsw_read_pq_center(Relation index, ProductQuantizer &pq, BlockNumber qtcode_block);

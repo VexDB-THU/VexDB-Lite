@@ -56,6 +56,11 @@ struct GraphIndexShared {
     
     /* Allocator state for bump allocation */
     AllocatorState alloc_state;
+    /* Number of participants (leader + workers) sharing alloc_state.
+     * Each participant pre-allocates an initial MemPool chunk; sizing
+     * the chunk against `total / nparticipants` keeps the sum within
+     * the DSM segment. */
+    int nparticipants;
     
     /* Graph state - shared atomic counters */
     LWLock allocator_lock;
@@ -128,7 +133,7 @@ static Metric get_metric_from_index(Relation index)
     return get_func_metric(procinfo->fn_oid);
 }
 
-extern "C" void graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);
+extern "C" PGDLLEXPORT void graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
 class GraphIndexBuild {
     friend void graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);
@@ -788,16 +793,24 @@ private:
          
          leader->shared = shared;
          leader->dsm_area = (char *)shm_toc_allocate(pcxt->toc, maintenance_work_mem_kb * 1024L);
-         
+
          /* Set up allocator state for leader - base points to DSM area */
          shared->alloc_state.base = leader->dsm_area;
          alloc_state = &shared->alloc_state;
-         
-         /* Create mem_store using DSM allocator */
+         shared->nparticipants = leader->nparticipants;
+
+         /* Create mem_store using DSM allocator. Each participant's
+          * MemPool pre-allocates one chunk sized to `target_size_mb`;
+          * with N participants sharing the DSM segment we must scale
+          * down by N or the first participant's chunks exhaust the
+          * whole buffer (observed: 16 GB DSM → 5 × 6 GB pre-allocate
+          * → "Allocator out of memory" on worker init). */
          size_t neighbors_size = id_type == IdType::U32 ?
              m * 2 * (sizeof(uint32) + sizeof(float)) :
              m * 2 * (sizeof(size_t) + sizeof(float));
-         size_t mempool_initsize_mb = maintenance_work_mem_kb / 1024 - 200;
+         size_t mempool_total_mb = maintenance_work_mem_kb / 1024;
+         size_t mempool_initsize_mb = mempool_total_mb > 200 ?
+             (mempool_total_mb - 200) / leader->nparticipants : 64;
          double ratio = (double)vector_size / (double)(vector_size + neighbors_size * 1.1);
          size_t vectorpool_initsize = (size_t)(mempool_initsize_mb * ratio);
          size_t pointpool_initsize = mempool_initsize_mb - vectorpool_initsize;
@@ -1026,7 +1039,7 @@ private:
     Timer *timer;
 };
 
-void
+PGDLLEXPORT void
 graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 {
     GraphIndexShared *shared;
@@ -1081,11 +1094,15 @@ graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc)
         shared->alloc_state.base = dsm_area;
         build.alloc_state = &shared->alloc_state;
         
-        /* Create MemStore using shared allocator */
+        /* Create MemStore using shared allocator. See leader-side comment
+         * in begin_parallel(): pre-alloc must be divided by participant
+         * count or the first participant's chunks exhaust the DSM. */
         size_t neighbors_size = build.id_type == IdType::U32 ?
             build.m * 2 * (sizeof(uint32) + sizeof(float)) :
             build.m * 2 * (sizeof(size_t) + sizeof(float));
-        size_t mempool_initsize_mb = shared->alloc_state.total_size / (1024 * 1024) - 200;
+        size_t total_mb = shared->alloc_state.total_size / (1024 * 1024);
+        int nparts = shared->nparticipants > 0 ? shared->nparticipants : 1;
+        size_t mempool_initsize_mb = total_mb > 200 ? (total_mb - 200) / nparts : 64;
         double ratio = (double)build.vector_size / (double)(build.vector_size + neighbors_size * 1.1);
         size_t vectorpool_initsize = (size_t)(mempool_initsize_mb * ratio);
         size_t pointpool_initsize = mempool_initsize_mb - vectorpool_initsize;

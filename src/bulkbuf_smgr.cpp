@@ -13,7 +13,8 @@ using namespace ann_helper;
 uint32 calculate_pow(uint32 elem_size, uint32 targe_size_mb)
 {
     targe_size_mb = Max(targe_size_mb, 1);
-    uint32 target_size = targe_size_mb * 1024 * 1024ul;
+    // 64-bit math: targe_size_mb >= 4096 would overflow uint32 here.
+    size_t target_size = (size_t)targe_size_mb * 1024ULL * 1024ULL;
     double target_count = static_cast<double>(target_size) / elem_size;
     double x_double = log2(target_count);
     int x = static_cast<int>(floor(x_double));
