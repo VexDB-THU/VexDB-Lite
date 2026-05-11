@@ -178,7 +178,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
 		if (query_input.ColumnCount() > 0) {
 			query_executor.SetChunk(query_input);
 		}
-		Vector query_result(query_vec_expr->return_type);
+		Vector query_result(query_vec_expr->GetReturnType());
 		query_executor.ExecuteExpression(query_result);
 		query_result.Flatten(1);
 		auto query_val = query_result.GetValue(0);
@@ -270,7 +270,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                 }
             }
             if (distance_output_index.IsValid()) {
-                auto dist_data = FlatVector::GetData<float>(output_chunk.data[distance_output_index.GetIndex()]);
+                auto dist_data = FlatVector::GetDataMutable<float>(output_chunk.data[distance_output_index.GetIndex()]);
                 for (idx_t i = 0; i < fetch_chunk.size(); i++) {
                     dist_data[i] = result_distances[dist_offset + i];
                 }

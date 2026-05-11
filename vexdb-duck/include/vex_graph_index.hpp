@@ -86,7 +86,7 @@ public:
     void VerifyAppend(DataChunk &chunk, IndexAppendInfo &info, optional_ptr<ConflictManager> manager) override;
     void VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, ConflictManager &manager) override;
     void Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) override;
-    void CommitDrop(IndexLock &index_lock) override;
+    void ResetStorage(IndexLock &index_lock) override;
     ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
     ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids, IndexAppendInfo &info) override;
     bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;

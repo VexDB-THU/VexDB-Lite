@@ -85,7 +85,7 @@ std::vector<BlockPointer> WriteBlobToBlocks(BlockManager &block_manager, QueryCo
         idx_t chunk_size = std::min<idx_t>(payload_size, blob.size() - offset);
         auto buffer = buffer_manager.Allocate(MemoryTag::ART_INDEX, &block_manager, false);
         auto block_id = block_manager.GetFreeBlockIdForCheckpoint();
-        auto ptr = buffer.Ptr();
+        auto ptr = buffer.GetDataMutable();
         uint32_t chunk_size_u32 = uint32_t(chunk_size);
         std::memcpy(ptr, &chunk_size_u32, sizeof(uint32_t));
         std::memcpy(ptr + sizeof(uint32_t), blob.data() + offset, chunk_size);

@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/types.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/scalar_function.hpp"
 
@@ -10,7 +11,7 @@
 namespace duckdb {
 
 LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
-    auto &type = expr.return_type;
+    auto &type = expr.GetReturnType();
     if (type.id() == LogicalTypeId::ARRAY) {
         if (ArrayType::GetChildType(type).id() != LogicalTypeId::FLOAT) {
             return LogicalType::ARRAY(LogicalType::FLOAT, ArrayType::GetSize(type));
@@ -54,13 +55,15 @@ LogicalType ResolveToFloatArray(ClientContext &context, Expression &expr) {
     throw InvalidInputException("Vector functions require FLOAT[N] array inputs, got %s", type.ToString());
 }
 
-static unique_ptr<FunctionData> BindResolveInput(ClientContext &context, ScalarFunction &bound_function,
-                                                 vector<unique_ptr<Expression>> &arguments) {
-    if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
+static unique_ptr<FunctionData> BindResolveInput(BindScalarFunctionInput &input) {
+    auto &context = input.GetClientContext();
+    auto &bound_function = input.GetBoundFunction();
+    auto &arguments = input.GetArguments();
+    if (arguments[0]->GetReturnType().id() == LogicalTypeId::UNKNOWN) {
         throw ParameterNotResolvedException();
     }
     auto resolved = ResolveToFloatArray(context, *arguments[0]);
-    bound_function.arguments[0] = resolved;
+    bound_function.GetArguments()[0] = resolved;
     return nullptr;
 }
 
@@ -72,7 +75,7 @@ static void VectorDimsFunction(DataChunk &args, ExpressionState &state, Vector &
 
     bool is_constant = vec.GetVectorType() == VectorType::CONSTANT_VECTOR;
     vec.Flatten(count);
-    auto result_data = FlatVector::GetData<int32_t>(result);
+    auto result_data = FlatVector::GetDataMutable<int32_t>(result);
     auto &validity = FlatVector::Validity(vec);
 
     for (idx_t i = 0; i < count; i++) {
@@ -99,10 +102,10 @@ static void L2NormalizeFunction(DataChunk &args, ExpressionState &state, Vector 
 
     auto &child_input = ArrayVector::GetEntry(vec);
     child_input.Flatten(count * dim);
-    auto in_data = FlatVector::GetData<float>(child_input);
+    auto in_data = FlatVector::GetDataMutable<float>(child_input);
 
     auto &child_result = ArrayVector::GetEntry(result);
-    auto out_data = FlatVector::GetData<float>(child_result);
+    auto out_data = FlatVector::GetDataMutable<float>(child_result);
 
     for (idx_t i = 0; i < count; i++) {
         if (!input_validity.RowIsValid(i)) {
@@ -132,28 +135,32 @@ static void L2NormalizeFunction(DataChunk &args, ExpressionState &state, Vector 
     }
 }
 
-static unique_ptr<FunctionData> BindL2Normalize(ClientContext &context, ScalarFunction &bound_function,
-                                                vector<unique_ptr<Expression>> &arguments) {
-    if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN) {
+static unique_ptr<FunctionData> BindL2Normalize(BindScalarFunctionInput &input) {
+    auto &context = input.GetClientContext();
+    auto &bound_function = input.GetBoundFunction();
+    auto &arguments = input.GetArguments();
+    if (arguments[0]->GetReturnType().id() == LogicalTypeId::UNKNOWN) {
         throw ParameterNotResolvedException();
     }
     auto resolved = ResolveToFloatArray(context, *arguments[0]);
-    bound_function.arguments[0] = resolved;
-    bound_function.return_type = resolved;
+    bound_function.GetArguments()[0] = resolved;
+    bound_function.SetReturnType(resolved);
     return nullptr;
 }
 
-static unique_ptr<FunctionData> BindBinaryArrayReturn(ClientContext &context, ScalarFunction &bound_function,
-                                                     vector<unique_ptr<Expression>> &arguments) {
-    if (arguments[0]->return_type.id() == LogicalTypeId::UNKNOWN ||
-        arguments[1]->return_type.id() == LogicalTypeId::UNKNOWN) {
+static unique_ptr<FunctionData> BindBinaryArrayReturn(BindScalarFunctionInput &input) {
+    auto &context = input.GetClientContext();
+    auto &bound_function = input.GetBoundFunction();
+    auto &arguments = input.GetArguments();
+    if (arguments[0]->GetReturnType().id() == LogicalTypeId::UNKNOWN ||
+        arguments[1]->GetReturnType().id() == LogicalTypeId::UNKNOWN) {
         throw ParameterNotResolvedException();
     }
-    auto &primary = arguments[0]->return_type.id() != LogicalTypeId::UNKNOWN ? *arguments[0] : *arguments[1];
+    auto &primary = arguments[0]->GetReturnType().id() != LogicalTypeId::UNKNOWN ? *arguments[0] : *arguments[1];
     auto resolved = ResolveToFloatArray(context, primary);
-    bound_function.arguments[0] = resolved;
-    bound_function.arguments[1] = resolved;
-    bound_function.return_type = resolved;
+    bound_function.GetArguments()[0] = resolved;
+    bound_function.GetArguments()[1] = resolved;
+    bound_function.SetReturnType(resolved);
     return nullptr;
 }
 
@@ -167,9 +174,9 @@ static void VectorNormFunction(DataChunk &args, ExpressionState &state, Vector &
     vec.Flatten(count);
     auto &child = ArrayVector::GetEntry(vec);
     child.Flatten(count * dim);
-    auto data = FlatVector::GetData<float>(child);
+    auto data = FlatVector::GetDataMutable<float>(child);
     auto &validity = FlatVector::Validity(vec);
-    auto result_data = FlatVector::GetData<double>(result);
+    auto result_data = FlatVector::GetDataMutable<double>(result);
 
     for (idx_t i = 0; i < count; i++) {
         if (!validity.RowIsValid(i)) {
@@ -208,12 +215,12 @@ static void VectorAddSubFunction(DataChunk &args, ExpressionState &state, Vector
     auto &child_b = ArrayVector::GetEntry(vec_b);
     child_a.Flatten(count * dim_a);
     child_b.Flatten(count * dim_b);
-    auto data_a = FlatVector::GetData<float>(child_a);
-    auto data_b = FlatVector::GetData<float>(child_b);
+    auto data_a = FlatVector::GetDataMutable<float>(child_a);
+    auto data_b = FlatVector::GetDataMutable<float>(child_b);
     auto &validity_a = FlatVector::Validity(vec_a);
     auto &validity_b = FlatVector::Validity(vec_b);
     auto &child_out = ArrayVector::GetEntry(result);
-    auto data_out = FlatVector::GetData<float>(child_out);
+    auto data_out = FlatVector::GetDataMutable<float>(child_out);
 
     for (idx_t i = 0; i < count; i++) {
         if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {

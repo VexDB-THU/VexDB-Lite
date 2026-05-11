@@ -61,7 +61,7 @@ unique_ptr<LocalSinkState> PhysicalVexCreateIndex::GetLocalSinkState(ExecutionCo
     auto state = make_uniq<VexCreateIndexLocalState>();
     vector<LogicalType> key_types;
     for (auto &expr : unbound_expressions) {
-        key_types.push_back(expr->return_type);
+        key_types.push_back(expr->GetReturnType());
     }
     state->key_chunk.Initialize(Allocator::Get(context.client), key_types);
     state->row_chunk.Initialize(Allocator::Get(context.client), {LogicalType::ROW_TYPE});
@@ -114,8 +114,8 @@ SinkResultType PhysicalVexCreateIndex::Sink(ExecutionContext &context, DataChunk
         auto dim = ArrayType::GetSize(vec_type);
         auto &validity = FlatVector::Validity(vec_vector);
         auto &child_vec = ArrayVector::GetEntry(vec_vector);
-        auto vec_data = FlatVector::GetData<float>(child_vec);
-        auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+        auto vec_data = FlatVector::GetDataMutable<float>(child_vec);
+        auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 
         std::lock_guard<std::mutex> lock(g_state.buffer_mutex);
         if (g_state.dimension == 0) {

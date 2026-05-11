@@ -97,7 +97,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
     // GRAPH_INDEX(vec, scalar1, scalar2). Reject any other layout up-front: silently
     // accepting duplicate or extra-vector columns corrupts the per-node metadata
     // segment layout, which assumes a fixed schema with one vector at slot 0.
-    auto &first_type = input.unbound_expressions[0]->return_type;
+    auto &first_type = input.unbound_expressions[0]->GetReturnType();
     if (first_type.id() != LogicalTypeId::ARRAY ||
         ArrayType::GetChildType(first_type).id() != LogicalTypeId::FLOAT) {
         throw InvalidInputException("GRAPH_INDEX first column must be FLOAT[N], got %s",
@@ -113,7 +113,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         seen_expr_sigs.insert(input.unbound_expressions[0]->ToString());
         for (idx_t i = 1; i < input.unbound_expressions.size(); i++) {
             auto &expr = *input.unbound_expressions[i];
-            auto &col_type = expr.return_type;
+            auto &col_type = expr.GetReturnType();
             if (col_type.id() == LogicalTypeId::ARRAY &&
                 ArrayType::GetChildType(col_type).id() == LogicalTypeId::FLOAT) {
                 throw InvalidInputException(
@@ -283,7 +283,7 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
     vector<LogicalType> proj_types;
     vector<unique_ptr<Expression>> select_list;
     for (idx_t i = 0; i < op.expressions.size(); i++) {
-        proj_types.push_back(op.expressions[i]->return_type);
+        proj_types.push_back(op.expressions[i]->GetReturnType());
         select_list.push_back(std::move(op.expressions[i]));
     }
     proj_types.emplace_back(LogicalType::ROW_TYPE);
@@ -763,8 +763,8 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     auto &vec_validity = FlatVector::Validity(vec_vector);
     auto &child_vec = ArrayVector::GetEntry(vec_vector);
     child_vec.Flatten(count * dim);
-    auto vec_data = FlatVector::GetData<float>(child_vec);
-    auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+    auto vec_data = FlatVector::GetDataMutable<float>(child_vec);
+    auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 
     const bool pq_active = pq_use_;
     const bool pq_normalize = pq_active && metric_ == VexMetric::COSINE;
@@ -858,7 +858,7 @@ void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identi
     pq_refine_rid_map_dirty_ = true;
 }
 
-void GraphIndex::CommitDrop(IndexLock &index_lock) {
+void GraphIndex::ResetStorage(IndexLock &index_lock) {
     (void)index_lock;
     if (runtime_) {
         ReleaseRawVectors();

@@ -141,14 +141,14 @@ static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, Log
     }
 
     info.func_expr = &resolved->Cast<BoundFunctionExpression>();
-    if (!IsDistanceFunction(info.func_expr->function.name) || info.func_expr->children.size() != 2) {
+    if (!IsDistanceFunction(info.func_expr->function.GetName()) || info.func_expr->children.size() != 2) {
         return false;
     }
     // For inner_product / <#> the user-facing scalar returns +(a·b) (greater = more similar),
     // so the natural query is ORDER BY ... DESC. The index ranks by -(a·b) ascending, which
     // matches; for L2 / cosine the user does ASC and the index ranks by sqrt-L2 / -cos_sim
     // ascending, also matching.
-    OrderType expected = IsAscDistanceFunction(info.func_expr->function.name)
+    OrderType expected = IsAscDistanceFunction(info.func_expr->function.GetName())
                              ? OrderType::ASCENDING
                              : OrderType::DESCENDING;
     if (order_type != expected) {
@@ -340,7 +340,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     // by row_id and does not honor LogicalGet's pushdown filters. Fall back to the
     // default plan (seq scan + sort), which produces correct results (just without
     // the index acceleration for the filter case).
-    if (!get->table_filters.filters.empty()) {
+    if (get->table_filters.HasFilters()) {
         return false;
     }
     if (get->dynamic_filters && get->dynamic_filters->HasFilters()) {
@@ -350,7 +350,7 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     auto &column_ids = get->GetColumnIds();
     IndexMatch match;
     if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index,
-                              dist_info.func_expr->function.name, match)) {
+                              dist_info.func_expr->function.GetName(), match)) {
         return false;
     }
 

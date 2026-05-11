@@ -172,23 +172,23 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
     auto &metric_vec = output.data[10];
     auto &mm_vec     = output.data[16];
 
-    auto name_data            = FlatVector::GetData<string_t>(name_vec);
-    auto type_data            = FlatVector::GetData<string_t>(type_vec);
-    auto table_data           = FlatVector::GetData<string_t>(table_vec);
-    auto part_count_data      = FlatVector::GetData<int32_t>(output.data[3]);
-    auto node_data            = FlatVector::GetData<int64_t>(output.data[4]);
-    auto level_data           = FlatVector::GetData<int32_t>(output.data[5]);
-    auto dim_data             = FlatVector::GetData<int32_t>(output.data[6]);
-    auto rmap_data            = FlatVector::GetData<int64_t>(output.data[7]);
-    auto m_data               = FlatVector::GetData<int32_t>(output.data[8]);
-    auto ef_data              = FlatVector::GetData<int32_t>(output.data[9]);
-    auto metric_data          = FlatVector::GetData<string_t>(metric_vec);
-    auto pq_data              = FlatVector::GetData<bool>(output.data[11]);
-    auto pqm_data             = FlatVector::GetData<int32_t>(output.data[12]);
-    auto mem_bytes_data       = FlatVector::GetData<int64_t>(output.data[13]);
-    auto pq_codes_bytes_data  = FlatVector::GetData<int64_t>(output.data[14]);
-    auto pq_codebook_bytes_data = FlatVector::GetData<int64_t>(output.data[15]);
-    auto mm_data              = FlatVector::GetData<string_t>(mm_vec);
+    auto name_data            = FlatVector::GetDataMutable<string_t>(name_vec);
+    auto type_data            = FlatVector::GetDataMutable<string_t>(type_vec);
+    auto table_data           = FlatVector::GetDataMutable<string_t>(table_vec);
+    auto part_count_data      = FlatVector::GetDataMutable<int32_t>(output.data[3]);
+    auto node_data            = FlatVector::GetDataMutable<int64_t>(output.data[4]);
+    auto level_data           = FlatVector::GetDataMutable<int32_t>(output.data[5]);
+    auto dim_data             = FlatVector::GetDataMutable<int32_t>(output.data[6]);
+    auto rmap_data            = FlatVector::GetDataMutable<int64_t>(output.data[7]);
+    auto m_data               = FlatVector::GetDataMutable<int32_t>(output.data[8]);
+    auto ef_data              = FlatVector::GetDataMutable<int32_t>(output.data[9]);
+    auto metric_data          = FlatVector::GetDataMutable<string_t>(metric_vec);
+    auto pq_data              = FlatVector::GetDataMutable<bool>(output.data[11]);
+    auto pqm_data             = FlatVector::GetDataMutable<int32_t>(output.data[12]);
+    auto mem_bytes_data       = FlatVector::GetDataMutable<int64_t>(output.data[13]);
+    auto pq_codes_bytes_data  = FlatVector::GetDataMutable<int64_t>(output.data[14]);
+    auto pq_codebook_bytes_data = FlatVector::GetDataMutable<int64_t>(output.data[15]);
+    auto mm_data              = FlatVector::GetDataMutable<string_t>(mm_vec);
 
     while (state.current_offset < state.entries.size() && count < max_count) {
         auto &e = state.entries[state.current_offset];
