@@ -25,9 +25,6 @@ extern "C" {
 PG_FUNCTION_INFO_V1(vex_index_info);
 }
 
-// Schema mirrors duckdb/vexdb-duck/functions/index_info_function.cpp.
-// `indexname` and `index_name` are both emitted because translated tests
-// reference both names interchangeably.
 #define VEX_INDEX_INFO_NCOLS 18
 
 static const char *metric_name(Metric m)
@@ -41,17 +38,6 @@ static const char *metric_name(Metric m)
     }
 }
 
-static int64 calculate_relation_total_size(Relation rel)
-{
-    int64 total = 0;
-    for (int fork = 0; fork <= MAX_FORKNUM; ++fork) {
-        if (smgrexists(RelationGetSmgr(rel), (ForkNumber)fork)) {
-            total += (int64)RelationGetNumberOfBlocksInFork(rel, (ForkNumber)fork) * BLCKSZ;
-        }
-    }
-    return total;
-}
-
 Datum vex_index_info(PG_FUNCTION_ARGS)
 {
     FuncCallContext *funcctx;
@@ -60,26 +46,15 @@ Datum vex_index_info(PG_FUNCTION_ARGS)
         funcctx = SRF_FIRSTCALL_INIT();
         MemoryContext oldctx = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
 
-        TupleDesc tupdesc = CreateTemplateTupleDesc(VEX_INDEX_INFO_NCOLS);
-        AttrNumber a = 1;
-        TupleDescInitEntry(tupdesc, a++, "index_name",        TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "indexname",         TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "index_type",        TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "table_name",        TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "partition_count",   INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "node_count",        INT8OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "max_level",         INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "dimension",         INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "row_id_map_size",   INT8OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "m",                 INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "ef_construction",   INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "metric",            TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "use_pq",            BOOLOID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "pq_m",              INT4OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "memory_bytes",      INT8OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "pq_codes_bytes",    INT8OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "pq_codebook_bytes", INT8OID, -1, 0);
-        TupleDescInitEntry(tupdesc, a++, "memory_mode",       TEXTOID, -1, 0);
+        // Use the SQL-declared RETURNS TABLE schema so we don't drift
+        // from the .sql definition (which would give "wrong record type"
+        // on tuple build).
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) {
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("vex_index_info() must be called in a context that "
+                       "expects a record type")));
+        }
         funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
         Oid am_oid = GetSysCacheOid1(AMNAME, Anum_pg_am_oid,
@@ -96,9 +71,7 @@ Datum vex_index_info(PG_FUNCTION_ARGS)
             while ((tup = systable_getnext(scan)) != NULL) {
                 Form_pg_class form = (Form_pg_class)GETSTRUCT(tup);
                 if (form->relkind == RELKIND_INDEX) {
-                    Oid relid;
-                    relid = form->oid;
-                    oids = lappend_oid(oids, relid);
+                    oids = lappend_oid(oids, form->oid);
                 }
             }
             systable_endscan(scan);
@@ -111,62 +84,80 @@ Datum vex_index_info(PG_FUNCTION_ARGS)
     }
 
     funcctx = SRF_PERCALL_SETUP();
+    if (funcctx->call_cntr >= funcctx->max_calls) SRF_RETURN_DONE(funcctx);
+
     List *oids = (List *)funcctx->user_fctx;
-    if ((int64)funcctx->call_cntr >= (int64)funcctx->max_calls) {
-        SRF_RETURN_DONE(funcctx);
-    }
     Oid index_oid = list_nth_oid(oids, (int)funcctx->call_cntr);
     Relation index = relation_open(index_oid, AccessShareLock);
 
     Datum values[VEX_INDEX_INFO_NCOLS];
-    bool nulls[VEX_INDEX_INFO_NCOLS] = {false};
+    bool nulls[VEX_INDEX_INFO_NCOLS];
+    memset(nulls, 0, sizeof(nulls));
     int c = 0;
 
-    const char *name = RelationGetRelationName(index);
-    values[c++] = CStringGetTextDatum(name);                 // index_name
-    values[c++] = CStringGetTextDatum(name);                 // indexname (alias)
-    values[c++] = CStringGetTextDatum("GRAPH_INDEX");        // index_type
-    char *tabname = get_rel_name(index->rd_index->indrelid);
-    values[c++] = tabname ? CStringGetTextDatum(tabname) : CStringGetTextDatum("");
-    values[c++] = Int32GetDatum(0);                          // partition_count
+    const char *iname = RelationGetRelationName(index);
+    values[c++] = CStringGetTextDatum(iname);
+    values[c++] = CStringGetTextDatum(iname);
+    values[c++] = CStringGetTextDatum("GRAPH_INDEX");
 
-    Buffer mb = ReadBuffer(index, GRAPH_INDEX_METAPAGE_BLKNO);
-    LockBuffer(mb, BUFFER_LOCK_SHARE);
-    GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
+    Oid table_oid = index->rd_index ? index->rd_index->indrelid : InvalidOid;
+    char *tabname = OidIsValid(table_oid) ? get_rel_name(table_oid) : NULL;
+    values[c++] = CStringGetTextDatum(tabname ? tabname : "");
+    values[c++] = Int32GetDatum(0);                            // partition_count
 
-    // num_vectors on the metapage tracks live in-memory graph nodes (some
-    // builds populate level-0 lazily). For a CREATE INDEX-just-finished
-    // count, prefer the heap's reltuples, which the build path stamps.
-    int64 node_count = (int64)mp->num_vectors;
-    HeapTuple htup = SearchSysCache1(RELOID,
-                                     ObjectIdGetDatum(index->rd_index->indrelid));
-    if (HeapTupleIsValid(htup)) {
-        Form_pg_class form = (Form_pg_class)GETSTRUCT(htup);
-        if (form->reltuples > 0) node_count = (int64)form->reltuples;
-        ReleaseSysCache(htup);
+    int64 node_count = 0;
+    int32 max_level = 0;
+    int32 dim = 0, m_val = 0, efc_val = 0;
+    const char *metric_str = "l2";
+    bool use_pq = false;
+    int32 pq_m_val = 0;
+
+    // Best-effort metapage read — guard against indexes whose main fork
+    // is empty (e.g., ambuildempty before any CREATE INDEX populates it).
+    if (RelationGetNumberOfBlocks(index) > GRAPH_INDEX_METAPAGE_BLKNO) {
+        Buffer mb = ReadBuffer(index, GRAPH_INDEX_METAPAGE_BLKNO);
+        LockBuffer(mb, BUFFER_LOCK_SHARE);
+        GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
+        if (mp->magic_number == GRAPH_INDEX_MAGIC_NUMBER) {
+            node_count = (int64)mp->num_vectors;
+            max_level  = (int32)(mp->entry_level + 1);
+            dim        = (int32)mp->dimension;
+            m_val      = (int32)mp->m;
+            efc_val    = (int32)mp->ef_construction;
+            metric_str = metric_name(mp->metric);
+            use_pq     = (mp->quantizer_metainfo.get_setting_type() == QuantizerType::PQ);
+            if (mp->quantizer_metainfo.get_setting_type() == QuantizerType::PQ) {
+                pq_m_val = (int32)mp->quantizer_metainfo.get_pq_metainfo().m;
+            }
+        }
+        UnlockReleaseBuffer(mb);
     }
-    values[c++] = Int64GetDatum(node_count);                  // node_count
-    values[c++] = Int32GetDatum((int32)mp->entry_level + 1); // max_level
-    values[c++] = Int32GetDatum((int32)mp->dimension);
-    values[c++] = Int64GetDatum(0);                          // row_id_map_size
-    values[c++] = Int32GetDatum((int32)mp->m);
-    values[c++] = Int32GetDatum((int32)mp->ef_construction);
-    values[c++] = CStringGetTextDatum(metric_name(mp->metric));
 
-    QuantizerType qt = mp->quantizer_metainfo.get_type();
-    values[c++] = BoolGetDatum(qt == QuantizerType::PQ);
-    int32 pq_m = (mp->quantizer_metainfo.get_setting_type() == QuantizerType::PQ)
-                     ? (int32)mp->quantizer_metainfo.get_pq_metainfo().m
-                     : 0;
-    values[c++] = Int32GetDatum(pq_m);
+    // Prefer heap reltuples for node_count if positive.
+    if (OidIsValid(table_oid)) {
+        HeapTuple htup = SearchSysCache1(RELOID, ObjectIdGetDatum(table_oid));
+        if (HeapTupleIsValid(htup)) {
+            Form_pg_class form = (Form_pg_class)GETSTRUCT(htup);
+            if (form->reltuples > 0) node_count = (int64)form->reltuples;
+            ReleaseSysCache(htup);
+        }
+    }
 
-    UnlockReleaseBuffer(mb);
+    values[c++] = Int64GetDatum(node_count);
+    values[c++] = Int32GetDatum(max_level);
+    values[c++] = Int32GetDatum(dim);
+    values[c++] = Int64GetDatum(0);                            // row_id_map_size
+    values[c++] = Int32GetDatum(m_val);
+    values[c++] = Int32GetDatum(efc_val);
+    values[c++] = CStringGetTextDatum(metric_str);
+    values[c++] = BoolGetDatum(use_pq);
+    values[c++] = Int32GetDatum(pq_m_val);
 
-    int64 mem = calculate_relation_total_size(index);
+    int64 mem = (int64)RelationGetNumberOfBlocks(index) * BLCKSZ;
     values[c++] = Int64GetDatum(mem);
-    values[c++] = Int64GetDatum(0);                          // pq_codes_bytes
-    values[c++] = Int64GetDatum(0);                          // pq_codebook_bytes
-    values[c++] = CStringGetTextDatum("full");               // memory_mode
+    values[c++] = Int64GetDatum(0);                            // pq_codes_bytes
+    values[c++] = Int64GetDatum(0);                            // pq_codebook_bytes
+    values[c++] = CStringGetTextDatum("full");
 
     relation_close(index, AccessShareLock);
 
