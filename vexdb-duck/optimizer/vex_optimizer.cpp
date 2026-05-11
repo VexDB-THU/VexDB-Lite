@@ -77,7 +77,7 @@ static bool IsAscDistanceFunction(const string &name) {
     return entry ? entry->ascending : true;
 }
 
-static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
+static bool IsColumnRefFromTable(const Expression &expr, TableIndex table_index, idx_t &col_index) {
     const Expression *cur = &expr;
     while (cur->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
         cur = cur->Cast<BoundCastExpression>().child.get();
@@ -93,7 +93,7 @@ static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_
     return true;
 }
 
-static bool HasColumnRefFromTable(const Expression &expr, idx_t table_index) {
+static bool HasColumnRefFromTable(const Expression &expr, TableIndex table_index) {
     const Expression *cur = &expr;
     while (cur->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
         cur = cur->Cast<BoundCastExpression>().child.get();

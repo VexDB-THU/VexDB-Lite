@@ -21,7 +21,7 @@ public:
     ColumnDataScanState scan_state;
 };
 
-LogicalVexIndexScan::LogicalVexIndexScan(idx_t table_index_p, vector<LogicalType> output_types_p,
+LogicalVexIndexScan::LogicalVexIndexScan(TableIndex table_index_p, vector<LogicalType> output_types_p,
                                          DuckTableEntry &table_p, GraphIndex &graph_index_p,
                                          unique_ptr<Expression> query_vec_expr_p, idx_t k_p,
                                          vector<ColumnIndex> column_ids_p, vector<idx_t> fetch_output_positions_p,
@@ -69,7 +69,7 @@ string LogicalVexIndexScan::GetExtensionName() const {
 vector<ColumnBinding> LogicalVexIndexScan::GetColumnBindings() {
     vector<ColumnBinding> result;
     for (idx_t i = 0; i < output_types.size(); i++) {
-        result.emplace_back(table_index, i);
+        result.emplace_back(table_index, ProjectionIndex(i));
     }
     for (auto &child : children) {
         auto child_bindings = child->GetColumnBindings();

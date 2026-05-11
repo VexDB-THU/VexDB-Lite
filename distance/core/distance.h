@@ -44,33 +44,9 @@ using Relation = void *;
 
 static_assert(__cplusplus >= 201402L, "C++14 or later required");
 
-#if defined(PG_VEXDB_TARGET_DUCK)
-enum class Arch : uint16 {
-#if COMPILER_SUPPORT_SSE
-    SSE,
-#endif
-#if COMPILER_SUPPORT_AVX
-    AVX,
-#endif
-#if COMPILER_SUPPORT_AVX512
-    AVX512,
-#endif
-#if COMPILER_SUPPORT_NEON
-    NEONV8,
-#endif
-#if COMPILER_SUPPORT_SVE
-    SVEV8,
-#endif
-#if COMPILER_SUPPORT_SVE2
-    SVE2V8,
-#endif
-    GENERAL
-};
-#else
 enum class Arch : uint16 {
     BOOST_PP_SEQ_ENUM(DISTANCER_ISAS)
 };
-#endif
 
 #if defined(PG_VEXDB_TARGET_DUCK)
 enum class Metric : uint32 {

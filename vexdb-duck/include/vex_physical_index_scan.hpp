@@ -12,7 +12,7 @@ class GraphIndex;
 
 struct LogicalVexIndexScan : public LogicalExtensionOperator {
 public:
-    LogicalVexIndexScan(idx_t table_index, vector<LogicalType> output_types,
+    LogicalVexIndexScan(TableIndex table_index, vector<LogicalType> output_types,
                         DuckTableEntry &table, GraphIndex &graph_index,
                         unique_ptr<Expression> query_vec_expr, idx_t k,
                         vector<ColumnIndex> column_ids, vector<idx_t> fetch_output_positions,
@@ -28,7 +28,7 @@ protected:
     void ResolveTypes() override;
 
 public:
-    idx_t table_index;
+    TableIndex table_index;
     vector<LogicalType> output_types;
     DuckTableEntry &table;
     GraphIndex &graph_index;

@@ -218,7 +218,8 @@ vector_preprocess_func get_vector_preprocess_func(Metric metric, DistPrecisionTy
         DistPrecisionTypeList<DistPrecisionType::FLOAT, DistPrecisionType::HALF>,
         DispatcherMode::NO_QUANT>::call(Metric::FAST_COSINE, type, dim, QuantizerType::NONE,
             [](auto &d) -> vector_preprocess_func {
-                using tr = typename std::decay_t<decltype(d)>::transform_type<TransformOp::NORMALIZE>;
+                using tr =
+                    typename std::decay_t<decltype(d)>::template transform_type<TransformOp::NORMALIZE>;
                 return [](const void *x, uint16 dim, void *out) {
                     tr::transform_single(x, x, out, dim);
                 };

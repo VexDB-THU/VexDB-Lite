@@ -1,108 +1,60 @@
 # vexdb-duck
 
-DuckDB `GRAPH_INDEX` extension for HNSW vector similarity search.
+`vexdb-duck` is the DuckDB side of `VexDB-Lite`.
 
-## Features
+This directory contains:
 
-- HNSW (Hierarchical Navigable Small World) graph index for approximate nearest neighbor search
-- Persistent storage via DuckDB's FixedSizeAllocator (survives checkpoint/restart)
-- L2 distance metric
-- Configurable index parameters (m, ef_construction)
+- the DuckDB extension entrypoint (`vex_extension.cpp`)
+- registered scalar/table functions (`functions/`)
+- the `GRAPH_INDEX` implementation (`index/`)
+- optimizer and physical operators (`optimizer/`)
+- benchmark and smoke scripts (`test/`)
 
-## Building
+For the up-to-date project overview, SQL examples, build steps, and benchmark results, use the repository root README files:
 
-This extension is built as part of DuckDB's extension system.
+- [../README.md](../README.md)
+- [../README.en.md](../README.en.md)
 
-### Prerequisites
+Quick reminders:
 
-- DuckDB source at `/home/mingwei6/workspace/duckdb_src` (or set via `DUCKDB_DIR`)
-- C++17 compiler
-- CMake
+## Build
 
-### Build Steps
+Register the extension in DuckDB's `extension_config_local.cmake`:
 
-1. Create a local extension config in DuckDB's extension directory:
-
-```bash
-cat > $DUCKDB_DIR/extension/extension_config_local.cmake << 'EOF'
+```cmake
 duckdb_extension_load(vex
-    SOURCE_DIR "/home/mingwei6/workspace/vexlite/vexdb-duck"
-    INCLUDE_DIR "/home/mingwei6/workspace/vexlite/vexdb-duck/include"
+    SOURCE_DIR "/path/to/VexDB-Lite/vexdb-duck"
+    INCLUDE_DIR "/path/to/VexDB-Lite/vexdb-duck/include"
 )
-EOF
 ```
 
-2. Configure and build:
+Then build:
 
 ```bash
-cd $DUCKDB_DIR/build
+cd /path/to/duckdb/build
 cmake .. -DOVERRIDE_GIT_DESCRIBE=v1.5.2
-make vex_loadable_extension -j8
+cmake --build . --target vex_loadable_extension -j$(nproc)
 ```
 
-> Note: `-DOVERRIDE_GIT_DESCRIBE=v1.5.2` is required to match the Python duckdb package version.
+## Load
 
-### Build Artifacts
-
-- Loadable extension: `$DUCKDB_DIR/build/extension/vex/vex.duckdb_extension`
-
-## Usage
-
-```python
-import duckdb
-
-# Load extension
-con = duckdb.connect(config={'allow_unsigned_extensions': 'true'})
-con.execute("LOAD '/path/to/vex.duckdb_extension'")
-
-# Create table with vectors
-con.execute("CREATE TABLE items (id INTEGER, vec FLOAT[128])")
-
-# Insert vectors
-con.execute("INSERT INTO items VALUES (1, [1.0, 2.0, ...]::FLOAT[128])")
-
-# Create HNSW index
-con.execute("CREATE INDEX idx_vec ON items USING GRAPH_INDEX (vec) WITH (metric='l2', m=16, ef_construction=64)")
-
-# Query for nearest neighbors
-results = con.execute("SELECT * FROM items ORDER BY vec <-> '[1.0, 2.0, ...]'::FLOAT[128] LIMIT 10").fetchall()
+```sql
+LOAD '/path/to/vex.duckdb_extension';
+SELECT vex_version();
 ```
 
-### Index Parameters
+## Minimal SQL Example
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `m` | 16 | Number of neighbors per node (higher = better recall, more memory) |
-| `ef_construction` | 64 | Dynamic candidate list size during build (higher = better quality, slower build) |
-| `metric` | 'l2' | Distance metric (currently only 'l2' supported) |
+```sql
+CREATE TABLE items (id INTEGER, vec FLOAT[3]);
 
-## Testing
+CREATE INDEX idx_items_vec
+ON items
+USING GRAPH_INDEX (vec)
+WITH (metric='l2', m=16, ef_construction=64);
 
-Run the smoke test with SIFT data:
-
-```bash
-python3 test/smoke_sift_literal.py \
-    /path/to/vex.duckdb_extension \
-    /path/to/sift.csv \
-    /path/to/sift.sql \
-    --row-limit 500 \
-    --query-limit 20
+SELECT id
+FROM items
+ORDER BY l2_distance(vec, [1.0, 2.0, 3.0]::FLOAT[3])
+LIMIT 10;
 ```
-
-## Architecture
-
-- `vex_hnsw_node.hpp`: Segment layouts for FixedSizeAllocator storage
-- `vex_graph_index_depend_duck.hpp`: DuckStore (MemStore) with allocator-backed storage
-- `vex_graph_index.hpp`: GraphIndex class implementing BoundIndex interface
-- `graph_index.cpp`: Index build, search, and serialization logic
-- `graph_index_disk.cpp`: Disk serialization via FixedSizeAllocator
-
-## Storage
-
-The index uses DuckDB's `FixedSizeAllocator` for persistent storage:
-
-- **Node allocator**: Stores node headers and level-0 neighbors
-- **Vector allocator**: Stores vector float data
-- **Upper allocator**: Stores upper-level neighbors for multi-layer nodes
-
-Data persists through DuckDB's checkpoint/WAL mechanism automatically.

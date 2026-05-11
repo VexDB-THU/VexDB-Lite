@@ -7,6 +7,7 @@
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/vector/array_vector.hpp"
 #include "duckdb/execution/index/index_type_set.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/config.hpp"

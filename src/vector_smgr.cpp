@@ -26,8 +26,27 @@
 #ifndef BOOST_NO_EXCEPTIONS
 #define BOOST_NO_EXCEPTIONS
 #endif
+
+#ifdef snprintf
+#define PG_VEXDB_RESTORE_SNPRINTF
+#undef snprintf
+#endif
+#ifdef vsnprintf
+#define PG_VEXDB_RESTORE_VSNPRINTF
+#undef vsnprintf
+#endif
+
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <boost/lockfree/queue.hpp>
+
+#ifdef PG_VEXDB_RESTORE_SNPRINTF
+#define snprintf pg_snprintf
+#undef PG_VEXDB_RESTORE_SNPRINTF
+#endif
+#ifdef PG_VEXDB_RESTORE_VSNPRINTF
+#define vsnprintf pg_vsnprintf
+#undef PG_VEXDB_RESTORE_VSNPRINTF
+#endif
 
 #include <vtl/pair>
 #include <vtl/hashtable>
