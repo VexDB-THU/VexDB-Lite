@@ -304,8 +304,6 @@ public:
     std::vector<std::vector<float>> upper_dists_;
     bool normalize_vectors_ = false;
 
-    // 并发原语（P3' 加入）。主库 MemStore (graph_index_storage.h) 的双锁
-    // 协议在 duck 单进程线程模型下用 SimpleRWLock 实现。
     //   entry_lock      : 保护 entry_info 的读写；HNSW search/insert 的 entry 点
     //   entry_waitlock  : 防写者饥饿——升级前先抢 wait gate 阻拦后续 reader
     //   elems_veclock   : 保护 elems / vectors / base_points / upper_points 的扩容
@@ -315,20 +313,92 @@ public:
     mutable LWLock elems_veclock;
     mutable LWLock async_ids_lock;
 
+    // Striped per-element 锁，用 idx & MASK 寻址。LWLockPadded 64-byte align
+    // 避免 cache line false sharing。STRIPE_COUNT 是 power-of-2 让 mask 高效。
+    // 64 stripe × 2 layer × 64B = 8KB，能装住 build/search 阶段的并发热点。
+    static constexpr size_t STRIPE_COUNT = 64;
+    static constexpr size_t STRIPE_MASK = STRIPE_COUNT - 1;
+    mutable LWLockPadded base_point_locks_[STRIPE_COUNT];
+    mutable LWLockPadded upper_point_locks_[STRIPE_COUNT];
+
+    // Atomic id counters: assign_vector_id 用 fetch_add 拿独占 id。
+    // 注意：next_*_id_ 跟 elems/upper_points 的 size 是松耦合的——id 由 atomic
+    // 决定，outer vector 扩容用 elems_veclock 串行化。
+    std::atomic<T> next_base_id_{0};
+    std::atomic<T> next_upper_id_{0};
+
     MemStore() {
-        // SimpleRWLock 是 default-constructible；显式 init 让语义跟主库对齐。
-        LWLockInitialize(&entry_lock, LWTRANCHE_EXTEND);
-        LWLockInitialize(&entry_waitlock, LWTRANCHE_EXTEND);
-        LWLockInitialize(&elems_veclock, LWTRANCHE_EXTEND);
-        LWLockInitialize(&async_ids_lock, LWTRANCHE_EXTEND);
+        InitLocks();
     }
     MemStore(uint_fast16_t dim_in, uint_fast16_t m_in, uint_fast32_t vec_size_in)
         : dim(dim_in), m(m_in), vec_size(vec_size_in) {
         entry_info.set(INVALID_VECTOR_ID, INVALID_VECTOR_ID, -1);
+        InitLocks();
+    }
+
+private:
+    void InitLocks() {
         LWLockInitialize(&entry_lock, LWTRANCHE_EXTEND);
         LWLockInitialize(&entry_waitlock, LWTRANCHE_EXTEND);
         LWLockInitialize(&elems_veclock, LWTRANCHE_EXTEND);
         LWLockInitialize(&async_ids_lock, LWTRANCHE_EXTEND);
+        for (size_t i = 0; i < STRIPE_COUNT; i++) {
+            LWLockInitialize(&base_point_locks_[i].lock, LWTRANCHE_EXTEND);
+            LWLockInitialize(&upper_point_locks_[i].lock, LWTRANCHE_EXTEND);
+        }
+    }
+
+public:
+    // 并行 build 启动前 caller 应调一次。两件事：
+    //   1. 预留 outer vector 容量避免并行阶段 realloc 让 raw ptr 失效
+    //   2. 预 New() 所有节点的 FixedSizeAllocator 槽位（FixedSizeAllocator 内
+    //      部 buffers map 不是 thread-safe，concurrent New/Get 会 race）。
+    //   预 New 后并行阶段的 assign_vector_id 只 atomic fetch_add 不碰 allocator。
+    void ReserveCapacity(size_t base_n, size_t upper_n) {
+        LWLockAcquire(&elems_veclock, LW_EXCLUSIVE);
+        const size_t cur_base = elems.size();
+        const size_t cur_upper = upper_points.size();
+        elems.reserve(base_n);
+        vectors.reserve(base_n);
+        base_points.reserve(base_n);
+        upper_points.reserve(upper_n);
+        id_to_node_ptr_.reserve(base_n);
+        upper_idx_to_ptr_.reserve(upper_n);
+
+        // Pre-allocate base: resize outer vectors + node_alloc_/vector_alloc_ New.
+        if (base_n > cur_base) {
+            elems.resize(base_n);
+            vectors.resize(base_n);
+            base_points.resize(base_n, MakeBasePoint());
+            base_layer.current_size = base_n;
+            id_to_node_ptr_.resize(base_n);
+            if (node_alloc_ && vector_alloc_) {
+                for (size_t i = cur_base; i < base_n; i++) {
+                    auto node_ptr = node_alloc_->New();
+                    auto vec_ptr = vector_alloc_->New();
+                    auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
+                    std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
+                    header->vector_ptr = vec_ptr;
+                    id_to_node_ptr_[i] = node_ptr;
+                    node_ptr_to_id_[node_ptr.Get()] = static_cast<T>(i);
+                }
+            }
+        }
+        // Pre-allocate upper: same pattern.
+        if (upper_n > cur_upper) {
+            upper_points.resize(upper_n, MakeUpperPoint());
+            upper_layer.current_size = upper_n;
+            upper_idx_to_ptr_.resize(upper_n);
+            if (upper_alloc_) {
+                for (size_t i = cur_upper; i < upper_n; i++) {
+                    auto upper_ptr = upper_alloc_->New();
+                    auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(upper_ptr));
+                    std::memset(upper, 0, duckdb::vex::HNSWUpperLevel<T>::SegmentSize(m));
+                    upper_idx_to_ptr_[i] = upper_ptr;
+                }
+            }
+        }
+        LWLockRelease(&elems_veclock);
     }
 
     // get_entry: 主库风格双锁协议（参考 graph_index_storage.h:434）。
@@ -362,57 +432,80 @@ public:
         LWLockRelease(&entry_lock);
     }
 
+    // assign_vector_id: 用 atomic counter 拿独占 id。如果 caller 已经调过
+    // ReserveCapacity 预 New 了足够多的槽位（base_n >= id+1），fast path
+    // 完全 lock-free。否则 fall back 到 EXCLUSIVE 锁下扩容 + New。
+    //
+    // Fast path: 单次 fetch_add，零 lock，零 allocator 接触。
+    // Slow path: caller 没预留（如 Append 增量）才走，触发 EXCLUSIVE。
     template <bool is_base_layer>
     T assign_vector_id() {
         if constexpr (is_base_layer) {
-            T id = T(elems.size());
-            elems.emplace_back();
-            vectors.emplace_back();
-            base_points.push_back(MakeBasePoint());
-            base_layer.current_size = base_points.size();
-
-            if (node_alloc_ && vector_alloc_) {
+            T id = next_base_id_.fetch_add(1, std::memory_order_relaxed);
+            if (id < base_layer.current_size) {
+                return id;
+            }
+            // Slow path: grow under lock. Race: another worker may have grown
+            // already; re-check size after acquire.
+            LWLockAcquire(&elems_veclock, LW_EXCLUSIVE);
+            if (id + 1 > elems.size()) {
+                elems.resize(id + 1);
+                vectors.resize(id + 1);
+                base_points.resize(id + 1, MakeBasePoint());
+                base_layer.current_size = base_points.size();
+                if (id >= id_to_node_ptr_.size()) {
+                    id_to_node_ptr_.resize(id + 1);
+                }
+            }
+            if (node_alloc_ && vector_alloc_ && !id_to_node_ptr_[id].Get()) {
                 auto node_ptr = node_alloc_->New();
                 auto vec_ptr = vector_alloc_->New();
                 auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                 std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
                 header->vector_ptr = vec_ptr;
-                if (id >= id_to_node_ptr_.size()) {
-                    id_to_node_ptr_.resize(id + 1);
-                }
                 id_to_node_ptr_[id] = node_ptr;
                 node_ptr_to_id_[node_ptr.Get()] = id;
             }
+            LWLockRelease(&elems_veclock);
             return id;
         } else {
-            T idx = T(upper_points.size());
-            upper_points.push_back(MakeUpperPoint());
-            upper_layer.current_size = upper_points.size();
-
-            if (upper_alloc_) {
-                auto upper_ptr = upper_alloc_->New();
-                auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(upper_ptr));
-                std::memset(upper, 0, duckdb::vex::HNSWUpperLevel<T>::SegmentSize(m));
+            T idx = next_upper_id_.fetch_add(1, std::memory_order_relaxed);
+            if (idx < upper_layer.current_size) {
+                return idx;
+            }
+            LWLockAcquire(&elems_veclock, LW_EXCLUSIVE);
+            if (idx + 1 > upper_points.size()) {
+                upper_points.resize(idx + 1, MakeUpperPoint());
+                upper_layer.current_size = upper_points.size();
                 if (idx >= upper_idx_to_ptr_.size()) {
                     upper_idx_to_ptr_.resize(idx + 1);
                 }
+            }
+            if (upper_alloc_ && !upper_idx_to_ptr_[idx].Get()) {
+                auto upper_ptr = upper_alloc_->New();
+                auto *upper = reinterpret_cast<duckdb::vex::HNSWUpperLevel<T> *>(upper_alloc_->Get(upper_ptr));
+                std::memset(upper, 0, duckdb::vex::HNSWUpperLevel<T>::SegmentSize(m));
                 upper_idx_to_ptr_[idx] = upper_ptr;
             }
+            LWLockRelease(&elems_veclock);
             return idx;
         }
     }
 
     void add_async_id(T id) {
+        LWLockAcquire(&async_ids_lock, LW_EXCLUSIVE);
         async_ids.push_back(id);
+        LWLockRelease(&async_ids_lock);
     }
 
+    // add_elem / add_vector: 同一个 id 只会被一个 worker 调用（id 由
+    // assign_vector_id 独占分配），写入 elems[id]/vectors[id] 的 inner 字段
+    // 在 id 维度上不竞争。需要的是 SHARED elems_veclock 防止外层 realloc
+    // 让 elems[id] 的 reference 失效。
     void add_elem(PointExtensionContext &ctx, T id, const ItemPointerData &tid) {
         (void)ctx;
-        if (id >= elems.size()) {
-            elems.resize(id + 1);
-        }
+        LWLockAcquire(&elems_veclock, LW_SHARED);
         elems[id].tids.push_back(tid);
-
         if (node_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
@@ -420,13 +513,10 @@ public:
                 header->row_id = tid.row_id;
             }
         }
+        LWLockRelease(&elems_veclock);
     }
 
     void add_vector(T id, const char *query) {
-        if (id >= vectors.size()) {
-            vectors.resize(id + 1);
-        }
-
         const char *store_data = query;
         std::vector<char> normalized;
         if (normalize_vectors_) {
@@ -448,8 +538,8 @@ public:
             store_data = normalized.data();
         }
 
+        LWLockAcquire(&elems_veclock, LW_SHARED);
         vectors[id].assign(store_data, store_data + vec_size);
-
         if (node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
@@ -460,9 +550,11 @@ public:
                 }
             }
         }
+        LWLockRelease(&elems_veclock);
     }
 
     void set_entrypoint(T id, T cur_layer_idx, int_fast8_t level) {
+        // caller (algorithm) is already holding entry_lock EXCLUSIVE
         entry_info.set(id, cur_layer_idx, level);
     }
 
@@ -596,13 +688,22 @@ public:
         return get_distance(distancer, query, id);
     }
 
+    // lock_point / unlock_point: 并发 build 时 algorithm 用来锁单个节点的
+    // 邻居数组。用 striped LWLock：idx & STRIPE_MASK 命中 64 把锁里某一把。
+    // unified unlock 让 caller 不需要传 shared/exclusive 标志。
     template <bool is_base_layer, bool shared_lock>
-    void lock_point(T) {
-        (void)shared_lock;
+    void lock_point(T idx) {
+        auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
+        if constexpr (shared_lock) {
+            LWLockAcquire(&lock, LW_SHARED);
+        } else {
+            LWLockAcquire(&lock, LW_EXCLUSIVE);
+        }
     }
-    template <bool is_base_layer, bool shared_lock>
-    void unlock_point(T) {
-        (void)shared_lock;
+    template <bool is_base_layer, bool /*shared_lock*/>
+    void unlock_point(T idx) {
+        auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
+        LWLockRelease(&lock);
     }
 
     template <bool is_base_layer>

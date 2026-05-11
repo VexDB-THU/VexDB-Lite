@@ -79,9 +79,10 @@ VexMetric ParseMetric(const string &metric_name) {
 GraphIndex::GraphIndex(const string &name, IndexConstraintType constraint_type, const vector<column_t> &column_ids,
                        TableIOManager &table_io_manager, const vector<unique_ptr<Expression>> &unbound_expressions,
                        AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
-                       idx_t vec_column_index, uint32_t pq_m, bool compact_mode)
+                       idx_t vec_column_index, uint32_t pq_m, bool compact_mode, int build_threads)
     : BoundIndex(name, TYPE_NAME, constraint_type, column_ids, table_io_manager, unbound_expressions, db),
-      dimension_(dimension), m_(m), ef_construction_(ef_construction), metric_(metric),
+      dimension_(dimension), m_(m), ef_construction_(ef_construction),
+      build_threads_(build_threads), metric_(metric),
       vec_column_index_(vec_column_index), pq_m_(pq_m),
       runtime_(make_uniq<GraphIndexRuntimeState>(dimension, m)),
       compact_mode_(compact_mode) {
@@ -162,20 +163,17 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
     if (metric_it != input.options.end()) {
         metric = ParseMetric(metric_it->second.GetValue<string>());
     }
+    int build_threads = 1;
     auto threads_it = input.options.find("threads");
     if (threads_it != input.options.end()) {
-        int threads_val = 0;
         try {
-            threads_val = threads_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
+            build_threads = threads_it->second.DefaultCastAs(LogicalType::INTEGER).GetValue<int>();
         } catch (...) {
             throw InvalidInputException("GRAPH_INDEX option 'threads' must be a valid integer in [1, 1024]");
         }
-        if (threads_val < 1 || threads_val > 1024) {
-            throw InvalidInputException("GRAPH_INDEX option 'threads' must be in [1, 1024], got %d", threads_val);
+        if (build_threads < 1 || build_threads > 1024) {
+            throw InvalidInputException("GRAPH_INDEX option 'threads' must be in [1, 1024], got %d", build_threads);
         }
-        // TODO: wire up parallel BuildBulk on duck side. PG already has it
-        // (BufferPtrCache pin strategy, see CLAUDE.md "Parallel construction");
-        // duck currently builds single-threaded regardless of `threads`.
     }
     uint32_t pq_m = 0;
     auto pq_m_it = input.options.find("pq_m");
@@ -240,7 +238,7 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
 
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
-                                             metric, 0, pq_m, compact_mode);
+                                             metric, 0, pq_m, compact_mode, build_threads);
 
     if (input.storage_info.allocator_infos.size() >= 3) {
         // Reload path: create allocators WITHOUT slot-0 reservation. The serialized
@@ -338,15 +336,81 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
     }
     const float *src = (metric_ == VexMetric::COSINE) ? normalized.data() : vectors.data();
 
+    // Pre-reserve outer vectors so concurrent assign_vector_id during the
+    // parallel phase doesn't realloc and invalidate raw pointers held by
+    // other workers' reads.
+    // - base: exact count, every row gets one base node
+    // - upper: expected ≈ base/(m-1) per HNSW theory, but the level distribution
+    //   has a long tail and parallel timing variance can land more upper points
+    //   per chunk. Reserve same as base to eliminate realloc risk; wastes some
+    //   memory on small datasets but keeps the build safe.
+    const size_t base_n = runtime_->store.get_vector_num() + row_ids.size();
+    const size_t upper_n = base_n;
+    runtime_->store.ReserveCapacity(base_n, upper_n);
+
+    const idx_t n = row_ids.size();
+    const int n_workers = std::clamp(build_threads_, 1, static_cast<int>(std::max<idx_t>(n, 1)));
+
     RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, runtime_->store, [&](auto &algo) {
         using AlgoT = std::decay_t<decltype(algo)>;
-        for (idx_t i = 0; i < row_ids.size(); i++) {
+
+        auto insert_one = [&](idx_t i) {
             PointExtensionContext point_ctx;
             ItemPointerData tid;
             tid.row_id = row_ids[i];
             const char *query = reinterpret_cast<const char *>(src + i * dimension_);
             typename AlgoT::InsertContextBase insert_ctx(point_ctx, query, &tid);
             algo.insert(insert_ctx);
+        };
+
+        // Phase A: serial first point if graph is empty. Multiple workers
+        // racing on get_entry<>(level=-1) would all enter the empty-graph
+        // branch and concurrently set_entrypoint, corrupting the entry.
+        idx_t start_index = 0;
+        if (runtime_->store.get_vector_num() == 0 && n > 0) {
+            insert_one(0);
+            start_index = 1;
+        }
+
+        // Phase B: serial loop if single-threaded or trivial remainder.
+        if (n_workers <= 1 || start_index >= n) {
+            for (idx_t i = start_index; i < n; i++) {
+                insert_one(i);
+            }
+            return;
+        }
+
+        // Phase C: std::thread pool, contiguous slices. First exception
+        // wins (HNSW build errors are usually OOM / NULL deref — one msg suffices).
+        std::vector<std::thread> workers;
+        std::vector<std::exception_ptr> errors(n_workers);
+        const idx_t remaining = n - start_index;
+        const idx_t per = remaining / n_workers;
+        const idx_t rem = remaining % n_workers;
+        idx_t offset = start_index;
+        workers.reserve(n_workers);
+        for (int t = 0; t < n_workers; t++) {
+            const idx_t count = per + (t < static_cast<int>(rem) ? 1 : 0);
+            const idx_t s = offset;
+            const idx_t e = offset + count;
+            offset = e;
+            workers.emplace_back([t, s, e, &errors, &insert_one]() {
+                try {
+                    for (idx_t i = s; i < e; i++) {
+                        insert_one(i);
+                    }
+                } catch (...) {
+                    errors[t] = std::current_exception();
+                }
+            });
+        }
+        for (auto &w : workers) {
+            w.join();
+        }
+        for (auto &ep : errors) {
+            if (ep) {
+                std::rethrow_exception(ep);
+            }
         }
     });
 

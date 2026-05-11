@@ -43,7 +43,8 @@ public:
                const vector<column_t> &column_ids, TableIOManager &table_io_manager,
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
-               idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false);
+               idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false,
+               int build_threads = 1);
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
@@ -111,6 +112,9 @@ private:
     idx_t dimension_;
     int m_;
     int ef_construction_;
+    // Parsed from WITH (threads=N). Default 1 = serial. >1 enables std::thread
+    // pool in BuildBulk (P5'). Must respect MemStore thread-safety contract.
+    int build_threads_ = 1;
     VexMetric metric_;
     idx_t vec_column_index_;
 
