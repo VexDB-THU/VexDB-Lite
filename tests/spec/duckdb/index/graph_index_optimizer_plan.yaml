@@ -1,0 +1,231 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_optimizer_plan
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Execution plan verification — ensure optimizer produces VEX_INDEX_SCAN (index) or SEQ_SCAN (fallback) as expected
+steps:
+- statement: CREATE TABLE t_plan (id INTEGER, tag VARCHAR, vec ${VECTOR(4)});
+- statement: "INSERT INTO t_plan SELECT i, 'tag_' || (i % 5)::VARCHAR, list_value(\n  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,\n  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(1, 501)}\
+    \ t(i);"
+- statement: CREATE INDEX idx_l2 ON t_plan USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: CREATE INDEX idx_cos ON t_plan USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- statement: CREATE INDEX idx_ip ON t_plan USING ${VEX_INDEX} (vec${OPS_IP_COL})${IDX_OPTS_IP};
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, [0.5, 0.5, 0.5, 0.5])} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, [1, 0, 0, 0])} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, [1, 0.5, 0, 0.5])} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${COSINE(vec, [0.5, 0.5, 0.5, 0.5])} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${IP(vec, [0.5, 0.5, 0.5, 0.5])} DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}, vec)} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${COSINE(${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}, vec)} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${IP(${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}, vec)} DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT * FROM (SELECT id, ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} AS dist FROM t_plan ORDER BY dist LIMIT 5);
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN WITH nn AS (SELECT id FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5) SELECT * FROM nn;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT * FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id, ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} AS dist FROM t_plan ORDER BY dist LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id, tag FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5 OFFSET 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})};
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${IP(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} ASC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY vec <~> ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)} DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: CREATE TABLE t_cos_only (id INTEGER, vec ${VECTOR(4)});
+- statement: INSERT INTO t_cos_only SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT)::${VECTOR(4)} FROM ${RANGE2(1, 201)} t(i);
+- statement: CREATE INDEX idx_cos_only ON t_cos_only USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- query: EXPLAIN SELECT id FROM t_cos_only ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_cos_only ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- statement: DROP TABLE t_cos_only;
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})}, id LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: CREATE TABLE t_two_vec (id INTEGER, v1 ${VECTOR(4)}, v2 ${VECTOR(4)});
+- statement: INSERT INTO t_two_vec VALUES (1, ${VEC_LITERAL([1,0,0,0], 4)}, ${VEC_LITERAL([0,1,0,0], 4)}), (2, ${VEC_LITERAL([0.5,0.5,0,0], 4)}, ${VEC_LITERAL([0.5,0.5,0,0], 4)});
+- statement: CREATE INDEX idx_two ON t_two_vec USING ${VEX_INDEX} (v1${OPS_L2_COL})${IDX_OPTS_L2};
+- query: EXPLAIN SELECT id FROM t_two_vec ORDER BY ${L2(v1, v2)} LIMIT 1;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: DROP TABLE t_two_vec;
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY abs(id) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: CREATE TABLE t_noindex (id INTEGER, vec ${VECTOR(4)});
+- statement: INSERT INTO t_noindex SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT)::${VECTOR(4)} FROM ${RANGE2(1, 201)} t(i);
+- query: EXPLAIN SELECT id FROM t_noindex ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: DROP TABLE t_noindex;
+- query: EXPLAIN SELECT id FROM t_plan WHERE tag = 'tag_1' ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY CAST(${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} AS REAL) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- statement: CREATE TABLE t_meta (id INTEGER, label VARCHAR);
+- statement: INSERT INTO t_meta SELECT i, 'label_' || i::VARCHAR FROM ${RANGE2(1, 501)} t(i);
+- query: EXPLAIN SELECT t_plan.id, t_meta.label FROM t_plan JOIN t_meta ON t_plan.id = t_meta.id ORDER BY ${L2(t_plan.vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: DROP TABLE t_meta;
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY vec <-> ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY vec <=> ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY vec <~> ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY array_distance(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY list_distance(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY array_cosine_distance(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY list_cosine_distance(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY array_inner_product(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY list_inner_product(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) DESC LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY array_negative_inner_product(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: EXPLAIN SELECT id FROM t_plan ORDER BY list_negative_inner_product(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)}) LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- statement: DROP TABLE t_plan;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_optimizer_plan.test

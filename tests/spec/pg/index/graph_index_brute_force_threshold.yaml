@@ -1,0 +1,74 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: graph_index_brute_force_threshold
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/index_basic/graph_index_brute_force_threshold.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: CREATE TABLE threshold_test (id INTEGER PRIMARY KEY, vec floatvector(4));
+- statement: CREATE INDEX idx ON threshold_test USING vexdb_graph (vec);
+- statement: 'INSERT INTO threshold_test SELECT i, (''[''||(sin(i*0.1)::FLOAT)::text||'',''||(cos(i*0.2)::FLOAT)::text||'',''||(sin(i*0.3)::FLOAT)::text||'',''||(cos(i*0.4)::FLOAT)::text||'']'')::floatvector
+
+    FROM generate_series(1, 65-1) t(i);'
+- query: SELECT count(*) FROM threshold_test;
+  expect:
+  - - 64
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 10
+- statement: INSERT INTO threshold_test VALUES (65, '[0.5, 0.5, 0.5, 0.5]'::floatvector);
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id = 65;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id > 30;
+- query: SELECT count(*) FROM threshold_test;
+  expect:
+  - - 30
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 10
+- statement: 'INSERT INTO threshold_test SELECT i, (''[''||(cos(i*0.2)::FLOAT)::text||'',''||(sin(i*0.3)::FLOAT)::text||'',''||(cos(i*0.4)::FLOAT)::text||'',''||(sin(i*0.5)::FLOAT)::text||'']'')::floatvector
+
+    FROM generate_series(100, 170-1) t(i);'
+- query: SELECT count(*) FROM threshold_test;
+  expect:
+  - - 100
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id >= 160;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.5, 0.5, 0.5, 0.5]'::floatvector) LIMIT 5);
+  expect:
+  - - 5
+- statement: 'INSERT INTO threshold_test SELECT i, (''[''||(sin(i)::FLOAT)::text||'',''||(cos(i)::FLOAT)::text||'',''||(0.0)::text||'',''||(0.0)::text||'']'')::floatvector
+
+    FROM generate_series(200, 210-1) t(i);'
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.5, 0.5, 0.5, 0.5]'::floatvector) LIMIT 5);
+  expect:
+  - - 5
+- statement: DELETE FROM threshold_test WHERE id >= 150;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[1.0, 1.0, 1.0, 1.0]'::floatvector) LIMIT 5);
+  expect:
+  - - 5
+- statement: DELETE FROM threshold_test WHERE id > 3;
+- query: SELECT count(*) FROM threshold_test;
+  expect:
+  - - 3
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 3
+- statement: DELETE FROM threshold_test WHERE id > 1;
+- query: SELECT count(*) FROM threshold_test;
+  expect:
+  - - 1
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY l2_distance(vec, '[0.0, 0.0, 0.0, 0.0]'::floatvector) LIMIT 10);
+  expect:
+  - - 1
+- statement: DROP TABLE threshold_test;

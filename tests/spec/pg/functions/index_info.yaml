@@ -1,0 +1,63 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: index_info
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/functions/index_info.sql
+engines:
+- pg
+- opengauss
+steps:
+- query: SELECT count(*) FROM vex_index_info();
+  expect:
+  - - 0
+- statement: CREATE TABLE t1 (id INTEGER, vec floatvector(4));
+- statement: "INSERT INTO t1 SELECT i,\n  ('[' || (i * 0.1) || ',' || (i * 0.2) || ',' || (i * 0.3) || ',' || (i * 0.4) || ']')::floatvector\n  FROM generate_series(0, 99) AS s(i);"
+- statement: CREATE INDEX idx1 ON t1 USING vexdb_graph (vec);
+- query: SELECT count(*) FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - 1
+- query: SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - idx1
+  - - GRAPH_INDEX
+  - - 100
+  - - 4
+- query: SELECT table_name FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - t1
+- query: SELECT partition_count FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - 0
+- query: SELECT m, ef_construction, metric, use_pq::INTEGER, pq_m FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - 16
+  - - 64
+  - - l2
+  - - 0
+  - - 0
+- statement: CREATE TABLE t2 (id INTEGER, vec floatvector(8));
+- statement: "INSERT INTO t2 SELECT i,\n  ('[' || ((0 + i)/100.0) || ',' || ((1 + i)/100.0) || ',' || ((2 + i)/100.0) || ',' ||\n          ((3 + i)/100.0) || ',' || ((4 + i)/100.0) || ',' || ((5 + i)/100.0)\
+    \ || ',' ||\n          ((6 + i)/100.0) || ',' || ((7 + i)/100.0) || ']')::floatvector\n  FROM generate_series(0, 49) AS s(i);"
+- statement: CREATE INDEX idx2 ON t2 USING vexdb_graph (vec);
+- query: SELECT count(*) FROM vex_index_info();
+  expect:
+  - - 2
+- query: SELECT index_name, index_type, node_count, dimension FROM vex_index_info() WHERE indexname = 'idx2';
+  expect:
+  - - idx2
+  - - GRAPH_INDEX
+  - - 50
+  - - 8
+- statement: DROP INDEX idx2;
+- query: SELECT count(*) FROM vex_index_info() WHERE indexname = 'idx2';
+  expect:
+  - - 0
+- query: SELECT count(*) FROM vex_index_info() WHERE indexname = 'idx1';
+  expect:
+  - - 1
+- statement: DROP TABLE t1;
+- statement: DROP TABLE t2;
+- query: SELECT count(*) FROM vex_index_info();
+  expect:
+  - - 0

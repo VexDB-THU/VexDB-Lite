@@ -11,7 +11,6 @@
 
 namespace duckdb {
 
-static constexpr int64_t kDefaultBruteForceThreshold = 64;
 static constexpr const char *kAlgorithmBruteForce = "brute-force";
 static constexpr const char *kAlgorithmHnsw = "hnsw";
 
@@ -38,11 +37,7 @@ PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, Physic
 	                                                query_vec_expr->Copy(), k, column_ids, fetch_output_positions,
 	                                                distance_output_index, returned_types, output_types.size());
     {
-        int64_t bft = kDefaultBruteForceThreshold;
-        Value bft_val;
-        if (context.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
-            bft = bft_val.GetValue<int64_t>();
-        }
+        auto bft = GetBruteForceThreshold(context);
         auto &phys_scan = scan.Cast<PhysicalVexIndexScan>();
         phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
                                        ? kAlgorithmBruteForce
@@ -202,22 +197,44 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                     "vex_ef_search must be in [1, 65535], got %d", ef);
             }
         }
-        Value bft_val;
-        if (context.client.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
-            int64_t bft = bft_val.GetValue<int64_t>();
-            if (bft < 0 || bft > 1000000) {
-                throw InvalidInputException(
-                    "vex_brute_force_threshold must be in [0, 1000000], got %lld",
-                    static_cast<long long>(bft));
-            }
-        }
+        // bft is validated up front in TryOptimizeANN; by the time we run, the
+        // optimizer has already routed sub-threshold queries to SEQ_SCAN.
         if (static_cast<int>(k) > ef) {
             ef = static_cast<int>(k) * 2;
         }
 
+        bool pq_only = false;
+        Value pq_mode_val;
+        if (context.client.TryGetCurrentSetting("vex_pq_search_mode", pq_mode_val)) {
+            auto mode = StringUtil::Lower(pq_mode_val.ToString());
+            if (mode == "pq_only") {
+                pq_only = true;
+            } else if (mode != "off" && !mode.empty()) {
+                throw InvalidInputException(
+                    "vex_pq_search_mode must be 'off' or 'pq_only', got '%s'", pq_mode_val.ToString());
+            }
+        }
+
         vector<row_t> result_row_ids;
         vector<float> result_distances;
-        graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
+        if (pq_only) {
+            if (!graph_index.UsesPQ()) {
+                throw InvalidInputException(
+                    "vex_pq_search_mode='pq_only' requires the index to be built with WITH (quantizer='pq', pq_m=N)");
+            }
+            double refine_factor = 1.0;
+            Value refine_val;
+            if (context.client.TryGetCurrentSetting("vex_pq_refine_k_factor", refine_val)) {
+                refine_factor = refine_val.GetValue<double>();
+                if (refine_factor < 1.0 || refine_factor > 1000.0) {
+                    throw InvalidInputException(
+                        "vex_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", refine_factor);
+                }
+            }
+            graph_index.SearchPQ(query_vec.data(), k, result_row_ids, result_distances, refine_factor);
+        } else {
+            graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
+        }
 
         auto fetch_types = BuildOutputTypes(column_ids, returned_types);
         auto fetched = FetchRowsByRowIds(context.client, table, column_ids, fetch_types, result_row_ids, k, 0);

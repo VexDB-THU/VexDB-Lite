@@ -51,6 +51,40 @@ bool graph_index_get_enable_async_insert(Relation index)
     return opts ? opts->enable_async_insert : false;
 }
 
+/* Stage 4 duck-parity reloption accessors. */
+int graph_index_get_pq_m(Relation index)
+{
+    GraphIndexOptions *opts = (GraphIndexOptions *)index->rd_options;
+    return opts ? opts->pq_m : 0;
+}
+
+bool graph_index_get_compact_mode(Relation index)
+{
+    GraphIndexOptions *opts = (GraphIndexOptions *)index->rd_options;
+    if (!opts || opts->memory_mode_offset <= 0) {
+        return false;
+    }
+    const char *s = (const char *)opts + opts->memory_mode_offset;
+    return pg_strcasecmp(s, "compact") == 0;
+}
+
+int graph_index_get_threads(Relation index)
+{
+    GraphIndexOptions *opts = (GraphIndexOptions *)index->rd_options;
+    if (!opts) return 1;
+    if (opts->threads > 0) return opts->threads;
+    return opts->parallel_workers > 0 ? opts->parallel_workers : 1;
+}
+
+const char *graph_index_get_metric_str(Relation index)
+{
+    GraphIndexOptions *opts = (GraphIndexOptions *)index->rd_options;
+    if (!opts || opts->metric_offset <= 0) {
+        return "l2";
+    }
+    return (const char *)opts + opts->metric_offset;
+}
+
 FmgrInfo *graph_index_optional_proc_info(Relation rel, uint16 procnum)
 {
     if (!OidIsValid(index_getprocid(rel, 1, procnum)))

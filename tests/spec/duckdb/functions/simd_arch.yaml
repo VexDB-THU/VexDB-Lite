@@ -1,0 +1,23 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__simd_arch
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: vex_simd_arch() exposes the runtime CPU arch picked by
+steps:
+- query: SELECT vex_simd_arch() IN ('SSE', 'AVX', 'AVX512', 'NEONV8', 'SVEV8', 'SVE2V8', 'GENERAL');
+  _field_types: I
+  expect:
+  - - 'true'
+- query: SELECT vex_simd_arch() != 'GENERAL';
+  _field_types: I
+  expect:
+  - - 'true'
+_migrated_from: vexdb-duck/test/sql/vex/functions/simd_arch.test

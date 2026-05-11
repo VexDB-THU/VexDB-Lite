@@ -1,0 +1,27 @@
+# auto-classified spec
+name: bf_threshold_explain
+tags:
+- vex
+- duckdb-only
+engines:
+- duckdb
+- pg
+- opengauss
+description: Verify vex_brute_force_threshold is reflected in EXPLAIN ANALYZE (TAPD Bug 1078122)
+steps:
+- statement: CREATE TABLE t_bf (id BIGINT, v ${VECTOR(4)});
+- statement: INSERT INTO t_bf SELECT i, ${VEC_LITERAL([(i*0.1)::FLOAT, (i*0.2)::FLOAT, (i*0.3)::FLOAT, (i*0.4)::FLOAT], 4)} FROM ${RANGE(500)} t(i);
+- statement: CREATE INDEX idx_bf ON t_bf USING ${VEX_INDEX}(v${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- statement: SET ${GUC_BF_THRESHOLD} = 100000;
+- query: EXPLAIN ANALYZE WITH tmp AS (SELECT ${VEC_LITERAL([0.1,0.2,0.3,0.4], 4)} AS vec) SELECT id FROM t_bf ORDER BY v <=> (SELECT vec FROM tmp) LIMIT 5;
+  _field_types: II
+  expect:
+  - - analyzed_plan
+    - <!REGEX>:.*VEX_INDEX_SCAN.*
+- statement: SET ${GUC_BF_THRESHOLD} = 10;
+- query: EXPLAIN ANALYZE WITH tmp AS (SELECT ${VEC_LITERAL([0.1,0.2,0.3,0.4], 4)} AS vec) SELECT id FROM t_bf ORDER BY v <=> (SELECT vec FROM tmp) LIMIT 5;
+  _field_types: II
+  expect:
+  - - analyzed_plan
+    - <REGEX>:.*Algorithm.*hnsw.*
+- statement: DROP TABLE t_bf;

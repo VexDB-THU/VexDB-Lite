@@ -40,13 +40,13 @@ static const DistanceFuncEntry kDistanceFuncs[] = {
 
     {"inner_product", VexMetric::INNER_PRODUCT, false},
     {"<#>", VexMetric::INNER_PRODUCT, false},
+    {"<~>", VexMetric::INNER_PRODUCT, true},
     {"array_inner_product", VexMetric::INNER_PRODUCT, false},
     {"list_inner_product", VexMetric::INNER_PRODUCT, false},
     {"array_negative_inner_product", VexMetric::INNER_PRODUCT, true},
     {"list_negative_inner_product", VexMetric::INNER_PRODUCT, true},
 
     {"cosine_distance", VexMetric::COSINE, true},
-    {"<~>", VexMetric::COSINE, true},
     {"<=>", VexMetric::COSINE, true},
     {"array_cosine_distance", VexMetric::COSINE, true},
     {"list_cosine_distance", VexMetric::COSINE, true},
@@ -351,6 +351,14 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     IndexMatch match;
     if (!TryFindMatchingIndex(context, storage, column_ids, dist_info.col_index,
                               dist_info.func_expr->function.name, match)) {
+        return false;
+    }
+
+    // Honor vex_brute_force_threshold: when node_count <= threshold, skip the rewrite
+    // and let DuckDB run the natural SEQ_SCAN+ORDER_BY+LIMIT plan, which returns the
+    // exact top-k. Users raise this to bypass HNSW (e.g., recall degradation after
+    // bulk delete + reinsert).
+    if (static_cast<int64_t>(match.graph_idx->GetNodeCount()) <= GetBruteForceThreshold(context)) {
         return false;
     }
 

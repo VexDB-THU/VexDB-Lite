@@ -464,7 +464,6 @@ retry:
         }
     }
 
-#if !defined(PG_VEXDB_TARGET_DUCK)
     void repair_entry(const UnorderedSet<size_t> &deleted)
     {
         /* acquire exclusive lock forcefully */
@@ -508,6 +507,7 @@ retry:
         store.release_entry_lock(shared_lock);
     }
 
+#if !defined(PG_VEXDB_TARGET_DUCK)
     void repair_graph_parallel(RepairGraphSharedState &ss)
     {
         CONSTEXPR_IF (use_dist_cache) {
@@ -596,11 +596,7 @@ private:
     bool is_valid(T id) { return likely(id != (T)INVALID_VECTOR_ID); }
     int_fast8_t get_insert_level()
     {
-#if defined(PG_VEXDB_TARGET_DUCK)
-        return 0;
-#else
         return std::min<int_fast8_t>((-log(RandomDouble()) * (1 / log(m))), (GRAPH_INDEX_MAX_LEVEL - 1));
-#endif
     }
     template <bool is_base_layer> uint_fast16_t get_nbr_num() { return is_base_layer ? m * 2 : m; }
     bool check_insertable(const Cand &ep, const char *query)

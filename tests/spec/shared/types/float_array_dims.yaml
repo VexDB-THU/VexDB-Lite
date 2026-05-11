@@ -1,0 +1,19 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: types__float_array_dims
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test vector dimension constraints
+steps:
+- statement: CREATE TABLE t_bad (v ${VECTOR(0)});
+  expect_error: ''
+- statement: CREATE TABLE t_large (v ${VECTOR(4096)});
+- statement: CREATE TABLE t_huge (v ${VECTOR(16384)});
+_migrated_from: vexdb-duck/test/sql/vex/types/float_array_dims.test

@@ -16,6 +16,7 @@ SRCS = \
     src/ann_utils.cpp \
     src/vector_storage.cpp \
     src/vector_smgr.cpp \
+    src/vex_index_info.cpp \
     knl/knl_alloc.cpp \
     src/distance/architecture_minimal.cpp \
     src/distance/distance.cpp \
@@ -23,7 +24,12 @@ SRCS = \
     src/distance/core/general_dispatcher.cpp \
     src/distance/core/sse_dispatcher.cpp \
     src/distance/core/avx_dispatcher.cpp \
-    src/distance/core/avx512_dispatcher.cpp
+    src/distance/core/avx512_dispatcher.cpp \
+    src/distance/core/pq_dispatcher.cpp \
+    src/pq.cpp \
+    quantizer/pq_alloc.cpp \
+    quantizer/annkmeans.cpp \
+    quantizer/product_quantizer.cpp
 # Defer full SIMD implementations:
 #    src/distance/general.cpp \
 #    src/distance/sse.cpp \

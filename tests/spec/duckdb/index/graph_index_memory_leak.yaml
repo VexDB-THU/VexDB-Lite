@@ -1,0 +1,72 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_memory_leak
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Verify no memory leak — FreeNode returns segments to allocator for reuse
+steps:
+- statement: CREATE TABLE leak1 (id INTEGER, vec ${VECTOR(8)});
+- statement: CREATE INDEX lidx1 ON leak1 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: "INSERT INTO leak1 SELECT i, list_value(\n  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT,\n  sin(i*0.5)::FLOAT, cos(i*0.6)::FLOAT, sin(i*0.7)::FLOAT, cos(i*0.8)::FLOAT\n\
+    )::${VECTOR(8)}\nFROM ${RANGE2(1, 201)} t(i);"
+- query: SELECT count(*) FROM leak1;
+  _field_types: I
+  expect:
+  - - 200
+- statement: DELETE FROM leak1;
+- query: SELECT count(*) FROM leak1;
+  _field_types: I
+  expect:
+  - - 0
+- statement: "INSERT INTO leak1 SELECT i, list_value(\n  cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT,\n  cos(i*0.5)::FLOAT, sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT\n\
+    )::${VECTOR(8)}\nFROM ${RANGE2(201, 401)} t(i);"
+- query: SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0], 8)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DELETE FROM leak1;
+- statement: "INSERT INTO leak1 SELECT i, list_value(\n  sin(i*0.2)::FLOAT, cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT, cos(i*0.5)::FLOAT,\n  sin(i*0.6)::FLOAT, cos(i*0.7)::FLOAT, sin(i*0.8)::FLOAT, cos(i*0.9)::FLOAT\n\
+    )::${VECTOR(8)}\nFROM ${RANGE2(401, 601)} t(i);"
+- query: SELECT count(*) FROM (SELECT id FROM leak1 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0], 8)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DROP TABLE leak1;
+- statement: CREATE TABLE leak2 (id INTEGER, vec ${VECTOR(4)});
+- statement: CREATE INDEX lidx2 ON leak2 USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: 'INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::${VECTOR(4)}
+
+    FROM ${RANGE2(1, 101)} t(i);'
+- statement: DELETE FROM leak2 WHERE id <= 50;
+- query: SELECT count(*) FROM leak2;
+  _field_types: I
+  expect:
+  - - 50
+- statement: 'INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.5, 0.5)::${VECTOR(4)}
+
+    FROM ${RANGE2(101, 151)} t(i);'
+- query: SELECT count(*) FROM leak2;
+  _field_types: I
+  expect:
+  - - 100
+- query: SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 20);
+  _field_types: I
+  expect:
+  - - 20
+- statement: DELETE FROM leak2;
+- statement: 'INSERT INTO leak2 SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 1.0, 1.0)::${VECTOR(4)}
+
+    FROM ${RANGE2(151, 251)} t(i);'
+- query: SELECT count(*) FROM (SELECT id FROM leak2 ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DROP TABLE leak2;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_memory_leak.test

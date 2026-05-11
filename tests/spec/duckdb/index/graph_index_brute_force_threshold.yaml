@@ -1,0 +1,94 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_brute_force_threshold
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test brute force / graph search threshold boundary (64 nodes)
+steps:
+- statement: CREATE TABLE threshold_test (id INTEGER PRIMARY KEY, vec ${VECTOR(4)});
+- statement: CREATE INDEX idx ON threshold_test USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: 'INSERT INTO threshold_test SELECT i, list_value(sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT)::${VECTOR(4)}
+
+    FROM ${RANGE2(1, 65)} t(i);'
+- query: SELECT count(*) FROM threshold_test;
+  _field_types: I
+  expect:
+  - - 64
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: INSERT INTO threshold_test VALUES (65, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)});
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id = 65;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id > 30;
+- query: SELECT count(*) FROM threshold_test;
+  _field_types: I
+  expect:
+  - - 30
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: 'INSERT INTO threshold_test SELECT i, list_value(cos(i*0.2)::FLOAT, sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT, sin(i*0.5)::FLOAT)::${VECTOR(4)}
+
+    FROM ${RANGE2(100, 170)} t(i);'
+- query: SELECT count(*) FROM threshold_test;
+  _field_types: I
+  expect:
+  - - 100
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: DELETE FROM threshold_test WHERE id >= 160;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5);
+  _field_types: I
+  expect:
+  - - 5
+- statement: 'INSERT INTO threshold_test SELECT i, list_value(sin(i)::FLOAT, cos(i)::FLOAT, 0.0, 0.0)::${VECTOR(4)}
+
+    FROM ${RANGE2(200, 210)} t(i);'
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} LIMIT 5);
+  _field_types: I
+  expect:
+  - - 5
+- statement: DELETE FROM threshold_test WHERE id >= 150;
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 1.0, 1.0, 1.0], 4)})} LIMIT 5);
+  _field_types: I
+  expect:
+  - - 5
+- statement: DELETE FROM threshold_test WHERE id > 3;
+- query: SELECT count(*) FROM threshold_test;
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 3
+- statement: DELETE FROM threshold_test WHERE id > 1;
+- query: SELECT count(*) FROM threshold_test;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT count(*) FROM (SELECT id FROM threshold_test ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 1
+- statement: DROP TABLE threshold_test;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_brute_force_threshold.test

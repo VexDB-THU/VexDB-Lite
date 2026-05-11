@@ -1,0 +1,83 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__vector_ops
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test vector utility functions
+steps:
+- query: SELECT vector_dims(${VEC_LITERAL([1.0, 2.0, 3.0], 3)});
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT vector_dims(${VEC_LITERAL([1.0], 1)});
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT vector_norm(${VEC_LITERAL([3.0, 4.0], 2)});
+  _field_types: R
+  expect:
+  - - 5.0
+- query: SELECT vector_norm(${VEC_LITERAL([0.0, 0.0, 0.0], 3)});
+  _field_types: R
+  expect:
+  - - 0.0
+- query: SELECT vector_norm(${VEC_LITERAL([1.0], 1)});
+  _field_types: R
+  expect:
+  - - 1.0
+- query: SELECT vector_dims(l2_normalize(${VEC_LITERAL([3.0, 4.0], 2)}));
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT vector_dims(vector_add(${VEC_LITERAL([1.0, 2.0], 2)}, ${VEC_LITERAL([3.0, 4.0], 2)}));
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT vector_dims(vector_sub(${VEC_LITERAL([3.0, 4.0], 2)}, ${VEC_LITERAL([1.0, 1.0], 2)}));
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT vector_dims('[1.0, 2.0, 3.0]');
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT vector_dims('[1.0]');
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT vector_norm('[3.0, 4.0]');
+  _field_types: R
+  expect:
+  - - 5.0
+- query: SELECT vector_norm(l2_normalize('[3.0, 4.0, 0.0]'));
+  _field_types: R
+  expect:
+  - - 1.000000023841858
+- query: SELECT vector_dims(vector_add('[1.0, 2.0, 3.0]', '[4.0, 5.0, 6.0]'));
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT vector_dims(vector_add(${VEC_LITERAL([1.0, 2.0], 2)}, '[3.0, 4.0]'));
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT vector_dims(vector_sub('[4.0, 5.0, 6.0]', '[1.0, 2.0, 3.0]'));
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT vector_norm(NULL::${VECTOR(3)});
+  _field_types: R
+  expect:
+  - - 'NULL'
+- query: SELECT vector_dims(NULL::${VECTOR(3)});
+  _field_types: I
+  expect:
+  - - 'NULL'
+_migrated_from: vexdb-duck/test/sql/vex/functions/vector_ops.test

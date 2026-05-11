@@ -3,7 +3,13 @@
 
 #include <stddef.h>
 #include <cstdint>
-#include "pg_compat.h"
+
+// Assert: PG defines it via postgres.h before this header is reached on the
+// PG build target; on duck/standalone builds we fall back to <cassert>.
+#ifndef Assert
+#include <cassert>
+#define Assert(x) assert(x)
+#endif
 
 /*************************************************
  * Objects to encode / decode strings of bits

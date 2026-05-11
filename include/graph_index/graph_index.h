@@ -68,6 +68,11 @@ IdType graph_index_get_id_type(Relation index);
 bool graph_index_get_enable_async_insert(Relation index);
 void graph_index_init_page(Buffer buf, Page page);
 QuantizerType graph_index_get_quantizer_type(Relation index);
+/* Stage 4 duck-parity reloption accessors. */
+int graph_index_get_pq_m(Relation index);
+bool graph_index_get_compact_mode(Relation index);
+int graph_index_get_threads(Relation index);
+const char *graph_index_get_metric_str(Relation index);
 FmgrInfo *graph_index_optional_proc_info(Relation index, uint16 procnum);
 void create_vec_data(Relation index, bool create);
 uint16_t graph_index_get_dim(Relation index);

@@ -8,6 +8,8 @@
 #include <atomic>
 
 #include "pg_compat.h"
+#include "annkmeans.h"
+#include "pq.h"
 
 extern "C" {
 #include "access/parallel.h"
@@ -161,11 +163,11 @@ public:
         
         int temp_dim = TupleDescAttr(index->rd_att, 0)->atttypmod;
         dimension = temp_dim > 0 ? (uint_fast16_t)temp_dim : 0;
-        
-        if (dimension == 0) {
-            elog(ERROR, "Could not determine vector dimension from index attribute");
-        }
-        
+        // dimension==0 means the indexed column is an untyped floatvector
+        // (CREATE TABLE AS or DDL without typmod). build_index() will
+        // sniff the first non-null tuple from heap and recompute
+        // vector_size; do not error out here.
+
         if (precision_type != DistPrecisionType::CUSTOM) {
             vector_size = dimension * get_dtype_size(precision_type);
         } else if (TupleDescAttr(index->rd_att, 0)->attbyval) {
@@ -237,6 +239,9 @@ public:
 
     BlockNumber build_index(Relation heap, Relation index, IndexInfo *index_info)
     {
+        if (dimension == 0) {
+            sniff_dimension_from_heap(heap, index);
+        }
         create_metapage(index);
         bool quant_trained = init_quantizer(heap, index);
         if (!quant_trained) {
@@ -245,6 +250,37 @@ public:
         build_graph(heap, index, index_info);
         log_index(index);
         return metablkno;
+    }
+
+    // For untyped floatvector columns (CREATE TABLE AS), the index
+    // attribute carries no typmod. Walk the heap until the first non-null
+    // vector and adopt its dimension. Errors only if the table is empty
+    // or has no non-null vectors.
+    void sniff_dimension_from_heap(Relation heap, Relation index)
+    {
+        Snapshot snap = GetActiveSnapshot();
+        TableScanDesc scan = table_beginscan(heap, snap, 0, NULL, 0);
+        TupleTableSlot *slot = table_slot_create(heap, NULL);
+        AttrNumber attno = index->rd_index->indkey.values[0];
+        while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+            bool isnull;
+            Datum d = slot_getattr(slot, attno, &isnull);
+            if (isnull) continue;
+            FloatVector *fv = DatumGetFloatVector(d);
+            if (fv->dim > 0) {
+                dimension = (uint_fast16_t)fv->dim;
+                break;
+            }
+        }
+        ExecDropSingleTupleTableSlot(slot);
+        table_endscan(scan);
+        if (dimension == 0) {
+            elog(ERROR, "Could not determine vector dimension from index attribute "
+                        "(empty table or all-null vector column)");
+        }
+        if (precision_type != DistPrecisionType::CUSTOM) {
+            vector_size = dimension * get_dtype_size(precision_type);
+        }
     }
 
     void create_metapage(Relation index)
@@ -433,8 +469,45 @@ private:
 
     bool init_quantizer(Relation heap, Relation index)
     {
-        /* For now, skip quantizer initialization - return false to disable */
-        return false;
+        if (qt_type != QuantizerType::PQ) return false;
+        if (heap == NULL) return false;  // INIT_FORKNUM path has no heap
+        // Sample size: ksub gives K-means a chance to spread; cap at 50K to
+        // bound train cost. openGauss uses similar heuristic via
+        // GetSampleNumbers; here we use a simple constant tied to ksub.
+        constexpr int sample_cap = 50000;
+        const int ksub = 256; // nbits=8
+        int target = (int)std::min<int64>((int64)reltuples, (int64)sample_cap);
+        if (target < ksub) target = ksub;
+        FloatVectorArray samples = FloatVectorArrayInit(target, dimension);
+        ann_sample_rows(samples, heap, index, dimension, target,
+                        /*need_norm*/ false, DistPrecisionType::FLOAT);
+        if (samples->length < ksub) {
+            // Not enough rows yet to train a meaningful codebook; build the
+            // index without PQ and let CREATE INDEX after data load enable it.
+            FloatVectorArrayFree(samples);
+            ereport(NOTICE, (errmsg("vex PQ: only %d sample rows < ksub=%d, "
+                                    "skipping PQ training", samples->length, ksub)));
+            return false;
+        }
+        // Stage-A: train into the persistent quantizer Variant so build
+        // / scan paths can call into PQDistancer. Keep stash_to_cache()
+        // for cross-process reuse after restart.
+        quantizer.emplace();
+        quantizer.value().template emplace<PQDistancer>();
+        PQDistancer &pq_dist = quantizer.value().template get<PQDistancer>();
+        pq_dist.train(index, samples, dimension, metric, /*need_norm*/ false,
+                      parallel_workers, maintenance_work_mem_kb);
+        FloatVectorArrayFree(samples);
+        // Flip metapage flag so quantizer_metainfo.get_type() returns PQ;
+        // build_callback's prepare_quantizer_disk_build() keys off this.
+        Buffer mb = ReadBufferExtended(index, fork_num, metablkno, RBM_NORMAL, NULL);
+        LockBuffer(mb, BUFFER_LOCK_EXCLUSIVE);
+        GraphIndexMetaPage mp = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(mb));
+        mp->quantizer_metainfo.set_enable();
+        MarkBufferDirty(mb);
+        LockBuffer(mb, BUFFER_LOCK_UNLOCK);
+        ReleaseBuffer(mb);
+        return true;
     }
 
     template <typename D>

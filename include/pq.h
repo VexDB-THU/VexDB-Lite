@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <cstdint>
+#include <cstring>
 #include "postgres.h"
 #include "utils/relcache.h"
 #include "floatvector.h"
@@ -99,7 +100,11 @@ struct PQDistancer {
     static constexpr bool has_estimation_func = false;
     static constexpr bool need_refine = true;
 
-    PQDistancer() : dist_table(NULL), prepared(false) {}
+    // Zero pq so prepare()'s `pq.M == 0` cache-miss path fires for fresh
+    // instances. ProductQuantizer is a plain struct with size_t / float* /
+    // function-pointer members — memset to 0 leaves all fields safely null.
+    PQDistancer() : dist_table(NULL), flag(0.0f), prepared(false)
+    { std::memset(&pq, 0, sizeof(pq)); }
     void train(Relation index, FloatVectorArray samples, size_t dimension, Metric metric,
                bool need_norm, int parallel_workers, int maintenance_work_mem);
     void prepare(Relation index, void *metap);
@@ -125,6 +130,12 @@ struct PQDistancer {
         }
     }
     void hnsw_read_pq_center(Relation index, ProductQuantizer &pq, BlockNumber qtcode_block);
+    // Cache the trained centroids in a process-local map keyed by the index
+    // OID so PQDistancer instances created later (in scan/insert paths) can
+    // reload them without re-training. Persistence to qtcode_block is a
+    // follow-up; for now PQ state is per-process and lost on restart.
+    void stash_to_cache(Relation index);
+    bool load_from_cache(Relation index, Metric metric);
 private:
     mutable ProductQuantizer pq;
     ann_helper::distance_func _get_distance_precise_func;

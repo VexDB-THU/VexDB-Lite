@@ -46,6 +46,20 @@ void LoadInternal(ExtensionLoader &loader) {
                               LogicalType::INTEGER, Value::INTEGER(40));
     config.AddExtensionOption("vex_brute_force_threshold", "Temporary brute-force threshold for GRAPH_INDEX.",
                               LogicalType::UBIGINT, Value::UBIGINT(64));
+    // off (default): search ignores PQ, runs HNSW on raw vectors.
+    // pq_only:       brute-force over PQ codes using a precomputed distance
+    //                table. Approximate but fast for small indexes; useful
+    //                as a way to verify PQ training is healthy.
+    config.AddExtensionOption("vex_pq_search_mode",
+                              "PQ search mode for GRAPH_INDEX: 'off' or 'pq_only'.",
+                              LogicalType::VARCHAR, Value("off"));
+    // pq_only-mode refinement: take top k*factor by PQ distance, then re-rank
+    // via raw vector L2/cosine. Trades a per-query raw-vec lookup for higher
+    // recall. 1.0 disables. Compact-mode indexes ignore (no raw vec to fetch).
+    config.AddExtensionOption("vex_pq_refine_k_factor",
+                              "PQ refine factor: SearchPQ takes top k*factor candidates "
+                              "and re-ranks by raw distance. 1.0 = no refine. Range [1.0, 1000.0].",
+                              LogicalType::DOUBLE, Value::DOUBLE(1.0));
 }
 
 void VexExtension::Load(ExtensionLoader &loader) {

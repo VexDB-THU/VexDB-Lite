@@ -131,6 +131,18 @@ CREATE OPERATOR <=> (
     COMMUTATOR = '<=>'
 );
 
+-- Duck-side parity: <~> aliases <=> for cosine distance.
+CREATE OPERATOR <~> (
+    LEFTARG = floatvector, RIGHTARG = floatvector, PROCEDURE = cosine_distance,
+    COMMUTATOR = '<~>'
+);
+
+-- Duck-side parity: vector_add/vector_sub alias floatvector_add/sub.
+CREATE FUNCTION vector_add(floatvector, floatvector) RETURNS floatvector
+    AS 'MODULE_PATHNAME', 'floatvector_add' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION vector_sub(floatvector, floatvector) RETURNS floatvector
+    AS 'MODULE_PATHNAME', 'floatvector_sub' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 CREATE OPERATOR + (
     LEFTARG = floatvector, RIGHTARG = floatvector, PROCEDURE = floatvector_add,
     COMMUTATOR = +
@@ -461,3 +473,30 @@ CREATE FUNCTION vectorbuffer_inspect()
 
 COMMENT ON FUNCTION vectorbuffer_inspect() IS
     'Returns statistics about the vector buffer cache';
+
+-- vex_index_info: SRF that lists all vexdb_graph indexes with metadata.
+-- Schema mirrors duckdb/vexdb-duck/functions/index_info_function.cpp.
+CREATE FUNCTION vex_index_info()
+    RETURNS TABLE(
+        index_name        text,
+        indexname         text,
+        index_type        text,
+        table_name        text,
+        partition_count   int4,
+        node_count        int8,
+        max_level         int4,
+        dimension         int4,
+        row_id_map_size   int8,
+        m                 int4,
+        ef_construction   int4,
+        metric            text,
+        use_pq            bool,
+        pq_m              int4,
+        memory_bytes      int8,
+        pq_codes_bytes    int8,
+        pq_codebook_bytes int8,
+        memory_mode       text)
+    AS 'MODULE_PATHNAME' LANGUAGE C;
+
+COMMENT ON FUNCTION vex_index_info() IS
+    'Lists all vexdb_graph indexes with metadata (mirrors duck-side schema)';

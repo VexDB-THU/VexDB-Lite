@@ -1,0 +1,87 @@
+# 引擎 dialect 字典 - L2 DSL 渲染器使用
+#
+# 三种变量形式:
+#   - 简单替换:    "${KEY}"             → 字符串
+#   - 函数调用:    "${FUNC(arg1, arg2)}" → 由 _functions 处理
+#   - 中缀运算符:  "${OP|a|b}"           → "a OP b" 或 "func(a,b)"
+
+duckdb:
+  vars:
+    # ── 索引/类型 ──
+    VEX_INDEX: "GRAPH_INDEX"
+    # OPS_*_COL: 在 CREATE INDEX (col[空格 opclass]) 列名之后插入. DuckDB 不用 opclass.
+    OPS_L2_COL: ""
+    OPS_COSINE_COL: ""
+    OPS_IP_COL: ""
+    # IDX_OPTS_*: 在 CREATE INDEX 末尾追加. DuckDB 用 WITH(metric=...) 指定.
+    IDX_OPTS_L2: ""
+    IDX_OPTS_COSINE: " WITH (metric='cosine')"
+    IDX_OPTS_IP: " WITH (metric='ip')"
+    # ── 系统表 ──
+    SYS_INDEXES: "duckdb_indexes()"
+    SYS_INDEXES_NAME: "index_name"
+    SYS_INDEXES_TABLE: "table_name"
+    # ── 运行时 GUC ──
+    GUC_EF_SEARCH: "vex_ef_search"
+    GUC_BF_THRESHOLD: "vex_brute_force_threshold"
+    GUC_PQ_SEARCH_MODE: "vex_pq_search_mode"
+    GUC_PQ_REFINE: "vex_pq_refine"
+    GUC_PARALLEL_SEARCH: "vex_parallel_search"
+    # ── 字面量 ──
+    NULL_LITERAL: "NULL"
+  functions:
+    VECTOR: "FLOAT[{0}]"
+    VEC_LITERAL: "{0}::FLOAT[{1}]"
+    L2: "l2_distance({0}, {1})"
+    COSINE: "cosine_distance({0}, {1})"
+    IP: "inner_product({0}, {1})"
+    NEG_IP: "(-inner_product({0}, {1}))"
+    # range(n) → 0..n-1, range(a, b) → a..b-1
+    RANGE: "range({0})"
+    RANGE2: "range({0}, {1})"
+    # CREATE INDEX 末尾带额外参数时使用 (metric 自动嵌入)
+    IDX_WITH_L2: " WITH ({0})"
+    IDX_WITH_COSINE: " WITH (metric='cosine', {0})"
+    IDX_WITH_IP: " WITH (metric='ip', {0})"
+
+pg:
+  vars:
+    VEX_INDEX: "vexdb_graph"
+    # PG 把 metric 编码进 opclass, 列名之后
+    OPS_L2_COL: " floatvector_l2_ops"
+    OPS_COSINE_COL: " floatvector_cosine_ops"
+    OPS_IP_COL: " floatvector_ip_ops"
+    IDX_OPTS_L2: ""
+    IDX_OPTS_COSINE: ""
+    IDX_OPTS_IP: ""
+    SYS_INDEXES: "pg_indexes"
+    SYS_INDEXES_NAME: "indexname"
+    SYS_INDEXES_TABLE: "tablename"
+    GUC_EF_SEARCH: "vexdb.ef_search"
+    GUC_BF_THRESHOLD: "vexdb.brute_force_threshold"
+    GUC_PQ_SEARCH_MODE: "vexdb.pq_search_mode"
+    GUC_PQ_REFINE: "vexdb.pq_refine"
+    GUC_PARALLEL_SEARCH: "vexdb.parallel_search"
+    NULL_LITERAL: "NULL"
+  functions:
+    VECTOR: "floatvector({0})"
+    VEC_LITERAL: "'{0}'::floatvector"
+    L2: "({0} <-> {1})"
+    COSINE: "({0} <=> {1})"
+    # PG <#> 返回负内积 (pgvector 约定); 正内积用函数
+    IP: "inner_product({0}, {1})"
+    NEG_IP: "({0} <#> {1})"
+    RANGE: "generate_series(0, ({0}) - 1)"
+    RANGE2: "generate_series({0}, ({1}) - 1)"
+    IDX_WITH_L2: " WITH ({0})"
+    IDX_WITH_COSINE: " WITH ({0})"
+    IDX_WITH_IP: " WITH ({0})"
+
+opengauss:
+  inherit: pg
+  vars: {}
+  functions: {}
+
+# ── 弃用别名 (保持向后兼容, 旧用例可继续工作) ──
+# 旧: ${OPS_L2} → 等同 ${OPS_L2_COL}
+# 新用例统一用 _COL 后缀

@@ -1,0 +1,197 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: graph_index_subquery_optimization
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test that subqueries as query vectors trigger index scan optimization
+steps:
+- statement: CREATE TABLE t (id INTEGER, v ${VECTOR(4)});
+- statement: INSERT INTO t SELECT i, ${VEC_LITERAL([0.01*i, 0.02*i, 0.03*i, 0.04*i], 4)} FROM ${RANGE2(1, 101)} tbl(i);
+- statement: CREATE INDEX idx_l2 ON t USING ${VEX_INDEX} (v${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: CREATE TABLE queries (qid INTEGER, qvec ${VECTOR(4)});
+- statement: "INSERT INTO queries VALUES\n  (1, ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)}),\n  (2, ${VEC_LITERAL([0.01, 0.02, 0.03, 0.04], 4)});"
+- query: 'EXPLAIN WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${L2(v, (SELECT vec FROM tmp))} LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: 'WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${L2(v, (SELECT vec FROM tmp))} LIMIT 5;'
+  _field_types: I
+  _sort: sort
+  expect:
+  - - 48
+  - - 49
+  - - 50
+  - - 51
+  - - 52
+- query: EXPLAIN SELECT id FROM t ORDER BY ${L2(v, (SELECT qvec FROM queries WHERE qid = 1))} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: SELECT id FROM t ORDER BY ${L2(v, (SELECT qvec FROM queries WHERE qid = 1))} LIMIT 5;
+  _field_types: I
+  _sort: sort
+  expect:
+  - - 48
+  - - 49
+  - - 50
+  - - 51
+  - - 52
+- query: SELECT id FROM t ORDER BY ${L2(v, (SELECT qvec FROM queries WHERE qid = 2))} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 1
+  - - 2
+  - - 3
+- query: 'EXPLAIN WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT id FROM t ORDER BY v <-> (SELECT v FROM q) LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: 'WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT id FROM t ORDER BY v <-> (SELECT v FROM q) LIMIT 5;'
+  _field_types: I
+  _sort: sort
+  expect:
+  - - 48
+  - - 49
+  - - 50
+  - - 51
+  - - 52
+- query: EXPLAIN SELECT id FROM t ORDER BY ${L2(v, (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)}))} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: SELECT id FROM t ORDER BY ${L2(v, (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)}))} LIMIT 5;
+  _field_types: I
+  _sort: sort
+  expect:
+  - - 48
+  - - 49
+  - - 50
+  - - 51
+  - - 52
+- query: EXPLAIN SELECT id FROM t ORDER BY ${L2(v, ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)})} LIMIT 5;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: SELECT id FROM t ORDER BY ${L2(v, ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)})} LIMIT 5;
+  _field_types: I
+  _sort: sort
+  expect:
+  - - 48
+  - - 49
+  - - 50
+  - - 51
+  - - 52
+- query: '(WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${L2(v, (SELECT vec FROM tmp))} LIMIT 5)
+
+    EXCEPT
+
+    (SELECT id FROM t ORDER BY ${L2(v, ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)})} LIMIT 5);'
+  _field_types: I
+  expect: []
+- statement: DROP INDEX idx_l2;
+- statement: CREATE INDEX idx_cos ON t USING ${VEX_INDEX} (v${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- query: 'EXPLAIN WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${COSINE(v, (SELECT vec FROM tmp))} LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: 'WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT count(*) FROM (SELECT id FROM t ORDER BY ${COSINE(v, (SELECT vec FROM tmp))} LIMIT 5);'
+  _field_types: I
+  expect:
+  - - 5
+- query: 'EXPLAIN WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT id FROM t ORDER BY v <=> (SELECT v FROM q) LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: 'WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT count(*) FROM (SELECT id FROM t ORDER BY v <=> (SELECT v FROM q) LIMIT 5);'
+  _field_types: I
+  expect:
+  - - 5
+- query: SELECT count(*) FROM (SELECT id FROM t ORDER BY ${COSINE(v, (SELECT qvec FROM queries WHERE qid = 1))} LIMIT 5);
+  _field_types: I
+  expect:
+  - - 5
+- statement: DROP INDEX idx_cos;
+- statement: CREATE INDEX idx_ip ON t USING ${VEX_INDEX} (v${OPS_IP_COL})${IDX_OPTS_IP};
+- query: 'EXPLAIN WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${IP(v, (SELECT vec FROM tmp))} DESC LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: 'WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${IP(v, (SELECT vec FROM tmp))} DESC LIMIT 5;'
+  _field_types: I
+  expect:
+  - - 100
+  - - 99
+  - - 98
+  - - 97
+  - - 96
+- query: 'EXPLAIN WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT id FROM t ORDER BY v <~> (SELECT v FROM q) DESC LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: CREATE INDEX idx_cos ON t USING ${VEX_INDEX} (v${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- query: 'EXPLAIN WITH q AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS v)
+
+    SELECT id FROM t ORDER BY v <~> (SELECT v FROM q) ASC LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEX_INDEX_SCAN.*
+- query: SELECT id FROM t ORDER BY ${IP(v, (SELECT qvec FROM queries WHERE qid = 1))} DESC LIMIT 5;
+  _field_types: I
+  expect:
+  - - 100
+  - - 99
+  - - 98
+  - - 97
+  - - 96
+- query: 'EXPLAIN WITH tmp AS (SELECT ${VEC_LITERAL([0.5, 1.0, 1.5, 2.0], 4)} AS vec)
+
+    SELECT id FROM t ORDER BY ${IP(v, (SELECT vec FROM tmp))} ASC LIMIT 5;'
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*SEQ_SCAN.*
+- statement: DROP INDEX idx_ip;
+- statement: DROP TABLE queries;
+- statement: DROP TABLE t;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_subquery_optimization.test

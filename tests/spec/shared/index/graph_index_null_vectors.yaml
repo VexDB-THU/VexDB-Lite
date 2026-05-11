@@ -1,0 +1,53 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_null_vectors
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test NULL vector handling with graph index
+steps:
+- statement: CREATE TABLE t_null (id INTEGER, vec ${VECTOR(3)});
+- statement: CREATE INDEX idx_null ON t_null USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: INSERT INTO t_null VALUES (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)});
+- statement: INSERT INTO t_null VALUES (2, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)});
+- statement: INSERT INTO t_null VALUES (3, NULL);
+- statement: INSERT INTO t_null VALUES (4, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)});
+- query: SELECT id FROM t_null ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.1, 0.0], 3)})} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 2
+- query: SELECT count(*) FROM t_null;
+  _field_types: I
+  expect:
+  - - 4
+- query: SELECT id FROM t_null WHERE vec IS NULL;
+  _field_types: I
+  expect:
+  - - 3
+- statement: DROP TABLE t_null;
+- statement: CREATE TABLE t_allnull (id INTEGER, vec ${VECTOR(3)});
+- statement: CREATE INDEX idx_allnull ON t_allnull USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: INSERT INTO t_allnull VALUES (1, NULL), (2, NULL), (3, NULL);
+- query: SELECT count(*) FROM t_allnull;
+  _field_types: I
+  expect:
+  - - 3
+- statement: DROP TABLE t_allnull;
+- statement: CREATE TABLE t_mixnull (id INTEGER, vec ${VECTOR(3)});
+- statement: CREATE INDEX idx_mixnull ON t_mixnull USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: "INSERT INTO t_mixnull VALUES\n  (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)}),\n  (2, NULL),\n  (3, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)}),\n  (4, NULL),\n  (5, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)});"
+- query: SELECT id FROM t_mixnull ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.1, 0.0], 3)})} LIMIT 3;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+  - - 5
+- statement: DROP TABLE t_mixnull;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_null_vectors.test

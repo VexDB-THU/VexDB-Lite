@@ -1,0 +1,32 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: distance_simd
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/functions/distance_simd.sql
+engines:
+- pg
+- opengauss
+steps:
+- query: SELECT l2_distance('[1, 2, 3]'::floatvector, '[4, 5, 6]'::floatvector);
+  expect:
+  - - 5.196152422706632
+- query: SELECT l2_distance('[1, 0, 0, 0]'::floatvector, '[0, 1, 0, 0]'::floatvector);
+  expect:
+  - - 1.4142135623730951
+- query: "SELECT inner_product(\n  '[1, 2, 3, 4, 5, 6, 7, 8]'::floatvector,\n  '[1, 1, 1, 1, 1, 1, 1, 1]'::floatvector);"
+  expect:
+  - - 36.0
+- statement: CREATE TABLE vec16 (id INT, v floatvector(16));
+- statement: "INSERT INTO vec16 VALUES\n  (1, '[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]'),\n  (2, '[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]');"
+- query: "SELECT l2_distance(\n  (SELECT v FROM vec16 WHERE id=1),\n  (SELECT v FROM vec16 WHERE id=2));"
+  expect:
+  - - 1.4142135623730951
+- query: "SELECT cosine_distance(\n  '[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]'::floatvector,\n  '[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,\
+    \ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]'::floatvector);"
+  expect:
+  - - 1.0
+- statement: DROP TABLE vec16;
+- query: "SELECT abs(inner_product(\n  l2_normalize('[1, 2, 3]'::floatvector),\n  l2_normalize('[1, 2, 3]'::floatvector)) - 1.0) < 0.0001;"
+  expect:
+  - - 'true'

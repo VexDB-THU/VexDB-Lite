@@ -1,0 +1,96 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__distance_defensive
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Defensive tests for distance functions - uncast literals, type coercion, error handling
+steps:
+- statement: CREATE TABLE t_def(c1 INTEGER, c2 ${VECTOR(3)});
+- statement: "INSERT INTO t_def VALUES\n  (1, [1.0, 2.0, 3.0]),\n  (2, [4.0, 5.0, 6.0]),\n  (3, [0.1, 0.2, 0.3]);"
+- query: SELECT ${L2(c2, [0.0, 0.0, 0.0])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 3.7416573867739413
+- query: SELECT ${COSINE(c2, [1.0, 0.0, 0.0])} > 0 FROM t_def WHERE c1 = 1;
+  _field_types: I
+  expect:
+  - - 'true'
+- query: SELECT ${IP(c2, [1.0, 0.0, 0.0])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 1.0
+- query: SELECT ${L2(c2, [0, 0, 0])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 3.7416573867739413
+- query: SELECT ${L2(c2, [1, 2, 3])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 0.0
+- query: SELECT ${IP(c2, [1, 0, 0])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 1.0
+- query: SELECT ${L2(c2, [1, 2.0, 3])} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 0.0
+- query: SELECT c1 FROM t_def ORDER BY ${L2(c2, [0.0, 0.0, 0.0])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT c1 FROM t_def ORDER BY ${L2(c2, [1, 2, 3])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT c1 FROM t_def ORDER BY ${COSINE(c2, [1.0, 0.0, 0.0])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 2
+- query: SELECT ${L2([0.0, 0.0, 0.0], c2)} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 3.7416573867739413
+- query: SELECT ${COSINE([1.0, 0.0, 0.0], c2)} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 0.732738733291626
+- statement: SELECT ${L2(c2, [0.0, 0.0])} FROM t_def WHERE c1 = 1;
+  expect_error: Cannot cast list with length 2 to array with length 3
+- statement: SELECT ${COSINE(c2, [0.0, 0.0, 0.0, 0.0])} FROM t_def WHERE c1 = 1;
+  expect_error: Cannot cast list with length 4 to array with length 3
+- query: SELECT ${L2(c2, NULL)} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 'NULL'
+- query: SELECT ${L2(NULL, c2)} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 'NULL'
+- query: SELECT ${COSINE(c2, NULL)} FROM t_def WHERE c1 = 1;
+  _field_types: R
+  expect:
+  - - 'NULL'
+- statement: CREATE INDEX idx_graph ON t_def USING ${VEX_INDEX} (c2${OPS_L2_COL})${IDX_OPTS_L2};
+- query: SELECT c1 FROM t_def ORDER BY ${L2(c2, [0.0, 0.0, 0.0])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 3
+- query: SELECT c1 FROM t_def ORDER BY ${L2(c2, [1, 2, 3])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- query: SELECT c1 FROM t_def ORDER BY ${COSINE(c2, [1.0, 0.0, 0.0])} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DROP INDEX idx_graph;
+- statement: DROP TABLE t_def;
+_migrated_from: vexdb-duck/test/sql/vex/functions/distance_defensive.test

@@ -1,0 +1,45 @@
+# auto-migrated from pg_tests/ — PG 专属用例, 不模板化
+name: graph_index_pq_real
+tags:
+- pg-only
+- migrated
+description: Migrated from pg_tests/index_pq/graph_index_pq_real.sql
+engines:
+- pg
+- opengauss
+steps:
+- statement: SET vex_brute_force_threshold = 0;
+- statement: CREATE TABLE pq_t (id INTEGER, vec floatvector(8));
+- statement: "INSERT INTO pq_t SELECT i,\n    ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n         || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ',' || (i*0.08)\
+    \ || ']')::floatvector\nFROM generate_series(0, 499) AS t(i);"
+- statement: CREATE INDEX idx_plain ON pq_t USING vexdb_graph (vec);
+- statement: CREATE INDEX idx_pq ON pq_t USING vexdb_graph (vec) WITH (quantizer = 'pq', pq_m = 4);
+- query: SELECT use_pq FROM vex_index_info() WHERE indexname = 'idx_plain';
+  expect: []
+- query: SELECT use_pq FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_m FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_codebook_bytes FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_codes_bytes FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_codebook_bytes, pq_codes_bytes FROM vex_index_info() WHERE indexname = 'idx_plain';
+  expect: []
+- query: SELECT id FROM pq_t ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
+  expect: []
+- statement: CHECKPOINT;
+- statement: '\echo "TODO: pg_ctl restart here"
+
+    SET vex_brute_force_threshold = 0;'
+- query: SELECT use_pq FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_m FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_codebook_bytes FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT pq_codes_bytes FROM vex_index_info() WHERE indexname = 'idx_pq';
+  expect: []
+- query: SELECT id FROM pq_t ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
+  expect: []
+- statement: DROP TABLE pq_t;

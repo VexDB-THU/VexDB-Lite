@@ -2,6 +2,7 @@
 #include "graph_index/graph_index_param.h"
 #include "graph_index/graph_index.h"
 #include "guc_config.h"
+#include "ann_utils.h"
 
 extern "C" {
 
@@ -53,7 +54,7 @@ graph_index_amroutine(void)
     amroutine->amconsistentordering = true;
     amroutine->amcanbackward = false;
     amroutine->amcanunique = false;
-    amroutine->amcanmulticol = false;
+    amroutine->amcanmulticol = true;
     amroutine->amoptionalkey = true;
     amroutine->amsearcharray = false;
     amroutine->amsearchnulls = false;
@@ -102,6 +103,7 @@ graph_index_amroutine(void)
 static IndexBuildResult *
 graph_index_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
+    check_ann_attributes(index);
     return graph_index_build_internal(heap, index, indexInfo);
 }
 

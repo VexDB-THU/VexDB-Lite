@@ -1,0 +1,40 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: functions__distance_l2
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Test l2_distance function
+steps:
+- query: SELECT ${L2(${VEC_LITERAL([1.0, 0.0, 0.0], 3)}, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)})};
+  _field_types: R
+  expect:
+  - - 1.4142135623730951
+- query: SELECT ${L2(${VEC_LITERAL([1.0, 2.0, 3.0], 3)}, ${VEC_LITERAL([1.0, 2.0, 3.0], 3)})};
+  _field_types: R
+  expect:
+  - - 0.0
+- query: SELECT ${L2(${VEC_LITERAL([0.0, 0.0], 2)}, ${VEC_LITERAL([3.0, 4.0], 2)})};
+  _field_types: R
+  expect:
+  - - 5.0
+- statement: CREATE TABLE items (id INT, v ${VECTOR(3)});
+- statement: "INSERT INTO items VALUES\n  (1, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)}),\n  (2, ${VEC_LITERAL([0.0, 1.0, 0.0], 3)}),\n  (3, ${VEC_LITERAL([0.0, 0.0, 1.0], 3)}),\n  (4, ${VEC_LITERAL([1.0, 1.0,\
+    \ 0.0], 3)});"
+- query: SELECT id FROM items ORDER BY ${L2(v, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})}, id LIMIT 3;
+  _field_types: I
+  expect:
+  - - 1
+  - - 4
+  - - 2
+- query: SELECT ${L2(NULL::${VECTOR(3)}, ${VEC_LITERAL([1.0, 2.0, 3.0], 3)})};
+  _field_types: R
+  expect:
+  - - 'NULL'
+_migrated_from: vexdb-duck/test/sql/vex/functions/distance_l2.test

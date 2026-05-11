@@ -281,6 +281,67 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
         info.options["upper_ptr_map"] = Value::BLOB(const_data_ptr_cast(upper_ptr_blob.data()), upper_ptr_blob.size());
     }
 
+    // Persist UpperPointRec fields. HNSWUpperLevel's segment only stores
+    // neighbor IDs per slot — cur_layer_idxs (the second half of neighbors_info)
+    // live exclusively in the in-memory copy and are needed for upper-layer
+    // descent, so we write them out alongside lower_layer_idx and id.
+    if (!store.upper_points.empty()) {
+        string upper_data_blob;
+        uint64_t num_entries = store.upper_points.size();
+        upper_data_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
+        for (auto &up : store.upper_points) {
+            uint32_t id_val = static_cast<uint32_t>(up.id);
+            uint32_t lower_val = static_cast<uint32_t>(up.lower_layer_idx);
+            upper_data_blob.append(reinterpret_cast<const char *>(&id_val), sizeof(id_val));
+            upper_data_blob.append(reinterpret_cast<const char *>(&lower_val), sizeof(lower_val));
+            uint64_t nbr_size = up.neighbors_info.size();
+            upper_data_blob.append(reinterpret_cast<const char *>(&nbr_size), sizeof(nbr_size));
+            if (nbr_size) {
+                upper_data_blob.append(reinterpret_cast<const char *>(up.neighbors_info.data()),
+                                       nbr_size * sizeof(uint32_t));
+            }
+        }
+        info.options["upper_points_data"] = Value::BLOB(const_data_ptr_cast(upper_data_blob.data()),
+                                                        upper_data_blob.size());
+    }
+
+    if (pq_use_) {
+        info.options["pq_m"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.M));
+        info.options["pq_dim"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.d));
+
+        // Codebook: M * ksub * dsub floats. Pin layout in case future versions
+        // change the in-memory shape — write dimensions inline so reload doesn't
+        // have to reconstruct from pq_m alone.
+        string codebook_blob;
+        uint64_t centroids_n = pq_quantizer_.get_centroids_size();
+        codebook_blob.append(reinterpret_cast<const char *>(&centroids_n), sizeof(centroids_n));
+        codebook_blob.append(reinterpret_cast<const char *>(pq_quantizer_.centroids),
+                             centroids_n * sizeof(float));
+        info.options["pq_codebook"] = Value::BLOB(const_data_ptr_cast(codebook_blob.data()),
+                                                  codebook_blob.size());
+
+        // Codes are indexed by row_id sort order; persist the order alongside the
+        // bytes so reload can reconstruct the row → code-slot mapping.
+        string codes_blob;
+        uint64_t codes_n = pq_codes_.size();
+        codes_blob.append(reinterpret_cast<const char *>(&codes_n), sizeof(codes_n));
+        codes_blob.append(reinterpret_cast<const char *>(pq_codes_.data()), codes_n);
+        info.options["pq_codes"] = Value::BLOB(const_data_ptr_cast(codes_blob.data()), codes_blob.size());
+
+        string order_blob;
+        uint64_t order_n = pq_row_id_order_.size();
+        order_blob.append(reinterpret_cast<const char *>(&order_n), sizeof(order_n));
+        for (auto &rid : pq_row_id_order_) {
+            int64_t v = static_cast<int64_t>(rid);
+            order_blob.append(reinterpret_cast<const char *>(&v), sizeof(v));
+        }
+        info.options["pq_row_order"] = Value::BLOB(const_data_ptr_cast(order_blob.data()), order_blob.size());
+    }
+
+    if (compact_mode_) {
+        info.options["compact_mode"] = Value::BOOLEAN(true);
+    }
+
     return info;
 }
 

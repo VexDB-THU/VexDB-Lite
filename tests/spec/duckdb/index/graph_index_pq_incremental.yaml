@@ -1,0 +1,69 @@
+# auto-migrated from sqllogictest; review before relying on it
+# 1. setup/teardown 未自动切分, 全在 steps; 必要时人工重组
+# 2. 变量反向替换仅做高置信度模式 (FLOAT[N]/GRAPH_INDEX/距离函数)
+# 3. 复杂指令 (loop/onlyif/skipif) 保留为 raw_directive
+name: index__graph_index_pq_incremental
+tags:
+- vex
+- migrated
+engines:
+- duckdb
+- pg
+- opengauss
+description: Rows INSERTed after the PQ index is built must be encoded into
+steps:
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- statement: CREATE TABLE pq_inc (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO pq_inc SELECT i,\n    ${VEC_LITERAL([(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,\n     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT],\
+    \ 8)}\nFROM ${RANGE(500)} t(i);"
+- statement: CREATE INDEX idx_pq_inc ON pq_inc USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer = 'pq', pq_m = 4)};
+- statement: "INSERT INTO pq_inc VALUES (501,\n    ${VEC_LITERAL([5.01::FLOAT, 10.02::FLOAT, 15.03::FLOAT, 20.04::FLOAT,\n     25.05::FLOAT, 30.06::FLOAT, 35.07::FLOAT, 40.08::FLOAT], 8)});"
+- statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_inc\n    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}\n    LIMIT 1000\n) t;"
+  _field_types: I
+  expect:
+  - - 501
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_inc\n    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}\n    LIMIT 1000\n) WHERE id = 501;"
+  _field_types: I
+  expect:
+  - - 1
+- query: 'SELECT id FROM pq_inc
+
+    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}
+
+    LIMIT 1;'
+  _field_types: I
+  expect:
+  - - 100
+- statement: RESET ${GUC_PQ_SEARCH_MODE};
+- statement: DROP TABLE pq_inc;
+- statement: CREATE TABLE pq_chunk (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO pq_chunk SELECT i,\n    ${VEC_LITERAL([(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,\n     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT],\
+    \ 8)}\nFROM ${RANGE(500)} t(i);"
+- statement: CREATE INDEX idx_pq_chunk ON pq_chunk USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer = 'pq', pq_m = 4)};
+- statement: "INSERT INTO pq_chunk SELECT 1000 + i,\n    ${VEC_LITERAL([(i*0.11)::FLOAT, (i*0.12)::FLOAT, (i*0.13)::FLOAT, (i*0.14)::FLOAT,\n     (i*0.15)::FLOAT, (i*0.16)::FLOAT, (i*0.17)::FLOAT, (i*0.18)::FLOAT],\
+    \ 8)}\nFROM ${RANGE(50)} t(i);"
+- statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_chunk\n    ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})}\n    LIMIT 10000\n) t;"
+  _field_types: I
+  expect:
+  - - 550
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_chunk\n    ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})}\n    LIMIT 10000\n) WHERE id = 1025;"
+  _field_types: I
+  expect:
+  - - 1
+- statement: RESET ${GUC_PQ_SEARCH_MODE};
+- statement: DROP TABLE pq_chunk;
+- statement: CREATE TABLE pq_cos (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO pq_cos SELECT i,\n    ${VEC_LITERAL([sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,\n     sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT,\n     sin(i*0.3)::FLOAT, cos(i*0.3)::FLOAT,\n     sin(i*0.4)::FLOAT,\
+    \ cos(i*0.4)::FLOAT], 8)}\nFROM ${RANGE(500)} t(i);"
+- statement: CREATE INDEX idx_pq_cos ON pq_cos USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_WITH_COSINE(quantizer = 'pq', pq_m = 4)};
+- statement: "INSERT INTO pq_cos VALUES (777,\n    ${VEC_LITERAL([10.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,\n     0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)});"
+- statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_cos\n    ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})}\n    LIMIT 10000\n) WHERE id = 777;"
+  _field_types: I
+  expect:
+  - - 1
+- statement: RESET ${GUC_PQ_SEARCH_MODE};
+- statement: DROP TABLE pq_cos;
+_migrated_from: vexdb-duck/test/sql/vex/index/graph_index_pq_incremental.test

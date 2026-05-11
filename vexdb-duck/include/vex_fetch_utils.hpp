@@ -10,6 +10,22 @@
 
 namespace duckdb {
 
+static constexpr int64_t kDefaultVexBruteForceThreshold = 64;
+
+static inline int64_t GetBruteForceThreshold(ClientContext &context) {
+    Value bft_val;
+    if (!context.TryGetCurrentSetting("vex_brute_force_threshold", bft_val)) {
+        return kDefaultVexBruteForceThreshold;
+    }
+    auto bft = bft_val.GetValue<int64_t>();
+    if (bft < 0 || bft > 1000000) {
+        throw InvalidInputException(
+            "vex_brute_force_threshold must be in [0, 1000000], got %lld",
+            static_cast<long long>(bft));
+    }
+    return bft;
+}
+
 static inline vector<LogicalType> BuildOutputTypes(const vector<ColumnIndex> &column_ids,
                                                    const vector<LogicalType> &returned_types) {
     vector<LogicalType> output_types;

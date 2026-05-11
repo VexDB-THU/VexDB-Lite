@@ -88,6 +88,12 @@ struct GraphIndexOptions {
     int qt_type_offset;
     int cluster_rate;
     bool enable_async_insert;
+    /* Duck-side parity options (Stage 4): accepted by amoptions; runtime
+     * usage may be partial — see graph_index_get_* accessors. */
+    int metric_offset;       /* string offset: 'l2' | 'cosine' | 'ip' (default 'l2') */
+    int pq_m;                /* >= 0; 0 = no PQ */
+    int memory_mode_offset;  /* string offset: 'full' | 'compact' (default 'full') */
+    int threads;             /* [1, 1024]; alias of parallel_workers when > 0 */
 };
 
 struct RepairGraphSharedState {

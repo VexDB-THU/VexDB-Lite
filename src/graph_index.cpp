@@ -214,7 +214,12 @@ bytea *graph_index_options_internal(Datum reloptions, bool validate)
         {"parallel_workers", RELOPT_TYPE_INT, offsetof(GraphIndexOptions, parallel_workers)},
         {"quantizer", RELOPT_TYPE_STRING, offsetof(GraphIndexOptions, qt_type_offset)},
         {"cluster_rate", RELOPT_TYPE_INT, offsetof(GraphIndexOptions, cluster_rate)},
-        {"enable_async_insert", RELOPT_TYPE_BOOL, offsetof(GraphIndexOptions, enable_async_insert)}
+        {"enable_async_insert", RELOPT_TYPE_BOOL, offsetof(GraphIndexOptions, enable_async_insert)},
+        /* Stage 4 duck-parity options */
+        {"metric", RELOPT_TYPE_STRING, offsetof(GraphIndexOptions, metric_offset)},
+        {"pq_m", RELOPT_TYPE_INT, offsetof(GraphIndexOptions, pq_m)},
+        {"memory_mode", RELOPT_TYPE_STRING, offsetof(GraphIndexOptions, memory_mode_offset)},
+        {"threads", RELOPT_TYPE_INT, offsetof(GraphIndexOptions, threads)}
     };
     GraphIndexOptions *rdopts = (GraphIndexOptions *)build_reloptions(reloptions, validate,
         RELOPT_KIND_GRAPH_INDEX, sizeof(GraphIndexOptions), tab, lengthof(tab));
@@ -225,6 +230,32 @@ bytea *graph_index_options_internal(Datum reloptions, bool validate)
                 errmsg("Invalid parameter value for \"cluster_rate\": %d, "
                         "the value should be either 0 or not less than %d",
                         rdopts->cluster_rate, min_ncluster)));
+        }
+        /* Validate Stage 4 options to match duck-side semantics. */
+        if (rdopts->metric_offset > 0) {
+            const char *s = (const char *)rdopts + rdopts->metric_offset;
+            if (pg_strcasecmp(s, "l2") != 0 && pg_strcasecmp(s, "cosine") != 0 &&
+                pg_strcasecmp(s, "ip") != 0) {
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                    errmsg("Invalid \"metric\" value '%s' (expected 'l2', 'cosine', or 'ip')", s)));
+            }
+        }
+        if (rdopts->pq_m < 0) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("Invalid \"pq_m\" value: %d (must be >= 0)", rdopts->pq_m)));
+        }
+        if (rdopts->memory_mode_offset > 0) {
+            const char *s = (const char *)rdopts + rdopts->memory_mode_offset;
+            if (pg_strcasecmp(s, "full") != 0 && pg_strcasecmp(s, "compact") != 0) {
+                ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                    errmsg("Invalid \"memory_mode\" value '%s' (expected 'full' or 'compact')", s)));
+            }
+        }
+        /* `threads` reloption is accepted for duck parity. PG build is currently
+         * driven by `parallel_workers`; if the user only set `threads`, mirror
+         * it into parallel_workers so build_with_workers picks it up. */
+        if (rdopts->threads > 1 && rdopts->parallel_workers == 0) {
+            rdopts->parallel_workers = rdopts->threads;
         }
     }
     return (bytea *)rdopts;
