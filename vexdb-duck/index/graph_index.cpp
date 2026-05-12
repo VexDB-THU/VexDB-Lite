@@ -389,20 +389,29 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
         const idx_t rem = remaining % n_workers;
         idx_t offset = start_index;
         workers.reserve(n_workers);
-        for (int t = 0; t < n_workers; t++) {
-            const idx_t count = per + (t < static_cast<int>(rem) ? 1 : 0);
-            const idx_t s = offset;
-            const idx_t e = offset + count;
-            offset = e;
-            workers.emplace_back([t, s, e, &errors, &insert_one]() {
-                try {
-                    for (idx_t i = s; i < e; i++) {
-                        insert_one(i);
+        try {
+            for (int t = 0; t < n_workers; t++) {
+                const idx_t count = per + (t < static_cast<int>(rem) ? 1 : 0);
+                const idx_t s = offset;
+                const idx_t e = offset + count;
+                offset = e;
+                workers.emplace_back([t, s, e, &errors, &insert_one]() {
+                    try {
+                        for (idx_t i = s; i < e; i++) {
+                            insert_one(i);
+                        }
+                    } catch (...) {
+                        errors[t] = std::current_exception();
                     }
-                } catch (...) {
-                    errors[t] = std::current_exception();
-                }
-            });
+                });
+            }
+        } catch (...) {
+            // emplace_back 中途 bad_alloc：必须 join 已 spawn 的，否则析构未 join
+            // 的 std::thread → std::terminate。
+            for (auto &w : workers) {
+                if (w.joinable()) w.join();
+            }
+            throw;
         }
         for (auto &w : workers) {
             w.join();
@@ -436,6 +445,7 @@ void GraphIndex::ReleaseRawVectors() {
     }
     store.vectors.clear();
     store.vectors.shrink_to_fit();
+    store.compact_mode_ = true;
 }
 
 void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids) {
@@ -473,14 +483,21 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
             std::vector<std::thread> workers;
             workers.reserve(n);
             std::vector<std::exception_ptr> errors(n);
-            for (size_t i = 0; i < n; i++) {
-                workers.emplace_back([i, &body, &errors]() {
-                    try {
-                        body(i);
-                    } catch (...) {
-                        errors[i] = std::current_exception();
-                    }
-                });
+            try {
+                for (size_t i = 0; i < n; i++) {
+                    workers.emplace_back([i, &body, &errors]() {
+                        try {
+                            body(i);
+                        } catch (...) {
+                            errors[i] = std::current_exception();
+                        }
+                    });
+                }
+            } catch (...) {
+                for (auto &t : workers) {
+                    if (t.joinable()) t.join();
+                }
+                throw;
             }
             for (auto &t : workers) t.join();
             for (auto &ep : errors) {
@@ -1309,14 +1326,11 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         pq_use_ = pq_quantizer_.trained && !pq_codes_.empty();
     }
 
-    auto compact_it = info.options.find("compact_mode");
-    if (compact_it != info.options.end()) {
-        compact_mode_ = compact_it->second.GetValue<bool>();
-        if (compact_mode_) {
-            // Raw vectors weren't persisted (or are stale); make sure the
-            // post-reload SearchANN guard fires by clearing any in-memory copy.
-            ReleaseRawVectors();
-        }
+    // compact_mode_ 已在函数顶部解析为 compact_mode_flag；这里只做一次同步与
+    // ReleaseRawVectors（其内部会同步 store.compact_mode_ = true）。
+    compact_mode_ = compact_mode_flag;
+    if (compact_mode_) {
+        ReleaseRawVectors();
     }
 }
 

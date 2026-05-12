@@ -270,9 +270,12 @@ public:
         std::vector<uint32> stat_words;
     };
     struct LayerView {
-        size_t current_size = 0;
+        // assign_vector_id fast-path 读 current_size 不持锁；slow-path 在
+        // EXCLUSIVE elems_veclock 下 store 新 size。原子化建立 happens-before
+        // 边：fast-path acquire 读，slow-path release 写。
+        std::atomic<size_t> current_size{0};
         size_t size() const {
-            return current_size;
+            return current_size.load(std::memory_order_acquire);
         }
         size_t n_data_per_block() const {
             return 1024;
@@ -295,6 +298,10 @@ public:
     duckdb::unique_ptr<duckdb::FixedSizeAllocator> node_alloc_;
     duckdb::unique_ptr<duckdb::FixedSizeAllocator> vector_alloc_;
     duckdb::unique_ptr<duckdb::FixedSizeAllocator> upper_alloc_;
+
+    // compact 模式：vector_alloc_ 被 Reset，header->vector_ptr 持失效 buffer_id。
+    // get_data/GetNodeHeader 必须短路，否则对空 allocator 调 Get() → SIGSEGV。
+    bool compact_mode_ = false;
 
     std::vector<duckdb::IndexPointer> id_to_node_ptr_;
     std::vector<duckdb::IndexPointer> upper_idx_to_ptr_;
@@ -441,8 +448,12 @@ public:
     template <bool is_base_layer>
     T assign_vector_id() {
         if constexpr (is_base_layer) {
-            T id = next_base_id_.fetch_add(1, std::memory_order_relaxed);
-            if (id < base_layer.current_size) {
+            // acq_rel：与其他 worker 的 set_neighbor (stripe lock 内) 之间已有
+            // happens-before；这里需要 release，因为后续在 elems_veclock 释放前
+            // 完成的写入（resize、New segment）必须对 fast-path 读 size() 的
+            // worker 可见。
+            T id = next_base_id_.fetch_add(1, std::memory_order_acq_rel);
+            if (id < base_layer.size()) {
                 return id;
             }
             // Slow path: grow under lock. Race: another worker may have grown
@@ -452,7 +463,7 @@ public:
                 elems.resize(id + 1);
                 vectors.resize(id + 1);
                 base_points.resize(id + 1, MakeBasePoint());
-                base_layer.current_size = base_points.size();
+                base_layer.current_size.store(base_points.size(), std::memory_order_release);
                 if (id >= id_to_node_ptr_.size()) {
                     id_to_node_ptr_.resize(id + 1);
                 }
@@ -469,14 +480,14 @@ public:
             LWLockRelease(&elems_veclock);
             return id;
         } else {
-            T idx = next_upper_id_.fetch_add(1, std::memory_order_relaxed);
-            if (idx < upper_layer.current_size) {
+            T idx = next_upper_id_.fetch_add(1, std::memory_order_acq_rel);
+            if (idx < upper_layer.size()) {
                 return idx;
             }
             LWLockAcquire(&elems_veclock, LW_EXCLUSIVE);
             if (idx + 1 > upper_points.size()) {
                 upper_points.resize(idx + 1, MakeUpperPoint());
-                upper_layer.current_size = upper_points.size();
+                upper_layer.current_size.store(upper_points.size(), std::memory_order_release);
                 if (idx >= upper_idx_to_ptr_.size()) {
                     upper_idx_to_ptr_.resize(idx + 1);
                 }
@@ -624,6 +635,7 @@ public:
     }
 
     float *GetVectorData(T id) {
+        if (compact_mode_) return nullptr;
         auto *header = GetNodeHeader(id);
         if (!header || !header->vector_ptr.Get()) return nullptr;
         return reinterpret_cast<float *>(vector_alloc_->Get(header->vector_ptr));
@@ -637,7 +649,7 @@ public:
         if (id >= vectors.size() && id >= elems.size()) {
             return nullptr;
         }
-        if (node_alloc_ && vector_alloc_) {
+        if (!compact_mode_ && node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
                 auto *hdr = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(ptr));
@@ -655,7 +667,7 @@ public:
         if (id >= vectors.size() && id >= elems.size()) {
             return nullptr;
         }
-        if (node_alloc_ && vector_alloc_) {
+        if (!compact_mode_ && node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
                 auto &alloc = *const_cast<duckdb::FixedSizeAllocator *>(node_alloc_.get());
@@ -667,6 +679,9 @@ public:
                     return reinterpret_cast<const char *>(valloc.Get(vptr));
                 }
             }
+        }
+        if (id >= vectors.size()) {
+            return nullptr;
         }
         return vectors[id].data();
     }
