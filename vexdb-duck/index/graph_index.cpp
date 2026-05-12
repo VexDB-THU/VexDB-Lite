@@ -1045,6 +1045,17 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
 
     auto &store = runtime_->store;
 
+    // compact_mode 模式下 vector_alloc_ 被 Reset，但 header->vector_ptr 仍是旧
+    // buffer_id；先识别 compact 标志，后续跳过 vectors mirror 以免对空 allocator
+    // 调 Get() 解引用空 buffers 数组导致 SIGSEGV。
+    bool compact_mode_flag = false;
+    {
+        auto compact_it = info.options.find("compact_mode");
+        if (compact_it != info.options.end()) {
+            compact_mode_flag = compact_it->second.GetValue<bool>();
+        }
+    }
+
     if (info.allocator_infos.size() >= 3) {
         store.node_alloc_->Init(info.allocator_infos[0]);
         store.vector_alloc_->Init(info.allocator_infos[1]);
@@ -1176,7 +1187,10 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
             }
         }
         // vectors[i] mirror (get_data fallback path)
-        if (store.vector_alloc_ && header->vector_ptr.Get() && i < store.vectors.size()) {
+        // compact_mode 下原始向量已被 ReleaseRawVectors 清空，header->vector_ptr 是
+        // 失效的 buffer_id；跳过避免对空 allocator 调 Get() 解引用 nullptr。
+        if (!compact_mode_flag && store.vector_alloc_ && header->vector_ptr.Get() &&
+            i < store.vectors.size()) {
             auto *vec_data = reinterpret_cast<const char *>(store.vector_alloc_->Get(header->vector_ptr));
             if (vec_data) {
                 store.vectors[i].assign(vec_data, vec_data + store.vec_size);

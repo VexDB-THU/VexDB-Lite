@@ -43,40 +43,51 @@ All tests passed (19 assertions in 1 test case)
 statements without `WITH (threads=N)` keep their pre-parallel behavior — zero
 regression risk for default users.
 
-## P8' partial reload-bug repair (commit `7a726d68b7`)
+## Reload bug repair (commits `7a726d68b7` + `f41c023246`)
 
 The pre-existing reload bug (memory `project_vexdb_duck_reload_gap.md`)
-was partially fixed in this branch:
+is **fully fixed** in this branch.
 
-1. **Patch stale neighbor slots at reload** — disk-backed HNSWNodeHeader
-   slots `[level0_count..m*2)` could hold garbage from previously-freed
-   segments. `is_valid()` only rejects `INVALID_VECTOR_ID` (0xFFFFFFFF);
-   other garbage like `0xfffffff7` passes and becomes an OOB index into
-   `vectors[]`. Fix: zero-pad unused slots to INVALID at reload time.
+Root causes (two independent bugs, both pre-dated this branch):
 
-2. **Refill in-memory mirrors** — `base_points[i].neighbors` and
-   `vectors[i]` are read by fallback code paths but were left at
-   `MakeBasePoint()` defaults after `ResizeForReload`.
+1. **`set_neighbor()` did not maintain `level0_count`** — when
+   reverse-edge updates wrote new neighbors via `set_neighbor`, only
+   `neighbors[pruned]` was updated; `header->level0_count` stayed at
+   its old value. A node could have N real neighbors in slots [0..N)
+   but report `level0_count = 0`. After restart, code that trusted
+   the count (the original P8' patch + `get_neighbors`'s `max_count`
+   fallback) treated the real neighbors as garbage and wiped them.
 
-3. **Defensive bound check** — `get_data(id)` now rejects ids that
-   exceed both `vectors.size()` and `elems.size()`.
+2. **Atomic id counters not reset on reload** —
+   `DeserializeFromStorage` restored `id_to_node_ptr_`, `elems`,
+   etc. but left `next_base_id_` / `next_upper_id_` at their default
+   value of 0. The next `assign_vector_id<true>()` then returned
+   `id = 0`, colliding with the existing node 0. The `add_elem` /
+   `add_vector` calls that followed clobbered node 0's segment with
+   the new row's data, so the next `search_layer` walked a corrupted
+   graph and SIGSEGV'd on garbage neighbor IDs.
 
-Test results (full restart+persistence suite):
+Additional defensive improvements:
 
-| | Before | After |
-|---|---|---|
-| restart+persistence tests passing | 0/13 | **5/13** |
+- **Patch stale unused slots at reload** — slots `[level0_count..m*2)`
+  in the disk-backed header could still contain garbage from previously
+  freed segments. Zero-pad them to `INVALID_VECTOR_ID` so `is_valid()`
+  correctly breaks the iteration.
+- **Refill `base_points[i].neighbors` / `vectors[i]`** from disk-backed
+  header at reload, for fallback code paths.
+- **`get_data(id)` defensive bound check** for any id that slips past
+  `is_valid`.
 
-Newly passing: `restart_delete`, `restart_drop`, `restart_search`,
-`multi_restart`, `pq_restart_recall`.
+Test results (full restart + persistence suite):
 
-Still failing (8 tests): `restart_insert/update/nocheckpoint`,
-`persistence/persistence_slow/persistence_full/pq_persistence`,
-`restart_large_slow`. All share the same root cause (HNSW neighbor
-slots not zero-initialized end-to-end across the persistence layer),
-but the specific corruption paths differ. Full fix requires a deeper
-audit of the serialize → checkpoint → reload roundtrip — out of scope
-for the parallel-build branch.
+| | Before | After P8' partial | After P8' full |
+|---|---|---|---|
+| restart+persistence passing | 0/13 | 5/13 | **13/13** |
+
+All previously-failing tests now pass: `restart_insert`,
+`restart_update`, `restart_nocheckpoint`, `restart_large_slow`,
+`persistence`, `persistence_slow`, `persistence_full`,
+`pq_persistence`.
 
 ## Key design choices documented in code
 

@@ -21,23 +21,15 @@ steps:
 - statement: CHECKPOINT;
 - raw_directive: restart
 - statement: SET ${GUC_BF_THRESHOLD} = 0;
-- statement: SELECT id FROM pq_compact_r ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;
-  expect_error: SearchANN is unavailable
-- statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
-- query: 'SELECT id FROM pq_compact_r
-
-    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}
-
-    LIMIT 1;'
+# compact mode auto-routes to PQ search; no explicit GUC needed
+- query: 'SELECT id FROM pq_compact_r ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;'
   _field_types: I
   expect:
   - - 100
-- statement: RESET ${GUC_PQ_SEARCH_MODE};
 - statement: DELETE FROM pq_compact_r WHERE id BETWEEN 50 AND 99;
 - statement: CHECKPOINT;
 - raw_directive: restart
 - statement: SET ${GUC_BF_THRESHOLD} = 0;
-- statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
 - query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact_r\n    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}\n    LIMIT 10000\n) t;"
   _field_types: I
   expect:
@@ -46,6 +38,5 @@ steps:
   _field_types: I
   expect:
   - - 0
-- statement: RESET ${GUC_PQ_SEARCH_MODE};
 - statement: DROP TABLE pq_compact_r;
 _migrated_from: vexdb-duck/test/sql/vex/index/graph_index_pq_compact_reload.test

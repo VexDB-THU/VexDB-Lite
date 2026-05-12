@@ -214,6 +214,10 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                     "vex_pq_search_mode must be 'off' or 'pq_only', got '%s'", pq_mode_val.ToString());
             }
         }
+        // compact mode 不保留原始向量，只能走 PQ 搜索；无视 GUC 自动路由
+        if (graph_index.IsCompactMode()) {
+            pq_only = true;
+        }
 
         vector<row_t> result_row_ids;
         vector<float> result_distances;
