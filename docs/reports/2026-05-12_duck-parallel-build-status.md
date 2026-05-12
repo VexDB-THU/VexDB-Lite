@@ -43,17 +43,40 @@ All tests passed (19 assertions in 1 test case)
 statements without `WITH (threads=N)` keep their pre-parallel behavior — zero
 regression risk for default users.
 
-## Known issue (out of scope for this branch)
+## P8' partial reload-bug repair (commit `7a726d68b7`)
 
-`index__graph_index_restart_large_slow.test` SIGSEGVs in
-`test_sqllogictest.cpp:41`. This is **not** introduced by parallel build —
-the failure is in deserialization after restart (`DeserializeFromStorage`
-only recovers metadata, missing elems/邻居 data). Tracked in memory
-`project_vexdb_duck_reload_gap.md` as a pre-existing reload bug.
+The pre-existing reload bug (memory `project_vexdb_duck_reload_gap.md`)
+was partially fixed in this branch:
 
-This bug pre-dates the parallel build work and applies equally to single-
-threaded builds (default behavior). Fixing it requires a separate
-work-stream on the persistence layer (P8' in the design doc).
+1. **Patch stale neighbor slots at reload** — disk-backed HNSWNodeHeader
+   slots `[level0_count..m*2)` could hold garbage from previously-freed
+   segments. `is_valid()` only rejects `INVALID_VECTOR_ID` (0xFFFFFFFF);
+   other garbage like `0xfffffff7` passes and becomes an OOB index into
+   `vectors[]`. Fix: zero-pad unused slots to INVALID at reload time.
+
+2. **Refill in-memory mirrors** — `base_points[i].neighbors` and
+   `vectors[i]` are read by fallback code paths but were left at
+   `MakeBasePoint()` defaults after `ResizeForReload`.
+
+3. **Defensive bound check** — `get_data(id)` now rejects ids that
+   exceed both `vectors.size()` and `elems.size()`.
+
+Test results (full restart+persistence suite):
+
+| | Before | After |
+|---|---|---|
+| restart+persistence tests passing | 0/13 | **5/13** |
+
+Newly passing: `restart_delete`, `restart_drop`, `restart_search`,
+`multi_restart`, `pq_restart_recall`.
+
+Still failing (8 tests): `restart_insert/update/nocheckpoint`,
+`persistence/persistence_slow/persistence_full/pq_persistence`,
+`restart_large_slow`. All share the same root cause (HNSW neighbor
+slots not zero-initialized end-to-end across the persistence layer),
+but the specific corruption paths differ. Full fix requires a deeper
+audit of the serialize → checkpoint → reload roundtrip — out of scope
+for the parallel-build branch.
 
 ## Key design choices documented in code
 
