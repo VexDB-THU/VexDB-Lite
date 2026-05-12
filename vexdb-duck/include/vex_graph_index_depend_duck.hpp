@@ -829,6 +829,14 @@ public:
                     auto *neighbors = header->GetLevel0Neighbors();
                     if (size_t(pruned) < size_t(m) * 2) {
                         neighbors[pruned] = newpoint_id;
+                        // Update level0_count to track the highest occupied slot.
+                        // Without this, reload-time logic that trusts level0_count
+                        // (P8' patch + get_neighbors max_count) misses neighbors
+                        // added via set_neighbor and overwrites them as INVALID.
+                        if (newpoint_id != T(INVALID_VECTOR_ID) &&
+                            uint16_t(pruned + 1) > header->level0_count) {
+                            header->level0_count = uint16_t(pruned + 1);
+                        }
                     }
                 }
             }
@@ -846,6 +854,10 @@ public:
                     auto *neighbors = upper->GetNeighbors(0, m);
                     if (size_t(pruned) < size_t(m)) {
                         neighbors[pruned] = newpoint_id;
+                        if (newpoint_id != T(INVALID_VECTOR_ID) &&
+                            uint16_t(pruned + 1) > upper->counts[0]) {
+                            upper->counts[0] = uint16_t(pruned + 1);
+                        }
                     }
                 }
             }

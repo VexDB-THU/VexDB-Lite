@@ -1064,6 +1064,12 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
     store.ResizeForReload(node_count, upper_count);
     store.id_to_node_ptr_.resize(node_count);
     store.upper_idx_to_ptr_.resize(upper_count);
+    // P8' critical fix: reset atomic id counters to match restored counts.
+    // Without this, the next assign_vector_id<true>() returns id=0 (from
+    // default-initialized atomic) and clobbers existing node 0's segment.
+    // Symptoms: SIGSEGV during the next Append's search_layer after restart.
+    store.next_base_id_.store(static_cast<uint32_t>(node_count), std::memory_order_relaxed);
+    store.next_upper_id_.store(static_cast<uint32_t>(upper_count), std::memory_order_relaxed);
 
     auto eid_it = info.options.find("entry_id");
     auto ec_it = info.options.find("entry_cur_layer_idx");
