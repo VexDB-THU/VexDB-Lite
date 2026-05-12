@@ -1114,28 +1114,68 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         }
     }
 
-    // Repopulate elems[id].tids from disk-backed HNSWNodeHeader.row_id.
-    // get_itempointer / get_tids read from elems[id], not from node_alloc_, so without
-    // this step search returns empty result sets after restart. Skip nodes whose
-    // header->deleted flag was set by a prior Delete() — restoring their tids would
-    // resurrect rows the table no longer has.
+    // Repopulate per-node mirrors from disk-backed HNSWNodeHeader. After reload
+    // ResizeForReload defaults elems / base_points / vectors to fresh blanks
+    // (tids empty, neighbors=INVALID_VECTOR_ID, dists=INVALID_DIST). Code paths
+    // that fall back to the in-memory mirrors (get_neighbors reads bp.dists
+    // unconditionally; get_data falls back to vectors[id].data() when the
+    // node_alloc_ path is missed) would otherwise see those blanks and either
+    // return zero results or follow INVALID neighbor IDs into out-of-bounds
+    // memory — manifesting as SIGSEGV during the next Append/INSERT that walks
+    // the graph from entry_point.
+    //
+    // Skip nodes whose header->deleted flag was set by a prior Delete() —
+    // restoring their tids would resurrect rows the table no longer has.
+    const int m_local = static_cast<int>(store.m);
+    const uint_fast16_t nbr_slots = static_cast<uint_fast16_t>(m_local * 2);
     for (size_t i = 0; i < store.id_to_node_ptr_.size() && i < store.elems.size(); i++) {
         auto ptr = store.id_to_node_ptr_[i];
         if (!ptr.Get() || !store.node_alloc_) {
             continue;
         }
         auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<uint32_t> *>(store.node_alloc_->Get(ptr));
-        if (!header || header->deleted) {
+        if (!header) {
             continue;
         }
-        if (deleted_rids_.find(header->row_id) != deleted_rids_.end()) {
-            continue;
+        // tids (skip deleted)
+        if (!header->deleted &&
+            deleted_rids_.find(header->row_id) == deleted_rids_.end()) {
+            auto &elem = store.elems[i];
+            elem.tids.clear();
+            ItemPointerData tid;
+            tid.row_id = header->row_id;
+            elem.tids.push_back(tid);
         }
-        auto &elem = store.elems[i];
-        elem.tids.clear();
-        ItemPointerData tid;
-        tid.row_id = header->row_id;
-        elem.tids.push_back(tid);
+        // base_points[i].neighbors mirror (search_layer fallback path)
+        // ALSO patch the disk-backed header: zero-initialized slots past
+        // level0_count can hold garbage if the segment was previously freed
+        // and re-allocated. search_layer iterates all m*2 slots regardless
+        // of level0_count and uses is_valid(id != INVALID_VECTOR_ID) to skip;
+        // garbage like 0xfffffff7 passes is_valid and then indexes into
+        // vectors[id] OOB, crashing in Append's commit path.
+        {
+            uint32_t *header_neighbors = header->GetLevel0Neighbors();
+            const uint16_t valid_count = header->level0_count;
+            for (uint_fast16_t j = valid_count; j < nbr_slots; j++) {
+                header_neighbors[j] = uint32_t(INVALID_VECTOR_ID);
+            }
+            if (i < store.base_points.size()) {
+                auto &bp = store.base_points[i];
+                if (bp.neighbors.size() != nbr_slots) {
+                    bp.neighbors.assign(nbr_slots, uint32_t(INVALID_VECTOR_ID));
+                }
+                for (uint_fast16_t j = 0; j < nbr_slots; j++) {
+                    bp.neighbors[j] = header_neighbors[j];
+                }
+            }
+        }
+        // vectors[i] mirror (get_data fallback path)
+        if (store.vector_alloc_ && header->vector_ptr.Get() && i < store.vectors.size()) {
+            auto *vec_data = reinterpret_cast<const char *>(store.vector_alloc_->Get(header->vector_ptr));
+            if (vec_data) {
+                store.vectors[i].assign(vec_data, vec_data + store.vec_size);
+            }
+        }
     }
 
     auto upper_ptr_it = info.options.find("upper_ptr_map");

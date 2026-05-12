@@ -630,6 +630,13 @@ public:
     }
 
     char *get_data(T id) {
+        // Defensive bound check: after reload, neighbor slots past header->level0_count
+        // can hold stale data from a previously freed segment. is_valid() only rejects
+        // INVALID_VECTOR_ID; any other garbage value (e.g. 0xfffffff7) is treated as a
+        // real id and routed here. Without this check we'd OOB into vectors[id].
+        if (id >= vectors.size() && id >= elems.size()) {
+            return nullptr;
+        }
         if (node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
@@ -639,9 +646,15 @@ public:
                 }
             }
         }
+        if (id >= vectors.size()) {
+            return nullptr;
+        }
         return vectors[id].data();
     }
     const char *get_data(T id) const {
+        if (id >= vectors.size() && id >= elems.size()) {
+            return nullptr;
+        }
         if (node_alloc_ && vector_alloc_) {
             auto ptr = GetNodePtr(id);
             if (ptr.Get()) {
