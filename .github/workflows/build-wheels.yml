@@ -15,7 +15,7 @@ on:
 
 env:
   PYTHON_VERSION: ${{ inputs.python_version || '3.12' }}
-  DUCKDB_VERSION: '1.5.0'
+  DUCKDB_VERSION: '1.5.2'
 
 jobs:
   # ── Step 1: Download sdist once, inject VEX, share as artifact ──
@@ -46,21 +46,19 @@ jobs:
           tar xzf duckdb-sdist.tar.gz
           BD="/tmp/duckdb-${{ env.DUCKDB_VERSION }}"
 
-          # Copy VEX extension
-          cp -r ${{ github.workspace }}/extension/vex "$BD/external/duckdb/extension/vex"
-
-          # Copy physical_create_graph_index
-          cp ${{ github.workspace }}/src/execution/operator/schema/physical_create_graph_index.cpp \
-             "$BD/external/duckdb/src/execution/operator/schema/"
-          cp ${{ github.workspace }}/src/include/duckdb/execution/operator/schema/physical_create_graph_index.hpp \
-             "$BD/external/duckdb/src/include/duckdb/execution/operator/schema/"
-
-          # Patch CMakeLists
-          sed -i 's/physical_create_index\.cpp/physical_create_index.cpp\n  physical_create_graph_index.cpp/' \
-            "$BD/external/duckdb/src/execution/operator/schema/CMakeLists.txt"
+          # Copy VEX extension and its shared kernel next to each other so
+          # vexdb_duckdb/CMakeLists.txt can keep using ../common paths.
+          cp -r ${{ github.workspace }}/vexdb_duckdb "$BD/external/duckdb/extension/vex"
+          cp -r ${{ github.workspace }}/common "$BD/external/duckdb/extension/common"
 
           # Add VEX to extension config
-          echo 'duckdb_extension_load(vex)' >> "$BD/external/duckdb/extension/extension_config.cmake"
+          cat >> "$BD/external/duckdb/extension/extension_config.cmake" <<'EOF'
+          duckdb_extension_load(vex
+              SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/vex
+              INCLUDE_DIR ${CMAKE_CURRENT_LIST_DIR}/vex/include
+              LOAD_TESTS
+          )
+          EOF
 
           # OEM: rename package to vexdb-lite
           sed -i 's/^name = "duckdb"/name = "vexdb-lite"/' "$BD/pyproject.toml"

@@ -259,6 +259,16 @@ SELECT * FROM vex_index_info() WHERE index_name = 'idx_vec';
 
 ### Python 接口
 
+如果使用 `vexdb-lite` Python wheel，可以通过 `vexdb_lite.connect()` 打开连接并自动加载 VEX：
+
+```python
+import vexdb_lite
+
+con = vexdb_lite.connect()
+```
+
+也可以直接使用 DuckDB Python 包并手动加载扩展：
+
 ```python
 import duckdb
 
