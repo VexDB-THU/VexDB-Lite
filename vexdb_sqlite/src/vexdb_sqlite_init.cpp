@@ -5,6 +5,7 @@ SQLITE_EXTENSION_INIT1
 #endif
 
 #include "vexdb_sqlite.h"
+#include "agent_files/vexfs_sqlite.h"
 #include "functions/distance_functions.h"
 #include "vtab/graph_index_vtab.h"
 
@@ -44,6 +45,9 @@ extern "C" int vexdb_sqlite_register(sqlite3 *db) {
     if (rc != SQLITE_OK) return rc;
 
     rc = vexdb_sqlite_register_distance_functions(db);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = vexfs_sqlite_register(db);
     if (rc != SQLITE_OK) return rc;
 
     rc = sqlite3_create_function(db, "vexdb_version", 0,

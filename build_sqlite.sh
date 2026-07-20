@@ -3,7 +3,8 @@
 # 仿 vexdb_pg 独立 CMake 模式（根 build.sh 深耦合 DuckDB 源码树，不复用）。
 #
 #   bash build_sqlite.sh build    # 配置 + 编译双形态 + smoke test 二进制
-#   bash build_sqlite.sh test     # build + 跑五层测试（smoke ×4 + spec）
+#   bash build_sqlite.sh test     # build + 跑 SQLite/VexFS smoke + spec
+#   bash build_sqlite.sh eval     # build + 跑 VexFS full eval（可传 quick/full/stress）
 #   bash build_sqlite.sh package  # Release 编 macOS arm64+x86_64 → dist/ tarball + SHA256
 #   bash build_sqlite.sh ios      # Stage C：device+sim 静态库 → XCFramework（+sim smoke）
 #   bash build_sqlite.sh android  # Stage C：NDK arm64-v8a/x86_64 静态库 + loadable .so
@@ -34,7 +35,7 @@ case "$CMD" in
     vendor)
         bash "$DIR/vendor_sqlite.sh"
         ;;
-    build|test)
+    build|test|eval)
         [ -f "$DIR/third_party/sqlite/sqlite3ext.h" ] || bash "$DIR/vendor_sqlite.sh"
         "$CMAKE" -S "$DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Debug}"
         "$CMAKE" --build "$BUILD_DIR" -j "$NCPU"
@@ -51,8 +52,26 @@ case "$CMD" in
             "$BUILD_DIR/m2_vtab_smoke"
             echo "=== M3 HNSW 冒烟 ==="
             "$BUILD_DIR/m3_hnsw_smoke"
+            echo "=== M3P 并行查询冒烟 ==="
+            "$BUILD_DIR/m3p_parallel_smoke"
+            echo "=== VexFS SQLite 合同冒烟 ==="
+            "$BUILD_DIR/vexfs_static_smoke"
+            echo "=== VexFS 挂载层 C ABI 冒烟 ==="
+            "$BUILD_DIR/vexfs_mount_contract_smoke"
+            echo "=== VexFS CLI 冒烟 ==="
+            bash "$DIR/../agent_files/cli/test/vexfs_cli_smoke.sh" "$BUILD_DIR/vexfs"
             echo "=== M4 spec（L2 DSL 渲染 + runner） ==="
             bash "$DIR/../tests/spec/_lib/docker/run_sqlite.sh"
+        elif [ "$CMD" = "eval" ]; then
+            EVAL_MODE="${2:-full}"
+            case "$EVAL_MODE" in
+                quick|full|stress) ;;
+                *) echo "eval mode 只能是 quick、full 或 stress" >&2; exit 2 ;;
+            esac
+            echo ""
+            echo "=== VexFS $EVAL_MODE eval ==="
+            python3 "$DIR/../tests/eval/vexfs/run.py" \
+                --mode "$EVAL_MODE" --build-dir "$BUILD_DIR"
         fi
         ;;
     package)
@@ -169,7 +188,7 @@ case "$CMD" in
         echo "已清理 build 目录"
         ;;
     *)
-        echo "Usage: $0 [build|test|package|ios|android|vendor|clean]"
+        echo "Usage: $0 [build|test|eval [quick|full|stress]|package|ios|android|vendor|clean]"
         exit 1
         ;;
 esac

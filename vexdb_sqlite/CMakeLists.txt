@@ -101,6 +101,7 @@ endif()
 
 set(VEXDB_SQLITE_SRCS
     src/vexdb_sqlite_init.cpp
+    src/agent_files/vexfs_sqlite.cpp
     src/vtab/graph_index_vtab.cpp
     src/functions/distance_functions.cpp
     src/functions/vector_codec.cpp
@@ -207,13 +208,43 @@ target_include_directories(vexdb_lite_static PRIVATE ${VEXDB_SQLITE_INCLUDES})
 target_compile_definitions(vexdb_lite_static PRIVATE VEXDB_SQLITE_CORE=1)
 set_target_properties(vexdb_lite_static PROPERTIES OUTPUT_NAME "vexdb_lite_static")
 
+# 平台挂载适配层共用的稳定 C ABI。FSKit/libfuse/WinFsp 都只接这一层，
+# 具体状态仍由上面的 SQLite 插件通过 vexfs_* SQL 管理。
+add_library(vexfs_mount_contract STATIC
+    ${REPO_ROOT}/agent_files/mount/common/src/vexfs_mount_contract_sqlite.cpp)
+target_include_directories(vexfs_mount_contract PUBLIC
+    ${REPO_ROOT}/agent_files/mount/common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${SQLITE_AMALG_DIR})
+target_compile_definitions(vexfs_mount_contract PRIVATE VEXDB_SQLITE_CORE=1)
+target_link_libraries(vexfs_mount_contract PUBLIC vexdb_lite_static)
+set_target_properties(vexfs_mount_contract PROPERTIES OUTPUT_NAME "vexfs_mount_contract")
+
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    enable_language(OBJCXX)
+    find_library(VEXFS_SYSTEM_SQLITE3 sqlite3 REQUIRED)
+    find_library(VEXFS_FOUNDATION Foundation REQUIRED)
+    add_executable(vexfs_cli
+        ${REPO_ROOT}/agent_files/cli/vexfs_main.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm)
+    set_source_files_properties(
+        ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm
+        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+    target_include_directories(vexfs_cli PRIVATE
+        ${REPO_ROOT}/agent_files/mount/common/include
+        ${REPO_ROOT}/agent_files/cli)
+    target_link_libraries(vexfs_cli PRIVATE vexfs_mount_contract
+        ${VEXFS_SYSTEM_SQLITE3} ${VEXFS_FOUNDATION} Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(vexfs_cli PROPERTIES OUTPUT_NAME "vexfs")
+endif()
+
 if(VEXDB_SQLITE_BUILD_TESTS)
     # 把 amalgamation 编成静态库供 smoke test 链接（模拟移动端宿主自带 sqlite3）。
     add_library(sqlite3_amalg STATIC ${SQLITE_AMALG_DIR}/sqlite3.c)
     target_include_directories(sqlite3_amalg PUBLIC ${SQLITE_AMALG_DIR})
     target_compile_definitions(sqlite3_amalg PRIVATE SQLITE_ENABLE_LOAD_EXTENSION=1)
 
-    foreach(smoke m0_static_smoke m1_distance_smoke m2_vtab_smoke m3_hnsw_smoke)
+    foreach(smoke m0_static_smoke m1_distance_smoke m2_vtab_smoke m3_hnsw_smoke vexfs_static_smoke)
         add_executable(${smoke} test/${smoke}.c)
         target_include_directories(${smoke} PRIVATE ${VEXDB_SQLITE_INCLUDES})
         # 宿主侧静态注册形态：直接用真实 sqlite3 符号（非 ext 间接表）。
@@ -228,4 +259,11 @@ if(VEXDB_SQLITE_BUILD_TESTS)
     target_compile_definitions(m3p_parallel_smoke PRIVATE VEXDB_SQLITE_CORE=1)
     target_link_libraries(m3p_parallel_smoke PRIVATE
         vexdb_lite_static sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    add_executable(vexfs_mount_contract_smoke
+        ${REPO_ROOT}/agent_files/mount/common/test/vexfs_mount_contract_smoke.cpp)
+    target_include_directories(vexfs_mount_contract_smoke PRIVATE
+        ${REPO_ROOT}/agent_files/mount/common/include ${SQLITE_AMALG_DIR})
+    target_link_libraries(vexfs_mount_contract_smoke PRIVATE
+        vexfs_mount_contract sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
 endif()

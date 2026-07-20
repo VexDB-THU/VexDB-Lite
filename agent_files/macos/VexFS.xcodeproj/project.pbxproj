@@ -1,0 +1,562 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 46;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		0BC68A3B319449C6CEE91C8D /* VexFSAppEx.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = 6CCDB74FA186F6FCD7A300FB /* VexFSAppEx.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		23DDC1E282C33F2F633E7872 /* VexFSBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = F36BCE283AA3A5947E3A75BC /* VexFSBackend.swift */; };
+		3B11C6F78EA62D945AF6E165 /* FSKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 24ABADDA7C830A7635A906E5 /* FSKit.framework */; };
+		A6C51020C5D7076193EA157A /* VexFSVolume+Operations.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0157B8EFB8B783DBB2A4B15D /* VexFSVolume+Operations.swift */; };
+		A89A6A7839DECBD962C9FA02 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D48085DD8AFB52024CD9512B /* Cocoa.framework */; };
+		B383BA27662F9E6DD90C2C81 /* VexFSFileSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 612EC9965B79CDECF771CFE7 /* VexFSFileSystem.swift */; };
+		B6B84C145BFAEA0C42E15916 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 339D10E1B23713660842B8ED /* ContentView.swift */; };
+		BD1E4AE3BF6880BE89877841 /* Cocoa.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D48085DD8AFB52024CD9512B /* Cocoa.framework */; };
+		BF65C046A873125AC5174F58 /* VexFSVolume.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12A53F9C5F028FC3DD4BE3E3 /* VexFSVolume.swift */; };
+		C9D129F35E11C5025B10D5F6 /* VexFSItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79162BBEE0BBD0A628DBB6BD /* VexFSItem.swift */; };
+		CCA1446D1EA1AA3AD47E37D0 /* VexFSAppEx.swift in Sources */ = {isa = PBXBuildFile; fileRef = 94204BA19A4C73FA79C190C9 /* VexFSAppEx.swift */; };
+		D180822993DA1907CE7B6A10 /* VexFSApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D63C4F4452011ECF470D69E /* VexFSApp.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		83549E04744B8CA7BF0D59B9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = AC4A42524ED5CBEE19926577 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1A5D042A492F7D6E68921B31;
+			remoteInfo = VexFSAppEx;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		C9410A46AA6747711A591D0A /* Embed ExtensionKit Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "$(EXTENSIONS_FOLDER_PATH)";
+			dstSubfolderSpec = 16;
+			files = (
+				0BC68A3B319449C6CEE91C8D /* VexFSAppEx.appex in Embed ExtensionKit Extensions */,
+			);
+			name = "Embed ExtensionKit Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		0157B8EFB8B783DBB2A4B15D /* VexFSVolume+Operations.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = "VexFSVolume+Operations.swift"; sourceTree = "<group>"; };
+		0D63C4F4452011ECF470D69E /* VexFSApp.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSApp.swift; sourceTree = "<group>"; };
+		12A53F9C5F028FC3DD4BE3E3 /* VexFSVolume.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSVolume.swift; sourceTree = "<group>"; };
+		24ABADDA7C830A7635A906E5 /* FSKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FSKit.framework; path = System/Library/Frameworks/FSKit.framework; sourceTree = SDKROOT; };
+		339D10E1B23713660842B8ED /* ContentView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		4A51E7C4A79392F1B486CBDC /* VexFSApp.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = VexFSApp.entitlements; sourceTree = "<group>"; };
+		5B9E7D35E13C5EDA8EB0EC02 /* VexFS-Bridging-Header.h */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.h; path = "VexFS-Bridging-Header.h"; sourceTree = "<group>"; };
+		612EC9965B79CDECF771CFE7 /* VexFSFileSystem.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSFileSystem.swift; sourceTree = "<group>"; };
+		6CCDB74FA186F6FCD7A300FB /* VexFSAppEx.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = VexFSAppEx.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		79162BBEE0BBD0A628DBB6BD /* VexFSItem.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSItem.swift; sourceTree = "<group>"; };
+		8B79A91CD5F1353E7C4DBC40 /* VexFSApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = VexFSApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		94204BA19A4C73FA79C190C9 /* VexFSAppEx.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSAppEx.swift; sourceTree = "<group>"; };
+		C9358B6392411F7B776722E1 /* VexFSAppEx.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = VexFSAppEx.entitlements; sourceTree = "<group>"; };
+		D48085DD8AFB52024CD9512B /* Cocoa.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Cocoa.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.0.sdk/System/Library/Frameworks/Cocoa.framework; sourceTree = DEVELOPER_DIR; };
+		E1821EECDA039CD17708C8F8 /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		F36BCE283AA3A5947E3A75BC /* VexFSBackend.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VexFSBackend.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		537E5BFB297AFC43B476E8BA /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A89A6A7839DECBD962C9FA02 /* Cocoa.framework in Frameworks */,
+				3B11C6F78EA62D945AF6E165 /* FSKit.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		F9E2F58F5023DE4798CEA89E /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				BD1E4AE3BF6880BE89877841 /* Cocoa.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1398F869C8324455467B1337 /* VexFSAppEx */ = {
+			isa = PBXGroup;
+			children = (
+				94204BA19A4C73FA79C190C9 /* VexFSAppEx.swift */,
+				F36BCE283AA3A5947E3A75BC /* VexFSBackend.swift */,
+				612EC9965B79CDECF771CFE7 /* VexFSFileSystem.swift */,
+				79162BBEE0BBD0A628DBB6BD /* VexFSItem.swift */,
+				12A53F9C5F028FC3DD4BE3E3 /* VexFSVolume.swift */,
+				0157B8EFB8B783DBB2A4B15D /* VexFSVolume+Operations.swift */,
+				5B9E7D35E13C5EDA8EB0EC02 /* VexFS-Bridging-Header.h */,
+				C9358B6392411F7B776722E1 /* VexFSAppEx.entitlements */,
+				E1821EECDA039CD17708C8F8 /* Info.plist */,
+			);
+			name = VexFSAppEx;
+			path = VexFSAppEx;
+			sourceTree = "<group>";
+		};
+		43A182FDE5C8742E9D66F9DE /* OS X */ = {
+			isa = PBXGroup;
+			children = (
+				D48085DD8AFB52024CD9512B /* Cocoa.framework */,
+			);
+			name = "OS X";
+			sourceTree = "<group>";
+		};
+		5C3B6513C200006C7D3ED342 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				8B79A91CD5F1353E7C4DBC40 /* VexFSApp.app */,
+				6CCDB74FA186F6FCD7A300FB /* VexFSAppEx.appex */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		667505ECC9BC5B1D8210D9F4 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				43A182FDE5C8742E9D66F9DE /* OS X */,
+				24ABADDA7C830A7635A906E5 /* FSKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		975A9C6292155E57E5284D04 = {
+			isa = PBXGroup;
+			children = (
+				5C3B6513C200006C7D3ED342 /* Products */,
+				667505ECC9BC5B1D8210D9F4 /* Frameworks */,
+				D6D01A997E4D4C079763432B /* VexFSApp */,
+				1398F869C8324455467B1337 /* VexFSAppEx */,
+			);
+			sourceTree = "<group>";
+		};
+		D6D01A997E4D4C079763432B /* VexFSApp */ = {
+			isa = PBXGroup;
+			children = (
+				0D63C4F4452011ECF470D69E /* VexFSApp.swift */,
+				339D10E1B23713660842B8ED /* ContentView.swift */,
+				4A51E7C4A79392F1B486CBDC /* VexFSApp.entitlements */,
+			);
+			name = VexFSApp;
+			path = VexFSApp;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1A5D042A492F7D6E68921B31 /* VexFSAppEx */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 81F32C156A3B0AF8EA9C65C0 /* Build configuration list for PBXNativeTarget "VexFSAppEx" */;
+			buildPhases = (
+				C4F2425D1C43106F2CDA1C6C /* Build VexFS SQLite Core */,
+				FE25A55875F5753214F89004 /* Sources */,
+				537E5BFB297AFC43B476E8BA /* Frameworks */,
+				3F8ACBA139F4993B190B48B6 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = VexFSAppEx;
+			productName = VexFSAppEx;
+			productReference = 6CCDB74FA186F6FCD7A300FB /* VexFSAppEx.appex */;
+			productType = "com.apple.product-type.extensionkit-extension";
+		};
+		6FF435D5C1BC036A4F7B4BA6 /* VexFSApp */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C235E4ED94D989172CFFDA17 /* Build configuration list for PBXNativeTarget "VexFSApp" */;
+			buildPhases = (
+				046F460A8B6C8F5B35D1F22D /* Sources */,
+				F9E2F58F5023DE4798CEA89E /* Frameworks */,
+				99F228151C9C8F18C28D2EBB /* Resources */,
+				C9410A46AA6747711A591D0A /* Embed ExtensionKit Extensions */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				479D729D1D8E7D50EEF80968 /* PBXTargetDependency */,
+			);
+			name = VexFSApp;
+			productName = VexFSApp;
+			productReference = 8B79A91CD5F1353E7C4DBC40 /* VexFSApp.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		AC4A42524ED5CBEE19926577 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				LastSwiftUpdateCheck = 2630;
+				LastUpgradeCheck = 2630;
+			};
+			buildConfigurationList = 3DCF428E65687F1FDC0726AD /* Build configuration list for PBXProject "VexFS" */;
+			compatibilityVersion = "Xcode 3.2";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = 975A9C6292155E57E5284D04;
+			minimizedProjectReferenceProxies = 0;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 5C3B6513C200006C7D3ED342 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				6FF435D5C1BC036A4F7B4BA6 /* VexFSApp */,
+				1A5D042A492F7D6E68921B31 /* VexFSAppEx */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		3F8ACBA139F4993B190B48B6 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		99F228151C9C8F18C28D2EBB /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		C4F2425D1C43106F2CDA1C6C /* Build VexFS SQLite Core */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build VexFS SQLite Core";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "set -e\nCMAKE_BIN=\"$(command -v cmake || true)\"\n[ -x \"$CMAKE_BIN\" ] || CMAKE_BIN=/opt/homebrew/bin/cmake\n[ -x \"$CMAKE_BIN\" ] || CMAKE_BIN=/usr/local/bin/cmake\n[ -x \"$CMAKE_BIN\" ] || { echo \"cmake is required\" >&2; exit 1; }\nBUILD_DIR=\"$SRCROOT/../../vexdb_sqlite/build-fskit\"\n\"$CMAKE_BIN\" -S \"$SRCROOT/../../vexdb_sqlite\" -B \"$BUILD_DIR\" \\\n  -DCMAKE_BUILD_TYPE=\"$CONFIGURATION\" -DVEXDB_SQLITE_BUILD_TESTS=OFF\n\"$CMAKE_BIN\" --build \"$BUILD_DIR\" --target vexfs_mount_contract -j \"$(sysctl -n hw.ncpu)\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		046F460A8B6C8F5B35D1F22D /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D180822993DA1907CE7B6A10 /* VexFSApp.swift in Sources */,
+				B6B84C145BFAEA0C42E15916 /* ContentView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		FE25A55875F5753214F89004 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				CCA1446D1EA1AA3AD47E37D0 /* VexFSAppEx.swift in Sources */,
+				23DDC1E282C33F2F633E7872 /* VexFSBackend.swift in Sources */,
+				B383BA27662F9E6DD90C2C81 /* VexFSFileSystem.swift in Sources */,
+				C9D129F35E11C5025B10D5F6 /* VexFSItem.swift in Sources */,
+				BF65C046A873125AC5174F58 /* VexFSVolume.swift in Sources */,
+				A6C51020C5D7076193EA157A /* VexFSVolume+Operations.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		479D729D1D8E7D50EEF80968 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = VexFSAppEx;
+			target = 1A5D042A492F7D6E68921B31 /* VexFSAppEx */;
+			targetProxy = 83549E04744B8CA7BF0D59B9 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		09491CF975FB59BD73BDAA62 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		31A0A5719E39E7BB401D99FE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = VexFSApp/VexFSApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = VexFS;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.vexdb.vexfs;
+				PRODUCT_NAME = VexFS;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		A6AECEA8884F34F863EE1397 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = VexFSApp/VexFSApp.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = VexFS;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.vexdb.vexfs;
+				PRODUCT_NAME = VexFS;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		B5F77B8B9328312919A0E4EA /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = VexFSAppEx/VexFSAppEx.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"$(SRCROOT)/../mount/common/include\"",
+				);
+				INFOPLIST_FILE = VexFSAppEx/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "VexFS file system";
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"\"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexfs_mount_contract.a\"",
+					"\"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexdb_lite_static.a\"",
+					"-lsqlite3",
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.vexdb.vexfs.extension;
+				PRODUCT_NAME = VexFSAppEx;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "VexFSAppEx/VexFS-Bridging-Header.h";
+			};
+			name = Release;
+		};
+		B6EE28519513696CE1930079 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		E8620A8E6E1735705B0CE3C8 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_ENTITLEMENTS = VexFSAppEx/VexFSAppEx.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
+				GENERATE_INFOPLIST_FILE = YES;
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"\"$(SRCROOT)/../mount/common/include\"",
+				);
+				INFOPLIST_FILE = VexFSAppEx/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "VexFS file system";
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks";
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MARKETING_VERSION = 0.1.0;
+				OTHER_LDFLAGS = (
+					"$(inherited)",
+					"\"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexfs_mount_contract.a\"",
+					"\"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexdb_lite_static.a\"",
+					"-lsqlite3",
+					"-lc++",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.vexdb.vexfs.extension;
+				PRODUCT_NAME = VexFSAppEx;
+				SDKROOT = macosx;
+				SKIP_INSTALL = YES;
+				SWIFT_OBJC_BRIDGING_HEADER = "VexFSAppEx/VexFS-Bridging-Header.h";
+			};
+			name = Debug;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		3DCF428E65687F1FDC0726AD /* Build configuration list for PBXProject "VexFS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B6EE28519513696CE1930079 /* Debug */,
+				09491CF975FB59BD73BDAA62 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		81F32C156A3B0AF8EA9C65C0 /* Build configuration list for PBXNativeTarget "VexFSAppEx" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B5F77B8B9328312919A0E4EA /* Release */,
+				E8620A8E6E1735705B0CE3C8 /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		C235E4ED94D989172CFFDA17 /* Build configuration list for PBXNativeTarget "VexFSApp" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A6AECEA8884F34F863EE1397 /* Release */,
+				31A0A5719E39E7BB401D99FE /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = AC4A42524ED5CBEE19926577 /* Project object */;
+}
