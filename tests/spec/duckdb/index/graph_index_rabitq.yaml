@@ -1,0 +1,154 @@
+name: duckdb_graph_index_rabitq
+tags: [duckdb, rabitq, regression]
+engines: [duckdb]
+description: DuckDB RaBitQ uses graph traversal, supports mutation, and exposes its storage state.
+steps:
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: CREATE TABLE rq_empty (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: CREATE INDEX idx_rq_empty ON rq_empty USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq')};
+  - query: SELECT quantizer, rabitq_codes_bytes, rabitq_fixed_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_empty';
+    _field_types: TII
+    expect:
+      - [rabitq, 0, 0]
+  - statement: "INSERT INTO rq_empty VALUES (1, ${VEC_LITERAL([1,2,3,4,5,6,7,8], 8)});"
+  - query: SELECT quantizer, rabitq_codes_bytes > 0, rabitq_fixed_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_empty';
+    _field_types: TII
+    expect:
+      - [rabitq, true, true]
+  - query: SELECT id FROM rq_empty ORDER BY ${L2(vec, ${VEC_LITERAL([1,2,3,4,5,6,7,8], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [1]
+  - statement: DROP TABLE rq_empty;
+
+  - statement: CREATE TABLE rq (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq SELECT i, ${VEC_LITERAL([
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT,
+      sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT,
+      sin(i*0.31)::FLOAT, cos(i*0.37)::FLOAT], 8)}
+      FROM ${RANGE2(1, 1001)} t(i);"
+  - statement: CREATE INDEX idx_rq ON rq USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', m=16, ef_construction=160)};
+  - query: SELECT quantizer, rabitq_codes_bytes > 0, rabitq_fixed_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq';
+    _field_types: TII
+    expect:
+      - [rabitq, true, true]
+  - query: SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      sin(25.0*0.11)::FLOAT, cos(25.0*0.13)::FLOAT,
+      sin(25.0*0.17)::FLOAT, cos(25.0*0.19)::FLOAT,
+      sin(25.0*0.23)::FLOAT, cos(25.0*0.29)::FLOAT,
+      sin(25.0*0.31)::FLOAT, cos(25.0*0.37)::FLOAT], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [25]
+  - query: EXPLAIN SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      sin(25.0*0.11)::FLOAT, cos(25.0*0.13)::FLOAT,
+      sin(25.0*0.17)::FLOAT, cos(25.0*0.19)::FLOAT,
+      sin(25.0*0.23)::FLOAT, cos(25.0*0.29)::FLOAT,
+      sin(25.0*0.31)::FLOAT, cos(25.0*0.37)::FLOAT], 8)})} LIMIT 1;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - statement: "INSERT INTO rq VALUES (9001, ${VEC_LITERAL([
+      7.01::FLOAT, 7.02::FLOAT, 7.03::FLOAT, 7.04::FLOAT,
+      7.05::FLOAT, 7.06::FLOAT, 7.07::FLOAT, 7.08::FLOAT], 8)});"
+  - query: SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      7.01::FLOAT, 7.02::FLOAT, 7.03::FLOAT, 7.04::FLOAT,
+      7.05::FLOAT, 7.06::FLOAT, 7.07::FLOAT, 7.08::FLOAT], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [9001]
+  - statement: DELETE FROM rq WHERE id = 9001;
+  - query: SELECT count(*) FROM (SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      7.01::FLOAT, 7.02::FLOAT, 7.03::FLOAT, 7.04::FLOAT,
+      7.05::FLOAT, 7.06::FLOAT, 7.07::FLOAT, 7.08::FLOAT], 8)})} LIMIT 10) WHERE id = 9001;
+    _field_types: I
+    expect:
+      - [0]
+  - statement: "UPDATE rq SET vec = ${VEC_LITERAL([
+      -7.01::FLOAT, -7.02::FLOAT, -7.03::FLOAT, -7.04::FLOAT,
+      -7.05::FLOAT, -7.06::FLOAT, -7.07::FLOAT, -7.08::FLOAT], 8)} WHERE id = 25;"
+  - query: SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      -7.01::FLOAT, -7.02::FLOAT, -7.03::FLOAT, -7.04::FLOAT,
+      -7.05::FLOAT, -7.06::FLOAT, -7.07::FLOAT, -7.08::FLOAT], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [25]
+  - statement: CREATE INDEX idx_rq_bad_pq ON rq USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', pq_m=4)};
+    expect_error: "cannot be combined with pq_m"
+  - statement: CREATE INDEX idx_rq_compact ON rq USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - query: SELECT memory_mode, quantizer, use_pq::INTEGER, rabitq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_compact';
+    _field_types: TTII
+    expect:
+      - [compact, rabitq, 0, true]
+  - query: EXPLAIN SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      sin(25.0*0.11)::FLOAT, cos(25.0*0.13)::FLOAT,
+      sin(25.0*0.17)::FLOAT, cos(25.0*0.19)::FLOAT,
+      sin(25.0*0.23)::FLOAT, cos(25.0*0.29)::FLOAT,
+      sin(25.0*0.31)::FLOAT, cos(25.0*0.37)::FLOAT], 8)})} LIMIT 1;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - statement: "INSERT INTO rq VALUES (9100, ${VEC_LITERAL([
+      9.01::FLOAT, 9.02::FLOAT, 9.03::FLOAT, 9.04::FLOAT,
+      9.05::FLOAT, 9.06::FLOAT, 9.07::FLOAT, 9.08::FLOAT], 8)});"
+  - query: SELECT id FROM rq ORDER BY ${L2(vec, ${VEC_LITERAL([
+      9.01::FLOAT, 9.02::FLOAT, 9.03::FLOAT, 9.04::FLOAT,
+      9.05::FLOAT, 9.06::FLOAT, 9.07::FLOAT, 9.08::FLOAT], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [9100]
+  - statement: DROP INDEX idx_rq_compact;
+  - statement: DELETE FROM rq WHERE id = 9100;
+  - statement: DROP TABLE rq;
+
+  - statement: CREATE TABLE rq_cos (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_cos SELECT i, ${VEC_LITERAL([
+      (sqrt(i) * sin(i*0.07))::FLOAT, (sqrt(i) * cos(i*0.07))::FLOAT,
+      (sqrt(i) * sin(i*0.11))::FLOAT, (sqrt(i) * cos(i*0.11))::FLOAT,
+      (sqrt(i) * sin(i*0.17))::FLOAT, (sqrt(i) * cos(i*0.17))::FLOAT,
+      (sqrt(i) * sin(i*0.23))::FLOAT, (sqrt(i) * cos(i*0.23))::FLOAT], 8)}
+      FROM ${RANGE2(1, 1001)} t(i);"
+  - statement: SET ${GUC_BF_THRESHOLD} = 1000000;
+  - statement: "CREATE TABLE rq_cos_truth AS SELECT id FROM rq_cos
+      ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;"
+  - statement: CREATE INDEX idx_rq_cos ON rq_cos USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_WITH_COSINE(quantizer='rabitq', m=16, ef_construction=160)};
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 160;
+  - query: EXPLAIN SELECT id FROM rq_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "WITH ann AS (SELECT id FROM rq_cos
+      ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10)
+      SELECT count(*) >= 8 FROM ann JOIN rq_cos_truth USING (id);"
+    _field_types: I
+    expect:
+      - [true]
+  - statement: DROP TABLE rq_cos;
+  - statement: DROP TABLE rq_cos_truth;
+
+  - statement: CREATE TABLE rq_ip (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_ip SELECT i, ${VEC_LITERAL([
+      (i * sin(i*0.07))::FLOAT, (i * cos(i*0.07))::FLOAT,
+      (i * sin(i*0.11))::FLOAT, (i * cos(i*0.11))::FLOAT,
+      (i * sin(i*0.17))::FLOAT, (i * cos(i*0.17))::FLOAT,
+      (i * sin(i*0.23))::FLOAT, (i * cos(i*0.23))::FLOAT], 8)}
+      FROM ${RANGE2(1, 1001)} t(i);"
+  - statement: SET ${GUC_BF_THRESHOLD} = 1000000;
+  - statement: "CREATE TABLE rq_ip_truth AS SELECT id FROM rq_ip
+      ORDER BY ${IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} DESC LIMIT 10;"
+  - statement: CREATE INDEX idx_rq_ip ON rq_ip USING ${VEX_INDEX} (vec${OPS_IP_COL})${IDX_WITH_IP(quantizer='rabitq', m=16, ef_construction=160)};
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: EXPLAIN SELECT id FROM rq_ip ORDER BY ${NEG_IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "WITH ann AS (SELECT id FROM rq_ip
+      ORDER BY ${NEG_IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10)
+      SELECT count(*) >= 8 FROM ann JOIN rq_ip_truth USING (id);"
+    _field_types: I
+    expect:
+      - [true]
+  - statement: DROP TABLE rq_ip;
+  - statement: DROP TABLE rq_ip_truth;

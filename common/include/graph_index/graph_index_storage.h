@@ -829,9 +829,12 @@ public:
             if (!can_reuse) {
                 id = base_layer.append();
                 LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-                metap->num_vectors = id + 1;
-                if (need_wal) {
-                    xlog.update_num_vector(metap->num_vectors);
+                const size_t new_count = size_t(id) + 1;
+                if (metap->num_vectors < new_count) {
+                    metap->num_vectors = new_count;
+                    if (need_wal) {
+                        xlog.update_num_vector(metap->num_vectors);
+                    }
                 }
                 LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
             }

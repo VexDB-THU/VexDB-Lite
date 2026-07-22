@@ -6,24 +6,30 @@
 #ifndef RABITQ_ROTATOR_H
 #define RABITQ_ROTATOR_H
 
-#include <vtl/vector>
-
-#include "pg_compat.h"
-#include "distance.h"
+#include <vector>
+#include "rabitq/platform.h"
+#include "distance/core/distance.h"
 
 namespace rabitq {
-class FhtKacRotator : public BaseObject {
+class FhtKacRotator {
 public:
     FhtKacRotator(int dim, int padded_dim)
-        : _dim(dim), _padded_dim(padded_dim), _flip(4 * _padded_dim / kByteLen, 0)
+        : _dim(dim),
+          _padded_dim(padded_dim),
+          _flip(4 * _padded_dim / kByteLen, 0)
     {
+        auto kernels = ann_helper::get_rabitq_kernels();
+        _flip_sign = kernels.flip_sign;
+        _kacs_walk = kernels.kacs_walk;
         uint32 bottom_log_dim = floor_log2(_dim);
         _trunc_dim = 1 << bottom_log_dim;
         _fac = 1.0f / std::sqrt(static_cast<float>(_trunc_dim));
         _fht_float = ann_helper::get_fht_func(bottom_log_dim);
         if (!_fht_float) {
-            ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-                errmsg("dimension of vector (%u:%u) is too big", _dim, bottom_log_dim)));
+            fail("vector dimension is too large for FHT");
+        }
+        if (!_flip_sign || !_kacs_walk) {
+            fail("SIMD rotation kernels are unavailable");
         }
     }
 
@@ -35,7 +41,10 @@ public:
     char *get_random_matrix() { return (char *)_flip.data(); }
     size_t get_random_matrix_size() const { return sizeof(uint8) * _flip.size(); }
 
-    void destroy() { ann_helper::optional_destroy(_flip); }
+    void destroy() {
+        _flip.clear();
+        _flip.shrink_to_fit();
+    }
 
 private:
     uint32 floor_log2(uint32 x) {
@@ -61,7 +70,9 @@ private:
     uint32 _trunc_dim{0};
     float _fac{0.0f};
     ann_helper::fht_func _fht_float;
-    Vector<uint8> _flip;
+    ann_helper::flip_sign_func _flip_sign;
+    ann_helper::kacs_walk_func _kacs_walk;
+    std::vector<uint8, HostAllocator<uint8>> _flip;
 };
 
 } /* namespace rabitq */

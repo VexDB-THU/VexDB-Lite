@@ -239,7 +239,13 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     info.options["dimension"] = Value::UBIGINT(uint64_t(dimension_));
     info.options["m"] = Value::INTEGER(m_);
     info.options["ef_construction"] = Value::INTEGER(ef_construction_);
-    info.options["metric"] = Value("l2");
+    const char *metric_name = "l2";
+    if (metric_ == VexMetric::INNER_PRODUCT) {
+        metric_name = "ip";
+    } else if (metric_ == VexMetric::COSINE) {
+        metric_name = "cosine";
+    }
+    info.options["metric"] = Value(metric_name);
     info.options["node_count"] = Value::UBIGINT(uint64_t(store.elems.size()));
     info.options["upper_count"] = Value::UBIGINT(uint64_t(store.upper_points.size()));
     info.options["entry_id"] = Value::UBIGINT(uint64_t(store.entry_info.id));
@@ -358,6 +364,38 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
         }
     }
 
+    if (rabitq_requested_) {
+        info.options["quantizer"] = Value("rabitq");
+    }
+    if (rabitq_use_ && rabitq_quantizer_) {
+        info.options["rabitq_version"] = Value::UINTEGER(2);
+        info.options["rabitq_query_rescaling_factor"] =
+            Value::DOUBLE(rabitq_query_rescaling_factor_);
+
+        const size_t random_bytes = rabitq_quantizer_->get_random_matrix_size();
+        const size_t centroid_bytes = HNSW_RABITQ_NUM_CLUSTERS * dimension_ * sizeof(float);
+        const size_t rotated_bytes = HNSW_RABITQ_NUM_CLUSTERS *
+                                     RABITQ_PADDED_DIM(dimension_) * sizeof(float);
+        string fixed_blob;
+        fixed_blob.reserve(random_bytes + centroid_bytes + rotated_bytes);
+        fixed_blob.append(rabitq_quantizer_->get_random_matrix(), random_bytes);
+        fixed_blob.append(reinterpret_cast<const char *>(rabitq_quantizer_->get_centroids()),
+                          centroid_bytes);
+        fixed_blob.append(reinterpret_cast<const char *>(rabitq_quantizer_->get_rotated_centroids()),
+                          rotated_bytes);
+        info.options["rabitq_fixed"] = Value::BLOB(
+            const_data_ptr_cast(fixed_blob.data()), fixed_blob.size());
+
+        string codes_blob;
+        uint64_t codes_n = rabitq_codes_.size();
+        codes_blob.append(reinterpret_cast<const char *>(&codes_n), sizeof(codes_n));
+        if (codes_n) {
+            codes_blob.append(reinterpret_cast<const char *>(rabitq_codes_.data()), codes_n);
+        }
+        info.options["rabitq_codes"] = Value::BLOB(
+            const_data_ptr_cast(codes_blob.data()), codes_blob.size());
+    }
+
     if (compact_mode_) {
         info.options["compact_mode"] = Value::BOOLEAN(true);
     }
@@ -394,32 +432,16 @@ IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> 
         return ExportStorageInfo();
     }
 
-    // Order matches ART::SerializeToWAL (duckdb/execution/index/art/art.cpp:1064):
-    // InitSerializationToWAL must run BEFORE GetInfo, because it sets each
-    // buffer's allocation_size and populates the serialization state that
-    // GetInfo() then reads. The returned IndexBufferInfo vectors MUST be
-    // placed into info.buffers, otherwise the WAL writes empty buffer data
-    // and reload populates the allocator's buffers map with INVALID_BLOCK
-    // block_pointers — first FixedSizeAllocator::Get() then SIGSEGVs in
-    // LoadFromDisk() because the BlockHandle points to no real block.
-    //
-    // Repro (m != 16 because m=16 happens to round to a buffer layout where
-    // the WAL replay path stumbles into a valid block by accident): 100 rows
-    // FLOAT[4] m=8 → CHECKPOINT → reopen → ANN query → SIGSEGV.
     IndexStorageInfo info(name);
-
+    info.root = 0;
     info.buffers.push_back(runtime_->store.node_alloc_->InitSerializationToWAL());
     info.buffers.push_back(runtime_->store.vector_alloc_->InitSerializationToWAL());
     info.buffers.push_back(runtime_->store.upper_alloc_->InitSerializationToWAL());
-
-    // Reuse ExportStorageInfo for the metadata (allocator_infos + options),
-    // but copy fields manually since IndexStorageInfo has a deleted copy ctor.
     auto src = ExportStorageInfo();
     for (auto &ainfo : src.allocator_infos) {
         info.allocator_infos.push_back(std::move(ainfo));
     }
     info.options = std::move(src.options);
-
     return info;
 }
 

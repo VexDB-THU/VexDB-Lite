@@ -44,9 +44,10 @@ void ProductQuantizer::set_basic_values(size_t dim, size_t m, size_t nbits_in) {
 }
 
 void ProductQuantizer::set_derived_values(const PQContext &ctx) {
-    if (d % M != 0) {
-        VEX_QUANT_ERROR("PQ: dimension (" + std::to_string(d) +
-                        ") must be a multiple of subquantizer count (" + std::to_string(M) + ")");
+    if (d == 0 || M == 0 || d % M != 0) {
+        VEX_QUANT_ERRORF(
+            "PQ: dimension (%zu) must be a positive multiple of subquantizer count (%zu)",
+            d, M);
     }
     dsub      = d / M;
     code_size = (nbits * M + 7) / 8;
@@ -56,8 +57,8 @@ void ProductQuantizer::set_derived_values(const PQContext &ctx) {
     // already supports >1GB so duck falls through unchanged.
     centroids = static_cast<float *>(ctx.allocator.AllocHugeZero(d * ksub * sizeof(float)));
     if (centroids == nullptr) {
-        VEX_QUANT_ERROR("PQ: failed to allocate " +
-                        std::to_string(d * ksub * sizeof(float)) + " bytes for centroids");
+        VEX_QUANT_ERRORF("PQ: failed to allocate %zu bytes for centroids",
+                         d * ksub * sizeof(float));
     }
 }
 

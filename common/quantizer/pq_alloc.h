@@ -27,7 +27,9 @@ extern "C" {
 #endif
 
 #include <cstddef>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -91,10 +93,31 @@ public:
 {
     throw VexQuantizerError(std::string(msg));
 }
+
+[[noreturn]] inline void VEX_QUANT_ERRORF(const char *format, ...)
+{
+    char message[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    throw VexQuantizerError(message);
+}
 #else
 [[noreturn]] inline void VEX_QUANT_ERROR(std::string_view msg)
 {
-    ereport(ERROR, (errmsg("PQ quantizer: %s", std::string(msg).c_str())));
+    ereport(ERROR, (errmsg("PQ quantizer: %.*s",
+                           static_cast<int>(msg.size()), msg.data())));
+}
+
+[[noreturn]] inline void VEX_QUANT_ERRORF(const char *format, ...)
+{
+    char message[256];
+    va_list args;
+    va_start(args, format);
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    ereport(ERROR, (errmsg("PQ quantizer: %s", message)));
 }
 #endif
 

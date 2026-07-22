@@ -377,6 +377,7 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
     auto dimension = graph_idx.GetDimension();
     auto metric = graph_idx.GetMetric();
     auto use_pq_checksum = graph_idx.UsesPQCoverageChecksum();
+    auto use_rabitq_checksum = graph_idx.UsesRaBitQCoverageChecksum();
 
     vector<StorageIndex> scan_column_ids;
     scan_column_ids.emplace_back(vector_column_id);
@@ -430,6 +431,8 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
             }
             if (use_pq_checksum) {
                 coverage.vector_checksum += graph_idx.HashPQVectorForCoverage(rid, vec);
+            } else if (use_rabitq_checksum) {
+                coverage.vector_checksum += graph_idx.HashRaBitQVectorForCoverage(rid, vec);
             } else {
                 coverage.vector_checksum += HashCoverageRowVector(rid, vec, dimension);
             }

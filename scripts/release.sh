@@ -578,6 +578,10 @@ build_pg() {
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_lite.so.debug" "$outdir/"
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/vexdb_lite.control" "$outdir/"
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0.sql" "$outdir/"
+    # 1.1 的完整安装内容与当前 1.0 安装脚本一致；另带增量升级脚本，
+    # 让已有 1.0 数据库可以通过 ALTER EXTENSION UPDATE 升级。
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0.sql" "$outdir/vexdb_lite--1.1.sql"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0--1.1.sql" "$outdir/"
 }
 
 # PG smoke：替换远程现成 PG 的 .so + CREATE EXTENSION + 最小 ANN 查询。
@@ -734,7 +738,8 @@ cmd_package() {
             local pgver="${entry%%:*}" pgdir="$archdir/${entry%%:*}"
             if [[ -f "$pgdir/vexdb_lite.so" ]]; then
                 pkg_tar "$RELEASE_DIR/vexdb-lite-${pgver}-linux-${arch}.tar.gz" "$pgdir" \
-                    vexdb_lite.so vexdb_lite.control vexdb_lite--1.0.sql
+                    vexdb_lite.so vexdb_lite.control vexdb_lite--1.0.sql \
+                    vexdb_lite--1.1.sql vexdb_lite--1.0--1.1.sql
             fi
             if [[ -f "$pgdir/vexdb_lite.so.debug" ]]; then
                 pkg_tar "$RELEASE_DIR/vexdb-lite-${pgver}-debugsymbols-linux-${arch}.tar.gz" "$pgdir" \

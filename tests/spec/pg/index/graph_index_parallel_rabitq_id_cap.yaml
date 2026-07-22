@@ -1,9 +1,10 @@
 name: graph_index_parallel_rabitq_id_cap
 tags: [pg-only, regression, parallel, rabitq]
 description: |
-  parallel_workers=32/64 + quantizer=rabitq + 含 NULL 行,
-  parallel build 不应超出 id_to_tid cap。
-  规模缩小到 2000 行 × 32d 但保留触发条件 (并行 + rabitq + NULL 行 + m/efc 参数)。
+  parallel_workers + quantizer=rabitq + 含 NULL 行时，必须保持索引正确。
+  数据量必须超过 10000，使 RaBitQ 真正启用；maintenance_work_mem 低于
+  1GB 会从一开始进入磁盘构建。多个 PG worker 会共享图页，并通过
+  vector_file_write 分片 LWLock 保护小 code 的对齐块读改写。
 engines: [pg]
 steps:
   - statement: SET maintenance_work_mem = '512MB';
@@ -12,14 +13,33 @@ steps:
   - statement: |
       INSERT INTO t_1078974
       SELECT i, ('[' || array_to_string(array(SELECT ((i+j*5) % 300)::float/15 FROM generate_series(0,31) j), ',') || ']')::floatvector(32)
-      FROM generate_series(1, 2000) AS i;
-  - statement: INSERT INTO t_1078974 VALUES (9999, NULL);
+      FROM generate_series(1, 12000) AS i;
+  - statement: INSERT INTO t_1078974 VALUES (20000, NULL);
+  - statement: >
+      INSERT INTO t_1078974 VALUES
+      (99999, '[1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000]'::floatvector(32));
 
   - statement: CREATE INDEX idx_1078974a ON t_1078974 USING vexdb_graph (v floatvector_l2_ops) WITH (m = 20, ef_construction = 100, quantizer = rabitq, parallel_workers = 4);
+  # Parallel scan order changes the graph insertion order. Use a wide search
+  # here so this corruption regression checks coverage, not low-ef recall noise.
+  - statement: SET vexdb.ef_search = 2048;
+  - query: >
+      SELECT content::text FROM index_inspect('idx_1078974a')
+      WHERE attribute = 'Working Quantizer';
+    expect: [["RaBitQ"]]
+  - query: >
+      SELECT content::text FROM index_inspect('idx_1078974a')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [["12001"]]
+  - statement: SET enable_seqscan = off;
+  - query: >
+      SELECT count(*) FROM (
+        SELECT id FROM t_1078974
+        ORDER BY v <-> '[1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000,1000]'::floatvector(32)
+        LIMIT 1
+      ) AS ann;
+    expect: [["1"]]
+  - statement: SET enable_seqscan = on;
+  - statement: RESET vexdb.ef_search;
   - statement: DROP INDEX idx_1078974a;
-
-  - statement: CREATE INDEX idx_1078974b ON t_1078974 USING vexdb_graph (v floatvector_cosine_ops) WITH (parallel_workers = 4);
-  - statement: DROP INDEX idx_1078974b;
-
-  - statement: CREATE INDEX idx_1078974c ON t_1078974 USING vexdb_graph (v floatvector_ip_ops) WITH (parallel_workers = 4);
-  - statement: DROP INDEX idx_1078974c;
+  - statement: DROP TABLE t_1078974 CASCADE;

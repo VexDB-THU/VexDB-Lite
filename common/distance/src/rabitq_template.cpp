@@ -20,7 +20,6 @@ static_assert(false, "don't use the file without definition DISTANCE_FUNC_NAME")
 #include <vtl/array>
 #include <vtl/expr_helper>
 
-#include "pg_compat.h"
 #include "distance/core/distance_utils_core.h"
 #include "distance/core/transform_template_core.h"
 
@@ -434,7 +433,6 @@ void DISTANCE_FUNC_NAME(kacs_walk)(float *data, size_t len)
 }
 }   /* namespace ann_helper */
 
-#include "rabitq.h"
 namespace ann_helper {
 float DISTANCE_FUNC_NAME(warmup_ip_x0_q)(uint64 *data, const uint64 *query, float delta, float vl, size_t dim)
 {

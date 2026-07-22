@@ -131,9 +131,9 @@ WITH (
     m = 16,                  -- 图索引 M 参数（邻居数上限）
     ef_construction = 64,    -- 建图时搜索宽度
     threads = 1,             -- 并行 worker 数（>1 启用并行构建）
-    quantizer = 'pq',        -- 可选：使用 PQ 量化
+    quantizer = 'pq',        -- 可选：'pq' 或 'rabitq'
     pq_m = 8,                -- PQ 子量化器数（每段 dim/pq_m 维度）
-    memory_mode = 'compact'  -- 可选：仅 PQ codes，不存原始向量
+    memory_mode = 'compact'  -- 可选：不保留索引侧原始向量镜像
 );
 ```
 
@@ -145,9 +145,9 @@ WITH (
 | `m` | `16` | 图索引每个节点的最大邻居数 |
 | `ef_construction` | `64` | 建图阶段搜索宽度，越大召回越好建索引越慢 |
 | `threads` | `1` | 并行构建 worker 数；`1` = 串行；>1 启用 striped lock 并发 |
-| `quantizer` | `none` | `'pq'` 启用 Product Quantization |
+| `quantizer` | `none` | `'pq'` 启用 Product Quantization；`'rabitq'` 启用 RaBitQ 图搜索 |
 | `pq_m` | (无) | PQ 子量化器数；要求 `dim % pq_m == 0` |
-| `memory_mode` | `'full'` | `'full'` 存原始向量 + PQ；`'compact'` 仅 PQ codes（节省 ~32x 内存，无法精确 refine） |
+| `memory_mode` | `'full'` | `'full'` 存索引侧原始向量 + 量化 code；`'compact'` 支持 PQ 和 RaBitQ |
 
 ### 索引 vs 暴力搜索
 
@@ -218,15 +218,41 @@ WITH (quantizer = 'pq', pq_m = 16, memory_mode = 'compact');
 ```
 
 `memory_mode='compact'` 时：
-- 原始向量在 PQ 训练后被释放（节省 32x 内存）
-- 查询自动走 PQ 路径，无法 refine
-- 适合内存敏感场景（百亿向量）
+
+- 表中的原始向量不变，索引侧的原始向量镜像在训练后被释放。
+- PQ 查询自动走 code 路径，无法使用原始向量 refine。
+- RaBitQ 查询仍通过 code-aware store 遍历原图，增量向量先编码再插入图。
+- PQ 与 RaBitQ 的 compact 状态都会持久化，checkpoint 或重启后无需重建。
+
+## RaBitQ
+
+RaBitQ 使用公共量化器和 code-aware 图遍历，支持 L2、cosine 和 inner product：
+
+```sql
+CREATE INDEX idx_vec_rabitq ON items
+USING GRAPH_INDEX (vec)
+WITH (metric = 'cosine', quantizer = 'rabitq', m = 16, ef_construction = 160);
+```
+
+RaBitQ compact 示例：
+
+```sql
+CREATE INDEX idx_vec_rabitq_compact ON items
+USING GRAPH_INDEX (vec)
+WITH (metric = 'cosine', quantizer = 'rabitq', memory_mode = 'compact',
+      m = 16, ef_construction = 160);
+```
+
+当前限制：
+
+- `quantizer='rabitq'` 不能与 `pq_m` 同时使用。
+- 当前版本优先保证统一算法、持久化和召回正确性；小规模数据上不保证比 plain 图索引更快。
 
 ### 搜索模式（GUC）
 
 ```sql
 SET vexdb_pq_search_mode = 'pq_only';   -- 仅用 PQ codes，最快
-SET vexdb_pq_search_mode = 'off';       -- 仅用原始向量（compact 模式会自动启用 pq_only）
+SET vexdb_pq_search_mode = 'off';       -- PQ 默认路径（compact PQ 会自动启用 pq_only）
 SET vexdb_pq_refine_k_factor = 4.0;     -- 图索引找 4k 个候选后用原向量精排
 ```
 
@@ -426,7 +452,7 @@ SELECT id FROM items ORDER BY list_negative_inner_product(vec, [...]::FLOAT[3]) 
 ### Index build OOM
 
 `m × ef_construction` 调小，或分批 INSERT 后 `CREATE INDEX`。
-PQ + `memory_mode='compact'` 在百万级以上明显省内存。
+PQ 或 RaBitQ + `memory_mode='compact'` 可避免索引内再保留一份原始向量。
 
 ---
 

@@ -43,6 +43,7 @@ extern "C" {
 #include "pq.h"
 #include "rabitq/rabitq_distancer.h"
 #include "rel_utils.h"
+#include "vector_buffer/vector_smgr.h"
 
 using namespace disk_container;
 using namespace ann_helper;
@@ -68,6 +69,16 @@ struct GraphIndexShared {
 
 #define ParallelTableScanFromGraphIndexShared(shared) \
     ((ParallelTableScanDesc)((char *)(shared) + MAXALIGN(sizeof(GraphIndexShared))))
+
+static LWLock *
+graph_build_insert_lock(Relation index)
+{
+    if (VexGraphBuildLocks == NULL) {
+        return NULL;
+    }
+    uint64 key = (uint64)RelationGetRelid(index) * UINT64CONST(11400714819323198485);
+    return &VexGraphBuildLocks[key % VEX_GRAPH_BUILD_LOCK_STRIPES].lock;
+}
 
 /* Lock-free bounded work queue for parallel memory build.
  * Uses boost::lockfree::queue with pg_yield backoff instead of mutex. */
@@ -138,6 +149,7 @@ public:
         : fork_num(fork_num),
           id_type(graph_index_get_id_type(index)),
           qt_type(graph_index_get_quantizer_type(index)),
+          compact_mode(graph_index_get_compact_mode(index)),
           precision_type(get_data_type(index)),
           m(adjust_m(graph_index_get_m(index), id_type)),
           ef_construction(graph_index_get_ef_construction(index)),
@@ -198,20 +210,30 @@ public:
 
     BlockNumber build_index(Relation heap, Relation index, IndexInfo *index_info)
     {
-        if (qt_type == QuantizerType::RABITQ) {
-            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                errmsg("RaBitQ quantizer is not yet supported"),
-                errhint("Remove 'quantizer=rabitq' from the index options.")));
+        if (compact_mode && heap != NULL &&
+            heap->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED) {
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("memory_mode='compact' is not supported for unlogged tables"),
+                 errdetail("The unlogged init fork cannot preserve a trained quantizer after a crash.")));
         }
+
         create_metapage(index);
-        if (qt_type == QuantizerType::PQ) {
+        if (qt_type != QuantizerType::NONE) {
             if (init_quantizer(heap, index)) {
                 LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
                 metap->quantizer_metainfo.set_enable();
                 MarkBufferDirty(metabuf);
                 LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
-                elem_size = metap->quantizer_metainfo.get_pq_metainfo().code_size();
+                elem_size = visit([](auto &q) { return q.code_size(); },
+                    quantizer.value());
             } else {
+                if (compact_mode && heap != NULL) {
+                    ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("memory_mode='compact' requires an active %s quantizer",
+                             quantizer_name(qt_type))));
+                }
                 qt_type = QuantizerType::NONE;
             }
         }
@@ -305,6 +327,7 @@ public:
 private:
     struct BuildCallbackDataBase {
         GraphIndexBuild *build;
+        Relation index;
         Relation heap;
         Buffer own_metabuf;
         DiskStoreVariant disk_store;
@@ -314,6 +337,7 @@ private:
         BuildCallbackDataBase(GraphIndexBuild *reference, Relation index, Relation heap,
             BlockNumber metablkno, GraphIndexShared *shared_arg = nullptr)
             : build(reference),
+              index(index),
               heap(heap),
               own_metabuf(ReadBuffer(index, metablkno)),
               ctx(index, GRAPH_INDEX_PS_BLKNO, false),
@@ -354,6 +378,7 @@ private:
     bool need_norm;
     IdType id_type;
     QuantizerType qt_type;
+    bool compact_mode;
     DistPrecisionType precision_type;
     static constexpr VecStorageType storage_type = VecStorageType::PureVec;
     uint_fast16_t dimension;
@@ -492,9 +517,16 @@ private:
 
     bool init_quantizer(Relation heap, Relation index)
     {
-        if (qt_type != QuantizerType::PQ) return false;
-        if (heap == NULL) return false;
-        if (build_state != BuildState::MEMORY) {
+        if (heap == NULL || qt_type == QuantizerType::NONE) return false;
+        if (qt_type == QuantizerType::PQ && build_state != BuildState::MEMORY) {
+            if (compact_mode) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("memory_mode='compact' requires an active PQ quantizer"),
+                     errdetail("PQ training requires the in-memory build path, but maintenance_work_mem is %dkB.",
+                         maintenance_work_mem_kb),
+                     errhint("Raise maintenance_work_mem to at least 1GB.")));
+            }
             ereport(NOTICE,
                 (errmsg("vexdb_graph: PQ requires memory build; "
                         "maintenance_work_mem (%dkB) too low — falling back to plain HNSW",
@@ -502,26 +534,76 @@ private:
                  errhint("Raise maintenance_work_mem to at least 1GB to enable PQ.")));
             return false;
         }
-        const int ksub = 256;
-        int target = (int)std::min<int64>((int64)reltuples, (int64)MAX_SAMPLE_VECTOR_NUM);
-        if (target < ksub) target = ksub;
-        FloatVectorArray samples = FloatVectorArrayInit(target, dimension);
-        ann_sample_rows(samples, heap, index, dimension, target,
-                        false, DistPrecisionType::FLOAT);
-        if (samples->length < ksub) {
-            int sample_len = samples->length;
-            FloatVectorArrayFree(samples);
-            ereport(NOTICE, (errmsg("vex PQ: only %d sample rows < ksub=%d, "
-                                    "skipping PQ training", sample_len, ksub)));
+
+        const int minimum_samples = qt_type == QuantizerType::PQ
+            ? 256
+            : GRAPH_INDEX_MIN_QT_SAMPLES_SIZE;
+        size_t estimated_samples = get_relstats_reltuples(heap);
+        size_t target = std::max<size_t>(minimum_samples, estimated_samples);
+        target = std::min<size_t>(target, MAX_SAMPLE_VECTOR_NUM);
+
+        size_t bytes_per_sample = (size_t)dimension * sizeof(float);
+        size_t sample_budget = (size_t)maintenance_work_mem_kb * 1024;
+        size_t max_samples_by_memory = std::min(
+            sample_budget / bytes_per_sample,
+            (size_t)MaxAllocSize / bytes_per_sample);
+        if (max_samples_by_memory < (size_t)minimum_samples) {
+            if (compact_mode) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("memory_mode='compact' requires an active %s quantizer",
+                         quantizer_name(qt_type)),
+                     errdetail("Training requires at least %zu MB of sample memory.",
+                         ((size_t)minimum_samples * bytes_per_sample + 1024 * 1024 - 1) /
+                             (1024 * 1024)),
+                     errhint("Raise maintenance_work_mem.")));
+            }
+            ereport(NOTICE,
+                (errmsg("vex %s: training samples need at least %zu MB, "
+                        "skipping quantizer training",
+                        quantizer_name(qt_type),
+                        ((size_t)minimum_samples * bytes_per_sample + 1024 * 1024 - 1) /
+                            (1024 * 1024)),
+                 errhint("Raise maintenance_work_mem to enable this quantizer.")));
             return false;
         }
-        {
+        target = std::min(target, max_samples_by_memory);
+
+        FloatVectorArray samples = FloatVectorArrayInit((int)target, dimension);
+        ann_sample_rows(samples, heap, index, dimension, (int)target,
+                        need_norm, DistPrecisionType::FLOAT);
+        if (samples->length < minimum_samples) {
+            int sample_len = samples->length;
+            FloatVectorArrayFree(samples);
+            if (compact_mode) {
+                ereport(ERROR,
+                    (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                     errmsg("memory_mode='compact' requires an active %s quantizer",
+                         quantizer_name(qt_type)),
+                     errdetail("Only %d sample rows are available; at least %d are required.",
+                         sample_len, minimum_samples)));
+            }
+            ereport(NOTICE,
+                (errmsg("vex %s: only %d sample rows < required=%d, "
+                        "skipping quantizer training",
+                        quantizer_name(qt_type), sample_len, minimum_samples)));
+            return false;
+        }
+
+        if (qt_type == QuantizerType::PQ) {
             quantizer.emplace();
             quantizer->template emplace<PQDistancer>();
             PQDistancer &tmp = quantizer->template get<PQDistancer>();
             tmp.train(index, samples, dimension, metric, false,
                       parallel_workers, maintenance_work_mem_kb,
                       (uint32)graph_index_get_pq_m(index));
+            tmp.flush(index, qtcode_block, false);
+        } else {
+            quantizer.emplace();
+            quantizer->template emplace<RabitqDistancer>();
+            RabitqDistancer &tmp = quantizer->template get<RabitqDistancer>();
+            tmp.train(index, samples, dimension, metric, need_norm,
+                      parallel_workers, maintenance_work_mem_kb);
             tmp.flush(index, qtcode_block, false);
         }
         FloatVectorArrayFree(samples);
@@ -541,18 +623,43 @@ private:
     void insert_on_disk(BuildCallbackDataBase &data, D &d, const char *query, ItemPointer tid)
     {
         d.process(query);
-        if (id_type == IdType::U32) {
-            auto &ds = data.disk_store.template get<DiskStore<uint32>>();
-            GraphIndexAlgorithm algo{ef_construction, m, ds, d};
-            typename decltype(algo)::InsertContext ctx{data.ctx, query, tid};
-            algo.insert(ctx);
-            ctx.destroy();
-        } else {
-            auto &ds = data.disk_store.template get<DiskStore<size_t>>();
-            GraphIndexAlgorithm algo{ef_construction, m, ds, d};
-            typename decltype(algo)::InsertContext ctx{data.ctx, query, tid};
-            algo.insert(ctx);
-            ctx.destroy();
+        /* DiskStore protects individual page reads/writes, but one HNSW insert
+         * is a compound operation: search neighbors, publish the code, then
+         * update reverse edges.  PG workers must not interleave those steps or
+         * another worker can observe a half-published node and persist invalid
+         * neighbor IDs.  PostgreSQL parallel workers share a heavyweight-lock
+         * group, so a named LWLock is required for true process-to-process
+         * exclusion here. */
+        LWLock *insert_lock = parallel_workers > 0 ? graph_build_insert_lock(data.index) : NULL;
+        if (insert_lock != NULL) {
+            LWLockAcquire(insert_lock, LW_EXCLUSIVE);
+        }
+        PG_TRY();
+        {
+            if (id_type == IdType::U32) {
+                auto &ds = data.disk_store.template get<DiskStore<uint32>>();
+                GraphIndexAlgorithm algo{ef_construction, m, ds, d};
+                typename decltype(algo)::InsertContext ctx{data.ctx, query, tid};
+                algo.insert(ctx);
+                ctx.destroy();
+            } else {
+                auto &ds = data.disk_store.template get<DiskStore<size_t>>();
+                GraphIndexAlgorithm algo{ef_construction, m, ds, d};
+                typename decltype(algo)::InsertContext ctx{data.ctx, query, tid};
+                algo.insert(ctx);
+                ctx.destroy();
+            }
+        }
+        PG_CATCH();
+        {
+            if (insert_lock != NULL) {
+                LWLockRelease(insert_lock);
+            }
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+        if (insert_lock != NULL) {
+            LWLockRelease(insert_lock);
         }
     }
 
@@ -883,12 +990,19 @@ private:
         uint32 num_vectors = store.get_vector_num();
         uint32 one_chunk_elem_nums = vector_pool.get_one_chunk_elem_nums();
 
-        bool pq_on = (qt_type == QuantizerType::PQ);
-        if (pq_on) {
+        bool quantizer_on = (qt_type != QuantizerType::NONE);
+        if (compact_mode && !quantizer_on) {
+            ereport(ERROR,
+                (errcode(ERRCODE_DATA_EXCEPTION),
+                 errmsg("memory_mode='compact' cannot flush raw vectors")));
+        }
+        if (quantizer_on) {
             if (!quantizer.has_value()) {
-                ereport(ERROR, (errmsg("PQ codebook unavailable during flush_graph")));
+                ereport(ERROR,
+                    (errmsg("%s codebook unavailable during flush_graph",
+                        quantizer_name(qt_type))));
             }
-            auto write_pq_codes = [&](auto &encoder) {
+            auto write_quantizer_codes = [&](auto &encoder) {
                 const size_t code_size = encoder.code_size();
                 char *code_chunk = (char *)palloc(one_chunk_elem_nums * code_size);
                 for (size_t i = 0; i < vec.size(); ++i) {
@@ -907,7 +1021,7 @@ private:
                 }
                 pfree(code_chunk);
             };
-            visit(write_pq_codes, quantizer.value());
+            visit(write_quantizer_codes, quantizer.value());
         } else {
             for (size_t i = 0; i < vec.size(); ++i) {
                 size_t batch_offset = i * one_chunk_elem_nums;
@@ -921,7 +1035,7 @@ private:
 
         flush_timer.report("Flush Finished");
         LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-        if (pq_on) {
+        if (quantizer_on) {
             metap->quantizer_metainfo.set_enable();
         }
         MarkBufferDirty(metabuf);
@@ -1034,24 +1148,45 @@ graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 
                 Pointer vec_p;
                 char *v = DatumGetVector(values[0], DistPrecisionType::FLOAT, &vec_p);
+                LWLock *insert_lock = graph_build_insert_lock(index);
 
-                cbdata.disk_distancer.process(v);
-                if (GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->id_type == IdType::U32) {
-                    auto &ds = cbdata.disk_store.template get<DiskStore<uint32>>();
-                    GraphIndexAlgorithm algo{GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->ef_construction,
-                                             GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->m, ds,
-                                             cbdata.disk_distancer};
-                    typename decltype(algo)::InsertContext ctx{cbdata.ctx, v, tid};
-                    algo.insert(ctx);
-                    ctx.destroy();
-                } else {
-                    auto &ds = cbdata.disk_store.template get<DiskStore<size_t>>();
-                    GraphIndexAlgorithm algo{GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->ef_construction,
-                                             GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->m, ds,
-                                             cbdata.disk_distancer};
-                    typename decltype(algo)::InsertContext ctx{cbdata.ctx, v, tid};
-                    algo.insert(ctx);
-                    ctx.destroy();
+                if (insert_lock != NULL) {
+                    LWLockAcquire(insert_lock, LW_EXCLUSIVE);
+                }
+                PG_TRY();
+                {
+                    cbdata.disk_distancer.process(v);
+                    if (GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->id_type == IdType::U32) {
+                        auto &ds = cbdata.disk_store.template get<DiskStore<uint32>>();
+                        GraphIndexAlgorithm algo{GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->ef_construction,
+                                                 GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->m, ds,
+                                                 cbdata.disk_distancer};
+                        typename decltype(algo)::InsertContext ctx{cbdata.ctx, v, tid};
+                        algo.insert(ctx);
+                        ctx.destroy();
+                    } else {
+                        auto &ds = cbdata.disk_store.template get<DiskStore<size_t>>();
+                        GraphIndexAlgorithm algo{GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->ef_construction,
+                                                 GRAPH_INDEX_PAGE_GET_META(BufferGetPage(cbdata.own_metabuf))->m, ds,
+                                                 cbdata.disk_distancer};
+                        typename decltype(algo)::InsertContext ctx{cbdata.ctx, v, tid};
+                        algo.insert(ctx);
+                        ctx.destroy();
+                    }
+                }
+                PG_CATCH();
+                {
+                    if (insert_lock != NULL) {
+                        LWLockRelease(insert_lock);
+                    }
+                    if (vec_p != DatumGetPointer(values[0])) {
+                        pfree(vec_p);
+                    }
+                    PG_RE_THROW();
+                }
+                PG_END_TRY();
+                if (insert_lock != NULL) {
+                    LWLockRelease(insert_lock);
                 }
 
                 if (vec_p != DatumGetPointer(values[0])) {
@@ -1067,13 +1202,16 @@ graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc)
             data.destroy();
         };
 
+        GraphIndexMetaPage metap = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf));
+        QuantizerType worker_qt_type = metap->quantizer_metainfo.get_type();
+
         DispatchRunner<true,
             MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE>,
             DistPrecisionTypeList<DistPrecisionType::FLOAT>,
             DispatcherMode::BUILD_PAIR>::call(
             get_metric_from_index(indexRel), DistPrecisionType::FLOAT,
             TupleDescAttr(indexRel->rd_att, 0)->atttypmod > 0 ? (uint_fast16_t)TupleDescAttr(indexRel->rd_att, 0)->atttypmod : 0,
-            QuantizerType::NONE, run_build_index);
+            worker_qt_type, run_build_index);
 
         disk_store.destroy();
         ctx.destroy();

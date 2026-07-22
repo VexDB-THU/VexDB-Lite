@@ -7,6 +7,7 @@
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
 #include "quantizer/product_quantizer.h"
+#include "rabitq/rabitq.h"
 
 #include <unordered_set>
 
@@ -53,7 +54,7 @@ public:
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
                idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false,
-               int build_threads = 1);
+               int build_threads = 1, bool rabitq_requested = false);
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
@@ -66,6 +67,8 @@ public:
     // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
     void SearchPQ(const float *query_vec, idx_t k, std::vector<row_t> &row_ids,
                   std::vector<float> &distances, double refine_factor = 1.0) const;
+    void SearchRaBitQ(const float *query_vec, idx_t k, int ef,
+                      std::vector<row_t> &row_ids, std::vector<float> &distances) const;
 
     idx_t GetDimension() const {
         return dimension_;
@@ -86,6 +89,8 @@ public:
     bool HasVectorCoverageChecksum() const;
     bool UsesPQCoverageChecksum() const;
     uint64_t HashPQVectorForCoverage(row_t row_id, const float *vec) const;
+    bool UsesRaBitQCoverageChecksum() const;
+    uint64_t HashRaBitQVectorForCoverage(row_t row_id, const float *vec) const;
     bool HasRowIdCoverageCheck() const { return rowid_coverage_checked_; }
     bool IsRowIdCoverageStale() const { return rowid_coverage_stale_; }
     void MarkRowIdCoverageChecked(bool stale) {
@@ -95,11 +100,15 @@ public:
     // HNSW entry-point level (top layer). -1 when the index has no nodes.
     int GetMaxLevel() const;
     bool UsesPQ() const { return pq_use_; }
+    bool UsesRaBitQ() const;
+    const char *GetQuantizerName() const;
     uint32_t GetPQM() const { return pq_use_ ? static_cast<uint32_t>(pq_quantizer_.M) : 0u; }
     idx_t GetPQCodesBytes() const { return pq_codes_.size(); }
     idx_t GetPQCodebookBytes() const {
         return pq_use_ ? pq_quantizer_.get_centroids_size() * sizeof(float) : 0u;
     }
+    idx_t GetRaBitQCodesBytes() const;
+    idx_t GetRaBitQFixedBytes() const;
     bool IsCompactMode() const { return compact_mode_; }
 
 public:
@@ -140,6 +149,7 @@ private:
     void DeserializeFromStorage(const IndexStorageInfo &info);
     void DeserializePQAndModeFromStorage(const IndexStorageInfo &info);
     void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
+    void TrainAndEncodeRaBitQ();
 
     idx_t dimension_;
     int m_;
@@ -174,10 +184,21 @@ private:
     std::vector<row_t> pq_row_id_order_;
     std::vector<uint64_t> pq_vector_coverage_hashes_;
 
-    // memory_mode='compact' (PQ-only). After BuildBulk + TrainAndEncodePQ
-    // releases the raw vector tier, SearchANN refuses to run and post-build
-    // INSERTs encode into pq_codes_ without traversing the (now-broken) HNSW
-    // graph. Persisted across CommitDrop / Vacuum / Reload.
+    // RaBitQ shares the graph topology with the raw-vector index, but replaces
+    // distance reads during search with compact codes aligned by internal node
+    // id. Training and estimation live in common/rabitq; this class only adapts
+    // DuckDB build, persistence and row-id filtering.
+    bool rabitq_requested_ = false;
+    bool rabitq_use_ = false;
+    std::unique_ptr<::rabitq::RaBitQuantizer> rabitq_quantizer_;
+    double rabitq_query_rescaling_factor_ = 0.0;
+    std::vector<uint8_t> rabitq_codes_;
+
+    // memory_mode='compact' releases only the index-side raw-vector mirror; the
+    // table column remains unchanged. PQ searches its code array, while RaBitQ
+    // keeps using the graph through a code-aware store. Post-build RaBitQ INSERTs
+    // are encoded before graph insertion. Persisted across CommitDrop / Vacuum /
+    // Reload.
     bool compact_mode_ = false;
 
     // Lazy row_id → store_id index used by SearchPQ refine. Built on first

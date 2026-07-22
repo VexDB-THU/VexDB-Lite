@@ -1,0 +1,29 @@
+name: graph_index_rabitq_dim1
+tags: [pg-only, regression, rabitq, active-quantizer, edge-case]
+description: |
+  floatvector(1) is a supported type dimension. RaBitQ's FHT rotation must
+  treat the one-element transform as identity instead of rejecting log2(1)=0.
+engines: [pg]
+steps:
+  - statement: SET maintenance_work_mem = '512MB';
+  - statement: DROP TABLE IF EXISTS t_rabitq_dim1 CASCADE;
+  - statement: CREATE TABLE t_rabitq_dim1 (id int, vec floatvector(1));
+  - statement: >
+      INSERT INTO t_rabitq_dim1
+      SELECT i, ('[' || ((i % 1000)::float4 / 10)::text || ']')::floatvector(1)
+      FROM generate_series(1, 12000) AS i;
+  - statement: INSERT INTO t_rabitq_dim1 VALUES (99999, '[10000]'::floatvector(1));
+  - statement: >
+      CREATE INDEX idx_rabitq_dim1 ON t_rabitq_dim1
+      USING vexdb_graph (vec floatvector_l2_ops) WITH (quantizer = rabitq);
+  - query: >
+      SELECT content::text FROM index_inspect('idx_rabitq_dim1')
+      WHERE attribute = 'Working Quantizer';
+    expect: [["RaBitQ"]]
+  - statement: SET enable_seqscan = off;
+  - query: >
+      SELECT id FROM t_rabitq_dim1
+      ORDER BY vec <-> '[10000]'::floatvector(1) LIMIT 1;
+    expect: [["99999"]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE t_rabitq_dim1 CASCADE;

@@ -81,6 +81,15 @@ endif()
 set(VEXDB_DISTANCE_SRCS
     ${REPO_ROOT}/common/distance/src/architecture.cpp
     ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/pq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/rabitq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/vector_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/pq_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/annkmeans.cpp
+    ${REPO_ROOT}/common/quantizer/product_quantizer.cpp
+    ${REPO_ROOT}/common/rabitq/rabitq.cpp
+    ${REPO_ROOT}/common/rabitq/estimator.cpp
+    ${REPO_ROOT}/common/rabitq/rotator.cpp
     src/distance/general.cpp
 )
 if(_VEX_TARGET_ARCH MATCHES "x86_64|amd64|AMD64")

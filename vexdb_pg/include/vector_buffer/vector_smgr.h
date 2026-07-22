@@ -12,6 +12,7 @@
 extern "C" {
 #endif
 #include "storage/smgr.h"
+#include "storage/lwlock.h"
 #ifdef __cplusplus
 }
 #endif
@@ -20,6 +21,13 @@ extern "C" {
 #include "vector_buffer/vector_buffer_manager.h"
 
 #define VERIFY_BUFFER false
+#define VEX_VEC_WRITE_LOCK_STRIPES 128
+#define VEX_GRAPH_BUILD_LOCK_STRIPES 128
+
+/* Cross-process locks for aligned-block read/modify/write in vec_write. */
+extern LWLockPadded *VexVecWriteLocks;
+/* Cross-process locks for one compound disk graph insertion. */
+extern LWLockPadded *VexGraphBuildLocks;
 
 /* SMGR_READ_STATUS enum */
 enum SMGR_READ_STATUS {

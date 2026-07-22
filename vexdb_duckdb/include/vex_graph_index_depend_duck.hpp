@@ -98,11 +98,7 @@ inline Oid index_getprocid(void *index, int attnum, int procnum) {
     return 0;
 }
 
-enum class QuantizerType : uint8 {
-    NONE = 0,
-    PQ = 1,
-    RABITQ = 2
-};
+#include "quantizer_type.h"
 
 using Relation = void *;
 
@@ -415,7 +411,7 @@ public:
      * the search path guarantees. Defaults false so the multi-threaded parallel
      * build path (which is not gated by graph_rwlock_) keeps its per-node
      * locks; a stale false merely takes the always-safe locking path. */
-    bool search_lock_free_ = false;
+    std::atomic<bool> search_lock_free_{false};
 
     GraphIndexEntryInfo entry_info;
     LayerView base_layer;
@@ -717,12 +713,13 @@ public:
                     id_to_node_ptr_.resize(id + 1);
                 }
             }
-            if (node_alloc_ && vector_alloc_ && !id_to_node_ptr_[id].Get()) {
+            if (node_alloc_ && !id_to_node_ptr_[id].Get()) {
                 auto node_ptr = node_alloc_->New();
-                auto vec_ptr = vector_alloc_->New();
                 auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                 std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
-                header->vector_ptr = vec_ptr;
+                if (vector_alloc_) {
+                    header->vector_ptr = vector_alloc_->New();
+                }
                 id_to_node_ptr_[id] = node_ptr;
                 node_ptr_to_id_[node_ptr.Get()] = id;
             }
@@ -1093,7 +1090,7 @@ public:
     template <bool is_base_layer, bool shared_lock>
     void lock_point(T idx) {
         if constexpr (shared_lock) {
-            if (search_lock_free_) return;
+            if (search_lock_free_.load(std::memory_order_acquire)) return;
         }
         auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
         if constexpr (shared_lock) {
@@ -1105,7 +1102,7 @@ public:
     template <bool is_base_layer, bool shared_lock>
     void unlock_point(T idx) {
         if constexpr (shared_lock) {
-            if (search_lock_free_) return;
+            if (search_lock_free_.load(std::memory_order_acquire)) return;
         }
         auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
         LWLockRelease(&lock);

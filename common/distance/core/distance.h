@@ -410,6 +410,7 @@ fvec_L2sqr_ny_nearest_func get_fvec_L2sqr_ny_nearest_func();
 distance_single_code_func get_distance_single_code_func(uint32 nbits);
 distance_four_codes_func get_distance_four_codes_func(uint32 nbits);
 fht_func get_fht_func(uint32 bottom_log_dim);
+RabitqKernels get_rabitq_kernels();
 void init_rabitq_func();
 
 /* we don't use func pointer here since it is not trivial */
@@ -424,7 +425,11 @@ char *alloc_vector(size_t vec_size, size_t n = 1);
 #if (defined(PG_VEXDB_TARGET_DUCK) || defined(PG_VEXDB_TARGET_SQLITE))
 inline void free_vector(void *vec) { std::free(vec); }
 #else
-inline void free_vector(void *vec) { pfree(vec); }
+inline void free_vector(void *vec) {
+    if (vec != nullptr) {
+        pfree(vec);
+    }
+}
 #endif
 bool is_aligned(const void *ptr);
 

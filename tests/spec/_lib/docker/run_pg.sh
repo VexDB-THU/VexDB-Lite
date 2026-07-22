@@ -81,6 +81,10 @@ cmd_up() {
         # 默认只绑 localhost; 跨主机访问需 PG_PUBLISH_HOST=0.0.0.0 显式打开
         docker run -d --name "$CONTAINER" -p "${PG_PUBLISH_HOST:-127.0.0.1}:5433:5432" "$IMAGE"
     fi
+    wait_pg_ready
+}
+
+wait_pg_ready() {
     info "等待 PG ready..."
     for _ in $(seq 1 30); do
         if docker exec "$CONTAINER" psql -d test -c 'SELECT 1' >/dev/null 2>&1; then
@@ -90,6 +94,48 @@ cmd_up() {
         sleep 1
     done
     fail "等待超时"; docker logs --tail 50 "$CONTAINER"; exit 1
+}
+
+restart_pg_immediate() {
+    info "按 spec 指令立即重启 PostgreSQL（验证 WAL 恢复）"
+    docker exec "$CONTAINER" pg_ctl -D /var/lib/postgresql/data \
+        -l /tmp/pg.log -m immediate -w restart >/dev/null
+    wait_pg_ready
+}
+
+run_spec_sql() {
+    local sql_file="$1"
+    local actual="$2"
+    local segment_dir
+    segment_dir="$(mktemp -d "${SPEC_DIR}/pg-segments.XXXXXX")"
+
+    # renderer 用精确的独立行 `-- @restart` 标记连接边界。切段后按顺序执行，
+    # 并在每个后续段之前立即重启 PG；这样有 CHECKPOINT 的场景验证磁盘数据，
+    # 无 CHECKPOINT 的场景验证 WAL 恢复。
+    awk -v dir="$segment_dir" '
+        BEGIN { part = 0; path = sprintf("%s/%04d.sql", dir, part) }
+        $0 == "-- @restart" {
+            close(path)
+            part++
+            path = sprintf("%s/%04d.sql", dir, part)
+            next
+        }
+        { print >> path }
+        END { close(path) }
+    ' "$sql_file"
+
+    : > "$actual"
+    local first=1
+    local segment
+    for segment in "$segment_dir"/*.sql; do
+        if (( first == 0 )); then
+            restart_pg_immediate
+        fi
+        first=0
+        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off \
+            >> "$actual" 2>&1 < "$segment" || true
+    done
+    rm -rf "$segment_dir"
 }
 
 cmd_down() {
@@ -139,8 +185,7 @@ BEGIN
   END LOOP;
 END $$;
 EOF
-        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off \
-            > "$actual" 2>&1 < "$sql_file" || true
+        run_spec_sql "$sql_file" "$actual"
         # 过滤 psql 命令完成消息 + 服务端日志级别消息 + 报错位置标记 (^ / LINE).
         # 单条 ERE 替代之前 23 个 -e 模式.
         sed -i.bak -E \

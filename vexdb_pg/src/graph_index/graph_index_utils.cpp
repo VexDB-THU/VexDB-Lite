@@ -27,9 +27,18 @@ int graph_index_get_build_parallel(Relation index)
 QuantizerType graph_index_get_quantizer_type(Relation index)
 {
     GraphIndexOptions *opts = (GraphIndexOptions *)index->rd_options;
-    return opts != NULL && opts->qt_type_offset > 0 ?
-        extract_qt((const char *)opts + opts->qt_type_offset) :
-        (QuantizerType)GRAPH_INDEX_DEFAULT_QUANTIZER_TYPE;
+    if (opts != NULL && opts->qt_type_offset > 0) {
+        return extract_qt((const char *)opts + opts->qt_type_offset);
+    }
+
+    /* Match the DuckDB contract: compact without an explicit quantizer uses
+     * PQ.  RaBitQ compact remains explicit because choosing it changes the
+     * approximation and training requirements. */
+    if (graph_index_get_compact_mode(index)) {
+        return QuantizerType::PQ;
+    }
+
+    return (QuantizerType)GRAPH_INDEX_DEFAULT_QUANTIZER_TYPE;
 }
 
 int graph_index_get_cluster_rate(Relation index)
@@ -107,6 +116,7 @@ void graph_index_store_qt_centroids(Relation index, BlockNumber qtcode_block, co
     Buffer buf = ReadBuffer(index, qtcode_block);
     Buffer new_buf = InvalidBuffer;
     for (;;) {
+        LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
         Page page = BufferGetPage(buf);
         PageHeader phdr = (PageHeader)page;
         graph_index_init_page(buf, page);
@@ -125,6 +135,7 @@ void graph_index_store_qt_centroids(Relation index, BlockNumber qtcode_block, co
             opaque->nextblkno = BufferGetBlockNumber(new_buf);
         }
         MarkBufferDirty(buf);
+        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
         ReleaseBuffer(buf);
         if (write_size == 0) {
             break;
@@ -136,8 +147,9 @@ void graph_index_store_qt_centroids(Relation index, BlockNumber qtcode_block, co
 FloatVectorArray graph_index_quantizer_sample_data(Relation heap, Relation index, size_t dimension,
     bool need_norm, DistPrecisionType precision_type, int parallel_workers, size_t sample_nums)
 {
+    (void)parallel_workers;
     FloatVectorArray samples = FloatVectorArrayInit(sample_nums, dimension);
-    ann_sample_rows(samples, heap, index, dimension, parallel_workers, need_norm, precision_type);
+    ann_sample_rows(samples, heap, index, dimension, sample_nums, need_norm, precision_type);
     return samples;
 }
 

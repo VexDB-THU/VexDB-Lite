@@ -78,6 +78,10 @@ void graph_index_rescan_internal(IndexScanDesc scan, ScanKey keys, int nkeys, Sc
     GraphIndexScanOpaque so = (GraphIndexScanOpaque)scan->opaque;
     so->first = true;
     ann_helper::optional_destroy(so->returned);
+    /* res is owned by tmp_ctx. MemoryContextReset frees it, so clear the
+     * borrowed pointer before the next parameterized scan tries to pfree it. */
+    so->res = nullptr;
+    so->has_more_data = false;
     so->tid_offset = 0;
     so->tid_count = 0;
     so->unordered_tids.clear();

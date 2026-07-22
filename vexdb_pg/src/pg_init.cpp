@@ -92,6 +92,8 @@ vexdb_lite_shmem_request(void)
     RequestAddinShmemSpace(vecbuf_shmem_size());
     RequestNamedLWLockTranche("vector_buffer", 1);
     RequestNamedLWLockTranche("graph_index_state", 1);
+    RequestNamedLWLockTranche("vector_file_write", VEX_VEC_WRITE_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_insert", VEX_GRAPH_BUILD_LOCK_STRIPES);
 }
 
 static void
@@ -163,6 +165,11 @@ void* mem_align_alloc(size_t alignment, size_t size)
     return palloc_aligned(size, alignment, 0);
 }
 
+void mem_align_free(void *ptr)
+{
+    pfree(ptr);
+}
+
 bool vexdb_lite_is_preloaded(void) { return vexdb_lite_preloaded; }
 
 extern "C" {
@@ -195,11 +202,7 @@ void _PG_init(void)
     g_instance.annvec_cxt.float_to_half = nullptr;
     g_instance.annvec_cxt.half_to_float = nullptr;
 
-    g_instance.annvec_cxt.f_flip_sign = nullptr;
-    g_instance.annvec_cxt.f_kacs_walk = nullptr;
-    g_instance.annvec_cxt.f_warmup_ip_x0_q = nullptr;
-    g_instance.annvec_cxt.f_ip_fxi = nullptr;
-    g_instance.annvec_cxt.f_mask_ip_x0_q = nullptr;
+    ann_helper::init_rabitq_func();
 
     g_instance.annvec_cxt.ann_cxt = nullptr;
     g_instance.annvec_cxt.redistrib_elem_tracker = nullptr;

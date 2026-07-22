@@ -21,11 +21,41 @@ steps:
     expect_error: 'Invalid "quantizer" value'
   - statement: CREATE INDEX idx_qz_bad3 ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer=1);
     expect_error: 'Invalid "quantizer" value'
+  - statement: CREATE INDEX idx_qz_compact_none ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='none', memory_mode='compact');
+    expect_error: "memory_mode='compact' requires"
+  - statement: CREATE INDEX idx_qz_rabitq_pqm ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='rabitq', pq_m=4);
+    expect_error: "pq_m is not valid"
+  - statement: CREATE INDEX idx_qz_compact_too_small ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='rabitq', memory_mode='compact');
+    expect_error: "memory_mode='compact' requires an active RaBitQ quantizer"
+  - statement: CREATE INDEX idx_qz_compact_auto_pq ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (memory_mode='compact');
+    expect_error: "memory_mode='compact' requires an active PQ quantizer"
+  - statement: CREATE UNLOGGED TABLE t_qz_unlogged (id int, v floatvector(8));
+  - statement: CREATE INDEX idx_qz_unlogged_compact ON t_qz_unlogged USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='rabitq', memory_mode='compact');
+    expect_error: "memory_mode='compact' is not supported for unlogged tables"
+  - statement: DROP TABLE t_qz_unlogged;
 
   # Legal spellings still work.
   - statement: CREATE INDEX idx_qz_none ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='none');
   - statement: DROP INDEX idx_qz_none;
+  # ALTER does not rebuild an existing raw index. Observability must report the
+  # effective storage instead of claiming compact from the reloption alone.
+  - statement: CREATE INDEX idx_qz_raw ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops);
+  - statement: ALTER INDEX idx_qz_raw SET (memory_mode='compact');
+  - query: SELECT memory_mode FROM vexdb_index_info() WHERE indexname = 'idx_qz_raw';
+    expect: [[full]]
+  - query: SELECT content::text FROM index_inspect('idx_qz_raw') WHERE attribute = 'Vector Storage';
+    expect: [["Raw Vector"]]
+  - statement: DROP INDEX idx_qz_raw;
   - statement: CREATE INDEX idx_qz_pq ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='pq', pq_m=4);
   - statement: DROP INDEX idx_qz_pq;
+  - statement: CREATE INDEX idx_qz_rabitq_mixed ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='RaBitQ');
+  - query: SELECT quantizer FROM vexdb_index_info() WHERE indexname = 'idx_qz_rabitq_mixed';
+    expect: [[rabitq]]
+  - statement: DROP INDEX idx_qz_rabitq_mixed;
+  - statement: CREATE INDEX idx_qz_rabitq_upper ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='RABITQ');
+  - query: SELECT quantizer FROM vexdb_index_info() WHERE indexname = 'idx_qz_rabitq_upper';
+    expect: [[rabitq]]
+  - statement: DROP INDEX idx_qz_rabitq_upper;
   - statement: CREATE INDEX idx_qz_bad_pq_m ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='pq', pq_m=3);
     expect_error: 'should be a multiple of pq_m'
+  - statement: DROP TABLE t_qz_invalid;

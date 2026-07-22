@@ -176,8 +176,8 @@ void ElkanKmeans(const KMeansState &state,
                         (sizeof(float) * num_centers) +                     // newcdist
                         (sizeof(float) * num_centers * dim);                // newCenters
     if (avg_work_mem_kb > 0 && total_size > static_cast<size_t>(avg_work_mem_kb) * 1024UL) {
-        VEX_QUANT_ERROR("k-means: working set " + std::to_string(total_size / (1024 * 1024) + 1) +
-                        " MB exceeds avg_work_mem " + std::to_string(avg_work_mem_kb / 1024) + " MB");
+        VEX_QUANT_ERRORF("k-means: working set %zu MB exceeds avg_work_mem %d MB",
+                         total_size / (1024 * 1024) + 1, avg_work_mem_kb / 1024);
     }
     if (num_centers * num_centers > static_cast<size_t>(INT_MAX)) {
         VEX_QUANT_ERROR("k-means: indexing overflow (numCenters^2 > INT_MAX)");

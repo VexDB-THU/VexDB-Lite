@@ -18,6 +18,7 @@
 #   ./build_duck.sh crash-recovery-matrix # run crash-recovery for DUCKDB_VERSIONS
 #   ./build_duck.sh bench-10k      # run SIFT 10k benchmark
 #   ./build_duck.sh bench-100k     # run SIFT 100k benchmark
+#   ./build_duck.sh bench-rabitq   # run generated-data RaBitQ benchmark
 #   ./build_duck.sh bench          # run both 10k + 100k
 #   ./build_duck.sh build-unittest # compile DuckDB unittest binary
 #   ./build_duck.sh unittest [pat] # run sqllogic .test files (default 'test/sql/vex/*')
@@ -229,6 +230,7 @@ cmd_bin() {
     _compile_one "$VEX_TEST/explain_literal_query.cpp"     "$DUCK_BIN/explain_literal_query"        "$LIBCORE"
     _compile_one "$VEX_TEST/crash_recovery.cpp"            "$DUCK_BIN/crash_recovery"               "$LIBVEX" "$LIBCORE"
     _compile_one "$VEX_TEST/benchmark/vex_sift_sql_benchmark.cpp" "$DUCK_BIN/vex_sift_sql_benchmark" "$LIBCORE"
+    _compile_one "$VEX_TEST/benchmark/vex_rabitq_synthetic_benchmark.cpp" "$DUCK_BIN/vex_rabitq_synthetic_benchmark" "$LIBCORE"
     ok "binaries built under $DUCK_BIN/"
 }
 
@@ -285,6 +287,11 @@ _bench() {
 cmd_bench_10k()  { _bench 10k;  }
 cmd_bench_100k() { _bench 100k; }
 cmd_bench()      { _bench both; }
+cmd_bench_rabitq() {
+    [[ -f "$DUCK_BIN/vex_rabitq_synthetic_benchmark" ]] || cmd_bin
+    info "running generated-data RaBitQ benchmark"
+    "$DUCK_BIN/vex_rabitq_synthetic_benchmark" "$EXTENSION_PATH"
+}
 
 cmd_all() {
     cmd_setup; cmd_data; cmd_build; cmd_bin; cmd_smoke; cmd_bench_10k
@@ -339,6 +346,7 @@ case "$CMD" in
     crash-recovery-matrix) cmd_crash_recovery_matrix ;;
     bench-10k)   cmd_bench_10k ;;
     bench-100k)  cmd_bench_100k ;;
+    bench-rabitq) cmd_bench_rabitq ;;
     bench)       cmd_bench ;;
     build-unittest) cmd_build_unittest ;;
     unittest)    cmd_unittest "$@" ;;

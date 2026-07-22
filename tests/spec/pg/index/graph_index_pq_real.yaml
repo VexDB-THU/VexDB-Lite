@@ -8,37 +8,48 @@ engines:
 - pg
 - opengauss
 steps:
+- statement: SET maintenance_work_mem = '2GB';
 - statement: CREATE TABLE pq_t (id INTEGER, vec floatvector(8));
 - statement: "INSERT INTO pq_t SELECT i,\n    ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n         || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ',' || (i*0.08)\
     \ || ']')::floatvector\nFROM generate_series(0, 499) AS t(i);"
 - statement: CREATE INDEX idx_plain ON pq_t USING vexdb_graph (vec);
 - statement: CREATE INDEX idx_pq ON pq_t USING vexdb_graph (vec) WITH (quantizer = 'pq', pq_m = 4);
 - query: SELECT use_pq FROM vexdb_index_info() WHERE indexname = 'idx_plain';
-  expect: []
+  expect:
+  - - f
 - query: SELECT use_pq FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - t
 - query: SELECT pq_m FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - 4
 - query: SELECT pq_codebook_bytes FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
-- query: SELECT pq_codes_bytes FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - 8192
+- query: SELECT pq_codes_bytes > 0 FROM vexdb_index_info() WHERE indexname = 'idx_pq';
+  expect:
+  - - t
 - query: SELECT pq_codebook_bytes, pq_codes_bytes FROM vexdb_index_info() WHERE indexname = 'idx_plain';
-  expect: []
+  expect:
+  - [0, 0]
 - query: SELECT id FROM pq_t ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
-  expect: []
+  expect:
+  - - 100
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    '
+- raw_directive: restart
 - query: SELECT use_pq FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - t
 - query: SELECT pq_m FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - 4
 - query: SELECT pq_codebook_bytes FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
-- query: SELECT pq_codes_bytes FROM vexdb_index_info() WHERE indexname = 'idx_pq';
-  expect: []
+  expect:
+  - - 8192
+- query: SELECT pq_codes_bytes > 0 FROM vexdb_index_info() WHERE indexname = 'idx_pq';
+  expect:
+  - - t
 - query: SELECT id FROM pq_t ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
-  expect: []
+  expect:
+  - - 100
 - statement: DROP TABLE pq_t;

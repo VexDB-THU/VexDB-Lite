@@ -8,8 +8,8 @@
 QuantizerType extract_qt(const char *qt_type)
 {
     if (qt_type == nullptr) return QuantizerType::NONE;
-    if (strcmp(qt_type, "pq") == 0)     return QuantizerType::PQ;
-    if (strcmp(qt_type, "rabitq") == 0) return QuantizerType::RABITQ;
+    if (pg_strcasecmp(qt_type, "pq") == 0)     return QuantizerType::PQ;
+    if (pg_strcasecmp(qt_type, "rabitq") == 0) return QuantizerType::RABITQ;
     return QuantizerType::NONE;
 }
 
@@ -64,8 +64,12 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     int dimensions, int sample_nums, bool need_norm, DistPrecisionType dist_type)
 {
     (void)dist_type;
-    (void)need_norm;
     if (heap == NULL || samples == NULL) return;
+
+    ann_helper::vector_preprocess_func norm_func = need_norm
+        ? ann_helper::get_vector_preprocess_func(Metric::FAST_COSINE,
+              DistPrecisionType::FLOAT, dimensions)
+        : nullptr;
 
     // Sequential scan, take first sample_nums non-null vectors. Not random
     // sampling — fine for codebook training when the table is in roughly
@@ -94,18 +98,35 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
            table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
         econtext->ecxt_scantuple = slot;
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
-        if (isnull[0]) continue;
-        FloatVector *fv = DatumGetFloatVector(values[0]);
-        if (fv->dim != dimensions) continue;
-        std::memcpy(FloatVectorArrayGet(samples, collected), fv->x,
-                    sizeof(float) * dimensions);
-        collected++;
-        samples->length = collected;
+        if (!isnull[0]) {
+            FloatVector *fv = DatumGetFloatVector(values[0]);
+            if (fv->dim == dimensions) {
+                float *sample = FloatVectorArrayGet(samples, collected);
+                std::memcpy(sample, fv->x, sizeof(float) * dimensions);
+                if (norm_func != nullptr) {
+                    norm_func(sample, dimensions, sample);
+                }
+                collected++;
+                samples->length = collected;
+            }
+        }
         ResetExprContext(econtext);
     }
     FreeExecutorState(estate);
     ExecDropSingleTupleTableSlot(slot);
     table_endscan(scan);
+}
+
+void RaBitQMeta::init(uint32 dim)
+{
+    enabled = false;
+    storage_version = 2;
+    size_t padded_dim = RABITQ_PADDED_DIM(dim);
+    size_t cid_size = rabitq::kCodeHeaderSize;
+    size_t bin_size = RABITQ_BIN_DATA_SIZE(padded_dim);
+    size_t ext_size = RABITQ_EXT_DATA_SIZE(padded_dim);
+    quant_size = cid_size + bin_size + ext_size;
+    query_rescaling_factor = rabitq::get_const_scaling_factors(padded_dim, 3);
 }
 
 namespace ann_helper {
@@ -142,31 +163,6 @@ void QuantizerMetaInfo::init(QuantizerType qt_type, uint32 dimension, uint32 req
         pq_set_param(dimension, metainfo.pq_metainfo.m, metainfo.pq_metainfo.k,
                      requested_pq_m);
     } else if (qt_type == QuantizerType::RABITQ) {
-        metainfo.rbq_meta.enabled               = false;
-        metainfo.rbq_meta.keep_vecs             = false;
-        metainfo.rbq_meta.quant_size            = 0;
-        metainfo.rbq_meta.query_rescaling_factor = 0.0;
+        metainfo.rbq_meta.init(dimension);
     }
-}
-
-namespace rabitq {
-
-int RaBitQuantizer::quantize(float *, char *, char *)
-{
-    return 0;
-}
-
-void RaBitQuantizer::train()
-{
-}
-
-float RaBitQEstimator::get_full_dist(int, char*, char*)
-{
-    return 0.0f;
-}
-
-void RaBitQEstimator::get_full_dist(int, char*, char*, EstimateRecord&)
-{
-}
-
 }

@@ -79,8 +79,8 @@ vexdb_lite_init_guc(void)
                       "Number of PQ subspaces. 0 disables PQ; otherwise must divide dimension.",
                       0, 0, INT_MAX, AccessExclusiveLock);
     add_string_reloption(RELOPT_KIND_GRAPH_INDEX, "memory_mode",
-                         "'full' keeps raw vectors; 'compact' releases raw vectors after PQ "
-                         "training (auto-selects pq_m if 0).",
+                         "'compact' requires an active PQ or RaBitQ quantizer and stores only "
+                         "quantizer codes in the index vector fork; omitted quantizer selects PQ.",
                          NULL, NULL, AccessExclusiveLock);
     add_int_reloption(RELOPT_KIND_GRAPH_INDEX, "threads",
                       "Build-time worker count (duck-side name; alias of parallel_workers).",

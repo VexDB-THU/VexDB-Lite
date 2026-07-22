@@ -70,6 +70,8 @@ extern "C" {
 using namespace ann_helper;
 
 bool vector_shutdown_requested = false;
+LWLockPadded *VexVecWriteLocks = NULL;
+LWLockPadded *VexGraphBuildLocks = NULL;
 
 /*
  * MdfdVec - same layout as _MdfdVec in md.c
@@ -868,6 +870,8 @@ void init_vector_smgr()
         return;
     }
     VectorBufferLock = &(GetNamedLWLockTranche("vector_buffer")->lock);
+    VexVecWriteLocks = GetNamedLWLockTranche("vector_file_write");
+    VexGraphBuildLocks = GetNamedLWLockTranche("graph_build_insert");
     void *mgr_mem = MemoryContextAlloc(vecbuf_shared_ctx, sizeof(VecBufferManager));
     VecBufMgr = new (mgr_mem) VecBufferManager();
     if (enable_vec_buffer_manager() && !VecBufMgr->buffer_inited) {
@@ -1176,6 +1180,59 @@ SMGR_READ_STATUS vec_read(SMgrRelation reln, off_t offset, size_t nbytes,
     return SMGR_RD_OK;
 }
 
+static LWLock *
+vec_partial_write_lock(SMgrRelation reln, BlockNumber segno, off_t aligned_off)
+{
+    if (VexVecWriteLocks == NULL)
+        return NULL;
+    uint64 key = (uint64)reln->smgr_rlocator.locator.relNumber * UINT64CONST(11400714819323198485);
+    key ^= (uint64)segno * UINT64CONST(0x9e3779b185ebca87);
+    key ^= (uint64)aligned_off / PG_IO_ALIGN_SIZE;
+    return &VexVecWriteLocks[key % VEX_VEC_WRITE_LOCK_STRIPES].lock;
+}
+
+static void
+vec_write_partial_aligned_block(SMgrRelation reln, MdfdVec *seg, BlockNumber blocknum,
+                                off_t aligned_off, size_t copy_off,
+                                const char *src, size_t copy_len, const char *part)
+{
+    const size_t io_align = PG_IO_ALIGN_SIZE;
+    LWLock *lock = vec_partial_write_lock(reln, seg->mdfd_segno, aligned_off);
+    if (lock != NULL)
+        LWLockAcquire(lock, LW_EXCLUSIVE);
+
+    PG_TRY();
+    {
+        alignas(PG_IO_ALIGN_SIZE) char tmp[BLCKSZ];
+        ssize_t nread = FileRead(seg->mdfd_vfd, tmp, io_align, aligned_off,
+                                 WAIT_EVENT_DATA_FILE_READ);
+        if (nread < 0)
+            nread = 0;
+        if ((size_t)nread < io_align)
+            memset(tmp + nread, 0, io_align - (size_t)nread);
+
+        memcpy(tmp + copy_off, src, copy_len);
+        if (FileWrite(seg->mdfd_vfd, tmp, io_align, aligned_off,
+                      WAIT_EVENT_DATA_FILE_WRITE) != (ssize_t)io_align) {
+            auto path = vec_segment_path(reln, blocknum / RELSEG_SIZE);
+            ereport(ERROR,
+                    (errcode_for_file_access(),
+                     errmsg("could not write %s block to vector file \"%s\": %m",
+                            part, VEC_PATH_STR(path))));
+        }
+    }
+    PG_CATCH();
+    {
+        if (lock != NULL)
+            LWLockRelease(lock);
+        PG_RE_THROW();
+    }
+    PG_END_TRY();
+
+    if (lock != NULL)
+        LWLockRelease(lock);
+}
+
 /*
  * vec_write - write vector data directly to file
  * Can throw ERROR on write failure.
@@ -1226,26 +1283,10 @@ void vec_write(SMgrRelation reln, off_t offset, size_t nbytes,
             tail = remaining - head - mid;
 
             if (head > 0) {
-                alignas(PG_IO_ALIGN_SIZE) char tmp[BLCKSZ];
                 off_t aligned_off = TYPEALIGN_DOWN(io_align, cur_off);
                 size_t copy_off = cur_off - aligned_off;
-                ssize_t nread = FileRead(seg->mdfd_vfd, tmp, io_align, aligned_off,
-                                         WAIT_EVENT_DATA_FILE_READ);
-
-                if (nread < 0)
-                    nread = 0;
-                if ((size_t)nread < io_align)
-                    memset(tmp + nread, 0, io_align - (size_t)nread);
-
-                memcpy(tmp + copy_off, src, head);
-
-                if (FileWrite(seg->mdfd_vfd, tmp, io_align, aligned_off,
-                              WAIT_EVENT_DATA_FILE_WRITE) != (ssize_t)io_align) {
-                    auto path = vec_segment_path(reln, blocknum / RELSEG_SIZE);
-                    ereport(ERROR,
-                            (errcode_for_file_access(),
-                             errmsg("could not write head block to vector file \"%s\": %m", VEC_PATH_STR(path))));
-                }
+                vec_write_partial_aligned_block(reln, seg, blocknum, aligned_off,
+                                                copy_off, src, head, "head");
 
                 src += head;
                 cur_off += head;
@@ -1295,24 +1336,9 @@ void vec_write(SMgrRelation reln, off_t offset, size_t nbytes,
             }
 
             if (tail > 0) {
-                alignas(PG_IO_ALIGN_SIZE) char tmp[BLCKSZ];
                 off_t aligned_off = TYPEALIGN_DOWN(io_align, cur_off);
-                ssize_t nread = FileRead(seg->mdfd_vfd, tmp, io_align, aligned_off,
-                                         WAIT_EVENT_DATA_FILE_READ);
-
-                if (nread < 0)
-                    nread = 0;
-                if ((size_t)nread < io_align)
-                    memset(tmp + nread, 0, io_align - (size_t)nread);
-
-                memcpy(tmp, src, tail);
-                if (FileWrite(seg->mdfd_vfd, tmp, io_align, aligned_off,
-                              WAIT_EVENT_DATA_FILE_WRITE) != (ssize_t)io_align) {
-                    auto path = vec_segment_path(reln, blocknum / RELSEG_SIZE);
-                    ereport(ERROR,
-                            (errcode_for_file_access(),
-                             errmsg("could not write tail block to vector file \"%s\": %m", VEC_PATH_STR(path))));
-                }
+                vec_write_partial_aligned_block(reln, seg, blocknum, aligned_off,
+                                                0, src, tail, "tail");
 
                 src += tail;
                 cur_off += tail;

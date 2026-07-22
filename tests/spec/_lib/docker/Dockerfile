@@ -11,10 +11,12 @@
 #   docker run --rm -v $(pwd)/build/spec/pg:/spec vexdb-pg19 \
 #       /opt/pg19/bin/psql -d test -f /spec/sql/types__floatvector_basic.sql
 
-# ─────────────────────────── stage 1: build PG 19devel ───────────────────────────
+# ─────────────────────────── stage 1: build PostgreSQL 19 ───────────────────────────
 FROM debian:trixie-slim AS pg-build
 
-ARG PG_GIT_TAG=master
+# PostgreSQL master moves to the next major immediately after branching. Keep
+# this image on the advertised major instead of silently testing PG 20devel.
+ARG PG_GIT_TAG=REL_19_STABLE
 ARG JOBS=4
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

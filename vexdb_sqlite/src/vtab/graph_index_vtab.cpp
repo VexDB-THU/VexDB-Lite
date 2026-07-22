@@ -18,9 +18,12 @@
 #include "vtab/graph_index_vtab.h"
 #include "functions/vector_codec.h"
 #include "index/graph_bridge.h"
+#include "quantizer/product_quantizer.h"
+#include "rabitq/code_distancer.h"
 #include "vex_distance_entry.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -78,6 +81,10 @@ struct GraphIndexVtab {
     int m = kDefaultM;
     int ef_construction = kDefaultEfConstruction;
     int ef_search = kDefaultEfSearch;
+    QuantizerType quantizer = QuantizerType::NONE;
+    bool quantizer_explicit = false;
+    uint32_t pq_m = 0;
+    bool compact_mode = false;
     sqlite3_int64 brute_force_threshold = kBruteForceThreshold;
     sqlite3_int64 graph_chunk_size = kDefaultGraphChunk;  // v2 起不再生效（段式天然分块），保留解析兼容旧建表 SQL
     // M9'：查询期图内存预算（字节）。0=无限制（全内存模式，性能形态）；
@@ -157,6 +164,15 @@ bool ParseMetric(const std::string &v, VexMetric &out) {
     return false;
 }
 
+const char *QuantizerName(QuantizerType quantizer) {
+    switch (quantizer) {
+    case QuantizerType::PQ: return "pq";
+    case QuantizerType::RABITQ: return "rabitq";
+    case QuantizerType::NONE: return "none";
+    }
+    return "none";
+}
+
 // 解析 CREATE VIRTUAL TABLE 的参数串（argv[3..]）：
 //   恰好一个向量列声明 "<col> FLOAT[<dim>]"（大小写不敏感），
 //   加可选 "metric=..." "m=..." "ef_construction=..."。
@@ -178,6 +194,35 @@ bool ParseCreateArgs(int argc, const char *const *argv, GraphIndexVtab &vt,
                 val = val.substr(1, val.size() - 2);
             if (key == "metric") {
                 if (!ParseMetric(val, vt.metric)) { err = "unknown metric: " + val; return false; }
+            } else if (key == "quantizer") {
+                vt.quantizer_explicit = true;
+                if (val == "rabitq") {
+                    vt.quantizer = QuantizerType::RABITQ;
+                } else if (val == "pq") {
+                    vt.quantizer = QuantizerType::PQ;
+                } else if (val == "none" || val.empty()) {
+                    vt.quantizer = QuantizerType::NONE;
+                } else {
+                    err = "quantizer must be 'pq', 'rabitq' or 'none'";
+                    return false;
+                }
+            } else if (key == "pq_m") {
+                char *end = nullptr;
+                long parsed = std::strtol(val.c_str(), &end, 10);
+                if (end == val.c_str() || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
+                    err = "pq_m must be a non-negative integer";
+                    return false;
+                }
+                vt.pq_m = uint32_t(parsed);
+            } else if (key == "memory_mode") {
+                if (val == "compact") {
+                    vt.compact_mode = true;
+                } else if (val == "full") {
+                    vt.compact_mode = false;
+                } else {
+                    err = "memory_mode must be 'full' or 'compact'";
+                    return false;
+                }
             } else if (key == "m") {
                 vt.m = atoi(val.c_str());
                 if (vt.m < 2 || vt.m > 256) { err = "m out of range [2,256]"; return false; }
@@ -244,6 +289,26 @@ bool ParseCreateArgs(int argc, const char *const *argv, GraphIndexVtab &vt,
         return false;
     }
     if (!have_col) { err = "missing vector column declaration, e.g. embedding FLOAT[128]"; return false; }
+    if (vt.compact_mode && vt.quantizer_explicit && vt.quantizer == QuantizerType::NONE) {
+        err = "memory_mode='compact' requires quantizer='pq' or quantizer='rabitq'";
+        return false;
+    }
+    if (vt.quantizer == QuantizerType::RABITQ && vt.pq_m != 0) {
+        err = "pq_m cannot be combined with quantizer='rabitq'";
+        return false;
+    }
+    if (vt.quantizer == QuantizerType::NONE && (vt.compact_mode || vt.pq_m != 0)) {
+        vt.quantizer = QuantizerType::PQ;
+    }
+    if (vt.quantizer == QuantizerType::PQ) {
+        if (vt.pq_m == 0) {
+            vt.pq_m = ::vex::quantizer::ProductQuantizer::AutoSelectM(uint32_t(vt.dim));
+        }
+        if (vt.pq_m == 0 || uint32_t(vt.dim) % vt.pq_m != 0) {
+            err = "pq_m must be a positive divisor of the vector dimension";
+            return false;
+        }
+    }
     return true;
 }
 
@@ -378,6 +443,9 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
         ConfigSet(*vt, "brute_force_threshold", std::to_string(vt->brute_force_threshold));
         ConfigSet(*vt, "graph_chunk_size", std::to_string(vt->graph_chunk_size));
         ConfigSet(*vt, "graph_memory_limit", std::to_string(vt->graph_memory_limit));
+        ConfigSet(*vt, "quantizer", QuantizerName(vt->quantizer));
+        ConfigSet(*vt, "pq_m", std::to_string(vt->pq_m));
+        ConfigSet(*vt, "memory_mode", vt->compact_mode ? "compact" : "full");
         ConfigSet(*vt, "column", col_name);
         ConfigSet(*vt, "cookie", "0");
         if (!vt->meta_cols.empty())
@@ -421,6 +489,36 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
         }
         if (ConfigGet(*vt, "graph_memory_limit", v)) {
             vt->graph_memory_limit = atoll(v.c_str());
+        }
+        if (ConfigGet(*vt, "quantizer", v)) {
+            if (v == "pq") vt->quantizer = QuantizerType::PQ;
+            else if (v == "rabitq") vt->quantizer = QuantizerType::RABITQ;
+            else vt->quantizer = QuantizerType::NONE;
+        }
+        if (ConfigGet(*vt, "pq_m", v)) {
+            vt->pq_m = uint32_t(std::max(0, atoi(v.c_str())));
+        }
+        if (ConfigGet(*vt, "memory_mode", v)) {
+            vt->compact_mode = v == "compact";
+        }
+        if (vt->quantizer == QuantizerType::PQ &&
+            (vt->pq_m == 0 || uint32_t(vt->dim) % vt->pq_m != 0)) {
+            *pzErr = sqlite3_mprintf(
+                "GRAPH_INDEX: persisted pq_m must be a positive divisor of the vector dimension");
+            delete vt;
+            return SQLITE_CORRUPT;
+        }
+        if (vt->quantizer == QuantizerType::RABITQ && vt->pq_m != 0) {
+            *pzErr = sqlite3_mprintf(
+                "GRAPH_INDEX: persisted pq_m cannot be combined with quantizer='rabitq'");
+            delete vt;
+            return SQLITE_CORRUPT;
+        }
+        if (vt->compact_mode && vt->quantizer == QuantizerType::NONE) {
+            *pzErr = sqlite3_mprintf(
+                "GRAPH_INDEX: persisted compact index requires a quantizer");
+            delete vt;
+            return SQLITE_CORRUPT;
         }
     }
 
@@ -623,7 +721,14 @@ GraphBridge::SegRecReadFn MakeRecReader(GraphIndexVtab &vt) {
 
 // 全内存图占用估算（DiskStore 分流判定；记录定长可精确推算，留 ~10% 容器开销不计较）
 sqlite3_int64 EstimateGraphBytes(const GraphIndexVtab &vt, sqlite3_int64 n) {
-    sqlite3_int64 per = sqlite3_int64(vt.dim) * 4            // 向量
+    sqlite3_int64 code_bytes = 0;
+    if (vt.quantizer == QuantizerType::PQ) {
+        code_bytes = sqlite3_int64(vt.pq_m);
+    } else if (vt.quantizer == QuantizerType::RABITQ) {
+        code_bytes = sqlite3_int64(::rabitq::CodeSize(vt.dim));
+    }
+    sqlite3_int64 vector_bytes = vt.compact_mode ? 0 : sqlite3_int64(vt.dim) * 4;
+    sqlite3_int64 per = vector_bytes + code_bytes            // raw mirror + 可选量化 code
                       + sqlite3_int64(vt.m) * 2 * 8          // base neighbors+dists
                       + 48;                                  // elems/tids/容器头
     sqlite3_int64 upper = (n / std::max(1, vt.m)) * (sqlite3_int64(vt.m) * 3 * 4 + 64);
@@ -692,7 +797,8 @@ int RebuildInMemory(GraphIndexVtab &vt) {
     int rc = PrereadVectors(vt, -1, vecs, rowids);
     if (rc != SQLITE_OK) return rc;
     auto bridge = std::make_unique<GraphBridge>(uint16_t(vt.dim), vt.m, vt.ef_construction,
-                                                vt.metric);
+                                                vt.metric, vt.quantizer, vt.pq_m,
+                                                vt.compact_mode);
     try {
         bridge->BuildBulk(vecs.data(), rowids.data(), rowids.size(), DefaultBuildThreads());
     } catch (const std::exception &e) {
@@ -736,7 +842,8 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
         if (rowids.empty()) return SQLITE_OK;
         last_rowid = rowids.back();
 
-        GraphBridge mem_bridge(uint16_t(vt.dim), vt.m, vt.ef_construction, vt.metric);
+        GraphBridge mem_bridge(uint16_t(vt.dim), vt.m, vt.ef_construction, vt.metric,
+                               vt.quantizer, vt.pq_m, vt.compact_mode);
         try {
             mem_bridge.BuildBulk(vecs.data(), rowids.data(), rowids.size(),
                                  DefaultBuildThreads());
@@ -755,6 +862,7 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
     std::string err;
     vt.graph = GraphBridge::OpenV2Disk(MakeSegReader(vt), MakeSegWriter(vt), MakeRecReader(vt),
                                        uint16_t(vt.dim), vt.m, vt.ef_construction, vt.metric,
+                                       vt.quantizer, vt.pq_m, vt.compact_mode,
                                        size_t(build_budget), err);
     if (!vt.graph) return vt.SetError(err.c_str());
     vt.graph_dirty = false;
@@ -798,10 +906,13 @@ void TryOpenGraph(GraphIndexVtab &vt) {
             // dirty，不会触发写。read_rec=记录粒度直读（缓存冻结后的 miss 路径）。
             vt.graph = GraphBridge::OpenV2Disk(reader, MakeSegWriter(vt), MakeRecReader(vt),
                                                uint16_t(vt.dim), vt.m, vt.ef_construction,
-                                               vt.metric, size_t(vt.graph_memory_limit), err);
+                                               vt.metric, vt.quantizer, vt.pq_m,
+                                               vt.compact_mode,
+                                               size_t(vt.graph_memory_limit), err);
         } else {
             vt.graph = GraphBridge::OpenV2(reader, uint16_t(vt.dim), vt.m, vt.ef_construction,
-                                           vt.metric, err);
+                                           vt.metric, vt.quantizer, vt.pq_m,
+                                           vt.compact_mode, err);
         }
     } catch (const std::exception &) {
         // bad_alloc 等：open 失败按"无图"处理（调用方有暴力退化/重建兜底），
@@ -1174,6 +1285,19 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
             return finish(KnnBruteScan(vt, cur, q, k));
         }
         std::vector<std::pair<double, int64_t>> hits;
+        const size_t requested_k = size_t(k);
+        auto pq_candidate_k = [&](uint32_t search_ef) -> size_t {
+            if (!vt.graph->UsesPQ()) return requested_k;
+            // 对齐 PG PQDistancer 的 1.25 倍 refine 候选。SQLite 的 compact
+            // 只删除索引侧 raw mirror，业务向量仍在 %_vectors，因此 full 和
+            // compact 都能把 ADC 候选按精确距离重排。此前只取前 k 个 ADC
+            // 结果再“重排”，候选已经丢失，20k×32 合成集 recall@10 仅约 0.23。
+            const double expanded =
+                std::ceil(double(std::max<size_t>(requested_k, search_ef)) * 1.25);
+            size_t candidates = std::max(requested_k, size_t(expanded));
+            size_t available = allowed.empty() ? size_t(CountVectors(vt)) : allowed.size();
+            return std::min(candidates, available);
+        };
         // DiskStore 段 I/O 可 throw（如写事务内 evict 脏段写回失败）——必须在
         // C 边界内 catch 转 SQL 错误，否则异常穿 SQLite C 帧 = UB/terminate。
         try {
@@ -1185,10 +1309,11 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
                 double sel = double(CountVectors(vt)) / double(allowed.size());
                 double base_ef = std::max<double>(double(k), double(vt.ef_search));
                 uint32_t ef_eff = uint32_t(base_ef * std::min(10.0, std::max(1.0, sel)));
-                vt.graph->Search(q.data, size_t(k), ef_eff,
+                vt.graph->Search(q.data, pq_candidate_k(ef_eff), ef_eff,
                                  [&](int64_t rid) { return allowed.count(rid) > 0; }, hits);
             } else {
-                vt.graph->Search(q.data, size_t(k), uint32_t(vt.ef_search), hits);
+                uint32_t ef = uint32_t(vt.ef_search);
+                vt.graph->Search(q.data, pq_candidate_k(ef), ef, hits);
             }
         } catch (const std::exception &e) {
             return vt.SetError(e.what());
@@ -1223,6 +1348,7 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
                   [](const GraphIndexCursor::Hit &a, const GraphIndexCursor::Hit &b) {
                       return a.dist < b.dist;
                   });
+        if (cur.hits.size() > requested_k) cur.hits.resize(requested_k);
         cur.pos = 0;
         return finish(SQLITE_OK);
     }

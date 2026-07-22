@@ -347,6 +347,8 @@ public:
     std::vector<T> async_ids;
 
     bool normalize_vectors_ = false;
+    // compact 模式只保留图结构与量化码，索引侧不再保存原始向量副本。
+    bool compact_mode_ = false;
 
     // ---- 并发原语（M3+ 并行 BuildBulk）。语义对照 duck 版：----
     //   entry_mutex_      : 保护 entry_info（升级协议见 get_entry）
@@ -468,10 +470,10 @@ public:
             std::unique_lock<std::shared_mutex> _lk(elems_mutex_);
             if (size_t(id) + 1 > elems.size()) {
                 elems.resize(id + 1);
-                vectors.resize(id + 1);
+                if (!compact_mode_) vectors.resize(id + 1);
                 base_points.resize(id + 1, MakeBasePoint());
             }
-            if (vectors[id].size() != (size_t)vec_size) {
+            if (!compact_mode_ && vectors[id].size() != (size_t)vec_size) {
                 vectors[id].resize(vec_size);
             }
             base_size_.store(elems.size(), std::memory_order_release);
@@ -561,7 +563,7 @@ public:
 
     void ResizeForReload(size_t base_n, size_t upper_n) {
         elems.resize(base_n);
-        vectors.resize(base_n);
+        if (!compact_mode_) vectors.resize(base_n);
         base_points.resize(base_n, MakeBasePoint());
         upper_points.resize(upper_n, MakeUpperPoint());
         next_base_id_.store(T(base_n), std::memory_order_relaxed);
@@ -845,6 +847,9 @@ public:
     static constexpr int KIND_UPPER = 2;
     static constexpr int KIND_BASE = 3;
     static constexpr int KIND_VEC = 4;
+    static constexpr int KIND_QUANTIZER_CODES = 6;
+    // 旧名字保留为源码兼容别名；持久化 kind 值不变。
+    static constexpr int KIND_RABITQ_CODES = KIND_QUANTIZER_CODES;
     // 段粒度：HNSW 查询是随机点查，段越大 I/O 放大越狠（读整段只用一条记录，
     // miss 成本=整段 blob 读）。64 条 → vec 段 32KB（128 维）/ base 段 16KB
     //（m=16），向 PG 8KB page 的取向靠拢；1M 行 ≈ 15625 段/类，%_graph 行数
@@ -865,6 +870,7 @@ public:
     uint_fast16_t m = 0;
     uint_fast32_t vec_size = 0;
     bool normalize_vectors_ = false;
+    bool compact_mode_ = false;
 
     GraphIndexEntryInfo entry_info;
     std::vector<point_type> elems;          // 常驻：id → rowids
@@ -875,20 +881,50 @@ public:
     size_t next_upper_id_ = 0;
 
     DiskStore(uint_fast16_t dim_in, uint_fast16_t m_in, uint_fast32_t vec_size_in,
-              PageIO io, size_t cache_budget_bytes)
+              PageIO io, size_t cache_budget_bytes, uint_fast32_t quantizer_code_size_in = 0,
+              bool compact_mode_in = false)
         : dim(dim_in), m(m_in), vec_size(vec_size_in), io_(std::move(io)),
-          cache_budget_(cache_budget_bytes) {
+          cache_budget_(cache_budget_bytes), quantizer_code_size_(quantizer_code_size_in) {
+        compact_mode_ = compact_mode_in;
         entry_info.set(INVALID_VECTOR_ID, INVALID_VECTOR_ID, -1);
         stat_scratch_.assign((size_t(m) * 2 + 31) / 32, 0);
-        // 预算下限：base/vec 各至少 2 段（pin 最近段 + 载入新段），防饿死
-        size_t min_budget = 2 * (seg_bytes(KIND_BASE) + seg_bytes(KIND_VEC));
+        // 预算下限：每种启用的数据各至少 2 段（pin 最近段 + 载入新段），
+        // 防写 miss 无处驱逐。量化 code 与 base/vec 共用同一预算。
+        size_t min_budget = 2 * seg_bytes(KIND_BASE);
+        if (!compact_mode_) min_budget += 2 * seg_bytes(KIND_VEC);
+        if (quantizer_code_size_ > 0) min_budget += 2 * seg_bytes(KIND_QUANTIZER_CODES);
         if (cache_budget_ < min_budget) cache_budget_ = min_budget;
     }
 
     size_t base_rec_bytes() const { return size_t(m) * 2 * (sizeof(T) + sizeof(float)); }
     size_t seg_bytes(int kind) const {
-        return SEG_RECORDS * (kind == KIND_BASE ? base_rec_bytes() : size_t(vec_size));
+        if (kind == KIND_BASE) return SEG_RECORDS * base_rec_bytes();
+        if (kind == KIND_QUANTIZER_CODES) return SEG_RECORDS * size_t(quantizer_code_size_);
+        return SEG_RECORDS * size_t(vec_size);
     }
+
+    size_t cache_bytes_used() const { return total_cache_bytes(); }
+    size_t cache_budget_bytes() const { return cache_budget_; }
+    size_t quantizer_code_size() const { return size_t(quantizer_code_size_); }
+    size_t rabitq_code_size() const { return quantizer_code_size(); }
+
+    const char *get_quantizer_code(T id) {
+        if (quantizer_code_size_ == 0) {
+            throw std::runtime_error("vexdb-sqlite: quantizer code cache is not configured");
+        }
+        if (size_t(id) >= next_base_id_) {
+            throw std::runtime_error("quantizer code coverage does not match graph nodes");
+        }
+        return quantizer_code_rec(id, false);
+    }
+    void set_quantizer_code(T id, const uint8_t *code) {
+        if (quantizer_code_size_ == 0 || code == nullptr) {
+            throw std::runtime_error("vexdb-sqlite: invalid quantizer code write");
+        }
+        std::memcpy(quantizer_code_rec(id, true), code, quantizer_code_size_);
+    }
+    const char *get_rabitq_code(T id) { return get_quantizer_code(id); }
+    void set_rabitq_code(T id, const uint8_t *code) { set_quantizer_code(id, code); }
 
     // ---- entry（常驻，单线程无锁） ----
     template <bool exclusive = false, bool bottom_only = false>
@@ -1142,12 +1178,20 @@ public:
                 kv.second.dirty = false;
             }
         }
+        for (auto &kv : quantizer_code_cache_.segs) {
+            if (kv.second.dirty &&
+                write_fn(KIND_QUANTIZER_CODES, kv.first, kv.second.data)) {
+                kv.second.dirty = false;
+            }
+        }
     }
     bool has_dirty() const {
         if (upper_dirty) return true;
         for (auto &kv : base_cache_.segs)
             if (kv.second.dirty) return true;
         for (auto &kv : vec_cache_.segs)
+            if (kv.second.dirty) return true;
+        for (auto &kv : quantizer_code_cache_.segs)
             if (kv.second.dirty) return true;
         return false;
     }
@@ -1165,13 +1209,14 @@ private:
 
     PageIO io_;
     size_t cache_budget_ = 0;
-    SegCache base_cache_, vec_cache_;
+    uint_fast32_t quantizer_code_size_ = 0;
+    SegCache base_cache_, vec_cache_, quantizer_code_cache_;
     uint64 tick_ = 0;
     std::vector<uint32> stat_scratch_;
     std::vector<std::vector<char>> val_pool_;
     // 直读单记录的暂存（per-kind 各一条：算法层在下一次同 kind 访问前必已
     // 消费完指针——search_layer 拷邻居/逐 id 即取即算的调用序保证）。
-    std::vector<char> base_scratch_, vec_scratch_;
+    std::vector<char> base_scratch_, vec_scratch_, quantizer_code_scratch_;
 
     char *pool_alloc(size_t n) {
         val_pool_.emplace_back(n);
@@ -1183,6 +1228,14 @@ private:
     }
     char *vec_rec(T idx, bool mark_dirty) {
         return rec_ptr(vec_cache_, KIND_VEC, idx, size_t(vec_size), vec_scratch_, mark_dirty);
+    }
+    char *quantizer_code_rec(T idx, bool mark_dirty) {
+        return rec_ptr(quantizer_code_cache_, KIND_QUANTIZER_CODES, idx,
+                       size_t(quantizer_code_size_), quantizer_code_scratch_, mark_dirty);
+    }
+
+    size_t total_cache_bytes() const {
+        return base_cache_.bytes + vec_cache_.bytes + quantizer_code_cache_.bytes;
     }
 
     // 记录访问入口。读 miss 的 admission＝缓存冻结策略：预算未满才整段进
@@ -1202,7 +1255,7 @@ private:
             return it->second.data.data() + off;
         }
         const size_t want = seg_bytes(kind);
-        const bool cache_full = base_cache_.bytes + vec_cache_.bytes + want > cache_budget_;
+        const bool cache_full = total_cache_bytes() + want > cache_budget_;
         if (!mark_dirty && cache_full && io_.read_rec) {
             scratch.resize(rec_size);
             if (!io_.read_rec(kind, seg, off, rec_size, scratch.data())) {
@@ -1218,7 +1271,13 @@ private:
         const size_t want = seg_bytes(kind);
         evict_if_needed(want);
         Seg s;
-        if (!io_.read || !io_.read(kind, seg, s.data) || s.data.size() != want) {
+        const bool found = io_.read && io_.read(kind, seg, s.data);
+        if (found && kind == KIND_QUANTIZER_CODES && !s.data.empty() &&
+            s.data.size() <= want && s.data.size() % size_t(quantizer_code_size_) == 0) {
+            // v2 兼容：历史格式的最后一个 code 段只保存实际记录，不补齐 64 条。
+            // cache 内统一补零成定长段；一旦变脏，按新格式整段写回。
+            s.data.resize(want, 0);
+        } else if (!found || s.data.size() != want) {
             fill_invalid(kind, s.data, want);
         }
         auto it = c.segs.emplace(seg, std::move(s)).first;
@@ -1247,15 +1306,16 @@ private:
     }
 
     void evict_if_needed(size_t incoming) {
-        if (base_cache_.bytes + vec_cache_.bytes + incoming <= cache_budget_) return;
+        if (total_cache_bytes() + incoming <= cache_budget_) return;
         // 一次扫描收集 (dirty, tick, cache, seg)，clean 段排前、再按 tick 升序，
         // 批量驱逐到预算 75%——dirty 段写回（UPSERT 整段）是构建期写放大的
         // 大头（反向边更新随机散布全图 base 段，驱逐后马上被重载再改 dirty），
         // clean 段驱逐零成本，优先丢弃；clean 不够时才动 dirty（buffer manager
         // 的脏页优先保留惯例）。批量化避免逐段驱逐每次全扫 map 的 O(n²)。
         std::vector<std::tuple<bool, uint64, SegCache *, uint32>> order;
-        order.reserve(base_cache_.segs.size() + vec_cache_.segs.size());
-        for (SegCache *c : {&base_cache_, &vec_cache_}) {
+        order.reserve(base_cache_.segs.size() + vec_cache_.segs.size() +
+                      quantizer_code_cache_.segs.size());
+        for (SegCache *c : {&base_cache_, &vec_cache_, &quantizer_code_cache_}) {
             uint64 newest = 0;
             for (auto &kv : c->segs) newest = std::max(newest, kv.second.tick);
             for (auto &kv : c->segs) {
@@ -1267,13 +1327,14 @@ private:
         std::sort(order.begin(), order.end());
         const size_t target = cache_budget_ - std::min(cache_budget_, cache_budget_ / 4);
         for (const auto &[dirty, tick, c, seg] : order) {
-            if (base_cache_.bytes + vec_cache_.bytes + incoming <= target) break;
+            if (total_cache_bytes() + incoming <= target) break;
             auto vit = c->segs.find(seg);
             if (vit == c->segs.end()) continue;
             if (vit->second.dirty) {
                 // dirty 段只在写事务内产生；只读打开不可能到达这里
-                if (!io_.write || !io_.write(c == &base_cache_ ? KIND_BASE : KIND_VEC, seg,
-                                             vit->second.data)) {
+                int kind = c == &base_cache_ ? KIND_BASE
+                    : (c == &vec_cache_ ? KIND_VEC : KIND_QUANTIZER_CODES);
+                if (!io_.write || !io_.write(kind, seg, vit->second.data)) {
                     throw std::runtime_error("vexdb-sqlite: dirty segment evict without write IO");
                 }
             }

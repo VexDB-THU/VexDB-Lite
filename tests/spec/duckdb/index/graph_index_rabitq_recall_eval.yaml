@@ -1,0 +1,26 @@
+name: duckdb_graph_index_rabitq_recall_eval
+tags: [duckdb, rabitq, eval, recall]
+engines: [duckdb]
+description: RaBitQ recall evaluation against a brute-force top-20 control.
+steps:
+  - statement: CREATE TABLE rq_eval (id INTEGER, vec ${VECTOR(16)});
+  - statement: "INSERT INTO rq_eval SELECT i, ${VEC_LITERAL([
+      sin(i*0.011)::FLOAT, cos(i*0.013)::FLOAT, sin(i*0.017)::FLOAT, cos(i*0.019)::FLOAT,
+      sin(i*0.023)::FLOAT, cos(i*0.029)::FLOAT, sin(i*0.031)::FLOAT, cos(i*0.037)::FLOAT,
+      sin(i*0.041)::FLOAT, cos(i*0.043)::FLOAT, sin(i*0.047)::FLOAT, cos(i*0.053)::FLOAT,
+      sin(i*0.059)::FLOAT, cos(i*0.061)::FLOAT, sin(i*0.067)::FLOAT, cos(i*0.071)::FLOAT], 16)}
+      FROM ${RANGE2(1, 5001)} t(i);"
+  - statement: SET ${GUC_BF_THRESHOLD} = 1000000;
+  - statement: "CREATE TABLE rq_truth AS SELECT id FROM rq_eval
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,0.9,0.8,0.7,0.6,0.5,0.4], 16)})} LIMIT 20;"
+  - statement: CREATE INDEX idx_rq_eval ON rq_eval USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', m=24, ef_construction=200)};
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 200;
+  - query: "WITH ann AS (SELECT id FROM rq_eval
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0,0.9,0.8,0.7,0.6,0.5,0.4], 16)})} LIMIT 20)
+      SELECT count(*) >= 16 FROM ann JOIN rq_truth USING (id);"
+    _field_types: I
+    expect:
+      - [true]
+  - statement: DROP TABLE rq_eval;
+  - statement: DROP TABLE rq_truth;

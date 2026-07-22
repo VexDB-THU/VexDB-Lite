@@ -16,7 +16,7 @@ steps:
     INSERT INTO pb_serial
     SELECT i,
            ${VEC_LITERAL([CAST(i % 7 AS FLOAT), CAST(i % 5 AS FLOAT), CAST(i % 3 AS FLOAT), CAST(i % 11 AS FLOAT), CAST(i % 13 AS FLOAT), CAST(i % 17 AS FLOAT), CAST(i % 19 AS FLOAT), CAST(i % 23 AS FLOAT)], 8)}
-    FROM ${RANGE(0, 200)} AS r(i);
+    FROM ${RANGE2(0, 200)} AS r(i);
 - statement: CREATE INDEX idx_pb_serial ON pb_serial USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(m=8, ef_construction=32, threads=1)};
 - query: SELECT COUNT(*) FROM (SELECT id FROM pb_serial ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})} LIMIT 10) sub;
   _field_types: I
@@ -31,7 +31,7 @@ steps:
     INSERT INTO pb_parallel
     SELECT i,
            ${VEC_LITERAL([CAST(i % 7 AS FLOAT), CAST(i % 5 AS FLOAT), CAST(i % 3 AS FLOAT), CAST(i % 11 AS FLOAT), CAST(i % 13 AS FLOAT), CAST(i % 17 AS FLOAT), CAST(i % 19 AS FLOAT), CAST(i % 23 AS FLOAT)], 8)}
-    FROM ${RANGE(0, 200)} AS r(i);
+    FROM ${RANGE2(0, 200)} AS r(i);
 - statement: CREATE INDEX idx_pb_parallel ON pb_parallel USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(m=8, ef_construction=32, threads=4)};
 - query: SELECT COUNT(*) FROM (SELECT id FROM pb_parallel ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})} LIMIT 10) sub;
   _field_types: I
@@ -45,7 +45,7 @@ steps:
 - statement: |
     INSERT INTO pb_over
     SELECT i, ${VEC_LITERAL([CAST(i AS FLOAT) / 100, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)}
-    FROM ${RANGE(0, 100)} AS r(i);
+    FROM ${RANGE2(0, 100)} AS r(i);
 - statement: CREATE INDEX idx_pb_over ON pb_over USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(threads=8)};
 
 # ------------------------------------------------------------
@@ -72,7 +72,7 @@ steps:
     INSERT INTO pb_cross_chunk
     SELECT i,
            ${VEC_LITERAL([CAST(i % 31 AS FLOAT), CAST(i % 17 AS FLOAT), CAST(i % 11 AS FLOAT), CAST(i % 5 AS FLOAT)], 4)}
-    FROM ${RANGE(0, 4000)} AS r(i);
+    FROM ${RANGE2(0, 4000)} AS r(i);
 - statement: CREATE INDEX idx_pb_cross_chunk ON pb_cross_chunk USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(m=4, ef_construction=32, threads=1)};
 - query: SELECT COUNT(*) FROM (SELECT id FROM pb_cross_chunk ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0], 4)})} LIMIT 10) sub;
   _field_types: I
