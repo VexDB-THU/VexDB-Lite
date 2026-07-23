@@ -1574,6 +1574,17 @@ def logical_export_import(ctx: Context) -> dict[str, Any]:
             source.scalar("SELECT vexfs_acl_set('default',?,"
                           "'[{\"principal\":\"alice\",\"effect\":\"allow\","
                           "\"permissions\":\"read\",\"inherit\":1}]')", (inode,))
+            source.scalar("SELECT vexfs_write('default','/project/deleted.lock','temp')")
+            deleted_inode = source.json(
+                "SELECT vexfs_stat('default','/project/deleted.lock')")["inode"]
+            source.scalar(
+                "SELECT vexfs_xattr_set('default',?,'user.deleted','temp',0)",
+                (deleted_inode,))
+            source.scalar(
+                "SELECT vexfs_acl_set('default',?,"
+                "'[{\"principal\":\"local\",\"effect\":\"allow\","
+                "\"permissions\":\"read,write\",\"inherit\":0}]')", (deleted_inode,))
+            source.scalar("SELECT vexfs_remove('default','/project/deleted.lock',0)")
             snapshot_commit = source.scalar(
                 "SELECT vexfs_snapshot_create('default','portable')")
             source.scalar("SELECT vexfs_write('default','/project/version.txt','after')")
@@ -1604,6 +1615,18 @@ def logical_export_import(ctx: Context) -> dict[str, Any]:
         ctx.equal(exported["source_commit"], snapshot_commit, "导出固定快照 commit")
         ctx.equal(exported["package_checksum"], verified["package_checksum"],
                   "导出和校验整包 hash 一致")
+        with sqlite3.connect(f"file:{archive}?mode=ro", uri=True) as package:
+            stale_metadata = package.execute(
+                "SELECT (SELECT count(*) FROM xattrs attribute "
+                "WHERE NOT EXISTS(SELECT 1 FROM inodes inode "
+                "WHERE inode.source_id=attribute.source_inode "
+                "AND inode.deleted_at IS NULL)) + "
+                "(SELECT count(*) FROM acl_entries entry "
+                "WHERE NOT EXISTS(SELECT 1 FROM inodes inode "
+                "WHERE inode.source_id=entry.source_inode "
+                "AND inode.deleted_at IS NULL))").fetchone()[0]
+        ctx.equal(stale_metadata, 0,
+                  "快照导出不把已删除 inode 的 xattr/ACL 当作当前元数据")
 
         import_started = time.perf_counter()
         imported = json.loads(run_process(

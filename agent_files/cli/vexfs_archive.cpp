@@ -701,7 +701,9 @@ SELECT printf('%020lld:%s',inode_id,hex(name)),inode_id,name,value,
        (SELECT created_at FROM package.manifest),
        vexfs_archive_sha256(CAST(json_array(inode_id,name,hex(value),
           (SELECT created_at FROM package.manifest)) AS BLOB))
-FROM ranked WHERE rank=1 AND deleted=0;
+FROM ranked
+JOIN package.inodes live ON live.source_id=ranked.inode_id AND live.deleted_at IS NULL
+WHERE rank=1 AND deleted=0;
 
 INSERT INTO package.acl_entries
 WITH ranked AS (
@@ -716,7 +718,9 @@ SELECT printf('%020lld:%s:%s',inode_id,hex(principal_id),effect),inode_id,princi
        vexfs_archive_sha256(CAST(json_array(inode_id,principal_id,effect,permissions,
           inherit_flags,(SELECT created_at FROM package.manifest),
           (SELECT created_at FROM package.manifest)) AS BLOB))
-FROM ranked WHERE rank=1 AND deleted=0;
+FROM ranked
+JOIN package.inodes live ON live.source_id=ranked.inode_id AND live.deleted_at IS NULL
+WHERE rank=1 AND deleted=0;
 
 INSERT INTO package.principals
 SELECT hex(principal),principal,
