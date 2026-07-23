@@ -1282,6 +1282,51 @@ def cross_session_snapshot_barrier(ctx: Context) -> dict[str, Any]:
                 "changes_after_publish": len(changes)}
 
 
+@case("contract.unpublished-create-history", "transaction",
+      "无关提交不能把尚未发布的 handle_create version 0 写入历史")
+def unpublished_create_history(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        handle = db.scalar(
+            "SELECT vexfs_handle_create('default','/index.lock',420,'create-lock')")
+        inode = db.json("SELECT vexfs_stat('default','/index.lock')")["inode"]
+        ctx.equal(db.json("SELECT vexfs_stat('default','/index.lock')")["version"], 0,
+                  "新建句柄在首次发布前仍是暂存版本")
+        db.scalar("SELECT vexfs_xattr_set('default',?,'user.vexfs.test','pending',0)",
+                  (inode,))
+
+        # Git 会在 index.lock 仍打开时创建 refs 等目录；这个独立提交过去会
+        # 错把 version 0 刷进不可变历史，最终令快照无法完整恢复。
+        db.scalar("SELECT vexfs_mkdir('default','/refs')")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_inode_states "
+            "WHERE inode_id=? AND current_version=0", (inode,)), 0,
+            "无关提交不记录未发布 inode")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_dentry_states WHERE inode_id=?", (inode,)), 0,
+            "无关提交不记录未发布 dentry")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_dirty_inodes WHERE inode_id=?", (inode,)), 1,
+            "未发布 inode 保留 dirty 状态")
+
+        generation = db.scalar(
+            "SELECT vexfs_handle_stage_write(?,0,'git-index','write-lock')", (handle,))
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_publish(?,?,'data','publish-lock')",
+            (handle, generation)), 1, "首次发布生成 version 1")
+        db.scalar("SELECT vexfs_handle_close(?,0,'close-lock')", (handle,))
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_inode_states "
+            "WHERE inode_id=? AND current_version=1", (inode,)), 1,
+            "首次发布原子写入有效历史")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_dirty_inodes WHERE inode_id=?", (inode,)), 0,
+            "首次发布清理 dirty inode")
+        report = db.json("SELECT vexfs_check('default',1)")
+        ctx.check(report["ok"], "真实 Git 锁文件顺序通过深度检查")
+        return {"inode": inode, "generation": generation,
+                "version": 1, "issue_count": report["issue_count"]}
+
+
 @case("integrity.checksum-and-aliases", "integrity",
       "SHA-256 覆盖普通版本、单文件恢复和 workspace 快照恢复，损坏内容不得返回")
 def integrity_checksum_and_aliases(ctx: Context) -> dict[str, Any]:

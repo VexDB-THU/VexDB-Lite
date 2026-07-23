@@ -1168,6 +1168,11 @@ SELECT i.workspace_id,i.id,?2,i.kind,i.mode,i.owner_principal,i.uid,i.gid,i.size
 FROM _vexfs_dirty_inodes dirty
 JOIN _vexfs_inodes i ON i.workspace_id=dirty.workspace_id AND i.id=dirty.inode_id
 WHERE dirty.workspace_id=?1
+  -- handle_create deliberately keeps a new file at version 0 until its first
+  -- publish, so several create/write/metadata calls can share one commit.  A
+  -- commit for another inode must not make that private staging state part of
+  -- immutable history: version 0 has no manifest and cannot be restored.
+  AND NOT (i.kind='file' AND i.current_version=0)
 )SQL");
     inodes.BindInt64(1, workspace.id);
     inodes.BindInt64(2, commit);
@@ -1183,6 +1188,12 @@ LEFT JOIN _vexfs_dentries d
   ON d.workspace_id=dirty.workspace_id AND d.parent_inode=dirty.parent_inode
  AND d.name=dirty.name
 WHERE dirty.workspace_id=?1
+  AND NOT EXISTS (
+    SELECT 1 FROM _vexfs_inodes pending
+    WHERE pending.workspace_id=dirty.workspace_id
+      AND pending.id=COALESCE(d.inode_id,dirty.inode_id)
+      AND pending.kind='file' AND pending.current_version=0
+  )
 )SQL");
     dentries.BindInt64(1, workspace.id);
     dentries.BindInt64(2, commit);
@@ -1196,6 +1207,11 @@ SELECT dirty.workspace_id,dirty.inode_id,dirty.name,?2,
 FROM _vexfs_dirty_xattrs dirty
 LEFT JOIN _vexfs_xattrs x ON x.inode_id=dirty.inode_id AND x.name=dirty.name
 WHERE dirty.workspace_id=?1
+  AND NOT EXISTS (
+    SELECT 1 FROM _vexfs_inodes pending
+    WHERE pending.workspace_id=dirty.workspace_id AND pending.id=dirty.inode_id
+      AND pending.kind='file' AND pending.current_version=0
+  )
 )SQL");
     xattrs.BindInt64(1, workspace.id);
     xattrs.BindInt64(2, commit);
@@ -1212,21 +1228,78 @@ LEFT JOIN _vexfs_acl_entries a
   ON a.workspace_id=dirty.workspace_id AND a.inode_id=dirty.inode_id
  AND a.principal_id=dirty.principal_id AND a.effect=dirty.effect
 WHERE dirty.workspace_id=?1
+  AND NOT EXISTS (
+    SELECT 1 FROM _vexfs_inodes pending
+    WHERE pending.workspace_id=dirty.workspace_id AND pending.id=dirty.inode_id
+      AND pending.kind='file' AND pending.current_version=0
+  )
 )SQL");
     acl.BindInt64(1, workspace.id);
     acl.BindInt64(2, commit);
     acl.Done();
 
-    Statement clear_inodes(db, "DELETE FROM _vexfs_dirty_inodes WHERE workspace_id=?1");
+    // Keep unpublished files dirty across unrelated commits.  Once publish
+    // advances current_version, the next CreateCommit flushes and clears all
+    // of their inode/dentry/xattr/ACL changes atomically.  A version-0 inode
+    // deleted before publish never entered history, so its dirty rows can be
+    // discarded.
+    Statement clear_inodes(db, R"SQL(
+DELETE FROM _vexfs_dirty_inodes
+WHERE workspace_id=?1 AND (
+  NOT EXISTS (
+    SELECT 1 FROM _vexfs_inodes pending
+    WHERE pending.workspace_id=_vexfs_dirty_inodes.workspace_id
+      AND pending.id=_vexfs_dirty_inodes.inode_id
+  ) OR EXISTS (
+    SELECT 1 FROM _vexfs_inodes publishable
+    WHERE publishable.workspace_id=_vexfs_dirty_inodes.workspace_id
+      AND publishable.id=_vexfs_dirty_inodes.inode_id
+      AND (publishable.kind<>'file' OR publishable.current_version>0
+           OR publishable.deleted_at IS NOT NULL)
+  )
+)
+)SQL");
     clear_inodes.BindInt64(1, workspace.id);
     clear_inodes.Done();
-    Statement clear_dentries(db, "DELETE FROM _vexfs_dirty_dentries WHERE workspace_id=?1");
+    Statement clear_dentries(db, R"SQL(
+DELETE FROM _vexfs_dirty_dentries
+WHERE workspace_id=?1 AND NOT EXISTS (
+  SELECT 1 FROM _vexfs_inodes pending
+  WHERE pending.workspace_id=_vexfs_dirty_dentries.workspace_id
+    AND pending.id=COALESCE((
+      SELECT live.inode_id FROM _vexfs_dentries live
+      WHERE live.workspace_id=_vexfs_dirty_dentries.workspace_id
+        AND live.parent_inode=_vexfs_dirty_dentries.parent_inode
+        AND live.name=_vexfs_dirty_dentries.name
+    ),_vexfs_dirty_dentries.inode_id)
+    AND pending.kind='file' AND pending.current_version=0
+    AND pending.deleted_at IS NULL
+)
+)SQL");
     clear_dentries.BindInt64(1, workspace.id);
     clear_dentries.Done();
-    Statement clear_xattrs(db, "DELETE FROM _vexfs_dirty_xattrs WHERE workspace_id=?1");
+    Statement clear_xattrs(db, R"SQL(
+DELETE FROM _vexfs_dirty_xattrs
+WHERE workspace_id=?1 AND NOT EXISTS (
+  SELECT 1 FROM _vexfs_inodes pending
+  WHERE pending.workspace_id=_vexfs_dirty_xattrs.workspace_id
+    AND pending.id=_vexfs_dirty_xattrs.inode_id
+    AND pending.kind='file' AND pending.current_version=0
+    AND pending.deleted_at IS NULL
+)
+)SQL");
     clear_xattrs.BindInt64(1, workspace.id);
     clear_xattrs.Done();
-    Statement clear_acl(db, "DELETE FROM _vexfs_dirty_acl WHERE workspace_id=?1");
+    Statement clear_acl(db, R"SQL(
+DELETE FROM _vexfs_dirty_acl
+WHERE workspace_id=?1 AND NOT EXISTS (
+  SELECT 1 FROM _vexfs_inodes pending
+  WHERE pending.workspace_id=_vexfs_dirty_acl.workspace_id
+    AND pending.id=_vexfs_dirty_acl.inode_id
+    AND pending.kind='file' AND pending.current_version=0
+    AND pending.deleted_at IS NULL
+)
+)SQL");
     clear_acl.BindInt64(1, workspace.id);
     clear_acl.Done();
 }

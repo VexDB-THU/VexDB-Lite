@@ -704,7 +704,9 @@ int main(int argc, char **argv) {
     vexfs_mount_free(state.data);
 
     // The mount-only create-and-open path must produce one history commit and
-    // one content version, even when macOS metadata arrives before content.
+    // one content version, even when macOS metadata or an unrelated commit
+    // arrives before content.  In particular, no immutable history row may
+    // point at the private version-0 staging state.
     const int64_t commits_before = Scalar(path, "SELECT count(*) FROM _vexfs_commits");
     const int64_t versions_before = Scalar(path, "SELECT count(*) FROM _vexfs_file_versions");
     const int64_t requests_before = Scalar(path, "SELECT count(*) FROM _vexfs_requests");
@@ -720,6 +722,17 @@ int main(int argc, char **argv) {
         return Fail("coalesced create has no empty version", error);
     const int64_t coalesced_inode = JsonInteger(coalesced_stat, "inode");
     vexfs_mount_free(coalesced_stat.data);
+    if (vexfs_mount_mkdir(session, "/agent/unrelated-boundary", &error) != VEXFS_MOUNT_OK)
+        return Fail("unrelated history boundary", error);
+    if (Scalar(path,
+            "SELECT count(*) FROM _vexfs_inode_states WHERE kind='file' "
+            "AND current_version=0") != 0 ||
+        Scalar(path,
+            "SELECT count(*) FROM _vexfs_dirty_inodes dirty "
+            "JOIN _vexfs_inodes inode ON inode.id=dirty.inode_id "
+            "WHERE inode.id=(SELECT inode_id FROM _vexfs_dentries "
+            "WHERE name='coalesced.txt') AND inode.current_version=0") != 1)
+        return Fail("unpublished create history isolation", error);
     if (vexfs_mount_xattr_set(session, coalesced_inode, "com.apple.provenance", "p", 1,
                               VEXFS_MOUNT_XATTR_ALWAYS_SET, &error) != VEXFS_MOUNT_OK)
         return Fail("coalesced provenance", error);
@@ -733,7 +746,7 @@ int main(int argc, char **argv) {
                                          &version, &error) !=
             VEXFS_MOUNT_OK || version != 1)
         return Fail("coalesced publish close", error);
-    if (Scalar(path, "SELECT count(*) FROM _vexfs_commits") - commits_before != 1 ||
+    if (Scalar(path, "SELECT count(*) FROM _vexfs_commits") - commits_before != 2 ||
         Scalar(path, "SELECT count(*) FROM _vexfs_file_versions") - versions_before != 1 ||
         Scalar(path, "SELECT count(*) FROM _vexfs_requests") - requests_before != 0)
         return Fail("coalesced write amplification", error);
