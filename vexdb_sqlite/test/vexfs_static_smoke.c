@@ -28,6 +28,14 @@ static int exec_fails(sqlite3 *db, const char *sql) {
     return rc != SQLITE_OK;
 }
 
+static int exec_fails_with(sqlite3 *db, const char *sql, const char *expected) {
+    char *message = NULL;
+    int rc = sqlite3_exec(db, sql, NULL, NULL, &message);
+    int matches = rc != SQLITE_OK && message != NULL && strstr(message, expected) != NULL;
+    sqlite3_free(message);
+    return matches;
+}
+
 static sqlite3_int64 scalar_int(sqlite3 *db, const char *sql, int *ok) {
     sqlite3_stmt *statement = NULL;
     *ok = 0;
@@ -75,6 +83,36 @@ int main(void) {
 
     char *text = scalar_text(db, "SELECT CAST(vexfs_read('default','/notes/2026/hello.txt') AS TEXT)");
     if (text == NULL || strcmp(text, "hello") != 0) return fail(db, "read after write");
+    free(text);
+
+    text = scalar_text(db,
+        "SELECT vexfs_grep('default','/notes','ell',0,100)");
+    if (text == NULL || strstr(text, "\"path\":\"/notes/2026/hello.txt\"") == NULL ||
+        strstr(text, "\"line\":1") == NULL || strstr(text, "\"match_count\":1") == NULL)
+        return fail(db, "database grep");
+    free(text);
+    text = scalar_text(db,
+        "SELECT vexfs_grep('default','/notes','HEL',1,100)");
+    if (text == NULL || strstr(text, "\"match_count\":1") == NULL)
+        return fail(db, "database grep ignore case");
+    free(text);
+    text = scalar_text(db, "SELECT vexfs_grep_index('enable')");
+    if (text == NULL || strstr(text, "\"enabled\":true") == NULL ||
+        strstr(text, "\"available\":true") == NULL ||
+        strstr(text, "\"backend\":\"fts5-trigram\"") == NULL)
+        return fail(db, "enable database grep index");
+    free(text);
+    text = scalar_text(db,
+        "SELECT vexfs_grep('default','/notes','ell',0,100)");
+    if (text == NULL || strstr(text, "\"index_used\":true") == NULL ||
+        strstr(text, "\"match_count\":1") == NULL)
+        return fail(db, "indexed database grep");
+    free(text);
+    text = scalar_text(db,
+        "SELECT vexfs_grep('default','/notes','el',0,100)");
+    if (text == NULL || strstr(text, "\"index_used\":false") == NULL ||
+        strstr(text, "\"match_count\":1") == NULL)
+        return fail(db, "short database grep fallback");
     free(text);
 
     // SQL 事务回滚必须同时回滚文件内容。
@@ -232,38 +270,93 @@ int main(void) {
         "SELECT vexfs_remove('default','/notes/2026',0);"))
         return fail(db, "move and remove");
 
+    // POSIX mode 与符号链接必须通过静态注册入口工作。
+    inode = scalar_int(db,
+        "SELECT vexfs_create('default','/notes/run.sh','file',488)", &ok);
+    if (!ok || inode == 0) return fail(db, "create file with mode");
+    snprintf(sql, sizeof(sql), "SELECT vexfs_set_mode('default',%lld,493)",
+             (long long)inode);
+    if (scalar_int(db, sql, &ok) != 493 || !ok) return fail(db, "set executable mode");
+    if (scalar_int(db,
+        "SELECT json_extract(vexfs_stat('default','/notes/run.sh'),'$.mode')", &ok) != 493 ||
+        !ok) return fail(db, "persist executable mode");
+    sqlite3_int64 link_inode = scalar_int(db,
+        "SELECT vexfs_symlink('default','/notes/run-link','run.sh')", &ok);
+    if (!ok || link_inode == 0) return fail(db, "create symlink");
+    snprintf(sql, sizeof(sql), "SELECT CAST(vexfs_readlink('default',%lld) AS TEXT)",
+             (long long)link_inode);
+    text = scalar_text(db, sql);
+    if (text == NULL || strcmp(text, "run.sh") != 0) return fail(db, "read symlink");
+    free(text);
+
+    if (!exec_ok(db,
+        "SELECT vexfs_xattr_set('default',"
+        "json_extract(vexfs_stat('default','/notes/run.sh'),'$.inode'),"
+        "'user.snapshot','old',0);"
+        "SELECT vexfs_snapshot_create('default','before-tree');"
+        "SELECT vexfs_write('default','/notes/run.sh','changed');"
+        "SELECT vexfs_set_mode('default',"
+        "json_extract(vexfs_stat('default','/notes/run.sh'),'$.inode'),420);"
+        "SELECT vexfs_rename('default','/notes/run.sh','/notes/renamed.sh',0);"
+        "SELECT vexfs_remove('default','/notes/run-link',0);"
+        "SELECT vexfs_xattr_set('default',"
+        "json_extract(vexfs_stat('default','/notes/renamed.sh'),'$.inode'),"
+        "'user.snapshot','new',0);")) return fail(db, "snapshot mutations");
+    text = scalar_text(db,
+        "SELECT vexfs_snapshot_diff('default','before-tree','HEAD')");
+    if (text == NULL || strstr(text, "renamed.sh") == NULL ||
+        strstr(text, "run-link") == NULL) return fail(db, "snapshot diff");
+    free(text);
+    version = scalar_int(db,
+        "SELECT vexfs_snapshot_restore('default','before-tree',"
+        "(SELECT head_commit FROM _vexfs_workspaces WHERE name='default'))", &ok);
+    if (!ok || version <= 0) return fail(db, "snapshot restore");
+    if (scalar_int(db,
+        "SELECT json_extract(vexfs_stat('default','/notes/run.sh'),'$.mode')", &ok) != 493 ||
+        !ok) return fail(db, "snapshot restored mode");
+    if (!exec_fails(db, "SELECT vexfs_stat('default','/notes/renamed.sh')"))
+        return fail(db, "snapshot removed later rename");
+    snprintf(sql, sizeof(sql), "SELECT CAST(vexfs_readlink('default',%lld) AS TEXT)",
+             (long long)link_inode);
+    text = scalar_text(db, sql);
+    if (text == NULL || strcmp(text, "run.sh") != 0)
+        return fail(db, "snapshot restored symlink");
+    free(text);
+    text = scalar_text(db,
+        "SELECT CAST(vexfs_xattr_get('default',"
+        "json_extract(vexfs_stat('default','/notes/run.sh'),'$.inode'),"
+        "'user.snapshot') AS TEXT)");
+    if (text == NULL || strcmp(text, "old") != 0) return fail(db, "snapshot restored xattr");
+    free(text);
+    text = scalar_text(db, "SELECT vexfs_snapshot_list('default')");
+    if (text == NULL || strstr(text, "before-tree") == NULL) return fail(db, "snapshot list");
+    free(text);
+
     scalar_int(db, "SELECT vexfs_item_reclaim('default','reclaim-1')", &ok);
     if (!ok) return fail(db, "reclaim");
 
     sqlite3_close(db);
 
-    // 0.1.0 数据库原地升级，保留当前 dirty generation，并清空旧幂等缓存。
+    // 尚未正式发版，不保留旧 schema 迁移。版本不匹配必须明确拒绝且不能改库。
     db = NULL;
-    if (sqlite3_open(":memory:", &db) != SQLITE_OK) return fail(db, "migration open");
-    if (vexdb_sqlite_register(db) != SQLITE_OK) return fail(db, "migration register");
+    if (sqlite3_open(":memory:", &db) != SQLITE_OK) return fail(db, "version mismatch open");
+    if (vexdb_sqlite_register(db) != SQLITE_OK) return fail(db, "version mismatch register");
     if (!exec_ok(db,
         "CREATE TABLE _vexfs_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
         "INSERT INTO _vexfs_meta VALUES('contract_version','0.1.0');"
-        "CREATE TABLE _vexfs_inodes(kind TEXT,deleted_at INTEGER,current_version INTEGER);"
-        "INSERT INTO _vexfs_inodes VALUES('directory',NULL,0);"
-        "CREATE TABLE _vexfs_handles(id TEXT PRIMARY KEY,dirty_generation INTEGER NOT NULL);"
-        "INSERT INTO _vexfs_handles VALUES('h',1);"
-        "CREATE TABLE _vexfs_staging(handle_id TEXT,generation INTEGER,content BLOB,"
-        "created_at INTEGER,PRIMARY KEY(handle_id,generation));"
-        "INSERT INTO _vexfs_staging VALUES('h',1,X'6162',123);"
-        "CREATE TABLE _vexfs_requests(request_id TEXT PRIMARY KEY,operation TEXT NOT NULL,"
-        "result_integer INTEGER,result_text TEXT,created_at INTEGER);"
-        "INSERT INTO _vexfs_requests VALUES('old','write',1,NULL,123);"
-        "SELECT vexfs_init();")) return fail(db, "0.1 migration");
+        "CREATE TABLE legacy_marker(value TEXT NOT NULL);"
+        "INSERT INTO legacy_marker VALUES('unchanged');"))
+        return fail(db, "version mismatch fixture");
+    if (!exec_fails_with(db, "SELECT vexfs_init();", "unsupported VexFS schema version: 0.1.0"))
+        return fail(db, "old schema must be rejected");
     text = scalar_text(db, "SELECT value FROM _vexfs_meta WHERE key='contract_version'");
-    if (text == NULL || strcmp(text, "0.3.0") != 0) return fail(db, "migration version");
+    if (text == NULL || strcmp(text, "0.1.0") != 0) return fail(db, "old schema changed");
     free(text);
-    if (scalar_int(db, "SELECT logical_size FROM _vexfs_staging WHERE handle_id='h'", &ok) != 2 ||
-        !ok) return fail(db, "migration staging");
-    if (scalar_int(db, "SELECT count(*) FROM _vexfs_requests", &ok) != 0 || !ok)
-        return fail(db, "migration request cache");
-    if (scalar_int(db, "SELECT current_version FROM _vexfs_inodes", &ok) != 1 || !ok)
-        return fail(db, "migration directory verifier");
+    text = scalar_text(db, "SELECT value FROM legacy_marker");
+    if (text == NULL || strcmp(text, "unchanged") != 0) return fail(db, "old data changed");
+    free(text);
+    if (scalar_int(db, "SELECT count(*) FROM sqlite_master WHERE name LIKE '_vexfs_%'", &ok) != 1 ||
+        !ok) return fail(db, "old schema was partially initialized");
     sqlite3_close(db);
     printf("VEXFS STATIC SMOKE: PASS\n");
     return 0;

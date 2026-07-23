@@ -104,16 +104,25 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
 
     func unloadResource(resource: FSResource, options: FSTaskOptions,
                         replyHandler: @escaping ((any Error)?) -> Void) {
-        guard let pathResource = resource as? FSPathURLResource,
-              pathResource.url == self.resource?.url else {
+        guard resource is FSPathURLResource else {
             return replyHandler(POSIXError(.EINVAL))
         }
+        // FSUnaryFileSystem has exactly one loaded resource. FSKit may give the
+        // unload callback a new FSPathURLResource object whose URL spelling is
+        // not byte-for-byte identical to the load callback (for example
+        // /tmp versus /private/tmp). Comparing URL objects here rejected a real
+        // unmount and left the database mount lease alive until its 30s expiry.
+        guard let loadedResource = self.resource else {
+            return replyHandler(nil)
+        }
+        Logger.vexfs.info("unloading VexFS resource")
         do { try volume?.synchronizeNow() } catch {
             Logger.vexfs.error("unload synchronize failed: \(error.localizedDescription)")
         }
+        volume?.closeBackend()
         self.volume = nil
         self.resource = nil
-        pathResource.url.stopAccessingSecurityScopedResource()
+        loadedResource.url.stopAccessingSecurityScopedResource()
         replyHandler(nil)
     }
 }

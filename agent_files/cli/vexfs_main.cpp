@@ -1,15 +1,9 @@
-#include "vexfs_mount_contract.h"
-#include "vexfs_fskit_state.h"
-
-#include <dlfcn.h>
-#include <sys/mount.h>
-#include <sys/stat.h>
-#include <sys/sysctl.h>
-#include <sys/wait.h>
-#include <unistd.h>
+#include "vexfs_runtime_admin.h"
+#include "vexfs_platform.h"
 
 #include <cerrno>
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -20,6 +14,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -33,21 +28,11 @@ struct Options {
     std::vector<std::string> arguments;
 };
 
-std::string HomeDirectory() {
-    const char *home = std::getenv("HOME");
-    return home == nullptr ? std::string(".") : std::string(home);
-}
-
-std::string DefaultDatabasePath() {
-    if (const char *configured = std::getenv("VEXFS_DATABASE")) return configured;
-    const std::filesystem::path directory = std::filesystem::path(HomeDirectory()) /
-        "Library/Application Support/VexFS";
-    return (directory / "vexfs.sqlite3").string();
-}
+std::string g_program_name = "vexfs";
 
 void Usage(std::ostream &output) {
     output <<
-        "Usage: vexfs [--db PATH] [--workspace NAME] COMMAND [ARGS]\n"
+        "Usage: " << g_program_name << " [--db PATH] [--workspace NAME] COMMAND [ARGS]\n"
         "\n"
         "Commands:\n"
         "  setup [--mount PATH]         Initialize and optionally mount a workspace\n"
@@ -56,6 +41,12 @@ void Usage(std::ostream &output) {
         "  write PATH [LOCAL_FILE]      Write a local file or stdin\n"
         "  cat PATH                     Print a file\n"
         "  ls [PATH] [--json]           List a directory\n"
+        "  grep [-i] [-l] [-n] [--max-results N] PATTERN [PATH]\n"
+        "                               Search current text files inside SQLite\n"
+        "  index status|enable|rebuild|disable\n"
+        "                               Manage the optional trigram text index\n"
+        "  check [--quick]              Verify workspace metadata and content\n"
+        "                               --quick skips SHA-256 BLOB hashing\n"
         "  stat PATH                    Print file metadata as JSON\n"
         "  history PATH [--limit N] [--before N] [--json]\n"
         "                               List one page of file versions\n"
@@ -63,18 +54,32 @@ void Usage(std::ostream &output) {
         "  diff PATH --from N [--to N] Compare two versions (default: current)\n"
         "  restore PATH --version N [--dry-run]\n"
         "                               Restore as a new version\n"
+        "  snapshot create NAME [--committed-only]\n"
+        "                               Snapshot all published data; default refuses\n"
+        "                               while another mount has unpublished writes\n"
+        "  snapshot list                List workspace snapshots\n"
+        "  snapshot show NAME           Show the complete historical tree as JSON\n"
+        "  snapshot diff FROM [--to TO] Compare snapshots (default TO: HEAD)\n"
+        "  snapshot restore NAME [--dry-run] [--force-unmount]\n"
+        "                               Restore the complete tree as a new commit\n"
+        "  snapshot drop NAME           Delete a snapshot name, not its history\n"
         "  mv SOURCE DESTINATION        Move a file or directory\n"
+        "  ln SOURCE DESTINATION        Create a hard link to a regular file\n"
+        "  chown UID:GID PATH            Store owner IDs (- keeps an ID)\n"
+        "  getfacl PATH                  Print the portable ACL JSON\n"
+        "  setfacl PATH [LOCAL_FILE]     Replace ACL JSON from file or stdin\n"
         "  rm [-r] PATH                 Remove a file or directory\n"
-        "  descriptor OUTPUT            Write an FSKit .vexfs descriptor\n"
-        "  mount MOUNT_POINT            Mount through the enabled FSKit extension\n"
+        "  descriptor OUTPUT            Write a portable workspace descriptor\n"
+        "  mount MOUNT_POINT            Mount through the platform adapter\n"
         "  mount status [MOUNT_POINT]   Show active VexFS mounts\n"
-        "  unmount MOUNT_POINT          Unmount a VexFS mount\n"
-        "  doctor [--json]              Check macOS, extension and SQLite state\n";
+        "  unmount [--force] MOUNT_POINT\n"
+        "                               Unmount; --force detaches a stale mount\n"
+        "  doctor [--json]              Check platform adapter and SQLite state\n";
 }
 
 Options ParseOptions(int argc, char **argv) {
     Options options;
-    options.database = DefaultDatabasePath();
+    options.database = VexFSPlatformDefaultDatabasePath();
     for (int index = 1; index < argc; ++index) {
         std::string argument = argv[index];
         if (argument == "--db" && index + 1 < argc) {
@@ -110,6 +115,7 @@ const char *ErrorCode(vexfs_mount_status status) {
         case VEXFS_MOUNT_NO_SPACE: return "VEXFS_NO_SPACE";
         case VEXFS_MOUNT_CORRUPTION: return "VEXFS_CORRUPTION";
         case VEXFS_MOUNT_UNSUPPORTED: return "VEXFS_UNSUPPORTED";
+        case VEXFS_MOUNT_NOT_EMPTY: return "VEXFS_NOT_EMPTY";
         case VEXFS_MOUNT_DATABASE_ERROR: return "VEXFS_DATABASE_ERROR";
         case VEXFS_MOUNT_INTERNAL_ERROR: return "VEXFS_INTERNAL_ERROR";
         default: return "VEXFS_ERROR";
@@ -128,6 +134,7 @@ int ExitCode(vexfs_mount_status status) {
         case VEXFS_MOUNT_DATABASE_ERROR: return 7;
         case VEXFS_MOUNT_CORRUPTION: return 8;
         case VEXFS_MOUNT_UNSUPPORTED: return 9;
+        case VEXFS_MOUNT_NOT_EMPTY: return 5;
         default: return 1;
     }
 }
@@ -150,15 +157,16 @@ class Session {
         if (initialize && path.has_parent_path()) {
             const bool existed = std::filesystem::exists(path.parent_path());
             std::filesystem::create_directories(path.parent_path());
-            if (!existed && chmod(path.parent_path().c_str(), 0700) != 0)
-                throw std::runtime_error(std::strerror(errno));
+            if (!existed) VexFSPlatformProtectDirectory(path.parent_path());
         }
         vexfs_mount_config config{};
-        config.abi_version = VEXFS_MOUNT_ABI_VERSION;
-        config.database_path = options.database.c_str();
+        config.abi_version = VEXFS_RUNTIME_ABI_VERSION;
+        config.backend = VEXFS_RUNTIME_BACKEND_SQLITE;
+        config.connection = options.database.c_str();
         config.workspace = options.workspace.c_str();
-        config.busy_timeout_ms = 5000;
-        config.flags = initialize ? 0 : VEXFS_MOUNT_OPEN_NO_CREATE;
+        config.principal = "local";
+        config.operation_timeout_ms = 5000;
+        config.flags = initialize ? 0 : VEXFS_RUNTIME_OPEN_NO_CREATE;
         vexfs_mount_error error{};
         const auto status = vexfs_mount_session_open(&config, &session_, &error);
         if (status != VEXFS_MOUNT_OK) throw CliError(status, ErrorMessage(error));
@@ -226,6 +234,36 @@ void PrintNames(const std::string &json) {
     while ((position = json.find(marker, position)) != std::string::npos) {
         position += marker.size();
         std::cout << JsonUnescape(json, &position) << '\n';
+    }
+}
+
+void PrintGrep(const std::string &json, bool files_only, bool show_line) {
+    const std::string path_marker = "\"path\":\"";
+    const std::string line_marker = "\"line\":";
+    const std::string text_marker = "\"text\":\"";
+    size_t position = 0;
+    while ((position = json.find(path_marker, position)) != std::string::npos) {
+        position += path_marker.size();
+        const std::string path = JsonUnescape(json, &position);
+        const size_t line_position = json.find(line_marker, position);
+        const size_t text_position = json.find(text_marker, position);
+        if (line_position == std::string::npos || text_position == std::string::npos) {
+            throw std::runtime_error("invalid grep JSON");
+        }
+        char *end = nullptr;
+        const long long line = std::strtoll(
+            json.c_str() + line_position + line_marker.size(), &end, 10);
+        if (end == json.c_str() + line_position + line_marker.size()) {
+            throw std::runtime_error("invalid grep line number");
+        }
+        position = text_position + text_marker.size();
+        const std::string text = JsonUnescape(json, &position);
+        std::cout << path;
+        if (!files_only) {
+            if (show_line) std::cout << ':' << line;
+            std::cout << ':' << text;
+        }
+        std::cout << '\n';
     }
 }
 
@@ -304,6 +342,19 @@ int64_t NonnegativeInteger(const std::string &value, const std::string &name) {
     return static_cast<int64_t>(result);
 }
 
+int64_t OwnerId(const std::string &value, const std::string &name) {
+    if (value == "-") return -1;
+    char *end = nullptr;
+    errno = 0;
+    const long long result = std::strtoll(value.c_str(), &end, 10);
+    if (errno != 0 || end == value.c_str() || *end != '\0' || result < 0 ||
+        static_cast<unsigned long long>(result) > 0xffffffffULL) {
+        throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                       name + " must be - or an integer in 0..4294967295");
+    }
+    return static_cast<int64_t>(result);
+}
+
 int64_t JsonInteger(const std::string &json, const std::string &name) {
     const std::string marker = "\"" + name + "\":";
     size_t position = json.find(marker);
@@ -332,6 +383,29 @@ bool JsonBoolean(const std::string &json, const std::string &name) {
     if (position == std::string::npos)
         throw std::runtime_error("invalid JSON result: missing " + name);
     return json.compare(position + marker.size(), 4, "true") == 0;
+}
+
+void PrintCheck(const std::string &json) {
+    const bool ok = JsonBoolean(json, "ok");
+    std::cout << (ok ? "OK" : "CORRUPT")
+              << " workspace=" << JsonString(json, "workspace")
+              << " mode=" << JsonString(json, "mode")
+              << " issues=" << JsonInteger(json, "issue_count")
+              << " versions=" << JsonInteger(json, "versions")
+              << " content_bytes=" << JsonInteger(json, "content_bytes")
+              << " elapsed_ms=" << JsonInteger(json, "elapsed_ms") << '\n';
+    const std::string code_marker = "\"code\":\"";
+    size_t position = 0;
+    while ((position = json.find(code_marker, position)) != std::string::npos) {
+        const size_t row_end = json.find('}', position);
+        if (row_end == std::string::npos) throw std::runtime_error("invalid check JSON");
+        const std::string row = json.substr(position, row_end - position + 1);
+        std::cout << JsonString(row, "code") << '\t'
+                  << JsonString(row, "object") << '\t'
+                  << JsonString(row, "message") << '\t'
+                  << JsonString(row, "suggestion") << '\n';
+        position = row_end + 1;
+    }
 }
 
 void PrintHistory(const std::string &json) {
@@ -474,166 +548,6 @@ void WriteDescriptor(const Options &options, const std::filesystem::path &path) 
            << "\",\n  \"workspace\": \"" << JsonEscape(options.workspace) << "\"\n}\n";
 }
 
-std::filesystem::path WriteMountResourceDescriptor(const Options &options) {
-    const std::filesystem::path database =
-        std::filesystem::absolute(options.database).lexically_normal();
-    const std::filesystem::path directory = database.parent_path();
-    if (directory.empty() || database.filename().empty()) {
-        throw std::runtime_error("database path must include a file name");
-    }
-    std::filesystem::create_directories(directory);
-    const std::filesystem::path descriptor = directory / ".vexfs-volume.json";
-    std::ofstream output(descriptor, std::ios::binary | std::ios::trunc);
-    if (!output) throw std::runtime_error("cannot write mount resource: " + descriptor.string());
-    output << "{\n  \"version\": 2,\n  \"database_file\": \""
-           << JsonEscape(database.filename().string())
-           << "\",\n  \"workspace\": \"" << JsonEscape(options.workspace) << "\"\n}\n";
-    return directory;
-}
-
-int RunProcess(const char *program, const std::vector<std::string> &arguments) {
-    const pid_t child = fork();
-    if (child < 0) throw std::runtime_error(std::strerror(errno));
-    if (child == 0) {
-        std::vector<char *> values;
-        values.push_back(const_cast<char *>(program));
-        for (const std::string &argument : arguments)
-            values.push_back(const_cast<char *>(argument.c_str()));
-        values.push_back(nullptr);
-        execv(program, values.data());
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(child, &status, 0) < 0) throw std::runtime_error(std::strerror(errno));
-    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-}
-
-struct ProcessOutput {
-    int exit_code = 1;
-    std::string output;
-};
-
-ProcessOutput CaptureProcess(const char *program, const std::vector<std::string> &arguments) {
-    int descriptors[2] = {-1, -1};
-    if (pipe(descriptors) != 0) throw std::runtime_error(std::strerror(errno));
-    const pid_t child = fork();
-    if (child < 0) {
-        close(descriptors[0]);
-        close(descriptors[1]);
-        throw std::runtime_error(std::strerror(errno));
-    }
-    if (child == 0) {
-        close(descriptors[0]);
-        dup2(descriptors[1], STDOUT_FILENO);
-        dup2(descriptors[1], STDERR_FILENO);
-        close(descriptors[1]);
-        std::vector<char *> values;
-        values.push_back(const_cast<char *>(program));
-        for (const std::string &argument : arguments)
-            values.push_back(const_cast<char *>(argument.c_str()));
-        values.push_back(nullptr);
-        execv(program, values.data());
-        _exit(127);
-    }
-    close(descriptors[1]);
-    ProcessOutput result;
-    char buffer[4096];
-    for (;;) {
-        const ssize_t count = read(descriptors[0], buffer, sizeof(buffer));
-        if (count > 0) result.output.append(buffer, static_cast<size_t>(count));
-        else if (count == 0) break;
-        else if (errno != EINTR) break;
-    }
-    close(descriptors[0]);
-    int status = 0;
-    if (waitpid(child, &status, 0) < 0) throw std::runtime_error(std::strerror(errno));
-    result.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
-    return result;
-}
-
-enum class ExtensionState { kMissing, kEnabled, kDisabled, kRegistered };
-
-ExtensionState VexFSExtensionState() {
-    char module_url[4096]{};
-    const int fskit_state = vexfs_fskit_extension_state(
-        "io.vexdb.vexfs.extension", module_url, sizeof(module_url));
-    if (std::getenv("VEXFS_DEBUG") != nullptr) {
-        std::cerr << "vexfs: FSKit state=" << fskit_state
-                  << " module=" << module_url << '\n';
-    }
-    if (fskit_state == 2) return ExtensionState::kEnabled;
-    if (fskit_state == 1) return ExtensionState::kDisabled;
-
-    // FSKit filters out modules whose signature or provisioning it cannot accept.
-    // pluginkit can still distinguish that state from a package that is not installed.
-    // Its '+' marker is registration/election, not the FSKit per-user enable switch,
-    // so it must never claim that mounting is ready.
-    const ProcessOutput result = CaptureProcess("/usr/bin/pluginkit",
-        {"-m", "-A", "-D", "-i", "io.vexdb.vexfs.extension"});
-    if (result.exit_code != 0 || result.output.empty()) return ExtensionState::kMissing;
-    for (size_t position = 0; position < result.output.size();) {
-        const size_t end = result.output.find('\n', position);
-        const std::string line = result.output.substr(position,
-            end == std::string::npos ? std::string::npos : end - position);
-        const size_t marker = line.find_first_not_of(" \t");
-        if (marker != std::string::npos) {
-            if (line[marker] == '+' || line[marker] == '!') return ExtensionState::kRegistered;
-            if (line[marker] == '-') return ExtensionState::kDisabled;
-        }
-        if (end == std::string::npos) break;
-        position = end + 1;
-    }
-    return ExtensionState::kRegistered;
-}
-
-const char *ExtensionStateName(ExtensionState state) {
-    switch (state) {
-        case ExtensionState::kEnabled: return "enabled";
-        case ExtensionState::kDisabled: return "disabled";
-        case ExtensionState::kRegistered: return "registered";
-        case ExtensionState::kMissing: return "missing";
-    }
-    return "missing";
-}
-
-struct MountedVolume {
-    std::string source;
-    std::string target;
-    std::string type;
-};
-
-std::string NormalizedPath(const std::string &path) {
-    std::error_code error;
-    const auto canonical = std::filesystem::weakly_canonical(path, error);
-    if (!error) return canonical.string();
-    return std::filesystem::absolute(path).lexically_normal().string();
-}
-
-std::vector<MountedVolume> VexFSMounts() {
-    struct statfs *entries = nullptr;
-    const int count = getmntinfo(&entries, MNT_NOWAIT);
-    std::vector<MountedVolume> mounts;
-    for (int index = 0; index < count; ++index) {
-        if (std::strcmp(entries[index].f_fstypename, "vexfs") != 0) continue;
-        mounts.push_back({entries[index].f_mntfromname, entries[index].f_mntonname,
-                          entries[index].f_fstypename});
-    }
-    return mounts;
-}
-
-bool ProductVersionSupported(const std::string &version) {
-    char *end = nullptr;
-    const long major = std::strtol(version.c_str(), &end, 10);
-    return end != version.c_str() && major >= 26;
-}
-
-std::string ProductVersion() {
-    char buffer[128] = {};
-    size_t size = sizeof(buffer);
-    if (sysctlbyname("kern.osproductversion", buffer, &size, nullptr, 0) != 0) return "unknown";
-    return buffer;
-}
-
 std::string DatabaseDiagnostics(Session &session) {
     vexfs_mount_bytes json{};
     vexfs_mount_error error{};
@@ -701,11 +615,30 @@ bool RunVersionDiff(Session &session, const std::string &path, int64_t from_vers
     return PrintDiff(path, from_version, from, to_version, to, false);
 }
 
+std::string NormalizedPath(const std::string &path) {
+    std::error_code error;
+    const auto canonical = std::filesystem::weakly_canonical(path, error);
+    if (!error) return canonical.string();
+    return std::filesystem::absolute(path).lexically_normal().string();
+}
+
+std::vector<VexFSPlatformMountEntry> WorkspaceMounts(const Options &options) {
+    const std::string database = NormalizedPath(options.database);
+    std::vector<VexFSPlatformMountEntry> matches;
+    for (const auto &mount : VexFSPlatformInspect().mounts) {
+        if (!mount.database.empty() && NormalizedPath(mount.database) == database &&
+            mount.workspace == options.workspace) {
+            matches.push_back(mount);
+        }
+    }
+    return matches;
+}
+
 int PrintMountStatus(const Options &options, const std::string &requested_path) {
-    const std::string normalized = requested_path.empty() ? "" : NormalizedPath(requested_path);
-    std::vector<MountedVolume> mounts;
-    for (const auto &mount : VexFSMounts()) {
-        if (normalized.empty() || NormalizedPath(mount.target) == normalized) mounts.push_back(mount);
+    const std::string requested = requested_path.empty() ? "" : NormalizedPath(requested_path);
+    std::vector<VexFSPlatformMountEntry> mounts;
+    for (const auto &mount : VexFSPlatformInspect().mounts) {
+        if (requested.empty() || NormalizedPath(mount.target) == requested) mounts.push_back(mount);
     }
     if (options.json) {
         std::cout << '[';
@@ -713,7 +646,10 @@ int PrintMountStatus(const Options &options, const std::string &requested_path) 
             if (index != 0) std::cout << ',';
             std::cout << "{\"source\":\"" << JsonEscape(mounts[index].source)
                       << "\",\"target\":\"" << JsonEscape(mounts[index].target)
-                      << "\",\"type\":\"" << JsonEscape(mounts[index].type) << "\"}";
+                      << "\",\"type\":\"" << JsonEscape(mounts[index].type)
+                      << "\",\"database\":\"" << JsonEscape(mounts[index].database)
+                      << "\",\"workspace\":\"" << JsonEscape(mounts[index].workspace)
+                      << "\"}";
         }
         std::cout << "]\n";
     } else if (mounts.empty()) {
@@ -725,71 +661,53 @@ int PrintMountStatus(const Options &options, const std::string &requested_path) 
     return requested_path.empty() || !mounts.empty() ? 0 : 1;
 }
 
-void PrepareMountPoint(const std::string &path) {
-    const std::filesystem::path mount_point(path);
-    if (std::filesystem::exists(mount_point) && !std::filesystem::is_directory(mount_point)) {
-        throw std::runtime_error("mount point is not a directory: " + path);
-    }
-    std::filesystem::create_directories(mount_point);
-    if (chmod(mount_point.c_str(), 0700) != 0) throw std::runtime_error(std::strerror(errno));
-    if (std::filesystem::directory_iterator(mount_point) != std::filesystem::directory_iterator()) {
-        throw std::runtime_error("mount point must be empty: " + path);
-    }
-}
-
-std::string MountedFileSystemAt(const std::string &path) {
-    const std::string normalized = NormalizedPath(path);
-    struct statfs *entries = nullptr;
-    const int count = getmntinfo(&entries, MNT_NOWAIT);
-    for (int index = 0; index < count; ++index) {
-        if (NormalizedPath(entries[index].f_mntonname) == normalized)
-            return entries[index].f_fstypename;
-    }
-    return {};
-}
-
 int MountWorkspace(const Options &options, const std::string &mount_point) {
-    const std::string mounted_type = MountedFileSystemAt(mount_point);
-    if (mounted_type == "vexfs") {
-        std::cout << mount_point << " is already mounted\n";
-        return 0;
-    }
-    if (!mounted_type.empty()) {
-        throw std::runtime_error("mount point is already used by " + mounted_type);
-    }
-    const ExtensionState extension = VexFSExtensionState();
-    if (extension != ExtensionState::kEnabled) {
-        throw std::runtime_error(std::string("VexFS extension is ") +
-            ExtensionStateName(extension) +
-            "; install VexFS.app and enable its file system extension in System Settings");
-    }
-    PrepareMountPoint(mount_point);
-    const std::filesystem::path resource_directory = WriteMountResourceDescriptor(options);
-    int result = 1;
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        result = RunProcess("/sbin/mount",
-            {"-F", "-t", "vexfs", resource_directory.string(), mount_point});
-        if (MountedFileSystemAt(mount_point) == "vexfs") {
-            result = 0;
-            break;
+    return VexFSPlatformMount(options.database, options.workspace, mount_point);
+}
+
+int UnmountWorkspace(const std::string &mount_point, bool force) {
+    return VexFSPlatformUnmount(mount_point, force);
+}
+
+void RemountWorkspace(const Options &options, const std::string &mount_point) {
+    std::string last_error = "mount returned a non-zero status";
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+    do {
+        try {
+            const int result = MountWorkspace(options, mount_point);
+            if (result == 0) return;
+            last_error = "mount exited with status " + std::to_string(result);
+        } catch (const std::exception &error) {
+            last_error = error.what();
         }
-        if (result == 0) break;
-        if (attempt != 2) usleep(500 * 1000);
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    } while (std::chrono::steady_clock::now() < deadline);
+    throw std::runtime_error(last_error);
+}
+
+int64_t RestoreSnapshotAfterUnmount(Session &session, const std::string &name,
+                                    int64_t head, bool wait_for_mount_shutdown,
+                                    std::chrono::seconds shutdown_timeout =
+                                        std::chrono::seconds(35)) {
+    const auto deadline = std::chrono::steady_clock::now() + shutdown_timeout;
+    while (true) {
+        int64_t commit = 0;
+        vexfs_mount_error error{};
+        const vexfs_mount_status status = vexfs_mount_snapshot_restore(
+            session.get(), name.c_str(), head, &commit, &error);
+        if (status == VEXFS_MOUNT_OK) return commit;
+        const std::string message = ErrorMessage(error);
+        if (!wait_for_mount_shutdown || status != VEXFS_MOUNT_BUSY ||
+            message.find("active mount session") == std::string::npos ||
+            std::chrono::steady_clock::now() >= deadline) {
+            Check(status, error);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    if (result == 0 && MountedFileSystemAt(mount_point) != "vexfs") {
-        throw std::runtime_error("mount command returned success but VexFS is not mounted");
-    }
-    return result;
 }
 
 int RunDoctor(const Options &options) {
-    const std::string version = ProductVersion();
-    const bool supported_macos = ProductVersionSupported(version);
-    void *framework = dlopen("/System/Library/Frameworks/FSKit.framework/FSKit", RTLD_LAZY);
-    const bool fskit = framework != nullptr;
-    if (framework != nullptr) dlclose(framework);
-    const ExtensionState extension = VexFSExtensionState();
-    const auto mounts = VexFSMounts();
+    const VexFSPlatformState platform = VexFSPlatformInspect();
     std::string database_details;
     std::string database_error;
     try {
@@ -799,29 +717,52 @@ int RunDoctor(const Options &options) {
         database_error = error.what();
     }
     const bool database_readable = !database_details.empty();
-    const bool database_ok = database_readable && JsonBoolean(database_details, "compatible");
+    const bool database_ok = database_readable && JsonBoolean(database_details, "schema_ready");
     if (options.json) {
-        std::cout << "{\"macos\":\"" << JsonEscape(version)
-                  << "\",\"macos_supported\":" << (supported_macos ? "true" : "false")
-                  << ",\"fskit\":" << (fskit ? "true" : "false")
-                  << ",\"extension\":\"" << ExtensionStateName(extension) << "\""
+        std::cout << "{\"platform\":\"" << JsonEscape(platform.platform)
+                  << "\",\"runtime_abi\":" << VEXFS_RUNTIME_ABI_VERSION
+                  << ",\"platform_version\":\"" << JsonEscape(platform.version)
+                  << "\",\"platform_supported\":"
+                  << (platform.platform_supported ? "true" : "false")
+                  << ",\"mount_driver\":\"" << JsonEscape(platform.mount_driver)
+                  << "\",\"mount_driver_available\":"
+                  << (platform.mount_driver_available ? "true" : "false")
+                  << ",\"mount_ready\":" << (platform.mount_ready ? "true" : "false")
+                  << ",\"extension\":\"" << JsonEscape(platform.extension_state) << "\""
+                  << ",\"extension_path\":\"" << JsonEscape(platform.extension_path) << "\""
+                  << ",\"extension_path_matches\":"
+                  << (platform.extension_path_matches ? "true" : "false");
+        if (platform.platform == "macos") {
+            std::cout << ",\"macos\":\"" << JsonEscape(platform.version)
+                      << "\",\"macos_supported\":"
+                      << (platform.platform_supported ? "true" : "false")
+                      << ",\"fskit\":"
+                      << (platform.mount_driver_available ? "true" : "false");
+        }
+        std::cout
                   << ",\"database\":";
         if (database_readable) std::cout << database_details;
         else std::cout << "{\"path\":\"" << JsonEscape(options.database)
                        << "\",\"error\":\"" << JsonEscape(database_error) << "\"}";
-        std::cout << ",\"mount_count\":" << mounts.size() << "}\n";
+        std::cout << ",\"mount_count\":" << platform.mounts.size() << "}\n";
     } else {
-        std::cout << "macOS: " << version << (supported_macos ? " (supported)" : " (requires 26+)") << '\n'
-                  << "FSKit: " << (fskit ? "available" : "missing") << '\n'
-                  << "extension: " << ExtensionStateName(extension) << '\n'
+        std::cout << "platform: " << platform.platform << ' ' << platform.version
+                  << (platform.platform_supported ? " (supported)" : " (unsupported)") << '\n'
+                  << "mount driver: " << platform.mount_driver << ' '
+                  << (platform.mount_driver_available ? "(available)" : "(unavailable)") << '\n'
+                  << "mount state: " << platform.extension_state << '\n'
+                  << (platform.extension_path.empty() ? std::string() :
+                      "extension path: " + platform.extension_path + "\n")
+                  << (platform.extension_path_matches ? std::string() :
+                      "extension path: does not match installed App\n")
                   << "database: " << options.database << '\n'
                   << "workspace: " << options.workspace << '\n'
-                  << "SQLite contract: " << (database_ok ? "ok" :
-                      (database_readable ? "upgrade required or incompatible" : database_error)) << '\n'
-                  << "active mounts: " << mounts.size() << '\n';
+                  << "SQLite schema: " << (database_ok ? "ok" :
+                      (database_readable ? "version mismatch" : database_error)) << '\n'
+                  << "active mounts: " << platform.mounts.size() << '\n';
         if (database_readable) std::cout << "database details: " << database_details << '\n';
     }
-    return supported_macos && fskit && extension == ExtensionState::kEnabled && database_ok ? 0 : 1;
+    return platform.mount_ready && database_ok ? 0 : 1;
 }
 
 int Run(const Options &options) {
@@ -847,15 +788,19 @@ int Run(const Options &options) {
         return MountWorkspace(options, options.arguments[1]);
     }
     if (command == "unmount") {
-        if (options.arguments.size() != 2) throw std::runtime_error("unmount needs MOUNT_POINT");
-        return RunProcess("/sbin/umount", {options.arguments[1]});
+        if (options.arguments.size() == 2)
+            return UnmountWorkspace(options.arguments[1], false);
+        if (options.arguments.size() == 3 && options.arguments[1] == "--force")
+            return UnmountWorkspace(options.arguments[2], true);
+        throw std::runtime_error("unmount needs [--force] MOUNT_POINT");
     }
     if (command == "doctor") {
         if (options.arguments.size() != 1) throw std::runtime_error("doctor accepts only global options");
         return RunDoctor(options);
     }
 
-    Session session(options);
+    // check 必须保持只读边界：不创建数据库、workspace、WAL/SHM，也不发布 staging。
+    Session session(options, command != "check");
     vexfs_mount_error error{};
     if (command == "init" || command == "setup") {
         if (options.arguments.size() != 1) throw std::runtime_error(command + " accepts only global options");
@@ -885,6 +830,47 @@ int Run(const Options &options) {
         Check(vexfs_mount_list(session.get(), path.c_str(), &json, &error), error);
         const std::string value = BytesToString(&json);
         if (options.json) std::cout << value << '\n'; else PrintNames(value);
+    } else if (command == "grep") {
+        const ParsedCommand parsed = ParseCommand(
+            options.arguments, {"--max-results"}, {"-i", "-l", "-n"});
+        if (parsed.positional.empty() || parsed.positional.size() > 2) {
+            throw std::runtime_error("grep needs PATTERN and optional PATH");
+        }
+        const std::string limit_value = parsed.Value("--max-results", false);
+        const int64_t limit = limit_value.empty() ? 1000 : PositiveInteger(limit_value, "max-results");
+        if (limit > 10240) {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, "max-results must be at most 10240");
+        }
+        uint32_t flags = 0;
+        if (parsed.Flag("-i")) flags |= VEXFS_MOUNT_GREP_IGNORE_CASE;
+        if (parsed.Flag("-l")) flags |= VEXFS_MOUNT_GREP_FILES_ONLY;
+        const std::string path = parsed.positional.size() == 2 ? parsed.positional[1] : "/";
+        vexfs_mount_bytes json{};
+        Check(vexfs_mount_grep(session.get(), path.c_str(), parsed.positional[0].c_str(),
+                               flags, static_cast<uint32_t>(limit), &json, &error), error);
+        const std::string value = BytesToString(&json);
+        if (options.json) std::cout << value << '\n';
+        else PrintGrep(value, parsed.Flag("-l"), parsed.Flag("-n"));
+        return JsonInteger(value, "match_count") == 0 ? 1 : 0;
+    } else if (command == "index") {
+        if (options.arguments.size() != 2) {
+            throw std::runtime_error("index needs status, enable, rebuild or disable");
+        }
+        vexfs_mount_bytes json{};
+        Check(vexfs_mount_grep_index(session.get(), options.arguments[1].c_str(),
+                                     &json, &error), error);
+        std::cout << BytesToString(&json) << '\n';
+    } else if (command == "check") {
+        const ParsedCommand parsed = ParseCommand(options.arguments, {}, {"--quick"});
+        if (!parsed.positional.empty()) {
+            throw std::runtime_error("check accepts only --quick and global --json");
+        }
+        vexfs_mount_bytes json{};
+        const uint32_t flags = parsed.Flag("--quick") ? VEXFS_MOUNT_CHECK_QUICK : 0;
+        Check(vexfs_mount_check(session.get(), flags, &json, &error), error);
+        const std::string value = BytesToString(&json);
+        if (options.json) std::cout << value << '\n'; else PrintCheck(value);
+        return JsonBoolean(value, "ok") ? 0 : ExitCode(VEXFS_MOUNT_CORRUPTION);
     } else if (command == "stat") {
         if (options.arguments.size() != 2) throw std::runtime_error("stat needs PATH");
         vexfs_mount_bytes json{};
@@ -942,10 +928,170 @@ int Run(const Options &options) {
                 std::cout << new_version << '\n';
             }
         }
+    } else if (command == "snapshot") {
+        if (options.arguments.size() < 2)
+            throw std::runtime_error("snapshot needs create, list, show, diff, restore or drop");
+        const std::string &action = options.arguments[1];
+        if (action == "create") {
+            const ParsedCommand parsed = ParseCommand(options.arguments, {}, {"--committed-only"});
+            if (parsed.positional.size() != 2 || parsed.positional[0] != "create")
+                throw std::runtime_error("snapshot create needs NAME and optional --committed-only");
+            const uint32_t flags = parsed.Flag("--committed-only")
+                ? VEXFS_SNAPSHOT_COMMITTED_ONLY : 0;
+            int64_t commit = 0;
+            Check(vexfs_mount_snapshot_create(session.get(), parsed.positional[1].c_str(),
+                                              flags, &commit, &error), error);
+            if (options.json) {
+                std::cout << "{\"name\":\"" << JsonEscape(parsed.positional[1])
+                          << "\",\"commit\":" << commit
+                          << ",\"consistency\":\""
+                          << (flags == 0 ? "consistent" : "committed-only") << "\"}\n";
+            } else {
+                std::cout << commit << '\n';
+            }
+        } else if (action == "list") {
+            if (options.arguments.size() != 2)
+                throw std::runtime_error("snapshot list accepts no arguments");
+            vexfs_mount_bytes json{};
+            Check(vexfs_mount_snapshot_list(session.get(), &json, &error), error);
+            const std::string value = BytesToString(&json);
+            if (options.json) std::cout << value << '\n'; else PrintNames(value);
+        } else if (action == "show") {
+            if (options.arguments.size() != 3)
+                throw std::runtime_error("snapshot show needs NAME");
+            vexfs_mount_bytes json{};
+            Check(vexfs_mount_snapshot_show(session.get(), options.arguments[2].c_str(),
+                                            &json, &error), error);
+            std::cout << BytesToString(&json) << '\n';
+        } else if (action == "diff") {
+            const ParsedCommand parsed = ParseCommand(options.arguments, {"--to"}, {});
+            if (parsed.positional.size() != 2 || parsed.positional[0] != "diff")
+                throw std::runtime_error("snapshot diff needs FROM and optional --to TO");
+            const std::string to = parsed.Value("--to", false).empty() ?
+                "HEAD" : parsed.Value("--to");
+            vexfs_mount_bytes json{};
+            Check(vexfs_mount_snapshot_diff(session.get(), parsed.positional[1].c_str(),
+                                            to.c_str(), &json, &error), error);
+            const std::string value = BytesToString(&json);
+            std::cout << value << '\n';
+            return value.find("\"changes\":[]") == std::string::npos ? 1 : 0;
+        } else if (action == "restore") {
+            const ParsedCommand parsed = ParseCommand(
+                options.arguments, {}, {"--dry-run", "--force-unmount"});
+            if (parsed.positional.size() != 2 || parsed.positional[0] != "restore")
+                throw std::runtime_error(
+                    "snapshot restore needs NAME and optional --dry-run/--force-unmount");
+            if (parsed.Flag("--dry-run") && parsed.Flag("--force-unmount"))
+                throw std::runtime_error("--force-unmount cannot be combined with --dry-run");
+            const std::string &name = parsed.positional[1];
+            int64_t head = 0;
+            Check(vexfs_mount_workspace_head(session.get(), &head, &error), error);
+            if (parsed.Flag("--dry-run")) {
+                vexfs_mount_bytes json{};
+                Check(vexfs_mount_snapshot_diff(session.get(), "HEAD", name.c_str(),
+                                                &json, &error), error);
+                std::cout << BytesToString(&json) << '\n';
+            } else {
+                const std::vector<VexFSPlatformMountEntry> mounts = WorkspaceMounts(options);
+                if (mounts.size() > 1) {
+                    throw CliError(VEXFS_MOUNT_BUSY,
+                        "workspace has more than one active mount; unmount them before restore");
+                }
+                const std::string mount_point = mounts.empty() ? "" : mounts.front().target;
+                if (!mount_point.empty()) {
+                    const int unmount = UnmountWorkspace(
+                        mount_point, parsed.Flag("--force-unmount"));
+                    if (unmount != 0) {
+                        throw CliError(VEXFS_MOUNT_BUSY,
+                            "cannot unmount active workspace; snapshot restore was not started");
+                    }
+                }
+
+                int64_t commit = 0;
+                try {
+                    commit = RestoreSnapshotAfterUnmount(
+                        session, name, head, !mount_point.empty(),
+                        std::chrono::seconds(35));
+                } catch (const std::exception &restore_error) {
+                    const std::string restore_message = restore_error.what();
+                    if (!mount_point.empty()) {
+                        try {
+                            RemountWorkspace(options, mount_point);
+                        } catch (const std::exception &remount_error) {
+                            throw std::runtime_error(
+                                "snapshot restore failed: " + restore_message +
+                                "; workspace remount also failed: " + remount_error.what());
+                        }
+                    }
+                    throw;
+                }
+                if (!mount_point.empty()) {
+                    try {
+                        RemountWorkspace(options, mount_point);
+                    } catch (const std::exception &remount_error) {
+                        throw std::runtime_error(
+                            "snapshot was restored at commit " + std::to_string(commit) +
+                            " but workspace remount failed: " + remount_error.what() +
+                            "; mount it again at " + mount_point);
+                    }
+                }
+                if (options.json) {
+                    std::cout << "{\"name\":\"" << JsonEscape(name)
+                              << "\",\"previous_head\":" << head
+                              << ",\"commit\":" << commit
+                              << ",\"remounted\":"
+                              << (mount_point.empty() ? "false" : "true");
+                    if (!mount_point.empty())
+                        std::cout << ",\"mount_point\":\"" << JsonEscape(mount_point) << "\"";
+                    std::cout << "}\n";
+                } else {
+                    std::cout << commit << '\n';
+                }
+            }
+        } else if (action == "drop") {
+            if (options.arguments.size() != 3)
+                throw std::runtime_error("snapshot drop needs NAME");
+            Check(vexfs_mount_snapshot_drop(session.get(), options.arguments[2].c_str(),
+                                            &error), error);
+        } else {
+            throw std::runtime_error("unknown snapshot command: " + action);
+        }
     } else if (command == "mv") {
         if (options.arguments.size() != 3) throw std::runtime_error("mv needs SOURCE DESTINATION");
         Check(vexfs_mount_move(session.get(), options.arguments[1].c_str(),
                                options.arguments[2].c_str(), &error), error);
+    } else if (command == "ln") {
+        if (options.arguments.size() != 3) throw std::runtime_error("ln needs SOURCE DESTINATION");
+        Check(vexfs_mount_link(session.get(), options.arguments[1].c_str(),
+                               options.arguments[2].c_str(), &error), error);
+    } else if (command == "chown") {
+        if (options.arguments.size() != 3) throw std::runtime_error("chown needs UID:GID PATH");
+        const std::string &owner = options.arguments[1];
+        const size_t separator = owner.find(':');
+        if (separator == std::string::npos || owner.find(':', separator + 1) != std::string::npos)
+            throw std::runtime_error("chown owner must be UID:GID");
+        const int64_t uid = OwnerId(owner.substr(0, separator), "uid");
+        const int64_t gid = OwnerId(owner.substr(separator + 1), "gid");
+        vexfs_mount_bytes stat{};
+        Check(vexfs_mount_stat(session.get(), options.arguments[2].c_str(), &stat, &error), error);
+        const int64_t inode = JsonInteger(BytesToString(&stat), "inode");
+        Check(vexfs_mount_chown(session.get(), inode, uid, gid, &error), error);
+    } else if (command == "getfacl") {
+        if (options.arguments.size() != 2) throw std::runtime_error("getfacl needs PATH");
+        vexfs_mount_bytes stat{};
+        Check(vexfs_mount_stat(session.get(), options.arguments[1].c_str(), &stat, &error), error);
+        const int64_t inode = JsonInteger(BytesToString(&stat), "inode");
+        vexfs_mount_bytes acl{};
+        Check(vexfs_mount_acl_get(session.get(), inode, &acl, &error), error);
+        std::cout << BytesToString(&acl) << '\n';
+    } else if (command == "setfacl") {
+        if (options.arguments.size() < 2 || options.arguments.size() > 3)
+            throw std::runtime_error("setfacl needs PATH and optional LOCAL_FILE");
+        vexfs_mount_bytes stat{};
+        Check(vexfs_mount_stat(session.get(), options.arguments[1].c_str(), &stat, &error), error);
+        const int64_t inode = JsonInteger(BytesToString(&stat), "inode");
+        const auto acl = ReadInput(options.arguments, 2);
+        Check(vexfs_mount_acl_set(session.get(), inode, acl.data(), acl.size(), &error), error);
     } else if (command == "rm") {
         bool recursive = false;
         size_t path_index = 1;
@@ -976,13 +1122,16 @@ void PrintError(const std::string &code, const std::string &message, int exit_co
                   << "\",\"message\":\"" << JsonEscape(message)
                   << "\",\"exit_code\":" << exit_code << "}}\n";
     } else {
-        std::cerr << "vexfs: " << message << '\n';
+        std::cerr << g_program_name << ": " << message << '\n';
     }
 }
 
 }  // namespace
 
-int main(int argc, char **argv) {
+int VexFsMain(int argc, char **argv) {
+    if (argc > 0 && argv[0] != nullptr && *argv[0] != '\0') {
+        g_program_name = std::filesystem::path(argv[0]).filename().string();
+    }
     try {
         return Run(ParseOptions(argc, argv));
     } catch (const CliError &error) {
@@ -993,3 +1142,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 }
+
+#ifndef VEXFS_EMBEDDED_MAIN
+int main(int argc, char **argv) { return VexFsMain(argc, argv); }
+#endif

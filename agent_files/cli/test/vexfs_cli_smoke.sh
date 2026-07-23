@@ -18,6 +18,12 @@ set -e
 [ ! -e "$DB" ]
 printf '%s' "$MISSING_DOCTOR" | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert "error" in value["database"]'
+set +e
+"$VEXFS" --db "$DB" --workspace smoke --json check >/dev/null 2>&1
+MISSING_CHECK_STATUS=$?
+set -e
+[ "$MISSING_CHECK_STATUS" -eq 7 ]
+[ ! -e "$DB" ]
 
 "$VEXFS" --db "$DB" --workspace smoke setup >/dev/null
 "$VEXFS" --db "$DB" --workspace smoke mkdir /agent
@@ -28,13 +34,27 @@ printf 'beta' | "$VEXFS" --db "$DB" --workspace smoke write /agent/version.txt >
 CONTENT="$("$VEXFS" --db "$DB" --workspace smoke cat /agent/task.txt)"
 [ "$CONTENT" = "hello from cli" ]
 
+"$VEXFS" --db "$DB" --workspace smoke ln /agent/task.txt /agent/task-copy.txt
+LINK_STAT="$("$VEXFS" --db "$DB" --workspace smoke stat /agent/task-copy.txt)"
+printf '%s' "$LINK_STAT" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["link_count"] == 2'
+"$VEXFS" --db "$DB" --workspace smoke chown -:1234 /agent/task.txt
+printf '%s' "$("$VEXFS" --db "$DB" --workspace smoke stat /agent/task.txt)" | /usr/bin/python3 -c \
+    'import json,sys; assert json.load(sys.stdin)["gid"] == 1234'
+printf '[{"principal":"alice","effect":"allow","permissions":"read,write","inherit":1}]' |
+    "$VEXFS" --db "$DB" --workspace smoke setfacl /agent/task.txt
+ACL="$("$VEXFS" --db "$DB" --workspace smoke getfacl /agent/task.txt)"
+printf '%s' "$ACL" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value[0]["principal"] == "alice"'
+
 LIST="$("$VEXFS" --db "$DB" --workspace smoke --json ls /agent)"
 printf '%s' "$LIST" | /usr/bin/python3 -c \
-    'import json,sys; rows=json.load(sys.stdin); assert rows[0]["name"] == "task.txt"'
+    'import json,sys; rows=json.load(sys.stdin); assert any(row["name"] == "task.txt" for row in rows)'
 
 HISTORY="$("$VEXFS" --db "$DB" --workspace smoke --json history /agent/version.txt)"
 printf '%s' "$HISTORY" | /usr/bin/python3 -c \
-    'import json,sys; page=json.load(sys.stdin); rows=page["entries"]; assert [row["version"] for row in rows] == [2,1]; assert rows[0]["current"] is True; assert page["next_before"] is None'
+    'import json,sys; page=json.load(sys.stdin); rows=page["entries"]; assert [row["version"] for row in rows] == [2,1]; assert all(len(row["checksum"]) == 64 for row in rows); assert rows[0]["current"] is True; assert page["next_before"] is None'
+[ "$("$VEXFS" --db "$DB" --workspace smoke stat /agent/version.txt | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["checksum"])')" = "f44e64e75f3948e9f73f8dfa94721c4ce8cbb4f265c4790c702b2d41cfbf2753" ]
 [ "$("$VEXFS" --db "$DB" --workspace smoke show /agent/version.txt --version 1)" = "alpha" ]
 set +e
 DIFF="$("$VEXFS" --db "$DB" --workspace smoke diff /agent/version.txt --from 1 --to 2)"
@@ -52,13 +72,40 @@ set -e
 [ "$("$VEXFS" --db "$DB" --workspace smoke restore /agent/version.txt --version 1)" = "3" ]
 [ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/version.txt)" = "alpha" ]
 
+SNAPSHOT_COMMIT="$("$VEXFS" --db "$DB" --workspace smoke snapshot create cli-baseline)"
+[ "$SNAPSHOT_COMMIT" -gt 0 ]
+printf 'changed after snapshot' | "$VEXFS" --db "$DB" --workspace smoke write /agent/task.txt >/dev/null
+set +e
+SNAPSHOT_DIFF="$("$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-baseline)"
+SNAPSHOT_DIFF_STATUS=$?
+set -e
+[ "$SNAPSHOT_DIFF_STATUS" -eq 1 ]
+printf '%s' "$SNAPSHOT_DIFF" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert any(row["path"] == "/agent/task.txt" for row in value["changes"])'
+"$VEXFS" --db "$DB" --workspace smoke snapshot restore cli-baseline --dry-run >/dev/null
+"$VEXFS" --db "$DB" --workspace smoke snapshot restore cli-baseline >/dev/null
+[ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/task.txt)" = "hello from cli" ]
+[ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/task-copy.txt)" = "hello from cli" ]
+"$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-baseline >/dev/null
+SNAPSHOT_LIST="$("$VEXFS" --db "$DB" --workspace smoke --json snapshot list)"
+printf '%s' "$SNAPSHOT_LIST" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value[0]["name"] == "cli-baseline"'
+"$VEXFS" --db "$DB" --workspace smoke snapshot show cli-baseline | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["name"] == "cli-baseline"'
+"$VEXFS" --db "$DB" --workspace smoke snapshot drop cli-baseline
+
+CHECK="$("$VEXFS" --db "$DB" --workspace smoke --json check)"
+printf '%s' "$CHECK" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["mode"] == "deep"; assert value["checked"]["versions"] >= 5'
+"$VEXFS" --db "$DB" --workspace smoke check --quick | grep -q '^OK '
+
 set +e
 DOCTOR="$("$VEXFS" --db "$DB" --workspace smoke --json doctor)"
 DOCTOR_STATUS=$?
 set -e
 [ "$DOCTOR_STATUS" -eq 0 ] || [ "$DOCTOR_STATUS" -eq 1 ]
 printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["database"]["contract_version"] == "0.3.0"'
+    'import json,sys; value=json.load(sys.stdin); assert value["database"]["schema_version"] == "0.7.0"'
 
 MOUNTS="$("$VEXFS" --json mount status)"
 printf '%s' "$MOUNTS" | /usr/bin/python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), list)'

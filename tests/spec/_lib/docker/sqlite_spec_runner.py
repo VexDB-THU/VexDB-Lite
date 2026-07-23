@@ -103,10 +103,18 @@ def main() -> int:
     for old in results.glob("*.diff"):
         old.unlink()
 
-    ext = str(root / "vexdb_sqlite/build/vexdb_lite")
-    if not (Path(ext + ".dylib").exists() or Path(ext + ".so").exists()):
-        print("loadable 扩展不存在，先 bash build_sqlite.sh build", file=sys.stderr)
-        return 1
+    configured_ext = sys.argv[3] if len(sys.argv) > 3 else ""
+    if configured_ext:
+        ext_path = Path(configured_ext).resolve()
+        if not ext_path.is_file():
+            print(f"显式指定的 loadable 扩展不存在: {ext_path}", file=sys.stderr)
+            return 1
+        ext = str(ext_path)
+    else:
+        ext = str(root / "vexdb_sqlite/build/vexdb_lite")
+        if not (Path(ext + ".dylib").exists() or Path(ext + ".so").exists()):
+            print("loadable 扩展不存在，先 bash build_sqlite.sh build", file=sys.stderr)
+            return 1
 
     compare = root / "tests/spec/_lib/docker/compare.py"
     passed, failed, failed_names = 0, 0, []

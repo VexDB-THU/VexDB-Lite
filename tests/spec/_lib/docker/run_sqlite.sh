@@ -3,6 +3,8 @@
 #
 #   bash run_sqlite.sh            # 渲染 + 全量跑
 #   bash run_sqlite.sh <name>     # 只跑名字含 <name> 的 spec
+#   VEXDB_SQLITE_EXTENSION=/abs/vexdb_lite.dylib bash run_sqlite.sh
+#                               # 显式绑定本次构建，避免误测旧产物
 #
 # 协议：
 #   - 渲染产物 build/spec/sqlite/sql/<name>.sql + expected/<name>.out
@@ -16,4 +18,5 @@ ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 FILTER="${1:-}"
 
 python3 "$ROOT_DIR/tests/spec/_lib/render.py" --engine sqlite --out build/spec >/dev/null || exit 1
-exec python3 "$ROOT_DIR/tests/spec/_lib/docker/sqlite_spec_runner.py" "$ROOT_DIR" "$FILTER"
+exec python3 "$ROOT_DIR/tests/spec/_lib/docker/sqlite_spec_runner.py" \
+    "$ROOT_DIR" "$FILTER" "${VEXDB_SQLITE_EXTENSION:-}"

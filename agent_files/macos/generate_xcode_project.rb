@@ -50,9 +50,12 @@ build_core.shell_script = <<~'SH'
   [ -x "$CMAKE_BIN" ] || CMAKE_BIN=/usr/local/bin/cmake
   [ -x "$CMAKE_BIN" ] || { echo "cmake is required" >&2; exit 1; }
   BUILD_DIR="$SRCROOT/../../vexdb_sqlite/build-fskit"
+  BUILD_JOBS="${VEXDB_LITE_BUILD_JOBS:-4}"
+  case "$BUILD_JOBS" in *[!0-9]*|0) echo "VEXDB_LITE_BUILD_JOBS must be a positive integer" >&2; exit 2;; esac
+  [ "$BUILD_JOBS" -le 4 ] || BUILD_JOBS=4
   "$CMAKE_BIN" -S "$SRCROOT/../../vexdb_sqlite" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE="$CONFIGURATION" -DVEXDB_SQLITE_BUILD_TESTS=OFF
-  "$CMAKE_BIN" --build "$BUILD_DIR" --target vexfs_mount_contract -j "$(sysctl -n hw.ncpu)"
+  "$CMAKE_BIN" --build "$BUILD_DIR" --target vexfs_runtime -j "$BUILD_JOBS"
 SH
 extension.build_phases.move(build_core, 0)
 
@@ -77,14 +80,15 @@ app.build_configurations.each do |configuration|
     'CODE_SIGN_ENTITLEMENTS' => 'VexFSApp/VexFSApp.entitlements',
     'CODE_SIGN_STYLE' => 'Automatic',
     'CURRENT_PROJECT_VERSION' => '1',
-    'DEVELOPMENT_TEAM' => '',
+    'DEVELOPMENT_TEAM' => 'BB5VK42K87',
     'ENABLE_APP_SANDBOX' => 'YES',
+    'ENABLE_HARDENED_RUNTIME' => 'YES',
     'GENERATE_INFOPLIST_FILE' => 'YES',
-    'INFOPLIST_KEY_CFBundleDisplayName' => 'VexFS',
+    'INFOPLIST_KEY_CFBundleDisplayName' => 'VexDB Lite',
     'LD_RUNPATH_SEARCH_PATHS' => '$(inherited) @executable_path/../Frameworks',
     'MARKETING_VERSION' => '0.1.0',
     'PRODUCT_BUNDLE_IDENTIFIER' => 'io.vexdb.vexfs',
-    'PRODUCT_NAME' => 'VexFS'
+    'PRODUCT_NAME' => 'VexDB Lite'
   )
 end
 
@@ -94,8 +98,9 @@ extension.build_configurations.each do |configuration|
     'CODE_SIGN_ENTITLEMENTS' => 'VexFSAppEx/VexFSAppEx.entitlements',
     'CODE_SIGN_STYLE' => 'Automatic',
     'CURRENT_PROJECT_VERSION' => '1',
-    'DEVELOPMENT_TEAM' => '',
+    'DEVELOPMENT_TEAM' => 'BB5VK42K87',
     'ENABLE_APP_SANDBOX' => 'YES',
+    'ENABLE_HARDENED_RUNTIME' => 'YES',
     'ENABLE_USER_SCRIPT_SANDBOXING' => 'NO',
     'GENERATE_INFOPLIST_FILE' => 'YES',
     'HEADER_SEARCH_PATHS' => '$(inherited) "$(SRCROOT)/../mount/common/include"',
@@ -105,7 +110,7 @@ extension.build_configurations.each do |configuration|
     'MARKETING_VERSION' => '0.1.0',
     'OTHER_LDFLAGS' => [
       '$(inherited)',
-      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexfs_mount_contract.a"',
+      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexfs_runtime.a"',
       '"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexdb_lite_static.a"',
       '-lsqlite3',
       '-lc++'

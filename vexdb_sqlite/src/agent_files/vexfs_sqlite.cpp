@@ -1,15 +1,21 @@
 #include "vexdb_sqlite_internal.h"
 
 #include "agent_files/vexfs_sqlite.h"
+#include "vexfs_checksum.h"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,9 +27,23 @@
 
 namespace {
 
-constexpr const char *kContractVersion = "0.3.0";
+constexpr const char *kContractVersion = "0.7.0";
 constexpr sqlite3_int64 kMaxStagedBytes = 128LL * 1024LL * 1024LL;
 constexpr sqlite3_int64 kInitialStagingCapacity = 64LL * 1024LL;
+constexpr sqlite3_int64 kEmptyFileStagingCapacity = 4LL * 1024LL;
+constexpr sqlite3_int64 kMaxXattrBytes = 64LL * 1024LL;
+constexpr sqlite3_int64 kMaxSymlinkBytes = 4096;
+constexpr sqlite3_int64 kRequestRetentionRows = 64LL * 1024LL;
+constexpr sqlite3_int64 kRequestPruneInterval = 4LL * 1024LL;
+constexpr sqlite3_int64 kMaxGrepResults = 10LL * 1024LL;
+constexpr size_t kMaxGrepPatternBytes = 4u * 1024u;
+
+std::mutex g_schema_ready_mutex;
+std::unordered_set<sqlite3 *> g_schema_ready_connections;
+enum class GrepIndexState { kDisabled, kAvailable, kUnavailable };
+std::unordered_map<sqlite3 *, GrepIndexState> g_grep_index_connections;
+
+bool IsSha256(const std::string &value);
 
 class SqlError : public std::runtime_error {
   public:
@@ -187,138 +207,297 @@ void AcquireWriteLock(sqlite3 *db) {
     Exec(db, "UPDATE _vexfs_meta SET value=value WHERE key='contract_version'");
 }
 
-bool HasVersionReferences(sqlite3 *db) {
+bool HasTable(sqlite3 *db, const char *table) {
     Statement statement(db,
-        "SELECT 1 FROM pragma_table_info('_vexfs_file_versions') "
-        "WHERE name='source_version_no' LIMIT 1");
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1 LIMIT 1");
+    statement.BindText(1, table);
     return statement.Row();
 }
 
-bool HasVersionTable(sqlite3 *db) {
-    Statement statement(db,
-        "SELECT 1 FROM sqlite_master WHERE type='table' "
-        "AND name='_vexfs_file_versions' LIMIT 1");
-    return statement.Row();
-}
-
-void EnsureVersionReferences(sqlite3 *db) {
-    // 极早期 0.1 测试库允许只包含 handle/staging 表；没有版本表时不凭空补半张 schema。
-    if (HasVersionTable(db) && !HasVersionReferences(db)) {
-        Exec(db, "ALTER TABLE _vexfs_file_versions ADD COLUMN source_version_no INTEGER");
-    }
-}
-
-void MigrateSchema010To020(sqlite3 *db) {
-    Exec(db, "SAVEPOINT vexfs_migrate_010_020");
-    try {
-        Exec(db, R"SQL(
-ALTER TABLE _vexfs_handles ADD COLUMN owner_session TEXT;
-ALTER TABLE _vexfs_staging RENAME TO _vexfs_staging_010;
-CREATE TABLE _vexfs_staging(
-    handle_id TEXT PRIMARY KEY,
-    generation INTEGER NOT NULL,
-    content BLOB NOT NULL,
-    logical_size INTEGER NOT NULL,
-    capacity INTEGER NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
-);
-INSERT INTO _vexfs_staging(handle_id, generation, content, logical_size, capacity, created_at)
-SELECT s.handle_id, s.generation, s.content, length(s.content), length(s.content), s.created_at
-FROM _vexfs_staging_010 s
-JOIN _vexfs_handles h ON h.id=s.handle_id AND h.dirty_generation=s.generation;
-DROP TABLE _vexfs_staging_010;
-ALTER TABLE _vexfs_requests ADD COLUMN request_fingerprint BLOB NOT NULL DEFAULT X'';
-DELETE FROM _vexfs_requests;
-UPDATE _vexfs_inodes SET current_version=1
-WHERE kind='directory' AND deleted_at IS NULL AND current_version<1;
-UPDATE _vexfs_meta SET value='0.2.0' WHERE key='contract_version';
-)SQL");
-        Exec(db, "RELEASE SAVEPOINT vexfs_migrate_010_020");
-    } catch (...) {
-        try {
-            Exec(db, "ROLLBACK TO SAVEPOINT vexfs_migrate_010_020");
-            Exec(db, "RELEASE SAVEPOINT vexfs_migrate_010_020");
-        } catch (...) {
-        }
-        throw;
-    }
-}
-
-void MigrateSchema020To030(sqlite3 *db) {
-    Savepoint savepoint(db, "vexfs_migrate_020_030");
+void CreateHistorySchema(sqlite3 *db) {
     Exec(db, R"SQL(
-CREATE TABLE IF NOT EXISTS _vexfs_staging_data(
-    handle_id TEXT PRIMARY KEY,
-    content BLOB NOT NULL
+CREATE TABLE IF NOT EXISTS _vexfs_inode_states(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    commit_id INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('file','directory','symlink')),
+    mode INTEGER NOT NULL,
+    owner_principal TEXT NOT NULL DEFAULT 'local',
+    uid INTEGER NOT NULL DEFAULT 0,
+    gid INTEGER NOT NULL DEFAULT 0,
+    size INTEGER NOT NULL,
+    current_version INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    accessed_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    changed_at INTEGER NOT NULL,
+    deleted_at INTEGER,
+    PRIMARY KEY(workspace_id, inode_id, commit_id)
 );
-INSERT OR REPLACE INTO _vexfs_staging_data(handle_id, content)
-SELECT handle_id, content FROM _vexfs_staging;
-UPDATE _vexfs_staging SET content=X'' WHERE length(content)>0;
-INSERT OR REPLACE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'split-v1');
-CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
-    workspace_id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL UNIQUE,
-    lease_until INTEGER NOT NULL,
+CREATE INDEX IF NOT EXISTS _vexfs_inode_states_commit_idx
+    ON _vexfs_inode_states(workspace_id, commit_id, inode_id);
+CREATE TABLE IF NOT EXISTS _vexfs_dentry_states(
+    workspace_id INTEGER NOT NULL,
+    parent_inode INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    commit_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    PRIMARY KEY(workspace_id, parent_inode, name, commit_id)
+);
+CREATE INDEX IF NOT EXISTS _vexfs_dentry_states_commit_idx
+    ON _vexfs_dentry_states(workspace_id, commit_id, parent_inode, name);
+CREATE TABLE IF NOT EXISTS _vexfs_xattr_states(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    commit_id INTEGER NOT NULL,
+    value BLOB NOT NULL,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    PRIMARY KEY(workspace_id, inode_id, name, commit_id)
+);
+CREATE INDEX IF NOT EXISTS _vexfs_xattr_states_commit_idx
+    ON _vexfs_xattr_states(workspace_id, commit_id, inode_id, name);
+CREATE TABLE IF NOT EXISTS _vexfs_acl_states(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    principal_id TEXT NOT NULL COLLATE BINARY,
+    effect TEXT NOT NULL,
+    commit_id INTEGER NOT NULL,
+    permissions TEXT NOT NULL,
+    inherit_flags INTEGER NOT NULL DEFAULT 0,
+    deleted INTEGER NOT NULL CHECK(deleted IN (0,1)),
+    PRIMARY KEY(workspace_id,inode_id,principal_id,effect,commit_id)
+);
+CREATE INDEX IF NOT EXISTS _vexfs_acl_states_commit_idx
+    ON _vexfs_acl_states(workspace_id,commit_id,inode_id,principal_id,effect);
+CREATE TABLE IF NOT EXISTS _vexfs_snapshots(
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    commit_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+    UNIQUE(workspace_id, name)
 );
+CREATE INDEX IF NOT EXISTS _vexfs_snapshots_commit_idx
+    ON _vexfs_snapshots(workspace_id, commit_id);
+
+CREATE TABLE IF NOT EXISTS _vexfs_dirty_inodes(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, inode_id)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_dirty_dentries(
+    workspace_id INTEGER NOT NULL,
+    parent_inode INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    inode_id INTEGER NOT NULL,
+    PRIMARY KEY(workspace_id, parent_inode, name)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_dirty_xattrs(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    PRIMARY KEY(workspace_id, inode_id, name)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_dirty_acl(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    principal_id TEXT NOT NULL COLLATE BINARY,
+    effect TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,inode_id,principal_id,effect)
+);
+
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_inode_insert
+AFTER INSERT ON _vexfs_inodes BEGIN
+    INSERT INTO _vexfs_dirty_inodes(workspace_id,inode_id)
+    VALUES(NEW.workspace_id,NEW.id)
+    ON CONFLICT(workspace_id,inode_id) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_inode_update
+AFTER UPDATE ON _vexfs_inodes BEGIN
+    INSERT INTO _vexfs_dirty_inodes(workspace_id,inode_id)
+    VALUES(NEW.workspace_id,NEW.id)
+    ON CONFLICT(workspace_id,inode_id) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_dentry_insert
+AFTER INSERT ON _vexfs_dentries BEGIN
+    INSERT INTO _vexfs_dirty_dentries(workspace_id,parent_inode,name,inode_id)
+    VALUES(NEW.workspace_id,NEW.parent_inode,NEW.name,NEW.inode_id)
+    ON CONFLICT(workspace_id,parent_inode,name) DO UPDATE SET inode_id=excluded.inode_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_dentry_update_old
+AFTER UPDATE ON _vexfs_dentries BEGIN
+    INSERT INTO _vexfs_dirty_dentries(workspace_id,parent_inode,name,inode_id)
+    VALUES(OLD.workspace_id,OLD.parent_inode,OLD.name,OLD.inode_id)
+    ON CONFLICT(workspace_id,parent_inode,name) DO UPDATE SET inode_id=excluded.inode_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_dentry_update_new
+AFTER UPDATE ON _vexfs_dentries BEGIN
+    INSERT INTO _vexfs_dirty_dentries(workspace_id,parent_inode,name,inode_id)
+    VALUES(NEW.workspace_id,NEW.parent_inode,NEW.name,NEW.inode_id)
+    ON CONFLICT(workspace_id,parent_inode,name) DO UPDATE SET inode_id=excluded.inode_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_dentry_delete
+AFTER DELETE ON _vexfs_dentries BEGIN
+    INSERT INTO _vexfs_dirty_dentries(workspace_id,parent_inode,name,inode_id)
+    VALUES(OLD.workspace_id,OLD.parent_inode,OLD.name,OLD.inode_id)
+    ON CONFLICT(workspace_id,parent_inode,name) DO UPDATE SET inode_id=excluded.inode_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_xattr_insert
+AFTER INSERT ON _vexfs_xattrs BEGIN
+    INSERT INTO _vexfs_dirty_xattrs(workspace_id,inode_id,name)
+    SELECT workspace_id,NEW.inode_id,NEW.name FROM _vexfs_inodes WHERE id=NEW.inode_id
+    ON CONFLICT(workspace_id,inode_id,name) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_xattr_update
+AFTER UPDATE ON _vexfs_xattrs BEGIN
+    INSERT INTO _vexfs_dirty_xattrs(workspace_id,inode_id,name)
+    SELECT workspace_id,NEW.inode_id,NEW.name FROM _vexfs_inodes WHERE id=NEW.inode_id
+    ON CONFLICT(workspace_id,inode_id,name) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_xattr_delete
+AFTER DELETE ON _vexfs_xattrs BEGIN
+    INSERT INTO _vexfs_dirty_xattrs(workspace_id,inode_id,name)
+    SELECT workspace_id,OLD.inode_id,OLD.name FROM _vexfs_inodes WHERE id=OLD.inode_id
+    ON CONFLICT(workspace_id,inode_id,name) DO NOTHING;
+END;
 )SQL");
-    EnsureVersionReferences(db);
-    // 合同标记必须最后写入；前面的布局升级有任何一步失败，整个 savepoint 回滚。
-    Exec(db, "UPDATE _vexfs_meta SET value='0.3.0' WHERE key='contract_version'");
+}
+
+void EnsureAclHistoryTriggers(sqlite3 *db) {
+    Exec(db, R"SQL(
+CREATE TABLE IF NOT EXISTS _vexfs_dirty_acl(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    principal_id TEXT NOT NULL COLLATE BINARY,
+    effect TEXT NOT NULL,
+    PRIMARY KEY(workspace_id,inode_id,principal_id,effect)
+);
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_acl_insert
+AFTER INSERT ON _vexfs_acl_entries BEGIN
+    INSERT INTO _vexfs_dirty_acl(workspace_id,inode_id,principal_id,effect)
+    VALUES(NEW.workspace_id,NEW.inode_id,NEW.principal_id,NEW.effect)
+    ON CONFLICT(workspace_id,inode_id,principal_id,effect) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_acl_update
+AFTER UPDATE ON _vexfs_acl_entries BEGIN
+    INSERT INTO _vexfs_dirty_acl(workspace_id,inode_id,principal_id,effect)
+    VALUES(NEW.workspace_id,NEW.inode_id,NEW.principal_id,NEW.effect)
+    ON CONFLICT(workspace_id,inode_id,principal_id,effect) DO NOTHING;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_history_acl_delete
+AFTER DELETE ON _vexfs_acl_entries BEGIN
+    INSERT INTO _vexfs_dirty_acl(workspace_id,inode_id,principal_id,effect)
+    VALUES(OLD.workspace_id,OLD.inode_id,OLD.principal_id,OLD.effect)
+    ON CONFLICT(workspace_id,inode_id,principal_id,effect) DO NOTHING;
+END;
+)SQL");
+}
+
+bool GrepIndexMarker(sqlite3 *db) {
+    Statement marker(db,
+        "SELECT 1 FROM _vexfs_meta WHERE key='grep_index' AND value='trigram-v1' LIMIT 1");
+    return marker.Row();
+}
+
+bool GrepIndexDirty(sqlite3 *db) {
+    Statement marker(db,
+        "SELECT 1 FROM _vexfs_meta WHERE key='grep_index_dirty' AND value='1' LIMIT 1");
+    return marker.Row();
+}
+
+void SetGrepIndexState(sqlite3 *db, GrepIndexState state) {
+    std::lock_guard<std::mutex> lock(g_schema_ready_mutex);
+    g_grep_index_connections[db] = state;
+}
+
+GrepIndexState GetGrepIndexState(sqlite3 *db) {
+    std::lock_guard<std::mutex> lock(g_schema_ready_mutex);
+    const auto found = g_grep_index_connections.find(db);
+    return found == g_grep_index_connections.end() ? GrepIndexState::kDisabled : found->second;
+}
+
+void RebuildGrepIndex(sqlite3 *db) {
+    Savepoint savepoint(db, "vexfs_grep_index_rebuild");
+    Exec(db, R"SQL(
+DELETE FROM _vexfs_content_fts;
+INSERT INTO _vexfs_content_fts(rowid,workspace_id,inode_id,version_no,content)
+SELECT inode.id,inode.workspace_id,inode.id,inode.current_version,
+       CAST(CASE WHEN version.source_version_no IS NULL
+                 THEN version.content ELSE source.content END AS TEXT)
+FROM _vexfs_inodes inode
+JOIN _vexfs_file_versions version
+  ON version.inode_id=inode.id AND version.version_no=inode.current_version
+LEFT JOIN _vexfs_file_versions source
+  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
+WHERE inode.kind='file' AND inode.deleted_at IS NULL;
+INSERT OR REPLACE INTO _vexfs_meta(key,value) VALUES('grep_index_dirty','0');
+)SQL");
     savepoint.Release();
 }
 
-void EnsureSplitStagingLayout(sqlite3 *db) {
-    Statement marker(db,
-        "SELECT 1 FROM _vexfs_meta WHERE key='staging_layout' AND value='split-v1' LIMIT 1");
-    if (marker.Row()) return;
+void DetectGrepIndex(sqlite3 *db) {
+    if (!GrepIndexMarker(db)) {
+        SetGrepIndexState(db, GrepIndexState::kDisabled);
+        return;
+    }
+    if (sqlite3_compileoption_used("ENABLE_FTS5") == 0 ||
+        !HasTable(db, "_vexfs_content_fts")) {
+        SetGrepIndexState(db, GrepIndexState::kUnavailable);
+        return;
+    }
+    if (GrepIndexDirty(db)) {
+        if (sqlite3_db_readonly(db, "main") == 1) {
+            SetGrepIndexState(db, GrepIndexState::kUnavailable);
+            return;
+        }
+        RebuildGrepIndex(db);
+    }
+    SetGrepIndexState(db, GrepIndexState::kAvailable);
+}
 
-    Exec(db, "SAVEPOINT vexfs_split_staging");
+void EnableGrepIndex(sqlite3 *db) {
+    if (sqlite3_compileoption_used("ENABLE_FTS5") == 0) {
+        throw SqlError("this SQLite host does not provide FTS5", SQLITE_MISMATCH);
+    }
+    const GrepIndexState previous_state = GetGrepIndexState(db);
+    Savepoint savepoint(db, "vexfs_grep_index_enable");
     try {
         Exec(db, R"SQL(
-CREATE TABLE IF NOT EXISTS _vexfs_staging_data(
-    handle_id TEXT PRIMARY KEY,
-    content BLOB NOT NULL
+CREATE VIRTUAL TABLE IF NOT EXISTS _vexfs_content_fts USING fts5(
+    workspace_id UNINDEXED,
+    inode_id UNINDEXED,
+    version_no UNINDEXED,
+    content,
+    tokenize='trigram'
 );
-INSERT OR REPLACE INTO _vexfs_staging_data(handle_id, content)
-SELECT handle_id, content FROM _vexfs_staging;
-UPDATE _vexfs_staging SET content=X'' WHERE length(content)>0;
-INSERT OR REPLACE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'split-v1');
+INSERT OR REPLACE INTO _vexfs_meta(key,value) VALUES('grep_index','trigram-v1');
+INSERT OR REPLACE INTO _vexfs_meta(key,value) VALUES('grep_index_dirty','1');
 )SQL");
-        Exec(db, "RELEASE SAVEPOINT vexfs_split_staging");
+        SetGrepIndexState(db, GrepIndexState::kAvailable);
+        RebuildGrepIndex(db);
+        savepoint.Release();
     } catch (...) {
-        try {
-            Exec(db, "ROLLBACK TO SAVEPOINT vexfs_split_staging");
-            Exec(db, "RELEASE SAVEPOINT vexfs_split_staging");
-        } catch (...) {
-        }
+        SetGrepIndexState(db, previous_state);
         throw;
     }
 }
 
-void EnsureRuntimeTables(sqlite3 *db) {
-    {
-        Statement exists(db,
-            "SELECT 1 FROM sqlite_master WHERE type='table' "
-            "AND name='_vexfs_mount_sessions' LIMIT 1");
-        if (!exists.Row()) {
-            Exec(db, R"SQL(
-CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
-    workspace_id INTEGER PRIMARY KEY,
-    session_id TEXT NOT NULL UNIQUE,
-    lease_until INTEGER NOT NULL,
-    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
-);
-)SQL");
-        }
+void DisableGrepIndex(sqlite3 *db) {
+    if (GrepIndexMarker(db) && sqlite3_compileoption_used("ENABLE_FTS5") == 0) {
+        throw SqlError("cannot remove the FTS5 index from this SQLite host", SQLITE_MISMATCH);
     }
-    EnsureVersionReferences(db);
+    Savepoint savepoint(db, "vexfs_grep_index_disable");
+    Exec(db, R"SQL(
+DROP TABLE IF EXISTS _vexfs_content_fts;
+DELETE FROM _vexfs_meta WHERE key IN ('grep_index','grep_index_dirty');
+)SQL");
+    savepoint.Release();
+    SetGrepIndexState(db, GrepIndexState::kDisabled);
 }
 
-void EnsureSchema(sqlite3 *db) {
+void EnsureSchemaSlow(sqlite3 *db) {
     bool schema_exists = false;
     std::string version;
     {
@@ -333,23 +512,9 @@ void EnsureSchema(sqlite3 *db) {
         }
     }
     if (schema_exists) {
-        if (version == "0.2.0" && sqlite3_db_readonly(db, "main") == 1) {
-            // 0.3 的版本读取 API 只依赖 0.2 已有的 file_versions/commits。
-            // 只读连接允许兼容读取，但不会创建 session 表或改写合同标记。
-            return;
-        }
-        if (version == "0.1.0") {
-            MigrateSchema010To020(db);
-            version = "0.2.0";
-        }
-        if (version == "0.2.0") {
-            MigrateSchema020To030(db);
-            version = "0.3.0";
-        }
         if (version != kContractVersion)
             throw SqlError("unsupported VexFS schema version: " + version, SQLITE_MISMATCH);
-        EnsureSplitStagingLayout(db);
-        EnsureRuntimeTables(db);
+        DetectGrepIndex(db);
         return;
     }
     Savepoint savepoint(db, "vexfs_schema_init");
@@ -363,17 +528,23 @@ CREATE TABLE IF NOT EXISTS _vexfs_workspaces(
     name TEXT NOT NULL UNIQUE,
     root_inode INTEGER,
     head_commit INTEGER,
+    history_floor_commit INTEGER,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
 CREATE TABLE IF NOT EXISTS _vexfs_inodes(
     id INTEGER PRIMARY KEY,
     workspace_id INTEGER NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('file','directory')),
+    kind TEXT NOT NULL CHECK(kind IN ('file','directory','symlink')),
     mode INTEGER NOT NULL,
+    owner_principal TEXT NOT NULL DEFAULT 'local',
+    uid INTEGER NOT NULL DEFAULT 0,
+    gid INTEGER NOT NULL DEFAULT 0,
     size INTEGER NOT NULL DEFAULT 0,
     current_version INTEGER NOT NULL DEFAULT 0,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    accessed_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    changed_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     deleted_at INTEGER
 );
 CREATE INDEX IF NOT EXISTS _vexfs_inodes_workspace_idx
@@ -385,7 +556,7 @@ CREATE TABLE IF NOT EXISTS _vexfs_dentries(
     inode_id INTEGER NOT NULL,
     PRIMARY KEY(workspace_id, parent_inode, name)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS _vexfs_dentries_inode_idx
+CREATE INDEX IF NOT EXISTS _vexfs_dentries_inode_idx
     ON _vexfs_dentries(workspace_id, inode_id);
 CREATE TABLE IF NOT EXISTS _vexfs_commits(
     id INTEGER PRIMARY KEY,
@@ -401,10 +572,31 @@ CREATE TABLE IF NOT EXISTS _vexfs_file_versions(
     commit_id INTEGER NOT NULL,
     content BLOB NOT NULL,
     size INTEGER NOT NULL,
+    checksum TEXT NOT NULL CHECK(length(checksum)=64),
     source_version_no INTEGER,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     UNIQUE(inode_id, version_no)
 );
+CREATE TABLE IF NOT EXISTS _vexfs_xattrs(
+    inode_id INTEGER NOT NULL,
+    name TEXT NOT NULL COLLATE BINARY,
+    value BLOB NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    PRIMARY KEY(inode_id, name)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_acl_entries(
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    principal_id TEXT NOT NULL COLLATE BINARY,
+    effect TEXT NOT NULL CHECK(effect IN ('allow','deny')),
+    permissions TEXT NOT NULL,
+    inherit_flags INTEGER NOT NULL DEFAULT 0 CHECK(inherit_flags >= 0),
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    PRIMARY KEY(workspace_id,inode_id,principal_id,effect)
+);
+CREATE INDEX IF NOT EXISTS _vexfs_acl_entries_inode_idx
+    ON _vexfs_acl_entries(workspace_id,inode_id,principal_id,effect);
 CREATE TABLE IF NOT EXISTS _vexfs_handles(
     id TEXT PRIMARY KEY,
     workspace_id INTEGER NOT NULL,
@@ -450,10 +642,46 @@ CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
-INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.3.0');
+INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.7.0');
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'split-v1');
 )SQL");
+    CreateHistorySchema(db);
+    EnsureAclHistoryTriggers(db);
     savepoint.Release();
+    DetectGrepIndex(db);
+}
+
+void MarkSchemaReady(sqlite3 *db) {
+    // A mounted workspace owns one long-lived SQLite connection. Schema validation and
+    // migration are connection setup work; repeating the sqlite_master/pragma checks for
+    // every stat, write and xattr callback becomes dominant on large trees.
+    std::lock_guard<std::mutex> lock(g_schema_ready_mutex);
+    g_schema_ready_connections.insert(db);
+}
+
+bool IsSchemaReady(sqlite3 *db) {
+    std::lock_guard<std::mutex> lock(g_schema_ready_mutex);
+    return g_schema_ready_connections.find(db) != g_schema_ready_connections.end();
+}
+
+void ForgetSchemaReady(void *pointer) {
+    auto *db = static_cast<sqlite3 *>(pointer);
+    std::lock_guard<std::mutex> lock(g_schema_ready_mutex);
+    g_schema_ready_connections.erase(db);
+    g_grep_index_connections.erase(db);
+}
+
+void EnsureSchema(sqlite3 *db) {
+    if (IsSchemaReady(db)) return;
+    EnsureSchemaSlow(db);
+    MarkSchemaReady(db);
+}
+
+void EnsureSchemaForced(sqlite3 *db) {
+    // vexfs_init 是显式校验边界。项目尚未发版，不做旧 schema 原地迁移；版本
+    // 不一致直接失败，避免把历史 SQLite 分支带入其他 backend。
+    EnsureSchemaSlow(db);
+    MarkSchemaReady(db);
 }
 
 std::string RequiredText(sqlite3_value *value, const char *name) {
@@ -497,6 +725,45 @@ sqlite3_int64 RequiredNonnegativeInteger(sqlite3_value *value, const char *name)
         throw SqlError(std::string(name) + " must be a non-negative integer", SQLITE_RANGE);
     }
     return result;
+}
+
+sqlite3_int64 RequiredOwnerId(sqlite3_value *value, const char *name) {
+    if (sqlite3_value_type(value) != SQLITE_INTEGER) {
+        throw SqlError(std::string(name) + " must be an integer", SQLITE_MISMATCH);
+    }
+    const sqlite3_int64 result = sqlite3_value_int64(value);
+    if (result < -1 || result > 0xffffffffLL) {
+        throw SqlError(std::string(name) + " must be -1 or fit unsigned 32-bit values",
+                       SQLITE_RANGE);
+    }
+    return result;
+}
+
+int RequiredMode(sqlite3_value *value) {
+    if (sqlite3_value_type(value) != SQLITE_INTEGER) {
+        throw SqlError("mode must be an integer", SQLITE_MISMATCH);
+    }
+    const sqlite3_int64 mode = sqlite3_value_int64(value);
+    if (mode < 0 || mode > 0777) {
+        throw SqlError("mode must contain only rwx permission bits (0..0777)", SQLITE_RANGE);
+    }
+    return static_cast<int>(mode);
+}
+
+sqlite3_int64 CurrentUid() {
+#if defined(_WIN32)
+    return 0;
+#else
+    return static_cast<sqlite3_int64>(getuid());
+#endif
+}
+
+sqlite3_int64 CurrentGid() {
+#if defined(_WIN32)
+    return 0;
+#else
+    return static_cast<sqlite3_int64>(getgid());
+#endif
 }
 
 std::vector<std::string> PathParts(const std::string &path) {
@@ -543,36 +810,31 @@ struct Node {
     sqlite3_int64 size = 0;
     sqlite3_int64 version = 0;
     int mode = 0;
+    std::string owner_principal = "local";
+    sqlite3_int64 uid = 0;
+    sqlite3_int64 gid = 0;
     sqlite3_int64 created_at = 0;
+    sqlite3_int64 accessed_at = 0;
     sqlite3_int64 updated_at = 0;
+    sqlite3_int64 changed_at = 0;
 };
 
 struct VersionStorage {
     sqlite3_int64 rowid = 0;
     sqlite3_int64 size = 0;
     sqlite3_int64 canonical_version = 0;
+    std::string checksum;
 };
 
 VersionStorage ResolveVersionStorage(sqlite3 *db, sqlite3_int64 inode_id,
                                      sqlite3_int64 version) {
-    if (!HasVersionReferences(db)) {
-        Statement statement(db,
-            "SELECT rowid,size,version_no FROM _vexfs_file_versions "
-            "WHERE inode_id=?1 AND version_no=?2");
-        statement.BindInt64(1, inode_id);
-        statement.BindInt64(2, version);
-        if (!statement.Row()) {
-            throw SqlError("file version not found: " + std::to_string(version),
-                           SQLITE_NOTFOUND);
-        }
-        return {statement.Int64(0), statement.Int64(1), statement.Int64(2)};
-    }
-
     Statement statement(db, R"SQL(
 SELECT CASE WHEN v.source_version_no IS NULL THEN v.rowid ELSE source.rowid END,
        v.size,
        COALESCE(v.source_version_no,v.version_no),
-       CASE WHEN v.source_version_no IS NULL THEN v.size ELSE source.size END
+       CASE WHEN v.source_version_no IS NULL THEN v.size ELSE source.size END,
+       v.checksum,
+       CASE WHEN v.source_version_no IS NULL THEN v.checksum ELSE source.checksum END
 FROM _vexfs_file_versions v
 LEFT JOIN _vexfs_file_versions source
   ON source.inode_id=v.inode_id AND source.version_no=v.source_version_no
@@ -584,10 +846,11 @@ WHERE v.inode_id=?1 AND v.version_no=?2
         throw SqlError("file version not found: " + std::to_string(version), SQLITE_NOTFOUND);
     }
     if (statement.Type(0) == SQLITE_NULL || statement.Int64(1) < 0 ||
-        statement.Int64(1) != statement.Int64(3)) {
+        statement.Int64(1) != statement.Int64(3) || statement.Text(4).size() != 64 ||
+        statement.Text(4) != statement.Text(5)) {
         throw SqlError("file version content reference is corrupt", SQLITE_CORRUPT);
     }
-    return {statement.Int64(0), statement.Int64(1), statement.Int64(2)};
+    return {statement.Int64(0), statement.Int64(1), statement.Int64(2), statement.Text(4)};
 }
 
 std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_id,
@@ -607,13 +870,17 @@ std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_i
             std::min<sqlite3_int64>(kChunkSize, storage.size - offset));
         blob.Read(content.data() + offset, bytes, static_cast<int>(offset));
     }
+    if (vexfs::Sha256Hex(content.data(), content.size()) != storage.checksum) {
+        throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
+    }
     return content;
 }
 
 bool FindChild(sqlite3 *db, sqlite3_int64 workspace_id, sqlite3_int64 parent,
                const std::string &name, Node *node) {
     Statement statement(db,
-        "SELECT i.id, i.kind, i.size, i.current_version, i.mode, i.created_at, i.updated_at "
+        "SELECT i.id, i.kind, i.size, i.current_version, i.mode, i.owner_principal, i.uid, i.gid, "
+        "i.created_at, i.accessed_at, i.updated_at, i.changed_at "
         "FROM _vexfs_dentries d JOIN _vexfs_inodes i ON i.id = d.inode_id "
         "WHERE d.workspace_id = ?1 AND d.parent_inode = ?2 AND d.name = ?3 "
         "AND i.deleted_at IS NULL");
@@ -622,19 +889,24 @@ bool FindChild(sqlite3 *db, sqlite3_int64 workspace_id, sqlite3_int64 parent,
     statement.BindText(3, name);
     if (!statement.Row()) return false;
     *node = {statement.Int64(0), statement.Text(1), statement.Int64(2),
-             statement.Int64(3), statement.Int(4), statement.Int64(5), statement.Int64(6)};
+             statement.Int64(3), statement.Int(4), statement.Text(5), statement.Int64(6),
+             statement.Int64(7), statement.Int64(8), statement.Int64(9),
+             statement.Int64(10), statement.Int64(11)};
     return true;
 }
 
 Node RootNode(sqlite3 *db, const Workspace &workspace) {
     Statement statement(db,
-        "SELECT id, kind, size, current_version, mode, created_at, updated_at FROM _vexfs_inodes "
+        "SELECT id, kind, size, current_version, mode, owner_principal, uid, gid, "
+        "created_at, accessed_at, updated_at, changed_at FROM _vexfs_inodes "
         "WHERE id = ?1 AND workspace_id = ?2 AND deleted_at IS NULL");
     statement.BindInt64(1, workspace.root_inode);
     statement.BindInt64(2, workspace.id);
     if (!statement.Row()) throw SqlError("workspace root is missing", SQLITE_CORRUPT);
     return {statement.Int64(0), statement.Text(1), statement.Int64(2),
-             statement.Int64(3), statement.Int(4), statement.Int64(5), statement.Int64(6)};
+             statement.Int64(3), statement.Int(4), statement.Text(5), statement.Int64(6),
+             statement.Int64(7), statement.Int64(8), statement.Int64(9),
+             statement.Int64(10), statement.Int64(11)};
 }
 
 bool TryResolve(sqlite3 *db, const Workspace &workspace, const std::vector<std::string> &parts,
@@ -687,6 +959,99 @@ SELECT '/' || path FROM ancestors WHERE parent_inode=?3 ORDER BY depth DESC LIMI
     return statement.Text(0);
 }
 
+sqlite3_int64 LinkCount(sqlite3 *db, const Workspace &workspace, sqlite3_int64 inode) {
+    Statement statement(db, R"SQL(
+SELECT i.kind,
+       CASE WHEN i.kind='directory' THEN
+         2 + (SELECT count(*) FROM _vexfs_dentries d
+              JOIN _vexfs_inodes child ON child.id=d.inode_id
+              WHERE d.workspace_id=i.workspace_id AND d.parent_inode=i.id
+                AND child.kind='directory' AND child.deleted_at IS NULL)
+       ELSE
+         (SELECT count(*) FROM _vexfs_dentries d
+          WHERE d.workspace_id=i.workspace_id AND d.inode_id=i.id)
+       END
+FROM _vexfs_inodes i WHERE i.workspace_id=?1 AND i.id=?2
+)SQL");
+    statement.BindInt64(1, workspace.id);
+    statement.BindInt64(2, inode);
+    if (!statement.Row()) throw SqlError("inode link count unavailable", SQLITE_CORRUPT);
+    return statement.Int64(1);
+}
+
+void FlushHistoryChanges(sqlite3 *db, const Workspace &workspace, sqlite3_int64 commit) {
+    Statement inodes(db, R"SQL(
+INSERT OR REPLACE INTO _vexfs_inode_states(
+ workspace_id,inode_id,commit_id,kind,mode,owner_principal,uid,gid,size,current_version,
+ created_at,accessed_at,updated_at,changed_at,deleted_at)
+SELECT i.workspace_id,i.id,?2,i.kind,i.mode,i.owner_principal,i.uid,i.gid,i.size,i.current_version,
+       i.created_at,i.accessed_at,i.updated_at,i.changed_at,i.deleted_at
+FROM _vexfs_dirty_inodes dirty
+JOIN _vexfs_inodes i ON i.workspace_id=dirty.workspace_id AND i.id=dirty.inode_id
+WHERE dirty.workspace_id=?1
+)SQL");
+    inodes.BindInt64(1, workspace.id);
+    inodes.BindInt64(2, commit);
+    inodes.Done();
+
+    Statement dentries(db, R"SQL(
+INSERT OR REPLACE INTO _vexfs_dentry_states(
+ workspace_id,parent_inode,name,commit_id,inode_id,deleted)
+SELECT dirty.workspace_id,dirty.parent_inode,dirty.name,?2,
+       COALESCE(d.inode_id,dirty.inode_id),CASE WHEN d.inode_id IS NULL THEN 1 ELSE 0 END
+FROM _vexfs_dirty_dentries dirty
+LEFT JOIN _vexfs_dentries d
+  ON d.workspace_id=dirty.workspace_id AND d.parent_inode=dirty.parent_inode
+ AND d.name=dirty.name
+WHERE dirty.workspace_id=?1
+)SQL");
+    dentries.BindInt64(1, workspace.id);
+    dentries.BindInt64(2, commit);
+    dentries.Done();
+
+    Statement xattrs(db, R"SQL(
+INSERT OR REPLACE INTO _vexfs_xattr_states(
+ workspace_id,inode_id,name,commit_id,value,deleted)
+SELECT dirty.workspace_id,dirty.inode_id,dirty.name,?2,
+       COALESCE(x.value,X''),CASE WHEN x.inode_id IS NULL THEN 1 ELSE 0 END
+FROM _vexfs_dirty_xattrs dirty
+LEFT JOIN _vexfs_xattrs x ON x.inode_id=dirty.inode_id AND x.name=dirty.name
+WHERE dirty.workspace_id=?1
+)SQL");
+    xattrs.BindInt64(1, workspace.id);
+    xattrs.BindInt64(2, commit);
+    xattrs.Done();
+
+    Statement acl(db, R"SQL(
+INSERT OR REPLACE INTO _vexfs_acl_states(
+ workspace_id,inode_id,principal_id,effect,commit_id,permissions,inherit_flags,deleted)
+SELECT dirty.workspace_id,dirty.inode_id,dirty.principal_id,dirty.effect,?2,
+       COALESCE(a.permissions,''),COALESCE(a.inherit_flags,0),
+       CASE WHEN a.inode_id IS NULL THEN 1 ELSE 0 END
+FROM _vexfs_dirty_acl dirty
+LEFT JOIN _vexfs_acl_entries a
+  ON a.workspace_id=dirty.workspace_id AND a.inode_id=dirty.inode_id
+ AND a.principal_id=dirty.principal_id AND a.effect=dirty.effect
+WHERE dirty.workspace_id=?1
+)SQL");
+    acl.BindInt64(1, workspace.id);
+    acl.BindInt64(2, commit);
+    acl.Done();
+
+    Statement clear_inodes(db, "DELETE FROM _vexfs_dirty_inodes WHERE workspace_id=?1");
+    clear_inodes.BindInt64(1, workspace.id);
+    clear_inodes.Done();
+    Statement clear_dentries(db, "DELETE FROM _vexfs_dirty_dentries WHERE workspace_id=?1");
+    clear_dentries.BindInt64(1, workspace.id);
+    clear_dentries.Done();
+    Statement clear_xattrs(db, "DELETE FROM _vexfs_dirty_xattrs WHERE workspace_id=?1");
+    clear_xattrs.BindInt64(1, workspace.id);
+    clear_xattrs.Done();
+    Statement clear_acl(db, "DELETE FROM _vexfs_dirty_acl WHERE workspace_id=?1");
+    clear_acl.BindInt64(1, workspace.id);
+    clear_acl.Done();
+}
+
 sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::string &message) {
     Savepoint savepoint(db, "vexfs_create_commit");
     Statement insert(db,
@@ -700,7 +1065,11 @@ sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::s
     }
     const sqlite3_int64 commit = sqlite3_last_insert_rowid(db);
 
-    Statement update(db, "UPDATE _vexfs_workspaces SET head_commit = ?1 WHERE id = ?2");
+    FlushHistoryChanges(db, workspace, commit);
+
+    Statement update(db,
+        "UPDATE _vexfs_workspaces SET head_commit=?1, "
+        "history_floor_commit=COALESCE(history_floor_commit,?1) WHERE id=?2");
     update.BindInt64(1, commit);
     update.BindInt64(2, workspace.id);
     update.Done();
@@ -710,12 +1079,14 @@ sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::s
 
 sqlite3_int64 CreateInode(sqlite3 *db, sqlite3_int64 workspace_id, const char *kind, int mode) {
     Statement insert(db,
-        "INSERT INTO _vexfs_inodes(workspace_id, kind, mode, current_version) "
-        "VALUES(?1, ?2, ?3, ?4)");
+        "INSERT INTO _vexfs_inodes(workspace_id, kind, mode, owner_principal, uid, gid, current_version) "
+        "VALUES(?1, ?2, ?3, 'local', ?4, ?5, ?6)");
     insert.BindInt64(1, workspace_id);
     insert.BindText(2, kind);
     insert.BindInt(3, mode);
-    insert.BindInt64(4, std::strcmp(kind, "directory") == 0 ? 1 : 0);
+    insert.BindInt64(4, CurrentUid());
+    insert.BindInt64(5, CurrentGid());
+    insert.BindInt64(6, std::strcmp(kind, "directory") == 0 ? 1 : 0);
     insert.Done();
     return sqlite3_last_insert_rowid(db);
 }
@@ -723,7 +1094,8 @@ sqlite3_int64 CreateInode(sqlite3 *db, sqlite3_int64 workspace_id, const char *k
 void TouchDirectory(sqlite3 *db, sqlite3_int64 workspace_id, sqlite3_int64 inode) {
     Statement update(db,
         "UPDATE _vexfs_inodes SET current_version=current_version+1, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 "
+        "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER), "
+        "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
         "WHERE id=?1 AND workspace_id=?2 AND kind='directory' AND deleted_at IS NULL");
     update.BindInt64(1, inode);
     update.BindInt64(2, workspace_id);
@@ -740,7 +1112,81 @@ void AddDentry(sqlite3 *db, sqlite3_int64 workspace_id, sqlite3_int64 parent,
     insert.BindText(3, name);
     insert.BindInt64(4, inode);
     insert.Done();
+    // ACLs marked inheritable are copied at creation time.  Existing inode ACLs
+    // win on hard-link creation, so this is an INSERT OR IGNORE rather than a
+    // replacement of the inode's access policy.
+    Statement inherit(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_acl_entries(
+ workspace_id,inode_id,principal_id,effect,permissions,inherit_flags)
+SELECT workspace_id,?3,principal_id,effect,permissions,inherit_flags
+FROM _vexfs_acl_entries
+WHERE workspace_id=?1 AND inode_id=?2 AND inherit_flags<>0
+)SQL");
+    inherit.BindInt64(1, workspace_id);
+    inherit.BindInt64(2, parent);
+    inherit.BindInt64(3, inode);
+    inherit.Done();
     TouchDirectory(db, workspace_id, parent);
+}
+
+void MarkGrepIndexDirty(sqlite3 *db) {
+    if (GetGrepIndexState(db) == GrepIndexState::kDisabled) return;
+    Exec(db,
+        "INSERT OR REPLACE INTO _vexfs_meta(key,value) VALUES('grep_index_dirty','1')");
+}
+
+void UpdateGrepIndexFromVersion(sqlite3 *db, sqlite3_int64 workspace_id,
+                                sqlite3_int64 inode_id, sqlite3_int64 version) {
+    const GrepIndexState state = GetGrepIndexState(db);
+    if (state == GrepIndexState::kDisabled) return;
+    if (state == GrepIndexState::kUnavailable) {
+        MarkGrepIndexDirty(db);
+        return;
+    }
+    Statement remove(db, "DELETE FROM _vexfs_content_fts WHERE rowid=?1");
+    remove.BindInt64(1, inode_id);
+    remove.Done();
+    Statement insert(db, R"SQL(
+INSERT INTO _vexfs_content_fts(rowid,workspace_id,inode_id,version_no,content)
+SELECT inode.id,inode.workspace_id,inode.id,version.version_no,
+       CAST(CASE WHEN version.source_version_no IS NULL
+                 THEN version.content ELSE source.content END AS TEXT)
+FROM _vexfs_inodes inode
+JOIN _vexfs_file_versions version
+  ON version.inode_id=inode.id AND version.version_no=?3
+LEFT JOIN _vexfs_file_versions source
+  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
+WHERE inode.id=?2 AND inode.workspace_id=?1 AND inode.kind='file'
+  AND inode.deleted_at IS NULL
+)SQL");
+    insert.BindInt64(1, workspace_id);
+    insert.BindInt64(2, inode_id);
+    insert.BindInt64(3, version);
+    insert.Done();
+}
+
+void RefreshGrepIndexAfterTreeChange(sqlite3 *db) {
+    const GrepIndexState state = GetGrepIndexState(db);
+    if (state == GrepIndexState::kAvailable) RebuildGrepIndex(db);
+    else if (state == GrepIndexState::kUnavailable) MarkGrepIndexDirty(db);
+}
+
+void RemoveDeletedFilesFromGrepIndex(sqlite3 *db, sqlite3_int64 workspace_id) {
+    const GrepIndexState state = GetGrepIndexState(db);
+    if (state == GrepIndexState::kDisabled) return;
+    if (state == GrepIndexState::kUnavailable) {
+        MarkGrepIndexDirty(db);
+        return;
+    }
+    Statement remove(db, R"SQL(
+DELETE FROM _vexfs_content_fts
+WHERE rowid IN (
+    SELECT id FROM _vexfs_inodes
+    WHERE workspace_id=?1 AND kind='file' AND deleted_at IS NOT NULL
+)
+)SQL");
+    remove.BindInt64(1, workspace_id);
+    remove.Done();
 }
 
 sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &node,
@@ -750,7 +1196,8 @@ sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &
     const sqlite3_int64 version = node.version + 1;
     Statement advance(db,
         "UPDATE _vexfs_inodes SET size=?1, current_version=?2, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 "
+        "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER), "
+        "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
         "WHERE id=?3 AND current_version=?4");
     advance.BindInt64(1, static_cast<sqlite3_int64>(content.size()));
     advance.BindInt64(2, version);
@@ -762,15 +1209,19 @@ sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &
     }
 
     const sqlite3_int64 commit = CreateCommit(db, workspace, message);
+    const std::string checksum = vexfs::Sha256Hex(content.data(), content.size());
     Statement insert(db,
-        "INSERT INTO _vexfs_file_versions(inode_id, version_no, commit_id, content, size) "
-        "VALUES(?1, ?2, ?3, ?4, ?5)");
+        "INSERT INTO _vexfs_file_versions"
+        "(inode_id,version_no,commit_id,content,size,checksum) "
+        "VALUES(?1,?2,?3,?4,?5,?6)");
     insert.BindInt64(1, node.id);
     insert.BindInt64(2, version);
     insert.BindInt64(3, commit);
     insert.BindBlob(4, content);
     insert.BindInt64(5, static_cast<sqlite3_int64>(content.size()));
+    insert.BindText(6, checksum);
     insert.Done();
+    UpdateGrepIndexFromVersion(db, workspace.id, node.id, version);
     savepoint.Release();
     return version;
 }
@@ -784,7 +1235,8 @@ sqlite3_int64 StoreVersionFromVersion(sqlite3 *db, const Workspace &workspace, c
     const sqlite3_int64 version = node.version + 1;
     Statement advance(db,
         "UPDATE _vexfs_inodes SET size=?1, current_version=?2, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 "
+        "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER), "
+        "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
         "WHERE id=?3 AND current_version=?4");
     advance.BindInt64(1, source.size);
     advance.BindInt64(2, version);
@@ -797,17 +1249,19 @@ sqlite3_int64 StoreVersionFromVersion(sqlite3 *db, const Workspace &workspace, c
     const sqlite3_int64 commit = CreateCommit(db, workspace, message);
     Statement insert(db,
         "INSERT INTO _vexfs_file_versions"
-        "(inode_id,version_no,commit_id,content,size,source_version_no) "
-        "VALUES(?1,?2,?3,X'',?4,?5)");
+        "(inode_id,version_no,commit_id,content,size,checksum,source_version_no) "
+        "VALUES(?1,?2,?3,X'',?4,?5,?6)");
     insert.BindInt64(1, node.id);
     insert.BindInt64(2, version);
     insert.BindInt64(3, commit);
     insert.BindInt64(4, source.size);
-    insert.BindInt64(5, source.canonical_version);
+    insert.BindText(5, source.checksum);
+    insert.BindInt64(6, source.canonical_version);
     insert.Done();
     if (sqlite3_changes64(db) != 1) {
         throw SqlError("file version not found: " + std::to_string(source_version), SQLITE_NOTFOUND);
     }
+    UpdateGrepIndexFromVersion(db, workspace.id, node.id, version);
     savepoint.Release();
     return version;
 }
@@ -823,6 +1277,63 @@ std::vector<unsigned char> ReadNodeVersion(sqlite3 *db, const Node &node,
     if (node.kind != "file") throw SqlError("path is not a file", SQLITE_MISMATCH);
     if (version <= 0) throw SqlError("version must be a positive integer", SQLITE_RANGE);
     return ReadVersionContent(db, node.id, version);
+}
+
+std::string CanonicalPath(const std::vector<std::string> &parts) {
+    if (parts.empty()) return "/";
+    std::string path;
+    for (const std::string &part : parts) {
+        path.push_back('/');
+        path += part;
+    }
+    return path;
+}
+
+bool IsUtf8Text(const std::vector<unsigned char> &content) {
+    for (size_t index = 0; index < content.size();) {
+        const unsigned char first = content[index];
+        if (first == 0) return false;
+        if (first < 0x80) {
+            ++index;
+            continue;
+        }
+        size_t trailing = 0;
+        uint32_t codepoint = 0;
+        uint32_t minimum = 0;
+        if ((first & 0xe0) == 0xc0) {
+            trailing = 1; codepoint = first & 0x1f; minimum = 0x80;
+        } else if ((first & 0xf0) == 0xe0) {
+            trailing = 2; codepoint = first & 0x0f; minimum = 0x800;
+        } else if ((first & 0xf8) == 0xf0) {
+            trailing = 3; codepoint = first & 0x07; minimum = 0x10000;
+        } else {
+            return false;
+        }
+        if (index + trailing >= content.size()) return false;
+        for (size_t offset = 1; offset <= trailing; ++offset) {
+            const unsigned char next = content[index + offset];
+            if ((next & 0xc0) != 0x80) return false;
+            codepoint = (codepoint << 6) | (next & 0x3f);
+        }
+        if (codepoint < minimum || codepoint > 0x10ffff ||
+            (codepoint >= 0xd800 && codepoint <= 0xdfff)) {
+            return false;
+        }
+        index += trailing + 1;
+    }
+    return true;
+}
+
+unsigned char FoldAscii(unsigned char value) {
+    return value >= 'A' && value <= 'Z' ? static_cast<unsigned char>(value + ('a' - 'A')) : value;
+}
+
+bool LineContains(const unsigned char *begin, const unsigned char *end,
+                  const std::string &pattern, bool ignore_case) {
+    const auto compare = [ignore_case](unsigned char left, unsigned char right) {
+        return ignore_case ? FoldAscii(left) == FoldAscii(right) : left == right;
+    };
+    return std::search(begin, end, pattern.begin(), pattern.end(), compare) != end;
 }
 
 sqlite3_int64 WritePath(sqlite3 *db, const Workspace &workspace,
@@ -959,7 +1470,11 @@ class RequestFingerprint {
 
 CachedRequest FindRequest(sqlite3 *db, const std::string &request_id, const char *operation,
                           const std::vector<unsigned char> &fingerprint) {
-    if (request_id.empty()) throw SqlError("request_id must not be empty", SQLITE_MISMATCH);
+    // An empty request ID is the in-process mount fast path.  Generation checks
+    // make stage/truncate/publish/synchronize replay-safe without growing the
+    // persistent request table.  Public callers still pass IDs and retain the
+    // cross-process retry contract.
+    if (request_id.empty()) return {};
     Statement statement(db,
         "SELECT operation, request_fingerprint, result_integer, result_text FROM _vexfs_requests "
         "WHERE request_id = ?1");
@@ -977,8 +1492,23 @@ CachedRequest FindRequest(sqlite3 *db, const std::string &request_id, const char
     return {CachedKind::kInteger, statement.Int64(2), {}};
 }
 
+void MaybePruneRequests(sqlite3 *db) {
+    const sqlite3_int64 newest_rowid = sqlite3_last_insert_rowid(db);
+    if (newest_rowid <= kRequestRetentionRows ||
+        newest_rowid % kRequestPruneInterval != 0) {
+        return;
+    }
+    // request_id protects retries, but keeping every completed request forever makes a
+    // long-lived mount grow without a bound.  Delete in batches so ordinary writes do
+    // not pay for a count/sort query; the newest 65,536 results remain replayable.
+    Statement prune(db, "DELETE FROM _vexfs_requests WHERE rowid <= ?1");
+    prune.BindInt64(1, newest_rowid - kRequestRetentionRows);
+    prune.Done();
+}
+
 void StoreRequestInteger(sqlite3 *db, const std::string &request_id, const char *operation,
                          const std::vector<unsigned char> &fingerprint, sqlite3_int64 result) {
+    if (request_id.empty()) return;
     Statement statement(db,
         "INSERT INTO _vexfs_requests(request_id, operation, request_fingerprint, result_integer) "
         "VALUES(?1, ?2, ?3, ?4)");
@@ -987,10 +1517,12 @@ void StoreRequestInteger(sqlite3 *db, const std::string &request_id, const char 
     statement.BindBlob(3, fingerprint);
     statement.BindInt64(4, result);
     statement.Done();
+    MaybePruneRequests(db);
 }
 
 void StoreRequestText(sqlite3 *db, const std::string &request_id, const char *operation,
                       const std::vector<unsigned char> &fingerprint, const std::string &result) {
+    if (request_id.empty()) return;
     Statement statement(db,
         "INSERT INTO _vexfs_requests(request_id, operation, request_fingerprint, result_text) "
         "VALUES(?1, ?2, ?3, ?4)");
@@ -999,6 +1531,7 @@ void StoreRequestText(sqlite3 *db, const std::string &request_id, const char *op
     statement.BindBlob(3, fingerprint);
     statement.BindText(4, result);
     statement.Done();
+    MaybePruneRequests(db);
 }
 
 struct Handle {
@@ -1099,7 +1632,9 @@ StagingInfo EnsureStagingCapacity(sqlite3 *db, const Handle &handle, StagingInfo
     if (required <= staging.capacity) return staging;
     if (required > kMaxStagedBytes)
         throw SqlError("staged file is larger than 128 MiB", SQLITE_TOOBIG);
-    sqlite3_int64 capacity = std::max(staging.capacity, kInitialStagingCapacity);
+    sqlite3_int64 capacity = staging.capacity == 0
+        ? kEmptyFileStagingCapacity
+        : std::max(staging.capacity, kInitialStagingCapacity);
     while (capacity < required) capacity = std::min(kMaxStagedBytes, capacity * 2);
     Statement grow(db,
         "UPDATE _vexfs_staging_data SET content=CAST(content||zeroblob(?1) AS BLOB) "
@@ -1120,7 +1655,9 @@ StagingInfo EnsureStagingCapacity(sqlite3 *db, const Handle &handle, StagingInfo
 void CreateStaging(sqlite3 *db, const Handle &handle,
                    const std::vector<unsigned char> &content) {
     sqlite3_int64 capacity = static_cast<sqlite3_int64>(content.size());
-    if (handle.writable && capacity < kInitialStagingCapacity) capacity = kInitialStagingCapacity;
+    if (handle.writable && capacity > 0 && capacity < kInitialStagingCapacity) {
+        capacity = kInitialStagingCapacity;
+    }
     Statement insert(db,
         "INSERT INTO _vexfs_staging(handle_id,generation,content,logical_size,capacity) "
         "VALUES(?1,?2,X'',?4,?3)");
@@ -1229,13 +1766,16 @@ Workspace WorkspaceById(sqlite3 *db, sqlite3_int64 id) {
 
 Node NodeById(sqlite3 *db, sqlite3_int64 id, bool include_deleted = false) {
     Statement statement(db,
-        "SELECT id, kind, size, current_version, mode, created_at, updated_at FROM _vexfs_inodes "
+        "SELECT id, kind, size, current_version, mode, owner_principal, uid, gid, "
+        "created_at, accessed_at, updated_at, changed_at FROM _vexfs_inodes "
         "WHERE id = ?1 AND (?2 OR deleted_at IS NULL)");
     statement.BindInt64(1, id);
     statement.BindInt(2, include_deleted ? 1 : 0);
     if (!statement.Row()) throw SqlError("inode not found", SQLITE_NOTFOUND);
     return {statement.Int64(0), statement.Text(1), statement.Int64(2),
-            statement.Int64(3), statement.Int(4), statement.Int64(5), statement.Int64(6)};
+            statement.Int64(3), statement.Int(4), statement.Text(5), statement.Int64(6),
+            statement.Int64(7), statement.Int64(8), statement.Int64(9),
+            statement.Int64(10), statement.Int64(11)};
 }
 
 sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation) {
@@ -1267,6 +1807,27 @@ sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation
     return version;
 }
 
+bool HasPendingContentPublish(sqlite3 *db, sqlite3_int64 workspace_id,
+                              sqlite3_int64 inode_id) {
+    Statement statement(db,
+        "SELECT 1 FROM _vexfs_handles WHERE workspace_id=?1 AND inode_id=?2 "
+        "AND writable=1 AND state IN ('open','retained') "
+        "AND dirty_generation>published_generation LIMIT 1");
+    statement.BindInt64(1, workspace_id);
+    statement.BindInt64(2, inode_id);
+    return statement.Row();
+}
+
+void CommitMetadataChange(sqlite3 *db, const Workspace &workspace,
+                          sqlite3_int64 inode_id, const char *message) {
+    // FSKit commonly sets mode/times/com.apple.provenance between create and
+    // the first content publish.  Leave those trigger rows dirty so the content
+    // publish flushes one coherent history commit instead of three.
+    if (!HasPendingContentPublish(db, workspace.id, inode_id)) {
+        CreateCommit(db, workspace, message);
+    }
+}
+
 void ResultBlob(sqlite3_context *context, const std::vector<unsigned char> &value) {
     const void *data = value.empty() ? static_cast<const void *>("") : value.data();
     sqlite3_result_blob64(context, data, value.size(), SQLITE_TRANSIENT);
@@ -1288,7 +1849,7 @@ void Guard(sqlite3_context *context, Function function) {
 
 void InitFunction(sqlite3_context *context, int, sqlite3_value **) {
     Guard(context, [&] {
-        EnsureSchema(sqlite3_context_db_handle(context));
+        EnsureSchemaForced(sqlite3_context_db_handle(context));
         sqlite3_result_int(context, 1);
     });
 }
@@ -1322,6 +1883,13 @@ void WorkspaceCreateFunction(sqlite3_context *context, int, sqlite3_value **valu
         update.BindInt64(1, root);
         update.BindInt64(2, workspace_id);
         update.Done();
+        Statement acl(db,
+            "INSERT INTO _vexfs_acl_entries(workspace_id,inode_id,principal_id,effect,permissions,inherit_flags) "
+            "VALUES(?1,?2,'local','allow','traverse,list,read,write,create,delete,rename,history,snapshot,share,admin',1)");
+        acl.BindInt64(1, workspace_id);
+        acl.BindInt64(2, root);
+        acl.Done();
+        CreateCommit(db, Workspace{workspace_id, root, 0}, "create workspace");
         sqlite3_result_int64(context, workspace_id);
     });
 }
@@ -1352,6 +1920,106 @@ void MkdirFunction(sqlite3_context *context, int, sqlite3_value **values) {
     });
 }
 
+void CreateFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const auto parts = PathParts(RequiredText(values[1], "path"));
+        const std::string kind = RequiredText(values[2], "kind");
+        const int mode = RequiredMode(values[3]);
+        if (parts.empty()) throw SqlError("workspace root already exists", SQLITE_CONSTRAINT);
+        if (kind != "file" && kind != "directory") {
+            throw SqlError("special files (fifo, device and socket) are not supported",
+                           SQLITE_MISMATCH);
+        }
+
+        Savepoint savepoint(db, "vexfs_create_item");
+        AcquireWriteLock(db);
+        auto [parent, name] = ResolveParent(db, workspace, parts);
+        Node existing;
+        if (FindChild(db, workspace.id, parent.id, name, &existing)) {
+            throw SqlError("destination already exists", SQLITE_CONSTRAINT);
+        }
+        Node node;
+        node.id = CreateInode(db, workspace.id, kind.c_str(), mode);
+        node.kind = kind;
+        node.mode = mode;
+        AddDentry(db, workspace.id, parent.id, name, node.id);
+        if (kind == "file") {
+            StoreVersion(db, workspace, node, {}, "create file");
+        } else {
+            CreateCommit(db, workspace, "create directory");
+        }
+        savepoint.Release();
+        sqlite3_result_int64(context, node.id);
+    });
+}
+
+void SymlinkFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const auto parts = PathParts(RequiredText(values[1], "path"));
+        const auto target = RequiredBlob(values[2], "symlink target");
+        if (parts.empty()) throw SqlError("workspace root already exists", SQLITE_CONSTRAINT);
+        if (target.empty()) throw SqlError("symlink target must not be empty", SQLITE_MISMATCH);
+        if (static_cast<sqlite3_int64>(target.size()) > kMaxSymlinkBytes) {
+            throw SqlError("symlink target is longer than 4096 bytes", SQLITE_TOOBIG);
+        }
+        if (std::find(target.begin(), target.end(), 0) != target.end()) {
+            throw SqlError("symlink target contains NUL", SQLITE_MISMATCH);
+        }
+
+        Savepoint savepoint(db, "vexfs_create_symlink");
+        AcquireWriteLock(db);
+        auto [parent, name] = ResolveParent(db, workspace, parts);
+        Node existing;
+        if (FindChild(db, workspace.id, parent.id, name, &existing)) {
+            throw SqlError("destination already exists", SQLITE_CONSTRAINT);
+        }
+        Node node;
+        node.id = CreateInode(db, workspace.id, "symlink", 0777);
+        node.kind = "symlink";
+        node.mode = 0777;
+        AddDentry(db, workspace.id, parent.id, name, node.id);
+        StoreVersion(db, workspace, node, target, "create symlink");
+        savepoint.Release();
+        sqlite3_result_int64(context, node.id);
+    });
+}
+
+void HardlinkFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const auto source_parts = PathParts(RequiredText(values[1], "source"));
+        const auto destination_parts = PathParts(RequiredText(values[2], "destination"));
+        if (source_parts.empty() || destination_parts.empty()) {
+            throw SqlError("hard links cannot target the workspace root", SQLITE_MISMATCH);
+        }
+        Savepoint savepoint(db, "vexfs_hardlink");
+        AcquireWriteLock(db);
+        const Node source = Resolve(db, workspace, source_parts);
+        if (source.kind != "file") {
+            throw SqlError("hard links are supported only for regular files", SQLITE_MISMATCH);
+        }
+        auto [parent, name] = ResolveParent(db, workspace, destination_parts);
+        Node existing;
+        if (FindChild(db, workspace.id, parent.id, name, &existing)) {
+            throw SqlError("destination already exists", SQLITE_CONSTRAINT);
+        }
+        AddDentry(db, workspace.id, parent.id, name, source.id);
+        CreateCommit(db, workspace, "create hard link");
+        savepoint.Release();
+        sqlite3_result_int64(context, source.id);
+    });
+}
+
+void RequireWorkspaceInode(sqlite3 *db, const Workspace &workspace, sqlite3_int64 inode);
+
 void WriteFunction(sqlite3_context *context, int, sqlite3_value **values) {
     Guard(context, [&] {
         sqlite3 *db = sqlite3_context_db_handle(context);
@@ -1366,6 +2034,31 @@ void WriteFunction(sqlite3_context *context, int, sqlite3_value **values) {
     });
 }
 
+void AppendFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const auto suffix = RequiredBlob(values[2], "content");
+        Savepoint savepoint(db, "vexfs_append");
+        AcquireWriteLock(db);
+        RequireWorkspaceInode(db, workspace, inode);
+        const Node node = NodeById(db, inode, true);
+        if (node.kind != "file") throw SqlError("inode is not a file", SQLITE_MISMATCH);
+        if (node.size < 0 || node.size > kMaxStagedBytes ||
+            suffix.size() > static_cast<size_t>(kMaxStagedBytes - node.size)) {
+            throw SqlError("file is larger than the Phase 0 limit (128 MiB)", SQLITE_TOOBIG);
+        }
+        std::vector<unsigned char> content = ReadNode(db, node);
+        content.insert(content.end(), suffix.begin(), suffix.end());
+        const sqlite3_int64 version = StoreVersion(
+            db, workspace, node, content, "append file");
+        savepoint.Release();
+        sqlite3_result_int64(context, version);
+    });
+}
+
 void ReadFunction(sqlite3_context *context, int, sqlite3_value **values) {
     Guard(context, [&] {
         sqlite3 *db = sqlite3_context_db_handle(context);
@@ -1373,6 +2066,207 @@ void ReadFunction(sqlite3_context *context, int, sqlite3_value **values) {
         const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         const Node node = Resolve(db, workspace, PathParts(RequiredText(values[1], "path")));
         ResultBlob(context, ReadNode(db, node));
+    });
+}
+
+void GrepFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const auto parts = PathParts(RequiredText(values[1], "path"));
+        const Node root = Resolve(db, workspace, parts);
+        const std::string pattern = RequiredText(values[2], "pattern");
+        const sqlite3_int64 flags = RequiredNonnegativeInteger(values[3], "flags");
+        const sqlite3_int64 limit = RequiredPositiveInteger(values[4], "limit");
+        if (pattern.empty() || pattern.size() > kMaxGrepPatternBytes) {
+            throw SqlError("grep pattern must be 1..4096 bytes", SQLITE_RANGE);
+        }
+        if ((flags & ~3LL) != 0) throw SqlError("unsupported grep flags", SQLITE_RANGE);
+        if (limit > kMaxGrepResults) {
+            throw SqlError("grep limit must be at most 10240", SQLITE_RANGE);
+        }
+        const bool ignore_case = (flags & 1) != 0;
+        const bool files_only = (flags & 2) != 0;
+        const std::vector<unsigned char> pattern_bytes(pattern.begin(), pattern.end());
+        size_t pattern_characters = 0;
+        if (IsUtf8Text(pattern_bytes)) {
+            pattern_characters = static_cast<size_t>(std::count_if(
+                pattern_bytes.begin(), pattern_bytes.end(),
+                [](unsigned char value) { return (value & 0xc0) != 0x80; }));
+        }
+        const bool index_used = GetGrepIndexState(db) == GrepIndexState::kAvailable &&
+            pattern_characters >= 3;
+        constexpr const char *scan_query = R"SQL(
+WITH RECURSIVE tree(inode_id,path,kind,current_version,size) AS (
+  SELECT i.id,?2,i.kind,i.current_version,i.size
+  FROM _vexfs_inodes i WHERE i.id=?3 AND i.workspace_id=?1 AND i.deleted_at IS NULL
+  UNION ALL
+  SELECT child.id,
+         CASE WHEN tree.path='/' THEN '/'||d.name ELSE tree.path||'/'||d.name END,
+         child.kind,child.current_version,child.size
+  FROM tree
+  JOIN _vexfs_dentries d ON d.workspace_id=?1 AND d.parent_inode=tree.inode_id
+  JOIN _vexfs_inodes child ON child.id=d.inode_id AND child.deleted_at IS NULL
+  WHERE tree.kind='directory'
+)
+SELECT tree.path,tree.inode_id,tree.current_version,tree.size,
+       CASE WHEN version.source_version_no IS NULL THEN version.content ELSE source.content END,
+       version.checksum
+FROM tree
+JOIN _vexfs_file_versions version
+  ON version.inode_id=tree.inode_id AND version.version_no=tree.current_version
+LEFT JOIN _vexfs_file_versions source
+  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
+WHERE tree.kind='file'
+)SQL";
+        constexpr const char *indexed_query = R"SQL(
+WITH RECURSIVE
+candidates(inode_id) AS MATERIALIZED (
+  SELECT rowid FROM _vexfs_content_fts WHERE _vexfs_content_fts MATCH ?4
+),
+ancestors(inode_id,parent_inode,path,depth) AS (
+  SELECT d.inode_id,d.parent_inode,d.name,1
+  FROM candidates candidate
+  JOIN _vexfs_dentries d ON d.inode_id=candidate.inode_id AND d.workspace_id=?1
+  UNION ALL
+  SELECT ancestor.inode_id,d.parent_inode,d.name||'/'||ancestor.path,ancestor.depth+1
+  FROM ancestors ancestor
+  JOIN _vexfs_dentries d ON d.inode_id=ancestor.parent_inode AND d.workspace_id=?1
+  WHERE ancestor.parent_inode<>?3 AND ancestor.depth<1024
+),
+paths(inode_id,path) AS MATERIALIZED (
+  SELECT inode_id,'/'||path FROM ancestors WHERE parent_inode=?3
+)
+SELECT paths.path,inode.id,inode.current_version,inode.size,
+       CASE WHEN version.source_version_no IS NULL THEN version.content ELSE source.content END,
+       version.checksum
+FROM paths
+JOIN _vexfs_inodes inode ON inode.id=paths.inode_id AND inode.deleted_at IS NULL
+JOIN _vexfs_file_versions version
+  ON version.inode_id=inode.id AND version.version_no=inode.current_version
+LEFT JOIN _vexfs_file_versions source
+  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
+WHERE inode.kind='file' AND
+      (?2='/' OR paths.path=?2 OR substr(paths.path,1,length(?2)+1)=?2||'/')
+)SQL";
+        Statement files(db, index_used ? indexed_query : scan_query);
+        files.BindInt64(1, workspace.id);
+        files.BindText(2, CanonicalPath(parts));
+        files.BindInt64(3, index_used ? workspace.root_inode : root.id);
+        if (index_used) {
+            std::string quoted_pattern = "\"";
+            for (const char value : pattern) {
+                if (value == '"') quoted_pattern += "\"\"";
+                else quoted_pattern.push_back(value);
+            }
+            quoted_pattern.push_back('"');
+            files.BindText(4, quoted_pattern);
+        }
+
+        std::string matches = "[";
+        bool first_match = true;
+        bool truncated = false;
+        sqlite3_int64 match_count = 0;
+        sqlite3_int64 files_scanned = 0;
+        sqlite3_int64 bytes_scanned = 0;
+        sqlite3_int64 binary_files_skipped = 0;
+        while (files.Row()) {
+            ++files_scanned;
+            const sqlite3_int64 expected_size = files.Int64(3);
+            if (expected_size < 0 || expected_size > kMaxStagedBytes ||
+                files.Type(4) == SQLITE_NULL) {
+                throw SqlError("current file content reference is corrupt", SQLITE_CORRUPT);
+            }
+            const std::vector<unsigned char> content = files.Blob(4);
+            if (static_cast<sqlite3_int64>(content.size()) != expected_size) {
+                throw SqlError("current file size does not match content", SQLITE_CORRUPT);
+            }
+            if (!IsSha256(files.Text(5)) ||
+                vexfs::Sha256Hex(content.data(), content.size()) != files.Text(5)) {
+                throw SqlError("current file checksum does not match content", SQLITE_CORRUPT);
+            }
+            bytes_scanned += expected_size;
+            if (!IsUtf8Text(content)) {
+                ++binary_files_skipped;
+                continue;
+            }
+            const std::string path = files.Text(0);
+            size_t line_start = 0;
+            sqlite3_int64 line_number = 1;
+            while (line_start < content.size()) {
+                const auto begin = content.begin() + static_cast<std::ptrdiff_t>(line_start);
+                const auto newline = std::find(begin, content.end(), static_cast<unsigned char>('\n'));
+                const size_t line_end = static_cast<size_t>(newline - content.begin());
+                if (LineContains(content.data() + line_start, content.data() + line_end,
+                                 pattern, ignore_case)) {
+                    if (!first_match) matches.push_back(',');
+                    first_match = false;
+                    const std::string line(reinterpret_cast<const char *>(content.data() + line_start),
+                                           line_end - line_start);
+                    matches += "{\"path\":\"" + JsonEscape(path) +
+                        "\",\"line\":" + std::to_string(line_number) +
+                        ",\"text\":\"" + JsonEscape(line) + "\"}";
+                    ++match_count;
+                    if (match_count == limit) {
+                        truncated = true;
+                        break;
+                    }
+                    if (files_only) break;
+                }
+                if (newline == content.end()) break;
+                line_start = line_end + 1;
+                ++line_number;
+            }
+            if (truncated) break;
+        }
+        matches.push_back(']');
+        const std::string json = "{\"matches\":" + matches +
+            ",\"match_count\":" + std::to_string(match_count) +
+            ",\"files_scanned\":" + std::to_string(files_scanned) +
+            ",\"bytes_scanned\":" + std::to_string(bytes_scanned) +
+            ",\"binary_files_skipped\":" + std::to_string(binary_files_skipped) +
+            ",\"index_used\":" + (index_used ? "true" : "false") +
+            ",\"truncated\":" + (truncated ? "true" : "false") + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+std::string GrepIndexStatus(sqlite3 *db) {
+    const GrepIndexState state = GetGrepIndexState(db);
+    sqlite3_int64 indexed_files = 0;
+    if (state == GrepIndexState::kAvailable) {
+        Statement count(db, "SELECT count(*) FROM _vexfs_content_fts");
+        if (count.Row()) indexed_files = count.Int64(0);
+    }
+    return "{\"enabled\":" + std::string(state == GrepIndexState::kDisabled ? "false" : "true") +
+        ",\"available\":" + (state == GrepIndexState::kAvailable ? "true" : "false") +
+        ",\"dirty\":" + (GrepIndexDirty(db) ? "true" : "false") +
+        ",\"backend\":\"" +
+        (state == GrepIndexState::kAvailable ? "fts5-trigram" : "scan") +
+        "\",\"indexed_files\":" + std::to_string(indexed_files) + "}";
+}
+
+void GrepIndexFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string action = RequiredText(values[0], "action");
+        if (action == "enable") {
+            EnableGrepIndex(db);
+        } else if (action == "rebuild") {
+            if (GetGrepIndexState(db) != GrepIndexState::kAvailable) {
+                throw SqlError("grep index is not enabled or available", SQLITE_MISMATCH);
+            }
+            RebuildGrepIndex(db);
+        } else if (action == "disable") {
+            DisableGrepIndex(db);
+        } else if (action != "status") {
+            throw SqlError("index action must be status, enable, rebuild or disable",
+                           SQLITE_MISMATCH);
+        }
+        const std::string json = GrepIndexStatus(db);
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
     });
 }
 
@@ -1390,7 +2284,8 @@ void HistoryFunction(sqlite3_context *context, int argument_count, sqlite3_value
         if (limit > 1000) throw SqlError("history limit must be at most 1000", SQLITE_RANGE);
 
         Statement statement(db,
-            "SELECT v.version_no, v.commit_id, c.parent_commit, v.size, v.created_at, c.message "
+            "SELECT v.version_no, v.commit_id, c.parent_commit, v.size, v.created_at, c.message, "
+            "v.checksum "
             "FROM _vexfs_file_versions v JOIN _vexfs_commits c ON c.id=v.commit_id "
             "WHERE v.inode_id=?1 AND (?2=0 OR v.version_no<?2) "
             "ORDER BY v.version_no DESC LIMIT ?3");
@@ -1418,6 +2313,7 @@ void HistoryFunction(sqlite3_context *context, int argument_count, sqlite3_value
             entries += ",\"size\":" + std::to_string(statement.Int64(3)) +
                 ",\"created_at\":" + std::to_string(statement.Int64(4)) +
                 ",\"message\":\"" + JsonEscape(statement.Text(5)) +
+                "\",\"checksum\":\"" + JsonEscape(statement.Text(6)) +
                 "\",\"current\":" +
                 (statement.Int64(0) == node.version ? "true" : "false") + "}";
             ++count;
@@ -1459,6 +2355,8 @@ void CompareVersionsFunction(sqlite3_context *context, int, sqlite3_value **valu
         }
         std::array<unsigned char, 64 * 1024> from_chunk{};
         std::array<unsigned char, 64 * 1024> to_chunk{};
+        vexfs::Sha256 from_hash;
+        vexfs::Sha256 to_hash;
         bool changed = from.size != to.size;
         bool binary = false;
         const sqlite3_int64 maximum = std::max(from.size, to.size);
@@ -1469,6 +2367,8 @@ void CompareVersionsFunction(sqlite3_context *context, int, sqlite3_value **valu
                 to_chunk.size(), std::max<sqlite3_int64>(0, to.size - offset)));
             if (from_bytes > 0) from_blob.Read(from_chunk.data(), from_bytes, static_cast<int>(offset));
             if (to_bytes > 0) to_blob.Read(to_chunk.data(), to_bytes, static_cast<int>(offset));
+            from_hash.Update(from_chunk.data(), static_cast<size_t>(from_bytes));
+            to_hash.Update(to_chunk.data(), static_cast<size_t>(to_bytes));
             binary = binary ||
                 std::find(from_chunk.begin(), from_chunk.begin() + from_bytes, 0) !=
                     from_chunk.begin() + from_bytes ||
@@ -1477,6 +2377,10 @@ void CompareVersionsFunction(sqlite3_context *context, int, sqlite3_value **valu
             if (!changed && (from_bytes != to_bytes ||
                 !std::equal(from_chunk.begin(), from_chunk.begin() + from_bytes,
                             to_chunk.begin()))) changed = true;
+        }
+        if (vexfs::Hex(from_hash.Finish()) != from.checksum ||
+            vexfs::Hex(to_hash.Finish()) != to.checksum) {
+            throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
         }
         const std::string json =
             "{\"path\":\"" + JsonEscape(path) + "\",\"from\":" +
@@ -1518,12 +2422,578 @@ void StatFunction(sqlite3_context *context, int, sqlite3_value **values) {
         const std::string path = RequiredText(values[1], "path");
         const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         const Node node = Resolve(db, workspace, PathParts(path));
+        std::string checksum;
+        if (node.kind != "directory" && node.version > 0) {
+            Statement version(db,
+                "SELECT checksum FROM _vexfs_file_versions WHERE inode_id=?1 AND version_no=?2");
+            version.BindInt64(1, node.id);
+            version.BindInt64(2, node.version);
+            if (!version.Row()) throw SqlError("current file version is missing", SQLITE_CORRUPT);
+            checksum = version.Text(0);
+        }
         const std::string json = "{\"path\":\"" + JsonEscape(path) + "\",\"inode\":" +
             std::to_string(node.id) + ",\"kind\":\"" + node.kind + "\",\"mode\":" +
-            std::to_string(node.mode) + ",\"size\":" + std::to_string(node.size) +
-            ",\"version\":" + std::to_string(node.version) + ",\"created_at\":" +
-            std::to_string(node.created_at) + ",\"updated_at\":" +
-            std::to_string(node.updated_at) + "}";
+            std::to_string(node.mode) + ",\"owner_principal\":\"" +
+            JsonEscape(node.owner_principal) + "\",\"uid\":" + std::to_string(node.uid) +
+            ",\"gid\":" + std::to_string(node.gid) + ",\"size\":" + std::to_string(node.size) +
+            ",\"link_count\":" + std::to_string(LinkCount(db, workspace, node.id)) +
+            ",\"version\":" + std::to_string(node.version) + ",\"checksum\":" +
+            (checksum.empty() ? "null" : "\"" + JsonEscape(checksum) + "\"") +
+            ",\"created_at\":" +
+            std::to_string(node.created_at) + ",\"accessed_at\":" +
+            std::to_string(node.accessed_at) + ",\"updated_at\":" +
+            std::to_string(node.updated_at) + ",\"changed_at\":" +
+            std::to_string(node.changed_at) + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+struct CheckIssue {
+    std::string code;
+    std::string object;
+    std::string type;
+    std::string message;
+    std::string suggestion;
+};
+
+struct CheckReport {
+    static constexpr size_t kMaxReportedIssues = 1000;
+
+    std::vector<CheckIssue> issues;
+    sqlite3_int64 total_issues = 0;
+    sqlite3_int64 inodes = 0;
+    sqlite3_int64 dentries = 0;
+    sqlite3_int64 versions = 0;
+    sqlite3_int64 content_bytes = 0;
+    sqlite3_int64 commits = 0;
+    sqlite3_int64 snapshots = 0;
+    sqlite3_int64 handles = 0;
+    sqlite3_int64 staging_objects = 0;
+    sqlite3_int64 history_rows = 0;
+
+    void Add(std::string code, std::string object, std::string type,
+             std::string message, std::string suggestion) {
+        ++total_issues;
+        if (issues.size() < kMaxReportedIssues) {
+            issues.push_back({std::move(code), std::move(object), std::move(type),
+                              std::move(message), std::move(suggestion)});
+        }
+    }
+};
+
+bool IsSha256(const std::string &value) {
+    if (value.size() != 64) return false;
+    return std::all_of(value.begin(), value.end(), [](unsigned char character) {
+        return (character >= '0' && character <= '9') ||
+               (character >= 'a' && character <= 'f');
+    });
+}
+
+std::string HashVersionBlob(sqlite3 *db, sqlite3_int64 rowid, sqlite3_int64 expected_size) {
+    ReadOnlyBlob blob(db, rowid);
+    if (blob.size() != expected_size) {
+        throw SqlError("file version size does not match content", SQLITE_CORRUPT);
+    }
+    vexfs::Sha256 hash;
+    std::array<unsigned char, 64 * 1024> chunk{};
+    for (sqlite3_int64 offset = 0; offset < expected_size; offset += chunk.size()) {
+        const int bytes = static_cast<int>(std::min<sqlite3_int64>(
+            static_cast<sqlite3_int64>(chunk.size()), expected_size - offset));
+        blob.Read(chunk.data(), bytes, static_cast<int>(offset));
+        hash.Update(chunk.data(), static_cast<size_t>(bytes));
+    }
+    return vexfs::Hex(hash.Finish());
+}
+
+std::string CheckReportJson(const CheckReport &report, const std::string &workspace,
+                            bool deep, sqlite3_int64 elapsed_ms) {
+    std::string issues = "[";
+    bool first = true;
+    for (const CheckIssue &issue : report.issues) {
+        if (!first) issues += ',';
+        first = false;
+        issues += "{\"code\":\"" + JsonEscape(issue.code) +
+            "\",\"object\":\"" + JsonEscape(issue.object) +
+            "\",\"type\":\"" + JsonEscape(issue.type) +
+            "\",\"message\":\"" + JsonEscape(issue.message) +
+            "\",\"suggestion\":\"" + JsonEscape(issue.suggestion) + "\"}";
+    }
+    issues += ']';
+    return "{\"ok\":" + std::string(report.total_issues == 0 ? "true" : "false") +
+        ",\"workspace\":\"" + JsonEscape(workspace) +
+        "\",\"mode\":\"" + (deep ? "deep" : "quick") +
+        "\",\"content_model\":\"full-blob-v1\",\"checked\":{" +
+        "\"inodes\":" + std::to_string(report.inodes) +
+        ",\"dentries\":" + std::to_string(report.dentries) +
+        ",\"versions\":" + std::to_string(report.versions) +
+        ",\"content_bytes\":" + std::to_string(report.content_bytes) +
+        ",\"commits\":" + std::to_string(report.commits) +
+        ",\"snapshots\":" + std::to_string(report.snapshots) +
+        ",\"handles\":" + std::to_string(report.handles) +
+        ",\"staging_objects\":" + std::to_string(report.staging_objects) +
+        ",\"history_rows\":" + std::to_string(report.history_rows) +
+        "},\"issue_count\":" + std::to_string(report.total_issues) +
+        ",\"reported_issue_count\":" + std::to_string(report.issues.size()) +
+        ",\"truncated\":" +
+        (report.total_issues > static_cast<sqlite3_int64>(report.issues.size()) ? "true" : "false") +
+        ",\"elapsed_ms\":" + std::to_string(elapsed_ms) +
+        ",\"issues\":" + issues + "}";
+}
+
+void CheckFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        const auto started = std::chrono::steady_clock::now();
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        if (sqlite3_value_type(values[1]) != SQLITE_INTEGER) {
+            throw SqlError("deep must be 0 or 1", SQLITE_MISMATCH);
+        }
+        const int deep_value = sqlite3_value_int(values[1]);
+        if (deep_value != 0 && deep_value != 1) {
+            throw SqlError("deep must be 0 or 1", SQLITE_RANGE);
+        }
+        const bool deep = deep_value != 0;
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        CheckReport report;
+
+        try {
+            Statement quick_check(db, "PRAGMA quick_check(100)");
+            while (quick_check.Row()) {
+                const std::string result = quick_check.Text(0);
+                if (result != "ok") {
+                    report.Add("VEXFS_SQLITE_CORRUPTION", "database", "sqlite",
+                               result, "restore the SQLite database from a verified backup");
+                }
+            }
+        } catch (const SqlError &error) {
+            report.Add("VEXFS_SQLITE_CHECK_FAILED", "database", "sqlite", error.what(),
+                       "run SQLite integrity_check offline and restore a verified backup");
+        }
+
+        std::unordered_map<sqlite3_int64, sqlite3_int64> commits;
+        {
+            Statement rows(db,
+                "SELECT id,COALESCE(parent_commit,0) FROM _vexfs_commits "
+                "WHERE workspace_id=?1 ORDER BY id");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.commits;
+                commits[rows.Int64(0)] = rows.Int64(1);
+            }
+        }
+        if (workspace.head_commit != 0 && commits.count(workspace.head_commit) == 0) {
+            report.Add("VEXFS_HEAD_COMMIT_MISSING", "workspace:" + workspace_name,
+                       "commit", "workspace head_commit does not exist",
+                       "restore a verified backup; do not create a replacement commit by hand");
+        }
+        for (const auto &entry : commits) {
+            const sqlite3_int64 id = entry.first;
+            const sqlite3_int64 parent = entry.second;
+            if (parent != 0 && commits.count(parent) == 0) {
+                report.Add("VEXFS_COMMIT_PARENT_MISSING", "commit:" + std::to_string(id),
+                           "commit", "parent commit does not exist in this workspace",
+                           "restore commit history from a verified backup");
+            } else if (parent >= id && parent != 0) {
+                report.Add("VEXFS_COMMIT_CHAIN_INVALID", "commit:" + std::to_string(id),
+                           "commit", "parent commit is not older than its child",
+                           "restore commit history from a verified backup");
+            }
+        }
+        std::unordered_set<sqlite3_int64> commit_chain;
+        sqlite3_int64 chain_commit = workspace.head_commit;
+        while (chain_commit != 0 && commits.count(chain_commit) != 0 &&
+               commit_chain.insert(chain_commit).second) {
+            chain_commit = commits.at(chain_commit);
+        }
+        if (chain_commit != 0 && commit_chain.count(chain_commit) != 0) {
+            report.Add("VEXFS_COMMIT_CYCLE", "commit:" + std::to_string(chain_commit),
+                       "commit", "workspace commit chain contains a cycle",
+                       "restore commit history from a verified backup");
+        }
+        for (const auto &entry : commits) {
+            if (commit_chain.count(entry.first) == 0) {
+                report.Add("VEXFS_COMMIT_UNREACHABLE", "commit:" +
+                           std::to_string(entry.first), "commit",
+                           "commit is not reachable from workspace head",
+                           "restore commit history from a verified backup");
+            }
+        }
+
+        struct InodeCheck {
+            std::string kind;
+            sqlite3_int64 size = 0;
+            sqlite3_int64 version = 0;
+            bool deleted = false;
+        };
+        std::unordered_map<sqlite3_int64, InodeCheck> inodes;
+        {
+            Statement rows(db,
+                "SELECT id,kind,size,current_version,deleted_at IS NOT NULL "
+                "FROM _vexfs_inodes WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.inodes;
+                inodes[rows.Int64(0)] = {rows.Text(1), rows.Int64(2), rows.Int64(3),
+                                         rows.Int(4) != 0};
+            }
+        }
+        const auto root = inodes.find(workspace.root_inode);
+        if (root == inodes.end() || root->second.deleted || root->second.kind != "directory") {
+            report.Add("VEXFS_ROOT_INVALID", "inode:" + std::to_string(workspace.root_inode),
+                       "inode", "workspace root is missing, deleted, or not a directory",
+                       "restore the workspace from a verified snapshot or backup");
+        }
+
+        std::unordered_map<sqlite3_int64, std::vector<sqlite3_int64>> children;
+        std::unordered_map<sqlite3_int64, sqlite3_int64> directory_links;
+        {
+            Statement rows(db,
+                "SELECT parent_inode,name,inode_id FROM _vexfs_dentries WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.dentries;
+                const sqlite3_int64 parent = rows.Int64(0);
+                const std::string name = rows.Text(1);
+                const sqlite3_int64 child = rows.Int64(2);
+                const auto parent_inode = inodes.find(parent);
+                const auto child_inode = inodes.find(child);
+                const std::string object = "dentry:" + std::to_string(parent) + "/" + name;
+                const bool valid_parent = parent_inode != inodes.end() &&
+                    !parent_inode->second.deleted && parent_inode->second.kind == "directory";
+                if (name.empty() || name == "." || name == ".." || name.size() > 255 ||
+                    name.find('/') != std::string::npos || name.find('\0') != std::string::npos) {
+                    report.Add("VEXFS_DENTRY_NAME_INVALID", object, "dentry",
+                               "directory entry name is invalid",
+                               "restore the directory entry from a verified snapshot");
+                }
+                if (!valid_parent) {
+                    report.Add("VEXFS_DENTRY_PARENT_INVALID", object, "dentry",
+                               "parent inode is missing, deleted, or not a directory",
+                               "restore the directory tree from a verified snapshot");
+                }
+                if (child_inode == inodes.end() || child_inode->second.deleted) {
+                    report.Add("VEXFS_DENTRY_CHILD_INVALID", object, "dentry",
+                               "child inode is missing or deleted",
+                               "restore the directory tree from a verified snapshot");
+                } else {
+                    if (child_inode->second.kind == "directory") ++directory_links[child];
+                    if (valid_parent) children[parent].push_back(child);
+                }
+                if (child == workspace.root_inode) {
+                    report.Add("VEXFS_ROOT_HAS_PARENT", object, "dentry",
+                               "workspace root appears as a child",
+                               "restore the directory tree from a verified snapshot");
+                }
+            }
+        }
+        for (const auto &entry : directory_links) {
+            if (entry.second > 1) {
+                report.Add("VEXFS_DIRECTORY_HARDLINK", "inode:" + std::to_string(entry.first),
+                           "dentry", "directory has more than one parent",
+                           "restore the directory tree from a verified snapshot");
+            }
+        }
+        std::unordered_set<sqlite3_int64> reachable;
+        std::vector<sqlite3_int64> pending;
+        if (root != inodes.end() && !root->second.deleted) {
+            reachable.insert(workspace.root_inode);
+            pending.push_back(workspace.root_inode);
+        }
+        while (!pending.empty()) {
+            const sqlite3_int64 parent = pending.back();
+            pending.pop_back();
+            for (const sqlite3_int64 child : children[parent]) {
+                if (reachable.insert(child).second) pending.push_back(child);
+            }
+        }
+        for (const auto &entry : inodes) {
+            if (!entry.second.deleted && reachable.count(entry.first) == 0) {
+                report.Add("VEXFS_INODE_UNREACHABLE", "inode:" + std::to_string(entry.first),
+                           "inode", "active inode is not reachable from the workspace root",
+                           "restore the directory tree from a verified snapshot");
+            }
+        }
+
+        struct VersionCheck {
+            sqlite3_int64 rowid = 0;
+            sqlite3_int64 commit = 0;
+            sqlite3_int64 size = 0;
+            sqlite3_int64 content_size = 0;
+            sqlite3_int64 source = 0;
+            std::string checksum;
+        };
+        std::map<std::pair<sqlite3_int64, sqlite3_int64>, VersionCheck> versions;
+        {
+            Statement rows(db, R"SQL(
+SELECT v.rowid,v.inode_id,v.version_no,v.commit_id,v.size,length(v.content),
+       COALESCE(v.source_version_no,0),v.checksum
+FROM _vexfs_file_versions v
+JOIN _vexfs_inodes i ON i.id=v.inode_id
+WHERE i.workspace_id=?1
+ORDER BY v.inode_id,v.version_no
+)SQL");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.versions;
+                VersionCheck version{rows.Int64(0), rows.Int64(3), rows.Int64(4),
+                                     rows.Int64(5), rows.Int64(6), rows.Text(7)};
+                versions[{rows.Int64(1), rows.Int64(2)}] = std::move(version);
+            }
+        }
+        {
+            Statement orphan(db,
+                "SELECT v.id,v.inode_id FROM _vexfs_file_versions v "
+                "LEFT JOIN _vexfs_inodes i ON i.id=v.inode_id WHERE i.id IS NULL");
+            while (orphan.Row()) {
+                report.Add("VEXFS_VERSION_INODE_MISSING",
+                           "version-row:" + std::to_string(orphan.Int64(0)), "content",
+                           "file version references an unknown inode",
+                           "restore version history from a verified backup");
+            }
+        }
+        for (const auto &entry : versions) {
+            const sqlite3_int64 inode = entry.first.first;
+            const sqlite3_int64 number = entry.first.second;
+            const VersionCheck &version = entry.second;
+            const std::string object = "version:" + std::to_string(inode) + "/" +
+                                       std::to_string(number);
+            if (version.size < 0 || version.size > kMaxStagedBytes) {
+                report.Add("VEXFS_VERSION_SIZE_INVALID", object, "content",
+                           "file version size is outside the supported range",
+                           "restore this file version from a verified snapshot or backup");
+            }
+            if (!IsSha256(version.checksum)) {
+                report.Add("VEXFS_CHECKSUM_INVALID", object, "content",
+                           "stored SHA-256 is not a lowercase 64-character digest",
+                           "restore this file version from a verified snapshot or backup");
+            }
+            if (commits.count(version.commit) == 0) {
+                report.Add("VEXFS_VERSION_COMMIT_MISSING", object, "commit",
+                           "file version commit does not exist in this workspace",
+                           "restore version history from a verified backup");
+            }
+            if (version.source == 0) {
+                report.content_bytes += std::max<sqlite3_int64>(version.size, 0);
+                if (version.content_size != version.size) {
+                    report.Add("VEXFS_CONTENT_SIZE_MISMATCH", object, "content",
+                               "stored BLOB length does not match version size",
+                               "restore this file version from a verified snapshot or backup");
+                } else if (deep && IsSha256(version.checksum)) {
+                    try {
+                        const std::string actual = HashVersionBlob(db, version.rowid, version.size);
+                        if (actual != version.checksum) {
+                            report.Add("VEXFS_CHECKSUM_MISMATCH", object, "content",
+                                       "stored BLOB does not match its SHA-256",
+                                       "restore this file version from a verified snapshot or backup");
+                        }
+                    } catch (const SqlError &error) {
+                        report.Add("VEXFS_CONTENT_UNREADABLE", object, "content", error.what(),
+                                   "restore this file version from a verified snapshot or backup");
+                    }
+                }
+            } else {
+                const auto source = versions.find({inode, version.source});
+                if (version.content_size != 0) {
+                    report.Add("VEXFS_ALIAS_HAS_CONTENT", object, "content",
+                               "version alias unexpectedly stores its own BLOB",
+                               "restore version history from a verified backup");
+                }
+                if (source == versions.end() || source->second.source != 0) {
+                    report.Add("VEXFS_VERSION_SOURCE_INVALID", object, "content",
+                               "version alias does not point directly to a canonical version",
+                               "restore version history from a verified backup");
+                } else if (source->second.size != version.size ||
+                           source->second.checksum != version.checksum) {
+                    report.Add("VEXFS_VERSION_SOURCE_MISMATCH", object, "content",
+                               "version alias metadata differs from its source",
+                               "restore version history from a verified backup");
+                }
+            }
+        }
+        for (const auto &entry : inodes) {
+            if (entry.second.deleted || entry.second.kind == "directory") continue;
+            const auto version = versions.find({entry.first, entry.second.version});
+            bool pending_first_publish = false;
+            if (entry.second.version == 0 && entry.second.size == 0) {
+                Statement handle(db,
+                    "SELECT 1 FROM _vexfs_handles WHERE workspace_id=?1 AND inode_id=?2 "
+                    "AND state IN ('open','retained') LIMIT 1");
+                handle.BindInt64(1, workspace.id);
+                handle.BindInt64(2, entry.first);
+                pending_first_publish = handle.Row();
+            }
+            if (!pending_first_publish &&
+                (entry.second.version <= 0 || version == versions.end())) {
+                report.Add("VEXFS_CURRENT_VERSION_MISSING", "inode:" + std::to_string(entry.first),
+                           "inode", "active file or symlink has no current version",
+                           "restore this inode from a verified snapshot or backup");
+            } else if (!pending_first_publish && version->second.size != entry.second.size) {
+                report.Add("VEXFS_CURRENT_SIZE_MISMATCH", "inode:" + std::to_string(entry.first),
+                           "inode", "inode size differs from its current version",
+                           "restore this inode from a verified snapshot or backup");
+            }
+        }
+
+        {
+            Statement rows(db,
+                "SELECT name,commit_id FROM _vexfs_snapshots WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.snapshots;
+                if (commits.count(rows.Int64(1)) == 0) {
+                    report.Add("VEXFS_SNAPSHOT_COMMIT_MISSING", "snapshot:" + rows.Text(0),
+                               "snapshot", "snapshot commit does not exist in this workspace",
+                               "drop the broken snapshot name or restore history from backup");
+                }
+            }
+        }
+        {
+            Statement rows(db,
+                "SELECT inode_id,commit_id,kind,size,current_version,deleted_at IS NOT NULL "
+                "FROM _vexfs_inode_states WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.history_rows;
+                const sqlite3_int64 inode = rows.Int64(0);
+                const sqlite3_int64 commit = rows.Int64(1);
+                const std::string object = "inode-state:" + std::to_string(inode) + "@" +
+                                           std::to_string(commit);
+                if (commits.count(commit) == 0) {
+                    report.Add("VEXFS_HISTORY_COMMIT_MISSING", object,
+                               "history", "history row references a missing commit",
+                               "restore workspace history from a verified backup");
+                }
+                if (inodes.count(inode) == 0) {
+                    report.Add("VEXFS_HISTORY_INODE_MISSING", object, "history",
+                               "inode state references an unknown inode",
+                               "restore workspace history from a verified backup");
+                }
+                if (rows.Int(5) == 0 && rows.Text(2) != "directory") {
+                    const auto version = versions.find({inode, rows.Int64(4)});
+                    if (version == versions.end()) {
+                        report.Add("VEXFS_HISTORY_VERSION_MISSING", object, "history",
+                                   "inode state references a missing file version",
+                                   "restore workspace history from a verified backup");
+                    } else if (version->second.size != rows.Int64(3)) {
+                        report.Add("VEXFS_HISTORY_SIZE_MISMATCH", object, "history",
+                                   "inode state size differs from its file version",
+                                   "restore workspace history from a verified backup");
+                    }
+                }
+            }
+        }
+        {
+            Statement rows(db,
+                "SELECT parent_inode,name,commit_id,inode_id FROM _vexfs_dentry_states "
+                "WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.history_rows;
+                const std::string object = "dentry-state:" + std::to_string(rows.Int64(0)) +
+                                           "/" + rows.Text(1) + "@" +
+                                           std::to_string(rows.Int64(2));
+                if (commits.count(rows.Int64(2)) == 0) {
+                    report.Add("VEXFS_HISTORY_COMMIT_MISSING", object, "history",
+                               "history row references a missing commit",
+                               "restore workspace history from a verified backup");
+                }
+                if (inodes.count(rows.Int64(0)) == 0 || inodes.count(rows.Int64(3)) == 0) {
+                    report.Add("VEXFS_HISTORY_DENTRY_INVALID", object, "history",
+                               "historical directory entry references an unknown inode",
+                               "restore workspace history from a verified backup");
+                }
+            }
+        }
+        for (const char *table : {"_vexfs_xattr_states", "_vexfs_acl_states"}) {
+            const std::string sql = "SELECT inode_id,commit_id FROM " + std::string(table) +
+                                    " WHERE workspace_id=?1";
+            Statement rows(db, sql.c_str());
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.history_rows;
+                const std::string object = std::string("table:") + table + "@" +
+                                           std::to_string(rows.Int64(1));
+                if (commits.count(rows.Int64(1)) == 0) {
+                    report.Add("VEXFS_HISTORY_COMMIT_MISSING", object, "history",
+                               "history row references a missing commit",
+                               "restore workspace history from a verified backup");
+                }
+                if (inodes.count(rows.Int64(0)) == 0) {
+                    report.Add("VEXFS_HISTORY_INODE_MISSING", object, "history",
+                               "history row references an unknown inode",
+                               "restore workspace history from a verified backup");
+                }
+            }
+        }
+
+        {
+            Statement rows(db, R"SQL(
+SELECT h.id,h.inode_id,h.state,h.dirty_generation,h.published_generation,
+       s.generation,s.logical_size,s.capacity,length(d.content)
+FROM _vexfs_handles h
+LEFT JOIN _vexfs_staging s ON s.handle_id=h.id
+LEFT JOIN _vexfs_staging_data d ON d.handle_id=h.id
+WHERE h.workspace_id=?1
+)SQL");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                ++report.handles;
+                const std::string id = rows.Text(0);
+                const std::string object = "handle:" + id;
+                const bool active = rows.Text(2) == "open" || rows.Text(2) == "retained";
+                if (inodes.count(rows.Int64(1)) == 0) {
+                    report.Add("VEXFS_HANDLE_INODE_MISSING", object, "staging",
+                               "handle inode does not exist in this workspace",
+                               "close the handle and restore the inode from backup if needed");
+                }
+                if (rows.Int64(3) < rows.Int64(4)) {
+                    report.Add("VEXFS_HANDLE_GENERATION_INVALID", object, "staging",
+                               "published generation is newer than dirty generation",
+                               "discard the handle and reopen the file");
+                }
+                if (active) {
+                    ++report.staging_objects;
+                    if (rows.Type(5) == SQLITE_NULL || rows.Type(8) == SQLITE_NULL) {
+                        report.Add("VEXFS_STAGING_MISSING", object, "staging",
+                                   "open or retained handle has no complete staging object",
+                                   "discard the handle; recover unpublished work from backup if available");
+                    } else if (rows.Int64(5) != rows.Int64(3) || rows.Int64(6) < 0 ||
+                               rows.Int64(7) < rows.Int64(6) ||
+                               rows.Int64(7) > kMaxStagedBytes || rows.Int64(8) != rows.Int64(7)) {
+                        report.Add("VEXFS_STAGING_INVALID", object, "staging",
+                                   "staging generation, size, or capacity is inconsistent",
+                                   "discard the handle; recover unpublished work from backup if available");
+                    }
+                } else if (rows.Type(5) != SQLITE_NULL || rows.Type(8) != SQLITE_NULL) {
+                    report.Add("VEXFS_CLOSED_HANDLE_STAGING", object, "staging",
+                               "closed handle still owns staging data",
+                               "run a future repair or garbage-collection command after backing up");
+                }
+            }
+        }
+        {
+            Statement orphan(db,
+                "SELECT s.handle_id FROM _vexfs_staging s LEFT JOIN _vexfs_handles h "
+                "ON h.id=s.handle_id WHERE h.id IS NULL");
+            while (orphan.Row()) {
+                report.Add("VEXFS_ORPHAN_STAGING", "handle:" + orphan.Text(0), "staging",
+                           "staging metadata has no owning handle",
+                           "run a future repair or garbage-collection command after backing up");
+            }
+            Statement orphan_data(db,
+                "SELECT d.handle_id FROM _vexfs_staging_data d LEFT JOIN _vexfs_staging s "
+                "ON s.handle_id=d.handle_id WHERE s.handle_id IS NULL");
+            while (orphan_data.Row()) {
+                report.Add("VEXFS_ORPHAN_STAGING_DATA", "handle:" + orphan_data.Text(0),
+                           "staging", "staging BLOB has no metadata row",
+                           "run a future repair or garbage-collection command after backing up");
+            }
+        }
+
+        const sqlite3_int64 elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        const std::string json = CheckReportJson(report, workspace_name, deep, elapsed_ms);
         sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
     });
 }
@@ -1549,7 +3019,8 @@ void ListFunction(sqlite3_context *context, int, sqlite3_value **values) {
 
         Statement statement(db,
             "SELECT d.name, i.id, i.kind, i.size, i.current_version, i.mode, "
-            "i.created_at, i.updated_at FROM _vexfs_dentries d "
+            "i.owner_principal, i.uid, i.gid, i.created_at, i.accessed_at, "
+            "i.updated_at, i.changed_at FROM _vexfs_dentries d "
             "JOIN _vexfs_inodes i ON i.id = d.inode_id "
             "WHERE d.workspace_id = ?1 AND d.parent_inode = ?2 AND i.deleted_at IS NULL "
             "ORDER BY d.name COLLATE BINARY");
@@ -1564,12 +3035,1229 @@ void ListFunction(sqlite3_context *context, int, sqlite3_value **values) {
                 std::to_string(statement.Int64(1)) + ",\"kind\":\"" + statement.Text(2) +
                 "\",\"size\":" + std::to_string(statement.Int64(3)) + ",\"version\":" +
                 std::to_string(statement.Int64(4)) + ",\"mode\":" +
-                std::to_string(statement.Int(5)) + ",\"created_at\":" +
-                std::to_string(statement.Int64(6)) + ",\"updated_at\":" +
-                std::to_string(statement.Int64(7)) + "}";
+                std::to_string(statement.Int(5)) + ",\"owner_principal\":\"" +
+                JsonEscape(statement.Text(6)) + "\",\"uid\":" +
+                std::to_string(statement.Int64(7)) + ",\"gid\":" +
+                std::to_string(statement.Int64(8)) + ",\"created_at\":" +
+                std::to_string(statement.Int64(9)) + ",\"accessed_at\":" +
+                std::to_string(statement.Int64(10)) + ",\"updated_at\":" +
+                std::to_string(statement.Int64(11)) + ",\"changed_at\":" +
+                std::to_string(statement.Int64(12)) + ",\"link_count\":" +
+                std::to_string(LinkCount(db, workspace, statement.Int64(1))) + "}";
         }
         json += ']';
         sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void RequireWorkspaceInode(sqlite3 *db, const Workspace &workspace, sqlite3_int64 inode) {
+    Statement statement(db,
+        "SELECT 1 FROM _vexfs_inodes WHERE id=?1 AND workspace_id=?2 LIMIT 1");
+    statement.BindInt64(1, inode);
+    statement.BindInt64(2, workspace.id);
+    if (!statement.Row()) throw SqlError("inode not found", SQLITE_NOTFOUND);
+}
+
+void ReadlinkFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        RequireWorkspaceInode(db, workspace, inode);
+        const Node node = NodeById(db, inode, true);
+        if (node.kind != "symlink") {
+            throw SqlError("inode is not a symbolic link", SQLITE_MISMATCH);
+        }
+        if (node.version <= 0) throw SqlError("symlink target is missing", SQLITE_CORRUPT);
+        ResultBlob(context, ReadVersionContent(db, node.id, node.version));
+    });
+}
+
+void SetModeFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const int mode = RequiredMode(values[2]);
+        Savepoint savepoint(db, "vexfs_set_mode");
+        AcquireWriteLock(db);
+        RequireWorkspaceInode(db, workspace, inode);
+        const Node node = NodeById(db, inode, true);
+        if (node.kind == "symlink") {
+            throw SqlError("symbolic link mode cannot be changed", SQLITE_MISMATCH);
+        }
+        if (node.mode != mode) {
+            Statement update(db,
+                "UPDATE _vexfs_inodes SET mode=?1, "
+                "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+                "WHERE id=?2 AND workspace_id=?3");
+            update.BindInt(1, mode);
+            update.BindInt64(2, inode);
+            update.BindInt64(3, workspace.id);
+            update.Done();
+            if (sqlite3_changes64(db) != 1) {
+                throw SqlError("inode not found", SQLITE_NOTFOUND);
+            }
+            CommitMetadataChange(db, workspace, inode, "chmod");
+        }
+        savepoint.Release();
+        sqlite3_result_int(context, mode);
+    });
+}
+
+void SetTimesFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const sqlite3_int64 accessed_at = RequiredNonnegativeInteger(values[2], "access time");
+        const sqlite3_int64 updated_at = RequiredNonnegativeInteger(values[3], "modify time");
+        const int mask = sqlite3_value_int(values[4]);
+        if ((mask & ~3) != 0 || mask == 0) {
+            throw SqlError("time mask must select access time, modify time, or both",
+                           SQLITE_MISMATCH);
+        }
+        Savepoint savepoint(db, "vexfs_set_times");
+        AcquireWriteLock(db);
+        RequireWorkspaceInode(db, workspace, inode);
+        Statement update(db,
+            "UPDATE _vexfs_inodes SET "
+            "accessed_at=CASE WHEN (?1&1)<>0 THEN ?2 ELSE accessed_at END,"
+            "updated_at=CASE WHEN (?1&2)<>0 THEN ?3 ELSE updated_at END,"
+            "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "WHERE id=?4 AND workspace_id=?5 AND deleted_at IS NULL");
+        update.BindInt(1, mask);
+        update.BindInt64(2, accessed_at);
+        update.BindInt64(3, updated_at);
+        update.BindInt64(4, inode);
+        update.BindInt64(5, workspace.id);
+        update.Done();
+        if (sqlite3_changes64(db) != 1) throw SqlError("inode not found", SQLITE_NOTFOUND);
+        CommitMetadataChange(db, workspace, inode, "set times");
+        savepoint.Release();
+        sqlite3_result_int(context, mask);
+    });
+}
+
+struct AclEntry {
+    std::string principal;
+    std::string effect;
+    std::string permissions;
+    sqlite3_int64 inherit_flags = 0;
+
+    bool operator==(const AclEntry &other) const {
+        return principal == other.principal && effect == other.effect &&
+            permissions == other.permissions && inherit_flags == other.inherit_flags;
+    }
+};
+
+std::vector<AclEntry> ReadAclEntries(sqlite3 *db, const Workspace &workspace,
+                                     sqlite3_int64 inode) {
+    Statement statement(db,
+        "SELECT principal_id,effect,permissions,inherit_flags FROM _vexfs_acl_entries "
+        "WHERE workspace_id=?1 AND inode_id=?2 ORDER BY principal_id COLLATE BINARY,effect");
+    statement.BindInt64(1, workspace.id);
+    statement.BindInt64(2, inode);
+    std::vector<AclEntry> entries;
+    while (statement.Row()) {
+        entries.push_back({statement.Text(0), statement.Text(1), statement.Text(2),
+                           statement.Int64(3)});
+    }
+    return entries;
+}
+
+std::string AclJson(const std::vector<AclEntry> &entries) {
+    std::string json = "[";
+    bool first = true;
+    for (const AclEntry &entry : entries) {
+        if (!first) json += ',';
+        first = false;
+        json += "{\"principal\":\"" + JsonEscape(entry.principal) +
+            "\",\"effect\":\"" + JsonEscape(entry.effect) +
+            "\",\"permissions\":\"" + JsonEscape(entry.permissions) +
+            "\",\"inherit\":" + std::to_string(entry.inherit_flags) + "}";
+    }
+    json += ']';
+    return json;
+}
+
+std::vector<AclEntry> ParseAclJson(sqlite3 *db, sqlite3_value *value) {
+    const std::string json = RequiredText(value, "acl");
+    Statement root(db, "SELECT json_type(?1)");
+    root.BindText(1, json);
+    if (!root.Row() || root.Type(0) == SQLITE_NULL || root.Text(0) != "array") {
+        throw SqlError("acl must be a JSON array", SQLITE_MISMATCH);
+    }
+    Statement statement(db, R"SQL(
+SELECT COALESCE(json_extract(value,'$.principal'),json_extract(value,'$.principal_id')),
+       COALESCE(json_extract(value,'$.effect'),'allow'),
+       json_extract(value,'$.permissions'),
+       COALESCE(json_extract(value,'$.inherit'),json_extract(value,'$.inherit_flags'),0)
+FROM json_each(?1)
+)SQL");
+    statement.BindText(1, json);
+    std::vector<AclEntry> entries;
+    while (statement.Row()) {
+        const std::string principal = statement.Text(0);
+        const std::string effect = statement.Text(1);
+        const std::string permissions = statement.Text(2);
+        const sqlite3_int64 inherit = statement.Int64(3);
+        if (principal.empty() || principal.size() > 255)
+            throw SqlError("acl principal must be 1..255 bytes", SQLITE_RANGE);
+        if (effect != "allow" && effect != "deny")
+            throw SqlError("acl effect must be allow or deny", SQLITE_MISMATCH);
+        if (permissions.empty() || permissions.size() > 1024)
+            throw SqlError("acl permissions must be 1..1024 bytes", SQLITE_RANGE);
+        if (inherit < 0 || inherit > 255)
+            throw SqlError("acl inherit flags must be 0..255", SQLITE_RANGE);
+        entries.push_back({principal, effect, permissions, inherit});
+        if (entries.size() > 1024) throw SqlError("acl has too many entries", SQLITE_TOOBIG);
+    }
+    return entries;
+}
+
+void AclGetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        RequireWorkspaceInode(db, workspace, inode);
+        const std::string json = AclJson(ReadAclEntries(db, workspace, inode));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void AclSetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        RequireWorkspaceInode(db, workspace, inode);
+        const std::vector<AclEntry> entries = ParseAclJson(db, values[2]);
+        Savepoint savepoint(db, "vexfs_acl_set");
+        AcquireWriteLock(db);
+        Statement clear(db, "DELETE FROM _vexfs_acl_entries WHERE workspace_id=?1 AND inode_id=?2");
+        clear.BindInt64(1, workspace.id);
+        clear.BindInt64(2, inode);
+        clear.Done();
+        for (const AclEntry &entry : entries) {
+            Statement insert(db,
+                "INSERT INTO _vexfs_acl_entries(workspace_id,inode_id,principal_id,effect,permissions,inherit_flags) "
+                "VALUES(?1,?2,?3,?4,?5,?6)");
+            insert.BindInt64(1, workspace.id);
+            insert.BindInt64(2, inode);
+            insert.BindText(3, entry.principal);
+            insert.BindText(4, entry.effect);
+            insert.BindText(5, entry.permissions);
+            insert.BindInt64(6, entry.inherit_flags);
+            insert.Done();
+        }
+        Statement touch(db,
+            "UPDATE _vexfs_inodes SET changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "WHERE id=?1 AND workspace_id=?2");
+        touch.BindInt64(1, inode);
+        touch.BindInt64(2, workspace.id);
+        touch.Done();
+        CommitMetadataChange(db, workspace, inode, "set acl");
+        savepoint.Release();
+        sqlite3_result_int(context, static_cast<int>(entries.size()));
+    });
+}
+
+void AclDeleteFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        RequireWorkspaceInode(db, workspace, inode);
+        Savepoint savepoint(db, "vexfs_acl_delete");
+        AcquireWriteLock(db);
+        Statement remove(db, "DELETE FROM _vexfs_acl_entries WHERE workspace_id=?1 AND inode_id=?2");
+        remove.BindInt64(1, workspace.id);
+        remove.BindInt64(2, inode);
+        remove.Done();
+        const sqlite3_int64 removed = sqlite3_changes64(db);
+        if (removed > 0) CommitMetadataChange(db, workspace, inode, "delete acl");
+        savepoint.Release();
+        sqlite3_result_int64(context, removed);
+    });
+}
+
+void AclGrantFunction(sqlite3_context *context, int argument_count, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const std::string principal = RequiredText(values[2], "principal");
+        const std::string permissions = RequiredText(values[3], "permissions");
+        if (principal.empty() || principal.size() > 255 || permissions.empty() || permissions.size() > 1024)
+            throw SqlError("invalid ACL principal or permissions", SQLITE_RANGE);
+        RequireWorkspaceInode(db, workspace, inode);
+        const std::string effect = (argument_count < 5 || sqlite3_value_type(values[4]) == SQLITE_NULL)
+            ? "allow" : RequiredText(values[4], "effect");
+        if (effect != "allow" && effect != "deny")
+            throw SqlError("acl effect must be allow or deny", SQLITE_MISMATCH);
+        Savepoint savepoint(db, "vexfs_acl_grant");
+        AcquireWriteLock(db);
+        Statement upsert(db,
+            "INSERT INTO _vexfs_acl_entries(workspace_id,inode_id,principal_id,effect,permissions) "
+            "VALUES(?1,?2,?3,?4,?5) ON CONFLICT(workspace_id,inode_id,principal_id,effect) "
+            "DO UPDATE SET permissions=excluded.permissions,updated_at=CAST(strftime('%s','now') AS INTEGER)*1000");
+        upsert.BindInt64(1, workspace.id);
+        upsert.BindInt64(2, inode);
+        upsert.BindText(3, principal);
+        upsert.BindText(4, effect);
+        upsert.BindText(5, permissions);
+        upsert.Done();
+        CommitMetadataChange(db, workspace, inode, "grant acl");
+        savepoint.Release();
+        sqlite3_result_int(context, 1);
+    });
+}
+
+void AclRevokeFunction(sqlite3_context *context, int argument_count, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const std::string principal = RequiredText(values[2], "principal");
+        RequireWorkspaceInode(db, workspace, inode);
+        const std::string effect = (argument_count < 4 || sqlite3_value_type(values[3]) == SQLITE_NULL)
+            ? std::string() : RequiredText(values[3], "effect");
+        if (!effect.empty() && effect != "allow" && effect != "deny")
+            throw SqlError("acl effect must be allow or deny", SQLITE_MISMATCH);
+        Savepoint savepoint(db, "vexfs_acl_revoke");
+        AcquireWriteLock(db);
+        Statement remove(db,
+            "DELETE FROM _vexfs_acl_entries WHERE workspace_id=?1 AND inode_id=?2 "
+            "AND principal_id=?3 AND (?4='' OR effect=?4)");
+        remove.BindInt64(1, workspace.id);
+        remove.BindInt64(2, inode);
+        remove.BindText(3, principal);
+        remove.BindText(4, effect);
+        remove.Done();
+        const sqlite3_int64 removed = sqlite3_changes64(db);
+        if (removed > 0) CommitMetadataChange(db, workspace, inode, "revoke acl");
+        savepoint.Release();
+        sqlite3_result_int64(context, removed);
+    });
+}
+
+void ChownFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const sqlite3_int64 requested_uid = RequiredOwnerId(values[2], "uid");
+        const sqlite3_int64 requested_gid = RequiredOwnerId(values[3], "gid");
+        RequireWorkspaceInode(db, workspace, inode);
+        const Node current = NodeById(db, inode, true);
+        const sqlite3_int64 uid = requested_uid < 0 ? current.uid : requested_uid;
+        const sqlite3_int64 gid = requested_gid < 0 ? current.gid : requested_gid;
+        Savepoint savepoint(db, "vexfs_chown");
+        AcquireWriteLock(db);
+        Statement update(db,
+            "UPDATE _vexfs_inodes SET uid=?1,gid=?2,changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "WHERE workspace_id=?3 AND id=?4");
+        update.BindInt64(1, uid);
+        update.BindInt64(2, gid);
+        update.BindInt64(3, workspace.id);
+        update.BindInt64(4, inode);
+        update.Done();
+        if (sqlite3_changes64(db) != 1) throw SqlError("inode not found", SQLITE_NOTFOUND);
+        CommitMetadataChange(db, workspace, inode, "chown");
+        savepoint.Release();
+        sqlite3_result_int64(context, uid);
+    });
+}
+
+void OwnerSetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string path = RequiredText(values[1], "path");
+        const std::string owner = RequiredText(values[2], "owner principal");
+        if (owner.empty() || owner.size() > 255) throw SqlError("owner principal must be 1..255 bytes", SQLITE_RANGE);
+        const Node node = Resolve(db, workspace, PathParts(path));
+        Savepoint savepoint(db, "vexfs_owner_set");
+        AcquireWriteLock(db);
+        Statement update(db,
+            "UPDATE _vexfs_inodes SET owner_principal=?1,changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "WHERE workspace_id=?2 AND id=?3");
+        update.BindText(1, owner);
+        update.BindInt64(2, workspace.id);
+        update.BindInt64(3, node.id);
+        update.Done();
+        if (sqlite3_changes64(db) != 1) throw SqlError("inode not found", SQLITE_NOTFOUND);
+        CommitMetadataChange(db, workspace, node.id, "set owner");
+        savepoint.Release();
+        sqlite3_result_text(context, owner.data(), static_cast<int>(owner.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void GetXattrFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const std::string name = RequiredText(values[2], "xattr name");
+        if (name.empty() || name.size() > 255)
+            throw SqlError("xattr name must be 1..255 bytes", SQLITE_RANGE);
+        RequireWorkspaceInode(db, workspace, inode);
+        Statement statement(db,
+            "SELECT value FROM _vexfs_xattrs WHERE inode_id=?1 AND name=?2");
+        statement.BindInt64(1, inode);
+        statement.BindText(2, name);
+        if (!statement.Row()) throw SqlError("xattr not found", SQLITE_NOTFOUND);
+        const std::vector<unsigned char> value = statement.Blob(0);
+        sqlite3_result_blob64(context, value.empty() ? static_cast<const void *>("") : value.data(),
+                              value.size(), SQLITE_TRANSIENT);
+    });
+}
+
+void ListXattrsFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        RequireWorkspaceInode(db, workspace, inode);
+        Statement statement(db,
+            "SELECT name FROM _vexfs_xattrs WHERE inode_id=?1 ORDER BY name COLLATE BINARY");
+        statement.BindInt64(1, inode);
+        std::string json = "[";
+        bool first = true;
+        while (statement.Row()) {
+            if (!first) json += ',';
+            first = false;
+            json += "\"" + JsonEscape(statement.Text(0)) + "\"";
+        }
+        json += ']';
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SetXattrFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 inode = RequiredPositiveInteger(values[1], "inode");
+        const std::string name = RequiredText(values[2], "xattr name");
+        const int policy = sqlite3_value_int(values[4]);
+        if (name.empty() || name.size() > 255)
+            throw SqlError("xattr name must be 1..255 bytes", SQLITE_RANGE);
+        if (policy < 0 || policy > 3)
+            throw SqlError("xattr policy must be 0..3", SQLITE_RANGE);
+        RequireWorkspaceInode(db, workspace, inode);
+
+        Statement exists(db,
+            "SELECT 1 FROM _vexfs_xattrs WHERE inode_id=?1 AND name=?2");
+        exists.BindInt64(1, inode);
+        exists.BindText(2, name);
+        const bool found = exists.Row();
+        if (policy == 1 && found) throw SqlError("xattr already exists", SQLITE_CONSTRAINT);
+        if ((policy == 2 || policy == 3) && !found)
+            throw SqlError("xattr not found", SQLITE_NOTFOUND);
+
+        Savepoint savepoint(db, "vexfs_set_xattr");
+        if (policy == 3) {
+            Statement remove(db,
+                "DELETE FROM _vexfs_xattrs WHERE inode_id=?1 AND name=?2");
+            remove.BindInt64(1, inode);
+            remove.BindText(2, name);
+            remove.Done();
+        } else {
+            const std::vector<unsigned char> value = RequiredBlob(values[3], "xattr value");
+            if (static_cast<sqlite3_int64>(value.size()) > kMaxXattrBytes)
+                throw SqlError("xattr is larger than 64 KiB", SQLITE_TOOBIG);
+            Statement store(db,
+                "INSERT INTO _vexfs_xattrs(inode_id,name,value) VALUES(?1,?2,?3) "
+                "ON CONFLICT(inode_id,name) DO UPDATE SET value=excluded.value, "
+                "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000");
+            store.BindInt64(1, inode);
+            store.BindText(2, name);
+            store.BindBlob(3, value);
+            store.Done();
+        }
+        Statement touch(db,
+            "UPDATE _vexfs_inodes SET changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+            "WHERE id=?1 AND workspace_id=?2");
+        touch.BindInt64(1, inode);
+        touch.BindInt64(2, workspace.id);
+        touch.Done();
+        CommitMetadataChange(db, workspace, inode,
+                             policy == 3 ? "remove xattr" : "set xattr");
+        savepoint.Release();
+        sqlite3_result_int(context, 1);
+    });
+}
+
+struct SnapshotInfo {
+    sqlite3_int64 id = 0;
+    std::string name;
+    sqlite3_int64 commit = 0;
+    sqlite3_int64 created_at = 0;
+};
+
+struct SnapshotTreeNode {
+    sqlite3_int64 inode = 0;
+    std::string kind;
+    int mode = 0;
+    std::string owner_principal = "local";
+    sqlite3_int64 uid = 0;
+    sqlite3_int64 gid = 0;
+    sqlite3_int64 size = 0;
+    sqlite3_int64 version = 0;
+    sqlite3_int64 canonical_version = 0;
+    sqlite3_int64 created_at = 0;
+    sqlite3_int64 accessed_at = 0;
+    sqlite3_int64 updated_at = 0;
+    sqlite3_int64 changed_at = 0;
+    std::vector<AclEntry> acl;
+    std::map<std::string, std::vector<unsigned char>> xattrs;
+};
+
+using SnapshotTree = std::map<std::string, SnapshotTreeNode>;
+
+void ResolveSnapshotCanonicalVersions(sqlite3 *db, SnapshotTree &tree) {
+    std::string requested = "[";
+    bool first = true;
+    size_t expected = 0;
+    std::map<std::pair<sqlite3_int64, sqlite3_int64>, bool> unique;
+    for (const auto &[path, node] : tree) {
+        (void)path;
+        if ((node.kind != "file" && node.kind != "symlink") || node.version <= 0) continue;
+        if (!unique.emplace(std::make_pair(node.inode, node.version), true).second) continue;
+        if (!first) requested += ',';
+        first = false;
+        ++expected;
+        requested += "{\"inode\":" + std::to_string(node.inode) +
+            ",\"version\":" + std::to_string(node.version) + "}";
+    }
+    requested += ']';
+    if (expected == 0) return;
+
+    Statement statement(db, R"SQL(
+WITH RECURSIVE
+requested(inode_id,requested_version) AS (
+  SELECT CAST(json_extract(value,'$.inode') AS INTEGER),
+         CAST(json_extract(value,'$.version') AS INTEGER)
+  FROM json_each(?1)
+),
+chain(inode_id,requested_version,version_no,source_version_no,depth) AS (
+  SELECT r.inode_id,r.requested_version,v.version_no,v.source_version_no,0
+  FROM requested r JOIN _vexfs_file_versions v
+    ON v.inode_id=r.inode_id AND v.version_no=r.requested_version
+  UNION ALL
+  SELECT c.inode_id,c.requested_version,v.version_no,v.source_version_no,c.depth+1
+  FROM chain c JOIN _vexfs_file_versions v
+    ON v.inode_id=c.inode_id AND v.version_no=c.source_version_no
+  WHERE c.source_version_no IS NOT NULL AND c.depth<1024
+)
+SELECT inode_id,requested_version,version_no FROM chain
+WHERE source_version_no IS NULL
+)SQL");
+    statement.BindText(1, requested);
+    std::map<std::pair<sqlite3_int64, sqlite3_int64>, sqlite3_int64> resolved;
+    while (statement.Row()) {
+        resolved[{statement.Int64(0), statement.Int64(1)}] = statement.Int64(2);
+    }
+    if (resolved.size() != expected) {
+        throw SqlError("workspace history references a missing or cyclic file version",
+                       SQLITE_CORRUPT);
+    }
+    for (auto &[path, node] : tree) {
+        (void)path;
+        if ((node.kind == "file" || node.kind == "symlink") && node.version > 0) {
+            node.canonical_version = resolved.at({node.inode, node.version});
+        } else {
+            node.canonical_version = node.version;
+        }
+    }
+}
+
+sqlite3_int64 CurrentHead(sqlite3 *db, const Workspace &workspace) {
+    Statement statement(db,
+        "SELECT COALESCE(head_commit,0) FROM _vexfs_workspaces WHERE id=?1");
+    statement.BindInt64(1, workspace.id);
+    if (!statement.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    return statement.Int64(0);
+}
+
+void ValidateHistoryCommit(sqlite3 *db, const Workspace &workspace, sqlite3_int64 commit) {
+    Statement statement(db,
+        "SELECT COALESCE(history_floor_commit,0),"
+        "EXISTS(SELECT 1 FROM _vexfs_commits WHERE id=?2 AND workspace_id=?1) "
+        "FROM _vexfs_workspaces WHERE id=?1");
+    statement.BindInt64(1, workspace.id);
+    statement.BindInt64(2, commit);
+    if (!statement.Row() || statement.Int(1) != 1) {
+        throw SqlError("workspace commit not found: " + std::to_string(commit), SQLITE_NOTFOUND);
+    }
+    const sqlite3_int64 floor = statement.Int64(0);
+    if (floor == 0 || commit < floor) {
+        throw SqlError("workspace history before commit " + std::to_string(floor) +
+                       " is not restorable", SQLITE_NOTFOUND);
+    }
+}
+
+SnapshotInfo FindSnapshot(sqlite3 *db, const Workspace &workspace, const std::string &name) {
+    Statement statement(db,
+        "SELECT id,name,commit_id,created_at FROM _vexfs_snapshots "
+        "WHERE workspace_id=?1 AND name=?2");
+    statement.BindInt64(1, workspace.id);
+    statement.BindText(2, name);
+    if (!statement.Row()) throw SqlError("snapshot not found: " + name, SQLITE_NOTFOUND);
+    SnapshotInfo result{statement.Int64(0), statement.Text(1), statement.Int64(2),
+                        statement.Int64(3)};
+    ValidateHistoryCommit(db, workspace, result.commit);
+    return result;
+}
+
+sqlite3_int64 ResolveSnapshotReference(sqlite3 *db, const Workspace &workspace,
+                                       const std::string &reference) {
+    if (reference == "HEAD") {
+        const sqlite3_int64 head = CurrentHead(db, workspace);
+        ValidateHistoryCommit(db, workspace, head);
+        return head;
+    }
+    return FindSnapshot(db, workspace, reference).commit;
+}
+
+SnapshotTree CurrentTree(sqlite3 *db, const Workspace &workspace) {
+    Statement statement(db, R"SQL(
+WITH RECURSIVE tree(path,inode_id,depth) AS (
+  SELECT '/',?2,0
+  UNION ALL
+  SELECT CASE WHEN tree.path='/' THEN '/'||d.name ELSE tree.path||'/'||d.name END,
+         d.inode_id,tree.depth+1
+  FROM tree JOIN _vexfs_dentries d
+    ON d.workspace_id=?1 AND d.parent_inode=tree.inode_id
+  JOIN _vexfs_inodes child ON child.id=d.inode_id AND child.deleted_at IS NULL
+  WHERE tree.depth<1024
+)
+SELECT tree.path,i.id,i.kind,i.mode,i.owner_principal,i.uid,i.gid,
+       i.size,i.current_version,i.created_at,i.accessed_at,i.updated_at,i.changed_at
+FROM tree JOIN _vexfs_inodes i ON i.id=tree.inode_id AND i.deleted_at IS NULL
+ORDER BY tree.path COLLATE BINARY
+)SQL");
+    statement.BindInt64(1, workspace.id);
+    statement.BindInt64(2, workspace.root_inode);
+    SnapshotTree tree;
+    std::map<sqlite3_int64, std::vector<std::string>> paths_by_inode;
+    while (statement.Row()) {
+        const std::string path = statement.Text(0);
+        SnapshotTreeNode node{statement.Int64(1), statement.Text(2), statement.Int(3),
+                              statement.Text(4), statement.Int64(5), statement.Int64(6),
+                              statement.Int64(7), statement.Int64(8), 0,
+                              statement.Int64(9), statement.Int64(10),
+                              statement.Int64(11), statement.Int64(12), {}, {}};
+        tree.emplace(path, std::move(node));
+        paths_by_inode[statement.Int64(1)].push_back(path);
+    }
+    if (tree.find("/") == tree.end()) {
+        throw SqlError("workspace root is missing", SQLITE_CORRUPT);
+    }
+    // A regular file (or symlink) may have more than one dentry when the
+    // workspace contains a hard link.  Directories may not: a repeated
+    // directory inode would make the path graph cyclic/ambiguous and would
+    // make a snapshot impossible to restore safely.  Keep this check after
+    // materialising the CTE so it also catches cycles in a manually-corrupted
+    // current tree (the depth guard in the CTE merely truncates those cycles).
+    for (const auto &[inode, paths] : paths_by_inode) {
+        const auto first = tree.find(paths.front());
+        if (first != tree.end() && first->second.kind == "directory" && paths.size() > 1) {
+            throw SqlError("workspace contains a directory cycle or duplicate inode",
+                           SQLITE_CORRUPT);
+        }
+        (void)inode;
+    }
+    ResolveSnapshotCanonicalVersions(db, tree);
+    Statement xattrs(db, R"SQL(
+SELECT x.inode_id,x.name,x.value FROM _vexfs_xattrs x
+JOIN _vexfs_inodes i ON i.id=x.inode_id
+WHERE i.workspace_id=?1 AND i.deleted_at IS NULL
+ORDER BY x.inode_id,x.name COLLATE BINARY
+)SQL");
+    xattrs.BindInt64(1, workspace.id);
+    while (xattrs.Row()) {
+        const auto paths = paths_by_inode.find(xattrs.Int64(0));
+        if (paths == paths_by_inode.end()) continue;
+        for (const std::string &path : paths->second) {
+            tree[path].xattrs.emplace(xattrs.Text(1), xattrs.Blob(2));
+        }
+    }
+    Statement acl(db,
+        "SELECT inode_id,principal_id,effect,permissions,inherit_flags FROM _vexfs_acl_entries "
+        "WHERE workspace_id=?1 ORDER BY inode_id,principal_id COLLATE BINARY,effect");
+    acl.BindInt64(1, workspace.id);
+    while (acl.Row()) {
+        const auto paths = paths_by_inode.find(acl.Int64(0));
+        if (paths == paths_by_inode.end()) continue;
+        const AclEntry entry{acl.Text(1), acl.Text(2), acl.Text(3), acl.Int64(4)};
+        for (const std::string &path : paths->second) tree[path].acl.push_back(entry);
+    }
+    return tree;
+}
+
+SnapshotTree TreeAtCommit(sqlite3 *db, const Workspace &workspace, sqlite3_int64 commit) {
+    ValidateHistoryCommit(db, workspace, commit);
+    Statement inode_statement(db, R"SQL(
+WITH
+ranked_inode AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2
+)
+SELECT inode_id,kind,mode,owner_principal,uid,gid,size,current_version,
+       created_at,accessed_at,updated_at,changed_at
+FROM ranked_inode WHERE vexfs_rank=1 AND deleted_at IS NULL ORDER BY inode_id
+)SQL");
+    inode_statement.BindInt64(1, workspace.id);
+    inode_statement.BindInt64(2, commit);
+    std::map<sqlite3_int64, SnapshotTreeNode> nodes;
+    while (inode_statement.Row()) {
+        SnapshotTreeNode node{inode_statement.Int64(0), inode_statement.Text(1),
+                              inode_statement.Int(2), inode_statement.Text(3),
+                              inode_statement.Int64(4), inode_statement.Int64(5),
+                              inode_statement.Int64(6), inode_statement.Int64(7), 0,
+                              inode_statement.Int64(8), inode_statement.Int64(9),
+                              inode_statement.Int64(10), inode_statement.Int64(11), {}, {}};
+        nodes.emplace(node.inode, std::move(node));
+    }
+    if (nodes.find(workspace.root_inode) == nodes.end()) {
+        throw SqlError("workspace root is missing from history", SQLITE_CORRUPT);
+    }
+
+    Statement dentry_statement(db, R"SQL(
+WITH
+ranked_dentry AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.parent_inode,s.name ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_dentry_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2
+)
+SELECT parent_inode,name,inode_id FROM ranked_dentry
+WHERE vexfs_rank=1 AND deleted=0 ORDER BY parent_inode,name COLLATE BINARY
+)SQL");
+    dentry_statement.BindInt64(1, workspace.id);
+    dentry_statement.BindInt64(2, commit);
+    std::map<sqlite3_int64, std::vector<std::pair<std::string, sqlite3_int64>>> children;
+    while (dentry_statement.Row()) {
+        children[dentry_statement.Int64(0)].emplace_back(
+            dentry_statement.Text(1), dentry_statement.Int64(2));
+    }
+
+    struct PendingNode {
+        sqlite3_int64 inode;
+        std::string path;
+        int depth;
+    };
+    std::vector<PendingNode> pending{{workspace.root_inode, "/", 0}};
+    // Files and symlinks can legitimately be reached through several
+    // dentries (hard links).  Only directory inodes participate in traversal,
+    // so only they need a visited set.  Treating every inode as globally
+    // visited incorrectly rejected a valid snapshot containing two hard links
+    // to the same file.
+    std::map<sqlite3_int64, bool> visited_directories;
+    SnapshotTree tree;
+    std::map<sqlite3_int64, std::vector<std::string>> paths_by_inode;
+    for (size_t index = 0; index < pending.size(); ++index) {
+        const PendingNode current = pending[index];
+        const auto node = nodes.find(current.inode);
+        if (node == nodes.end()) continue;
+        if (node->second.kind == "directory" &&
+            !visited_directories.emplace(current.inode, true).second) {
+            throw SqlError("workspace history contains a directory cycle or duplicate inode",
+                           SQLITE_CORRUPT);
+        }
+        tree.emplace(current.path, node->second);
+        paths_by_inode[current.inode].push_back(current.path);
+        if (node->second.kind != "directory") continue;
+        const auto child_entries = children.find(current.inode);
+        if (child_entries == children.end()) continue;
+        if (current.depth >= 1024) {
+            throw SqlError("workspace history exceeds 1024 path components", SQLITE_TOOBIG);
+        }
+        for (const auto &[name, child_inode] : child_entries->second) {
+            if (nodes.find(child_inode) == nodes.end()) continue;
+            const std::string child_path = current.path == "/" ? "/" + name :
+                current.path + "/" + name;
+            pending.push_back({child_inode, child_path, current.depth + 1});
+        }
+    }
+    ResolveSnapshotCanonicalVersions(db, tree);
+
+    Statement xattrs(db, R"SQL(
+WITH ranked AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id,s.name ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_xattr_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2)
+SELECT inode_id,name,value FROM ranked
+WHERE vexfs_rank=1 AND deleted=0 ORDER BY inode_id,name COLLATE BINARY
+)SQL");
+    xattrs.BindInt64(1, workspace.id);
+    xattrs.BindInt64(2, commit);
+    while (xattrs.Row()) {
+        const auto paths = paths_by_inode.find(xattrs.Int64(0));
+        if (paths == paths_by_inode.end()) continue;
+        for (const std::string &path : paths->second) {
+            tree[path].xattrs.emplace(xattrs.Text(1), xattrs.Blob(2));
+        }
+    }
+    Statement acl(db, R"SQL(
+WITH ranked AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id,s.principal_id,s.effect ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_acl_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2)
+SELECT inode_id,principal_id,effect,permissions,inherit_flags FROM ranked
+WHERE vexfs_rank=1 AND deleted=0
+ORDER BY inode_id,principal_id COLLATE BINARY,effect
+)SQL");
+    acl.BindInt64(1, workspace.id);
+    acl.BindInt64(2, commit);
+    while (acl.Row()) {
+        const auto paths = paths_by_inode.find(acl.Int64(0));
+        if (paths == paths_by_inode.end()) continue;
+        const AclEntry entry{acl.Text(1), acl.Text(2), acl.Text(3), acl.Int64(4)};
+        for (const std::string &path : paths->second) tree[path].acl.push_back(entry);
+    }
+    return tree;
+}
+
+bool SnapshotNodesEqual(const SnapshotTreeNode &left, const SnapshotTreeNode &right) {
+    return left.inode == right.inode && left.kind == right.kind && left.mode == right.mode &&
+        left.size == right.size && left.canonical_version == right.canonical_version &&
+        left.owner_principal == right.owner_principal && left.uid == right.uid &&
+        left.gid == right.gid && left.created_at == right.created_at &&
+        left.accessed_at == right.accessed_at && left.updated_at == right.updated_at &&
+        left.changed_at == right.changed_at && left.acl == right.acl &&
+        left.xattrs == right.xattrs;
+}
+
+std::string SnapshotNodeJson(const SnapshotTreeNode &node) {
+    std::string xattrs = "[";
+    bool first = true;
+    for (const auto &entry : node.xattrs) {
+        if (!first) xattrs += ',';
+        first = false;
+        xattrs += "\"" + JsonEscape(entry.first) + "\"";
+    }
+    xattrs += ']';
+    std::string acl = "[";
+    first = true;
+    for (const AclEntry &entry : node.acl) {
+        if (!first) acl += ',';
+        first = false;
+        acl += "{\"principal\":\"" + JsonEscape(entry.principal) +
+            "\",\"effect\":\"" + JsonEscape(entry.effect) +
+            "\",\"permissions\":\"" + JsonEscape(entry.permissions) +
+            "\",\"inherit\":" + std::to_string(entry.inherit_flags) + "}";
+    }
+    acl += ']';
+    return "{\"inode\":" + std::to_string(node.inode) +
+        ",\"kind\":\"" + JsonEscape(node.kind) + "\",\"mode\":" +
+        std::to_string(node.mode) + ",\"owner_principal\":\"" +
+        JsonEscape(node.owner_principal) + "\",\"uid\":" + std::to_string(node.uid) +
+        ",\"gid\":" + std::to_string(node.gid) + ",\"size\":" + std::to_string(node.size) +
+        ",\"version\":" + std::to_string(node.version) +
+        ",\"content_version\":" + std::to_string(node.canonical_version) +
+        ",\"created_at\":" + std::to_string(node.created_at) +
+        ",\"accessed_at\":" + std::to_string(node.accessed_at) +
+        ",\"updated_at\":" + std::to_string(node.updated_at) +
+        ",\"changed_at\":" + std::to_string(node.changed_at) +
+        ",\"acl\":" + acl + ",\"xattrs\":" + xattrs + "}";
+}
+
+std::string SnapshotTreeJson(const SnapshotTree &tree) {
+    std::string json = "[";
+    bool first = true;
+    for (const auto &[path, node] : tree) {
+        if (!first) json += ',';
+        first = false;
+        json += "{\"path\":\"" + JsonEscape(path) + "\",\"state\":" +
+            SnapshotNodeJson(node) + "}";
+    }
+    json += ']';
+    return json;
+}
+
+std::string SnapshotDiffJson(const SnapshotTree &before, const SnapshotTree &after) {
+    std::string json = "[";
+    bool first = true;
+    auto append = [&](const std::string &path, const char *change,
+                      const SnapshotTreeNode *old_node, const SnapshotTreeNode *new_node) {
+        if (!first) json += ',';
+        first = false;
+        json += "{\"path\":\"" + JsonEscape(path) + "\",\"change\":\"" + change +
+            "\",\"before\":" + (old_node == nullptr ? "null" : SnapshotNodeJson(*old_node)) +
+            ",\"after\":" + (new_node == nullptr ? "null" : SnapshotNodeJson(*new_node)) + "}";
+    };
+    auto left = before.begin();
+    auto right = after.begin();
+    while (left != before.end() || right != after.end()) {
+        if (right == after.end() || (left != before.end() && left->first < right->first)) {
+            append(left->first, "delete", &left->second, nullptr);
+            ++left;
+        } else if (left == before.end() || right->first < left->first) {
+            append(right->first, "add", nullptr, &right->second);
+            ++right;
+        } else {
+            if (!SnapshotNodesEqual(left->second, right->second)) {
+                append(left->first, "modify", &left->second, &right->second);
+            }
+            ++left;
+            ++right;
+        }
+    }
+    json += ']';
+    return json;
+}
+
+void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
+                            sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string name = RequiredText(values[1], "snapshot name");
+        if (name.empty() || name.size() > 128 || name == "HEAD") {
+            throw SqlError("snapshot name must be 1..128 bytes and not HEAD", SQLITE_MISMATCH);
+        }
+        const std::string mode = argument_count == 4
+            ? RequiredText(values[3], "snapshot mode") : "consistent";
+        if (mode != "consistent" && mode != "committed-only") {
+            throw SqlError("snapshot mode must be consistent or committed-only", SQLITE_MISMATCH);
+        }
+        Savepoint savepoint(db, "vexfs_snapshot_create");
+        AcquireWriteLock(db);
+        const sqlite3_int64 head = CurrentHead(db, workspace);
+        if (argument_count >= 3 && sqlite3_value_type(values[2]) != SQLITE_NULL) {
+            const sqlite3_int64 expected = RequiredPositiveInteger(values[2], "expected head");
+            if (expected != head) throw SqlError("workspace head conflict", SQLITE_CONSTRAINT);
+        }
+        if (mode == "consistent") {
+            Statement dirty(db,
+                "SELECT count(*) FROM _vexfs_handles WHERE workspace_id=?1 "
+                "AND state IN ('open','retained') "
+                "AND dirty_generation>published_generation");
+            dirty.BindInt64(1, workspace.id);
+            dirty.Row();
+            if (dirty.Int64(0) != 0) {
+                throw SqlError(
+                    "workspace has unpublished file handles; synchronize the owning mount "
+                    "or use committed-only", SQLITE_BUSY);
+            }
+        }
+        ValidateHistoryCommit(db, workspace, head);
+        Statement insert(db,
+            "INSERT INTO _vexfs_snapshots(workspace_id,name,commit_id) VALUES(?1,?2,?3)");
+        insert.BindInt64(1, workspace.id);
+        insert.BindText(2, name);
+        insert.BindInt64(3, head);
+        insert.Done();
+        savepoint.Release();
+        sqlite3_result_int64(context, head);
+    });
+}
+
+void SnapshotListFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        Statement statement(db,
+            "SELECT name,commit_id,created_at FROM _vexfs_snapshots "
+            "WHERE workspace_id=?1 ORDER BY created_at DESC,id DESC");
+        statement.BindInt64(1, workspace.id);
+        std::string json = "[";
+        bool first = true;
+        while (statement.Row()) {
+            if (!first) json += ',';
+            first = false;
+            json += "{\"name\":\"" + JsonEscape(statement.Text(0)) +
+                "\",\"commit\":" + std::to_string(statement.Int64(1)) +
+                ",\"created_at\":" + std::to_string(statement.Int64(2)) + "}";
+        }
+        json += ']';
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SnapshotShowFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const SnapshotInfo snapshot = FindSnapshot(
+            db, workspace, RequiredText(values[1], "snapshot name"));
+        const std::string json = "{\"name\":\"" + JsonEscape(snapshot.name) +
+            "\",\"commit\":" + std::to_string(snapshot.commit) +
+            ",\"created_at\":" + std::to_string(snapshot.created_at) +
+            ",\"entries\":" + SnapshotTreeJson(TreeAtCommit(db, workspace, snapshot.commit)) + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SnapshotDiffFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string from = RequiredText(values[1], "from snapshot");
+        const std::string to = RequiredText(values[2], "to snapshot");
+        const sqlite3_int64 from_commit = ResolveSnapshotReference(db, workspace, from);
+        const sqlite3_int64 to_commit = ResolveSnapshotReference(db, workspace, to);
+        const SnapshotTree from_tree = from == "HEAD" ? CurrentTree(db, workspace) :
+            TreeAtCommit(db, workspace, from_commit);
+        const SnapshotTree to_tree = to == "HEAD" ? CurrentTree(db, workspace) :
+            TreeAtCommit(db, workspace, to_commit);
+        const std::string changes = SnapshotDiffJson(from_tree, to_tree);
+        const std::string json = "{\"from\":\"" + JsonEscape(from) +
+            "\",\"from_commit\":" + std::to_string(from_commit) +
+            ",\"to\":\"" + JsonEscape(to) + "\",\"to_commit\":" +
+            std::to_string(to_commit) + ",\"changes\":" + changes + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SnapshotDropFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string name = RequiredText(values[1], "snapshot name");
+        Statement remove(db,
+            "DELETE FROM _vexfs_snapshots WHERE workspace_id=?1 AND name=?2");
+        remove.BindInt64(1, workspace.id);
+        remove.BindText(2, name);
+        remove.Done();
+        if (sqlite3_changes64(db) != 1) {
+            throw SqlError("snapshot not found: " + name, SQLITE_NOTFOUND);
+        }
+        sqlite3_result_int(context, 1);
+    });
+}
+
+void RestoreWorkspaceTree(sqlite3 *db, const Workspace &workspace, sqlite3_int64 commit) {
+    Statement clear_acl(db,
+        "DELETE FROM _vexfs_acl_entries WHERE workspace_id=?1");
+    clear_acl.BindInt64(1, workspace.id);
+    clear_acl.Done();
+    Statement clear_xattrs(db, R"SQL(
+DELETE FROM _vexfs_xattrs WHERE inode_id IN (
+  SELECT id FROM _vexfs_inodes WHERE workspace_id=?1)
+)SQL");
+    clear_xattrs.BindInt64(1, workspace.id);
+    clear_xattrs.Done();
+    Statement clear_dentries(db, "DELETE FROM _vexfs_dentries WHERE workspace_id=?1");
+    clear_dentries.BindInt64(1, workspace.id);
+    clear_dentries.Done();
+    Statement tombstone(db,
+        "UPDATE _vexfs_inodes SET deleted_at=CAST(strftime('%s','now') AS INTEGER)*1000 "
+        "WHERE workspace_id=?1");
+    tombstone.BindInt64(1, workspace.id);
+    tombstone.Done();
+
+    Statement restore_inodes(db, R"SQL(
+WITH ranked AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest AS MATERIALIZED (SELECT * FROM ranked WHERE vexfs_rank=1)
+UPDATE _vexfs_inodes AS inode SET
+  kind=(SELECT kind FROM latest WHERE inode_id=inode.id),
+  mode=(SELECT mode FROM latest WHERE inode_id=inode.id),
+  owner_principal=(SELECT owner_principal FROM latest WHERE inode_id=inode.id),
+  uid=(SELECT uid FROM latest WHERE inode_id=inode.id),
+  gid=(SELECT gid FROM latest WHERE inode_id=inode.id),
+  size=(SELECT size FROM latest WHERE inode_id=inode.id),
+  current_version=(SELECT current_version FROM latest WHERE inode_id=inode.id),
+  created_at=(SELECT created_at FROM latest WHERE inode_id=inode.id),
+  accessed_at=(SELECT accessed_at FROM latest WHERE inode_id=inode.id),
+  updated_at=(SELECT updated_at FROM latest WHERE inode_id=inode.id),
+  changed_at=(SELECT changed_at FROM latest WHERE inode_id=inode.id),
+  deleted_at=NULL
+WHERE inode.workspace_id=?1 AND EXISTS(
+  SELECT 1 FROM latest WHERE inode_id=inode.id AND deleted_at IS NULL)
+)SQL");
+    restore_inodes.BindInt64(1, workspace.id);
+    restore_inodes.BindInt64(2, commit);
+    restore_inodes.Done();
+
+    Statement restore_dentries(db, R"SQL(
+WITH
+ranked_inode AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest_inode AS MATERIALIZED (SELECT * FROM ranked_inode WHERE vexfs_rank=1),
+active_inode AS MATERIALIZED (SELECT * FROM latest_inode WHERE deleted_at IS NULL),
+ranked_dentry AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.parent_inode,s.name ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_dentry_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest_dentry AS MATERIALIZED (SELECT * FROM ranked_dentry WHERE vexfs_rank=1)
+INSERT INTO _vexfs_dentries(workspace_id,parent_inode,name,inode_id)
+SELECT d.workspace_id,d.parent_inode,d.name,d.inode_id FROM latest_dentry d
+JOIN active_inode child ON child.inode_id=d.inode_id
+JOIN active_inode parent ON parent.inode_id=d.parent_inode
+WHERE d.deleted=0
+)SQL");
+    restore_dentries.BindInt64(1, workspace.id);
+    restore_dentries.BindInt64(2, commit);
+    restore_dentries.Done();
+
+    Statement restore_xattrs(db, R"SQL(
+WITH
+ranked_inode AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest_inode AS MATERIALIZED (SELECT * FROM ranked_inode WHERE vexfs_rank=1),
+active_inode AS MATERIALIZED (SELECT * FROM latest_inode WHERE deleted_at IS NULL),
+ranked_xattr AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id,s.name ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_xattr_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest_xattr AS MATERIALIZED (SELECT * FROM ranked_xattr WHERE vexfs_rank=1)
+INSERT INTO _vexfs_xattrs(inode_id,name,value)
+SELECT x.inode_id,x.name,x.value FROM latest_xattr x
+JOIN active_inode inode ON inode.inode_id=x.inode_id
+WHERE x.deleted=0
+)SQL");
+    restore_xattrs.BindInt64(1, workspace.id);
+    restore_xattrs.BindInt64(2, commit);
+    restore_xattrs.Done();
+
+    Statement restore_acl(db, R"SQL(
+WITH
+ranked_inode AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+active_inode AS MATERIALIZED (SELECT * FROM ranked_inode WHERE vexfs_rank=1 AND deleted_at IS NULL),
+ranked_acl AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id,s.principal_id,s.effect ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_acl_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest_acl AS MATERIALIZED (SELECT * FROM ranked_acl WHERE vexfs_rank=1)
+INSERT INTO _vexfs_acl_entries(workspace_id,inode_id,principal_id,effect,permissions,inherit_flags)
+SELECT ?1,a.inode_id,a.principal_id,a.effect,a.permissions,a.inherit_flags
+FROM latest_acl a JOIN active_inode inode ON inode.inode_id=a.inode_id
+WHERE a.deleted=0
+)SQL");
+    restore_acl.BindInt64(1, workspace.id);
+    restore_acl.BindInt64(2, commit);
+    restore_acl.Done();
+}
+
+void PrepareRestoredVersionAliases(sqlite3 *db, const Workspace &workspace,
+                                   sqlite3_int64 target_commit) {
+    Statement update(db, R"SQL(
+WITH
+ranked AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest AS MATERIALIZED (SELECT * FROM ranked WHERE vexfs_rank=1),
+maximum AS (
+  SELECT inode_id,MAX(version_no) AS version_no FROM _vexfs_file_versions GROUP BY inode_id)
+UPDATE _vexfs_inodes AS inode SET
+  current_version=(SELECT maximum.version_no+1 FROM maximum WHERE maximum.inode_id=inode.id)
+WHERE inode.workspace_id=?1 AND inode.deleted_at IS NULL
+  AND inode.kind IN ('file','symlink')
+  AND EXISTS(
+    SELECT 1 FROM latest JOIN maximum ON maximum.inode_id=latest.inode_id
+    WHERE latest.inode_id=inode.id AND latest.deleted_at IS NULL
+      AND maximum.version_no>latest.current_version)
+)SQL");
+    update.BindInt64(1, workspace.id);
+    update.BindInt64(2, target_commit);
+    update.Done();
+}
+
+void StoreRestoredVersionAliases(sqlite3 *db, const Workspace &workspace,
+                                 sqlite3_int64 target_commit, sqlite3_int64 restore_commit) {
+    Statement insert(db, R"SQL(
+WITH ranked AS MATERIALIZED (
+  SELECT s.*,ROW_NUMBER() OVER(
+    PARTITION BY s.inode_id ORDER BY s.commit_id DESC) AS vexfs_rank
+  FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
+latest AS MATERIALIZED (SELECT * FROM ranked WHERE vexfs_rank=1)
+INSERT INTO _vexfs_file_versions(
+ inode_id,version_no,commit_id,content,size,checksum,source_version_no)
+SELECT inode.id,inode.current_version,?3,X'',target.size,source.checksum,
+       COALESCE(source.source_version_no,source.version_no)
+FROM _vexfs_inodes inode
+JOIN latest target ON target.inode_id=inode.id AND target.deleted_at IS NULL
+JOIN _vexfs_file_versions source
+  ON source.inode_id=target.inode_id AND source.version_no=target.current_version
+WHERE inode.workspace_id=?1 AND inode.deleted_at IS NULL
+  AND inode.kind IN ('file','symlink')
+  AND inode.current_version<>target.current_version
+)SQL");
+    insert.BindInt64(1, workspace.id);
+    insert.BindInt64(2, target_commit);
+    insert.BindInt64(3, restore_commit);
+    insert.Done();
+}
+
+void SnapshotRestoreFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string name = RequiredText(values[1], "snapshot name");
+        const sqlite3_int64 expected_head = RequiredPositiveInteger(values[2], "expected head");
+        Savepoint savepoint(db, "vexfs_snapshot_restore");
+        AcquireWriteLock(db);
+        workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        if (workspace.head_commit != expected_head) {
+            throw SqlError("workspace head conflict: expected " + std::to_string(expected_head) +
+                           ", current " + std::to_string(workspace.head_commit),
+                           SQLITE_CONSTRAINT);
+        }
+        Statement active_mount(db,
+            "SELECT 1 FROM _vexfs_mount_sessions WHERE workspace_id=?1 "
+            "AND lease_until>CAST(strftime('%s','now') AS INTEGER)*1000 LIMIT 1");
+        active_mount.BindInt64(1, workspace.id);
+        if (active_mount.Row()) {
+            throw SqlError(
+                "workspace has an active mount session; unmount before snapshot restore",
+                SQLITE_BUSY);
+        }
+        const SnapshotInfo snapshot = FindSnapshot(db, workspace, name);
+        Statement handles(db,
+            "SELECT 1 FROM _vexfs_handles WHERE workspace_id=?1 "
+            "AND state IN ('open','retained') LIMIT 1");
+        handles.BindInt64(1, workspace.id);
+        if (handles.Row()) {
+            throw SqlError("workspace has open or retained file handles", SQLITE_BUSY);
+        }
+        const SnapshotTree current = CurrentTree(db, workspace);
+        const SnapshotTree target = TreeAtCommit(db, workspace, snapshot.commit);
+        if (SnapshotDiffJson(current, target) == "[]") {
+            throw SqlError("snapshot already matches current workspace", SQLITE_MISMATCH);
+        }
+        RestoreWorkspaceTree(db, workspace, snapshot.commit);
+        PrepareRestoredVersionAliases(db, workspace, snapshot.commit);
+        const sqlite3_int64 commit = CreateCommit(db, workspace, "restore snapshot " + name);
+        StoreRestoredVersionAliases(db, workspace, snapshot.commit, commit);
+        RefreshGrepIndexAfterTreeChange(db);
+        savepoint.Release();
+        sqlite3_result_int64(context, commit);
     });
 }
 
@@ -1596,6 +4284,22 @@ WHERE workspace_id = ?2 AND id IN (SELECT id FROM tree)
     tombstone.BindInt64(1, inode);
     tombstone.BindInt64(2, workspace_id);
     tombstone.Done();
+    RemoveDeletedFilesFromGrepIndex(db, workspace_id);
+}
+
+void TombstoneIfUnreferenced(sqlite3 *db, sqlite3_int64 workspace_id,
+                             sqlite3_int64 inode) {
+    Statement tombstone(db, R"SQL(
+UPDATE _vexfs_inodes SET deleted_at=CAST(strftime('%s','now') AS INTEGER)*1000
+WHERE workspace_id=?1 AND id=?2 AND kind<>'directory'
+  AND NOT EXISTS(
+    SELECT 1 FROM _vexfs_dentries
+    WHERE workspace_id=?1 AND inode_id=?2)
+)SQL");
+    tombstone.BindInt64(1, workspace_id);
+    tombstone.BindInt64(2, inode);
+    tombstone.Done();
+    RemoveDeletedFilesFromGrepIndex(db, workspace_id);
 }
 
 void RenameFunction(sqlite3_context *context, int argument_count, sqlite3_value **values) {
@@ -1628,7 +4332,8 @@ void RenameFunction(sqlite3_context *context, int argument_count, sqlite3_value 
             if (source.kind != existing.kind)
                 throw SqlError("source and destination types differ", SQLITE_MISMATCH);
             if (existing.kind == "directory" && !DirectoryIsEmpty(db, workspace.id, existing.id)) {
-                throw SqlError("destination directory is not empty", SQLITE_CONSTRAINT);
+                throw SqlError("destination directory is not empty",
+                               VEXFS_SQLITE_CONSTRAINT_NOT_EMPTY);
             }
             Statement detach(db,
                 "DELETE FROM _vexfs_dentries WHERE workspace_id=?1 AND parent_inode=?2 AND name=?3");
@@ -1636,7 +4341,11 @@ void RenameFunction(sqlite3_context *context, int argument_count, sqlite3_value 
             detach.BindInt64(2, destination_parent.id);
             detach.BindText(3, destination_name);
             detach.Done();
-            TombstoneTree(db, workspace.id, existing.id);
+            if (existing.kind == "directory") {
+                TombstoneTree(db, workspace.id, existing.id);
+            } else {
+                TombstoneIfUnreferenced(db, workspace.id, existing.id);
+            }
         }
         Statement update(db,
             "UPDATE _vexfs_dentries SET parent_inode = ?1, name = ?2 "
@@ -1670,7 +4379,7 @@ void RemoveFunction(sqlite3_context *context, int, sqlite3_value **values) {
             throw SqlError("path not found", SQLITE_NOTFOUND);
         if (node.kind == "directory" && !recursive &&
             !DirectoryIsEmpty(db, workspace.id, node.id)) {
-            throw SqlError("directory is not empty", SQLITE_CONSTRAINT);
+            throw SqlError("directory is not empty", VEXFS_SQLITE_CONSTRAINT_NOT_EMPTY);
         }
         Statement detach(db,
             "DELETE FROM _vexfs_dentries WHERE workspace_id=?1 AND parent_inode=?2 AND name=?3");
@@ -1678,10 +4387,73 @@ void RemoveFunction(sqlite3_context *context, int, sqlite3_value **values) {
         detach.BindInt64(2, parent.id);
         detach.BindText(3, name);
         detach.Done();
-        TombstoneTree(db, workspace.id, node.id);
+        if (node.kind == "directory") {
+            TombstoneTree(db, workspace.id, node.id);
+        } else {
+            TombstoneIfUnreferenced(db, workspace.id, node.id);
+        }
         TouchDirectory(db, workspace.id, parent.id);
         CreateCommit(db, workspace, "remove");
         sqlite3_result_int(context, 1);
+    });
+}
+
+void HandleCreateFunction(sqlite3_context *context, int argument_count,
+                          sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const std::string path = RequiredText(values[1], "path");
+        const int mode = RequiredMode(values[2]);
+        const std::string request_id = RequiredText(values[3], "request_id");
+        const std::string owner_session = argument_count == 5
+            ? RequiredText(values[4], "owner_session") : std::string();
+        RequestFingerprint fingerprint_builder("handle_create");
+        fingerprint_builder.AddText(workspace_name);
+        fingerprint_builder.AddText(path);
+        fingerprint_builder.AddInt64(mode);
+        fingerprint_builder.AddText(owner_session);
+        const auto fingerprint = fingerprint_builder.Finish();
+        const CachedRequest cached = FindRequest(db, request_id, "handle_create", fingerprint);
+        if (cached.kind == CachedKind::kText) {
+            sqlite3_result_text(context, cached.text.data(),
+                                static_cast<int>(cached.text.size()), SQLITE_TRANSIENT);
+            return;
+        }
+
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        const auto parts = PathParts(path);
+        if (parts.empty()) throw SqlError("workspace root already exists", SQLITE_CONSTRAINT);
+        Savepoint savepoint(db, "vexfs_handle_create");
+        AcquireWriteLock(db);
+        auto [parent, name] = ResolveParent(db, workspace, parts);
+        Node existing;
+        if (FindChild(db, workspace.id, parent.id, name, &existing)) {
+            throw SqlError("destination already exists", SQLITE_CONSTRAINT);
+        }
+        const sqlite3_int64 inode = CreateInode(db, workspace.id, "file", mode);
+        AddDentry(db, workspace.id, parent.id, name, inode);
+
+        const std::string handle_id = RandomHandleId();
+        Statement insert(db,
+            "INSERT INTO _vexfs_handles(id, workspace_id, inode_id, open_flags, writable, "
+            "expected_version, dirty_generation, state, owner_session) "
+            "VALUES(?1,?2,?3,'rw',1,0,1,'open',?4)");
+        insert.BindText(1, handle_id);
+        insert.BindInt64(2, workspace.id);
+        insert.BindInt64(3, inode);
+        if (argument_count == 5) insert.BindText(4, owner_session);
+        else insert.BindNull(4);
+        insert.Done();
+
+        Handle handle{handle_id, workspace.id, inode, true, 0, 1, 0,
+                      "open", owner_session};
+        CreateStaging(db, handle, {});
+        StoreRequestText(db, request_id, "handle_create", fingerprint, handle_id);
+        savepoint.Release();
+        sqlite3_result_text(context, handle_id.data(),
+                            static_cast<int>(handle_id.size()), SQLITE_TRANSIENT);
     });
 }
 
@@ -1784,6 +4556,66 @@ void HandleStageWriteFunction(sqlite3_context *context, int, sqlite3_value **val
     });
 }
 
+void HandleAppendFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string handle_id = RequiredText(values[0], "handle");
+        const auto suffix = RequiredBlob(values[1], "content");
+        const std::string request_id = RequiredText(values[2], "request_id");
+        RequestFingerprint fingerprint_builder("handle_append");
+        fingerprint_builder.AddText(handle_id);
+        fingerprint_builder.AddBlob(suffix);
+        const auto fingerprint = fingerprint_builder.Finish();
+        const CachedRequest cached = FindRequest(db, request_id, "handle_append", fingerprint);
+        if (cached.kind == CachedKind::kInteger) {
+            sqlite3_result_int64(context, cached.integer);
+            return;
+        }
+        Handle handle = FindHandle(db, handle_id);
+        if (handle.state != "open") throw SqlError("handle is not open", SQLITE_NOTFOUND);
+        if (!handle.writable) throw SqlError("handle is read-only", SQLITE_READONLY);
+        if (handle.dirty_generation != handle.published_generation) {
+            throw SqlError("append requires a clean handle", SQLITE_CONSTRAINT);
+        }
+        Workspace workspace = WorkspaceById(db, handle.workspace_id);
+        Savepoint savepoint(db, "vexfs_handle_append");
+        AcquireWriteLock(db);
+        const Node node = NodeById(db, handle.inode_id, true);
+        if (node.kind != "file") throw SqlError("inode is not a file", SQLITE_MISMATCH);
+        if (node.size < 0 || node.size > kMaxStagedBytes ||
+            suffix.size() > static_cast<size_t>(kMaxStagedBytes - node.size)) {
+            throw SqlError("file is larger than the Phase 0 limit (128 MiB)", SQLITE_TOOBIG);
+        }
+        std::vector<unsigned char> content = ReadNode(db, node);
+        content.insert(content.end(), suffix.begin(), suffix.end());
+        const sqlite3_int64 version = StoreVersion(
+            db, workspace, node, content, "append handle");
+
+        StagingInfo staging = EnsureStagingCapacity(
+            db, handle, FindStaging(db, handle), static_cast<sqlite3_int64>(content.size()));
+        if (!content.empty()) {
+            WriteBlob(db, staging.rowid, 0, content.data(),
+                      static_cast<sqlite3_int64>(content.size()));
+        }
+        Statement stage(db,
+            "UPDATE _vexfs_staging SET logical_size=?1,"
+            "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE handle_id=?2");
+        stage.BindInt64(1, static_cast<sqlite3_int64>(content.size()));
+        stage.BindText(2, handle.id);
+        stage.Done();
+        Statement update(db,
+            "UPDATE _vexfs_handles SET expected_version=?1,"
+            "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE id=?2");
+        update.BindInt64(1, version);
+        update.BindText(2, handle.id);
+        update.Done();
+        StoreRequestInteger(db, request_id, "handle_append", fingerprint, version);
+        savepoint.Release();
+        sqlite3_result_int64(context, version);
+    });
+}
+
 void HandleTruncateFunction(sqlite3_context *context, int, sqlite3_value **values) {
     Guard(context, [&] {
         sqlite3 *db = sqlite3_context_db_handle(context);
@@ -1847,6 +4679,34 @@ void HandlePublishFunction(sqlite3_context *context, int, sqlite3_value **values
         const Handle handle = FindHandle(db, handle_id);
         const sqlite3_int64 version = PublishHandle(db, handle, generation);
         StoreRequestInteger(db, request_id, "handle_publish", fingerprint, version);
+        sqlite3_result_int64(context, version);
+    });
+}
+
+void HandlePublishCloseFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string handle_id = RequiredText(values[0], "handle");
+        const sqlite3_int64 generation = sqlite3_value_int64(values[1]);
+        const std::string durability = RequiredText(values[2], "durability");
+        if (durability != "none" && durability != "data" && durability != "full") {
+            throw SqlError("durability must be none, data, or full", SQLITE_MISMATCH);
+        }
+        Savepoint savepoint(db, "vexfs_handle_publish_close");
+        const sqlite3_int64 version = PublishHandle(db, FindHandle(db, handle_id), generation);
+        Statement update(db,
+            "UPDATE _vexfs_handles SET state='closed',lease_until=NULL,"
+            "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?1");
+        update.BindText(1, handle_id);
+        update.Done();
+        Statement clear_data(db, "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+        clear_data.BindText(1, handle_id);
+        clear_data.Done();
+        Statement clear(db, "DELETE FROM _vexfs_staging WHERE handle_id=?1");
+        clear.BindText(1, handle_id);
+        clear.Done();
+        savepoint.Release();
         sqlite3_result_int64(context, version);
     });
 }
@@ -2086,6 +4946,10 @@ void ReclaimFunction(sqlite3_context *context, int, sqlite3_value **values) {
     });
 }
 
+void ConnectionGuardFunction(sqlite3_context *context, int, sqlite3_value **) {
+    sqlite3_result_int(context, 1);
+}
+
 struct FunctionDefinition {
     const char *name;
     int arguments;
@@ -2102,25 +4966,60 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
          SQLITE_UTF8 | SQLITE_DETERMINISTIC},
         {"vexfs_workspace_create", 1, WorkspaceCreateFunction, SQLITE_UTF8},
         {"vexfs_mkdir", 2, MkdirFunction, SQLITE_UTF8},
+        {"vexfs_create", 4, CreateFunction, SQLITE_UTF8},
+        {"vexfs_symlink", 3, SymlinkFunction, SQLITE_UTF8},
+        {"vexfs_link", 3, HardlinkFunction, SQLITE_UTF8},
         {"vexfs_write", 3, WriteFunction, SQLITE_UTF8},
+        {"vexfs_append", 3, AppendFunction, SQLITE_UTF8},
         {"vexfs_read", 2, ReadFunction, SQLITE_UTF8},
+        {"vexfs_grep", 5, GrepFunction, SQLITE_UTF8},
+        {"vexfs_grep_index", 1, GrepIndexFunction, SQLITE_UTF8},
         {"vexfs_history", 2, HistoryFunction, SQLITE_UTF8},
         {"vexfs_history", 4, HistoryFunction, SQLITE_UTF8},
         {"vexfs_read_version", 3, ReadVersionFunction, SQLITE_UTF8},
         {"vexfs_compare_versions", 4, CompareVersionsFunction, SQLITE_UTF8},
         {"vexfs_restore_version", 4, RestoreVersionFunction, SQLITE_UTF8},
         {"vexfs_stat", 2, StatFunction, SQLITE_UTF8},
+        {"vexfs_check", 2, CheckFunction, SQLITE_UTF8},
         {"vexfs_path", 2, PathFunction, SQLITE_UTF8},
         {"vexfs_list", 2, ListFunction, SQLITE_UTF8},
+        {"vexfs_readlink", 2, ReadlinkFunction, SQLITE_UTF8},
+        {"vexfs_set_mode", 3, SetModeFunction, SQLITE_UTF8},
+        {"vexfs_set_times", 5, SetTimesFunction, SQLITE_UTF8},
+        {"vexfs_chown", 4, ChownFunction, SQLITE_UTF8},
+        {"vexfs_owner_set", 3, OwnerSetFunction, SQLITE_UTF8},
+        {"vexfs_acl_get", 2, AclGetFunction, SQLITE_UTF8},
+        {"vexfs_acl_list", 2, AclGetFunction, SQLITE_UTF8},
+        {"vexfs_acl_set", 3, AclSetFunction, SQLITE_UTF8},
+        {"vexfs_acl_delete", 2, AclDeleteFunction, SQLITE_UTF8},
+        {"vexfs_acl_grant", 4, AclGrantFunction, SQLITE_UTF8},
+        {"vexfs_acl_grant", 5, AclGrantFunction, SQLITE_UTF8},
+        {"vexfs_acl_revoke", 3, AclRevokeFunction, SQLITE_UTF8},
+        {"vexfs_acl_revoke", 4, AclRevokeFunction, SQLITE_UTF8},
+        {"vexfs_xattr_get", 3, GetXattrFunction, SQLITE_UTF8},
+        {"vexfs_xattr_list", 2, ListXattrsFunction, SQLITE_UTF8},
+        {"vexfs_xattr_set", 5, SetXattrFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create", 2, SnapshotCreateFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create", 3, SnapshotCreateFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create", 4, SnapshotCreateFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_list", 1, SnapshotListFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_show", 2, SnapshotShowFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_diff", 3, SnapshotDiffFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_drop", 2, SnapshotDropFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_restore", 3, SnapshotRestoreFunction, SQLITE_UTF8},
         {"vexfs_move", 3, RenameFunction, SQLITE_UTF8},
         {"vexfs_rename", 4, RenameFunction, SQLITE_UTF8},
         {"vexfs_remove", 3, RemoveFunction, SQLITE_UTF8},
+        {"vexfs_handle_create", 4, HandleCreateFunction, SQLITE_UTF8},
+        {"vexfs_handle_create", 5, HandleCreateFunction, SQLITE_UTF8},
         {"vexfs_handle_open", 4, HandleOpenFunction, SQLITE_UTF8},
         {"vexfs_handle_open", 5, HandleOpenFunction, SQLITE_UTF8},
         {"vexfs_handle_stage_write", 4, HandleStageWriteFunction, SQLITE_UTF8},
+        {"vexfs_handle_append", 3, HandleAppendFunction, SQLITE_UTF8},
         {"vexfs_handle_truncate", 3, HandleTruncateFunction, SQLITE_UTF8},
         {"vexfs_handle_read", 3, HandleReadFunction, SQLITE_UTF8},
         {"vexfs_handle_publish", 4, HandlePublishFunction, SQLITE_UTF8},
+        {"vexfs_handle_publish_close", 3, HandlePublishCloseFunction, SQLITE_UTF8},
         {"vexfs_handle_close", 3, HandleCloseFunction, SQLITE_UTF8},
         {"vexfs_mount_session_start", 2, SessionStartFunction, SQLITE_UTF8},
         {"vexfs_mount_session_heartbeat", 2, SessionHeartbeatFunction, SQLITE_UTF8},
@@ -2129,10 +5028,17 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_mount_synchronize", 3, SynchronizeFunction, SQLITE_UTF8},
         {"vexfs_item_reclaim", 2, ReclaimFunction, SQLITE_UTF8},
     };
+    // sqlite3_create_function_v2 exists throughout the supported SQLite range.  Its
+    // destructor removes the pointer-keyed schema cache before a connection address can
+    // be reused; this avoids requiring sqlite3 client-data APIs added only in 3.44.
+    int rc = sqlite3_create_function_v2(
+        db, "_vexfs_connection_guard", 0, SQLITE_UTF8 | SQLITE_DETERMINISTIC, db,
+        ConnectionGuardFunction, nullptr, nullptr, ForgetSchemaReady);
+    if (rc != SQLITE_OK) return rc;
     for (const auto &definition : functions) {
-        const int rc = sqlite3_create_function(db, definition.name, definition.arguments,
-                                               definition.flags, nullptr, definition.function,
-                                               nullptr, nullptr);
+        rc = sqlite3_create_function(db, definition.name, definition.arguments,
+                                     definition.flags, nullptr, definition.function,
+                                     nullptr, nullptr);
         if (rc != SQLITE_OK) return rc;
     }
     return SQLITE_OK;

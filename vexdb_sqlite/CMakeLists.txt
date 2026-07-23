@@ -14,6 +14,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VEXDB_SQLITE_BUILD_TESTS "Build M0 smoke tests" ON)
+set(VEXDB_LITE_VERSION "0.1.0-dev" CACHE STRING "VexDB-Lite product version")
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -102,6 +103,7 @@ endif()
 set(VEXDB_SQLITE_SRCS
     src/vexdb_sqlite_init.cpp
     src/agent_files/vexfs_sqlite.cpp
+    ${REPO_ROOT}/agent_files/mount/common/src/vexfs_checksum.cpp
     src/vtab/graph_index_vtab.cpp
     src/functions/distance_functions.cpp
     src/functions/vector_codec.cpp
@@ -112,6 +114,7 @@ set(VEXDB_SQLITE_SRCS
 )
 
 set(VEXDB_SQLITE_INCLUDES
+    ${REPO_ROOT}/agent_files/mount/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/store
     ${SQLITE_AMALG_DIR}
@@ -123,15 +126,20 @@ set(VEXDB_SQLITE_INCLUDES
     ${VEXDB_BOOST_INC}
 )
 
-# 版本信息注入（vexdb_version() 输出；对齐 duck 端做法）
-execute_process(COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE VEXDB_SQLITE_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# 版本信息注入（vexdb_version() 输出；对齐 duck 端做法）。远程发行构建不带
+# .git，允许发布脚本把本机提交号显式传进来，避免产物显示 unknown。
+set(VEXDB_SQLITE_GIT_HASH "" CACHE STRING "VexDB-Lite source revision")
+if(NOT VEXDB_SQLITE_GIT_HASH)
+    execute_process(COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE VEXDB_SQLITE_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
 if(NOT VEXDB_SQLITE_GIT_HASH)
     set(VEXDB_SQLITE_GIT_HASH "unknown")
 endif()
 string(TIMESTAMP VEXDB_SQLITE_BUILD_TIME "%Y-%m-%d %H:%M")
 add_compile_definitions(
+    VEXDB_LITE_VERSION="${VEXDB_LITE_VERSION}"
     VEXDB_SQLITE_GIT_HASH="${VEXDB_SQLITE_GIT_HASH}"
     VEXDB_SQLITE_BUILD_TIME="${VEXDB_SQLITE_BUILD_TIME}")
 
@@ -208,42 +216,104 @@ target_include_directories(vexdb_lite_static PRIVATE ${VEXDB_SQLITE_INCLUDES})
 target_compile_definitions(vexdb_lite_static PRIVATE VEXDB_SQLITE_CORE=1)
 set_target_properties(vexdb_lite_static PROPERTIES OUTPUT_NAME "vexdb_lite_static")
 
-# 平台挂载适配层共用的稳定 C ABI。FSKit/libfuse/WinFsp 都只接这一层，
-# 具体状态仍由上面的 SQLite 插件通过 vexfs_* SQL 管理。
-add_library(vexfs_mount_contract STATIC
+# 平台和 CLI 共用的 runtime。平台只能包含 runtime_io，CLI 额外包含
+# runtime_admin；SQLite 只是当前 backend adapter。
+add_library(vexfs_runtime STATIC
     ${REPO_ROOT}/agent_files/mount/common/src/vexfs_mount_contract_sqlite.cpp)
-target_include_directories(vexfs_mount_contract PUBLIC
+target_include_directories(vexfs_runtime PUBLIC
     ${REPO_ROOT}/agent_files/mount/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${SQLITE_AMALG_DIR})
-target_compile_definitions(vexfs_mount_contract PRIVATE VEXDB_SQLITE_CORE=1)
-target_link_libraries(vexfs_mount_contract PUBLIC vexdb_lite_static)
-set_target_properties(vexfs_mount_contract PROPERTIES OUTPUT_NAME "vexfs_mount_contract")
+target_compile_definitions(vexfs_runtime PRIVATE VEXDB_SQLITE_CORE=1)
+target_link_libraries(vexfs_runtime PUBLIC vexdb_lite_static)
+set_target_properties(vexfs_runtime PROPERTIES OUTPUT_NAME "vexfs_runtime")
 
-if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
-    enable_language(OBJCXX)
-    find_library(VEXFS_SYSTEM_SQLITE3 sqlite3 REQUIRED)
-    find_library(VEXFS_FOUNDATION Foundation REQUIRED)
-    add_executable(vexfs_cli
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
+    set(VEXDB_SQLITE_DESKTOP ON)
+endif()
+
+if(VEXDB_SQLITE_BUILD_TESTS OR VEXDB_SQLITE_DESKTOP)
+    # 自带 SQLite 的 shell 和 smoke test 共用同一份锁定版本 amalgamation。
+    add_library(sqlite3_amalg STATIC ${SQLITE_AMALG_DIR}/sqlite3.c)
+    target_include_directories(sqlite3_amalg PUBLIC ${SQLITE_AMALG_DIR})
+    target_compile_definitions(sqlite3_amalg PRIVATE
+        SQLITE_ENABLE_LOAD_EXTENSION=1 SQLITE_ENABLE_FTS5=1)
+endif()
+
+if(VEXDB_SQLITE_DESKTOP)
+    set_source_files_properties(${SQLITE_AMALG_DIR}/shell.c PROPERTIES
+        COMPILE_DEFINITIONS "main=vexdb_sqlite_shell_main;SQLITE_SHELL_INIT_PROC=vexdb_shell_init")
+    set(VEXDB_CLI_SOURCES
+        ${REPO_ROOT}/agent_files/cli/vexdb_main.cpp
+        ${REPO_ROOT}/agent_files/cli/vexdb_shell_init.c
         ${REPO_ROOT}/agent_files/cli/vexfs_main.cpp
-        ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm)
-    set_source_files_properties(
-        ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm
-        PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-    target_include_directories(vexfs_cli PRIVATE
+        ${REPO_ROOT}/agent_files/cli/vexfs_platform_registry.cpp
+        ${SQLITE_AMALG_DIR}/shell.c)
+    set(VEXDB_CLI_PLATFORM_LIBS)
+    if(APPLE)
+        enable_language(OBJCXX)
+        find_library(VEXFS_FOUNDATION Foundation REQUIRED)
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_macos.cpp
+            ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm)
+        set_source_files_properties(
+            ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        list(APPEND VEXDB_CLI_PLATFORM_LIBS ${VEXFS_FOUNDATION})
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_linux.cpp)
+    else()
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_stub.cpp)
+    endif()
+    add_executable(vexdb_cli ${VEXDB_CLI_SOURCES})
+    target_include_directories(vexdb_cli PRIVATE
         ${REPO_ROOT}/agent_files/mount/common/include
-        ${REPO_ROOT}/agent_files/cli)
-    target_link_libraries(vexfs_cli PRIVATE vexfs_mount_contract
-        ${VEXFS_SYSTEM_SQLITE3} ${VEXFS_FOUNDATION} Threads::Threads ${CMAKE_DL_LIBS})
-    set_target_properties(vexfs_cli PROPERTIES OUTPUT_NAME "vexfs")
+        ${REPO_ROOT}/agent_files/cli
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${SQLITE_AMALG_DIR})
+    target_compile_definitions(vexdb_cli PRIVATE VEXFS_EMBEDDED_MAIN=1 VEXDB_SQLITE_CORE=1)
+    target_link_libraries(vexdb_cli PRIVATE vexfs_runtime sqlite3_amalg
+        ${VEXDB_CLI_PLATFORM_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+    set_target_properties(vexdb_cli PROPERTIES OUTPUT_NAME "vexdb" LINKER_LANGUAGE CXX)
+    if(WIN32)
+        add_custom_command(TARGET vexdb_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:vexdb_cli>
+                $<TARGET_FILE_DIR:vexdb_cli>/vexfs${CMAKE_EXECUTABLE_SUFFIX}
+            COMMENT "Create vexfs compatibility entry")
+    else()
+        add_custom_command(TARGET vexdb_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E remove -f $<TARGET_FILE_DIR:vexdb_cli>/vexfs
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                $<TARGET_FILE_NAME:vexdb_cli> $<TARGET_FILE_DIR:vexdb_cli>/vexfs
+            COMMENT "Create vexfs compatibility entry")
+    endif()
+    add_custom_target(vexfs_cli DEPENDS vexdb_cli)
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+        endif()
+        if(TARGET PkgConfig::FUSE3)
+            add_executable(vexfs_fuse
+                ${REPO_ROOT}/agent_files/mount/linux/vexfs_fuse.cpp)
+            target_include_directories(vexfs_fuse PRIVATE
+                ${REPO_ROOT}/agent_files/mount/common/include)
+            target_link_libraries(vexfs_fuse PRIVATE vexfs_runtime sqlite3_amalg
+                PkgConfig::FUSE3 Threads::Threads ${CMAKE_DL_LIBS})
+            set_target_properties(vexfs_fuse PROPERTIES OUTPUT_NAME "vexfs-fuse")
+            add_dependencies(vexfs_cli vexfs_fuse)
+        else()
+            message(WARNING
+                "libfuse3 development files were not found; vexfs-fuse will not be built")
+        endif()
+    endif()
 endif()
 
 if(VEXDB_SQLITE_BUILD_TESTS)
-    # 把 amalgamation 编成静态库供 smoke test 链接（模拟移动端宿主自带 sqlite3）。
-    add_library(sqlite3_amalg STATIC ${SQLITE_AMALG_DIR}/sqlite3.c)
-    target_include_directories(sqlite3_amalg PUBLIC ${SQLITE_AMALG_DIR})
-    target_compile_definitions(sqlite3_amalg PRIVATE SQLITE_ENABLE_LOAD_EXTENSION=1)
-
     foreach(smoke m0_static_smoke m1_distance_smoke m2_vtab_smoke m3_hnsw_smoke vexfs_static_smoke)
         add_executable(${smoke} test/${smoke}.c)
         target_include_directories(${smoke} PRIVATE ${VEXDB_SQLITE_INCLUDES})
@@ -260,10 +330,28 @@ if(VEXDB_SQLITE_BUILD_TESTS)
     target_link_libraries(m3p_parallel_smoke PRIVATE
         vexdb_lite_static sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
 
-    add_executable(vexfs_mount_contract_smoke
+    add_executable(vexfs_runtime_smoke
         ${REPO_ROOT}/agent_files/mount/common/test/vexfs_mount_contract_smoke.cpp)
-    target_include_directories(vexfs_mount_contract_smoke PRIVATE
+    target_include_directories(vexfs_runtime_smoke PRIVATE
         ${REPO_ROOT}/agent_files/mount/common/include ${SQLITE_AMALG_DIR})
-    target_link_libraries(vexfs_mount_contract_smoke PRIVATE
-        vexfs_mount_contract sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+    target_link_libraries(vexfs_runtime_smoke PRIVATE
+        vexfs_runtime sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    add_executable(vexfs_platform_registry_smoke
+        ${REPO_ROOT}/agent_files/cli/test/vexfs_platform_registry_smoke.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_platform_registry.cpp)
+    target_include_directories(vexfs_platform_registry_smoke PRIVATE
+        ${REPO_ROOT}/agent_files/cli)
+
+    foreach(platform linux windows)
+        add_executable(vexfs_platform_${platform}_smoke
+            ${REPO_ROOT}/agent_files/cli/test/vexfs_platform_stub_smoke.cpp
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_stub.cpp)
+        target_include_directories(vexfs_platform_${platform}_smoke PRIVATE
+            ${REPO_ROOT}/agent_files/cli)
+        string(TOUPPER "${platform}" platform_upper)
+        target_compile_definitions(vexfs_platform_${platform}_smoke PRIVATE
+            VEXFS_PLATFORM_STUB_${platform_upper}=1
+            VEXFS_PLATFORM_EXPECT_${platform_upper}=1)
+    endforeach()
 endif()

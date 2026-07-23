@@ -15,13 +15,17 @@ SQLITE_EXTENSION_INIT1
 #ifndef VEXDB_SQLITE_BUILD_TIME
 #define VEXDB_SQLITE_BUILD_TIME "unknown"
 #endif
+#ifndef VEXDB_LITE_VERSION
+#define VEXDB_LITE_VERSION "0.1.0-dev"
+#endif
 
 namespace {
 
 void VexVersionFunc(sqlite3_context *ctx, int /*argc*/, sqlite3_value ** /*argv*/) {
     sqlite3_result_text(
         ctx,
-        "vexdb_lite sqlite extension " VEXDB_SQLITE_GIT_HASH " (" VEXDB_SQLITE_BUILD_TIME ")",
+        "vexdb-lite " VEXDB_LITE_VERSION " sqlite extension " VEXDB_SQLITE_GIT_HASH
+        " (" VEXDB_SQLITE_BUILD_TIME ")",
         -1, SQLITE_STATIC);
 }
 

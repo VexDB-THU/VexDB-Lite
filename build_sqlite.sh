@@ -56,10 +56,24 @@ case "$CMD" in
             "$BUILD_DIR/m3p_parallel_smoke"
             echo "=== VexFS SQLite 合同冒烟 ==="
             "$BUILD_DIR/vexfs_static_smoke"
-            echo "=== VexFS 挂载层 C ABI 冒烟 ==="
-            "$BUILD_DIR/vexfs_mount_contract_smoke"
+            echo "=== VexFS runtime C ABI 冒烟 ==="
+            "$BUILD_DIR/vexfs_runtime_smoke"
+            echo "=== VexFS Linux/Windows 平台边界冒烟 ==="
+            "$BUILD_DIR/vexfs_platform_linux_smoke"
+            "$BUILD_DIR/vexfs_platform_windows_smoke"
+            "$BUILD_DIR/vexfs_platform_registry_smoke"
+            if [ -x "$BUILD_DIR/vexfs-fuse" ]; then
+                echo "=== VexFS Linux FUSE helper 冒烟 ==="
+                FUSE_SMOKE_DB="${TMPDIR:-/tmp}/vexfs-fuse-helper-smoke-$$.sqlite3"
+                trap 'rm -f "$FUSE_SMOKE_DB" "$FUSE_SMOKE_DB-wal" "$FUSE_SMOKE_DB-shm"' EXIT
+                "$BUILD_DIR/vexfs-fuse" --db "$FUSE_SMOKE_DB" --workspace smoke --self-test
+                rm -f "$FUSE_SMOKE_DB" "$FUSE_SMOKE_DB-wal" "$FUSE_SMOKE_DB-shm"
+                trap - EXIT
+            fi
             echo "=== VexFS CLI 冒烟 ==="
             bash "$DIR/../agent_files/cli/test/vexfs_cli_smoke.sh" "$BUILD_DIR/vexfs"
+            echo "=== VexDB-Lite 统一 CLI 冒烟 ==="
+            bash "$DIR/../agent_files/cli/test/vexdb_unified_smoke.sh" "$BUILD_DIR/vexdb"
             echo "=== M4 spec（L2 DSL 渲染 + runner） ==="
             bash "$DIR/../tests/spec/_lib/docker/run_sqlite.sh"
         elif [ "$CMD" = "eval" ]; then

@@ -3,24 +3,92 @@ import FSKit
 
 final class VexFSVolume: FSVolume,
                          FSVolume.ReadWriteOperations,
-                         FSVolume.OpenCloseOperations {
+                         FSVolume.OpenCloseOperations,
+                         FSVolume.XattrOperations {
     let backend: VexFSBackend
     let workspace: String
     let rootItem: VexFSItem
     private let cacheLock = NSLock()
     private var itemCache: [UInt64: VexFSItem] = [:]
+    private let maximumReadCacheBytes: UInt64 = 1024 * 1024
+    private let maximumTotalReadCacheBytes: UInt64 = 64 * 1024 * 1024
+    private var readCacheBytes: UInt64 = 0
+    private var observedCacheGeneration: UInt64
 
     init(backend: VexFSBackend, workspace: String, volumeID: UUID) throws {
         self.backend = backend
         self.workspace = workspace
+        let visibility = try backend.refreshVisibility()
+        self.observedCacheGeneration = visibility.generation
         let rootRecord = try backend.stat(path: "/")
-        self.rootItem = VexFSItem(path: "/", record: rootRecord, parentID: .parentOfRoot)
+        self.rootItem = VexFSItem(path: "/", record: rootRecord,
+                                  parentID: .parentOfRoot,
+                                  cacheGeneration: visibility.generation)
         super.init(volumeID: FSVolume.Identifier(uuid: volumeID),
                    volumeName: FSFileName(string: "VexFS \(workspace)"))
         itemCache[rootRecord.inode] = rootItem
     }
 
     func synchronizeNow() throws { try backend.synchronize() }
+
+    func closeBackend() { backend.close() }
+
+    func reactivateBackend() throws {
+        try backend.reopen()
+        let visibility = try backend.refreshVisibility()
+        let rootRecord = try backend.stat(path: "/")
+
+        rootItem.lock.lock()
+        rootItem.record = rootRecord
+        rootItem.recordValidatedAt = ProcessInfo.processInfo.systemUptime
+        rootItem.cacheGeneration = visibility.generation
+        rootItem.readCache = nil
+        rootItem.isUnlinked = false
+        rootItem.lock.unlock()
+
+        cacheLock.lock()
+        for item in itemCache.values { item.readCache = nil }
+        itemCache.removeAll(keepingCapacity: true)
+        itemCache[rootRecord.inode] = rootItem
+        readCacheBytes = 0
+        observedCacheGeneration = visibility.generation
+        cacheLock.unlock()
+    }
+
+    // PRAGMA data_version 只在其他连接提交后变化。runtime 仅在变化时读取
+    // workspace HEAD；这里保存一个 generation，已有 vnode 在下次访问时懒刷新。
+    func currentCacheGeneration() throws -> UInt64 {
+        let visibility = try backend.refreshVisibility()
+        cacheLock.lock()
+        observedCacheGeneration = visibility.generation
+        let generation = observedCacheGeneration
+        cacheLock.unlock()
+        return generation
+    }
+
+    func clearReadCache(_ item: VexFSItem) {
+        cacheLock.lock()
+        if let cached = item.readCache {
+            readCacheBytes -= min(readCacheBytes, UInt64(cached.count))
+            item.readCache = nil
+        }
+        cacheLock.unlock()
+    }
+
+    func installReadCache(_ data: Data, for item: VexFSItem) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        if let previous = item.readCache {
+            readCacheBytes -= min(readCacheBytes, UInt64(previous.count))
+            item.readCache = nil
+        }
+        guard UInt64(data.count) <= maximumTotalReadCacheBytes - readCacheBytes else {
+            return false
+        }
+        item.readCache = data
+        readCacheBytes += UInt64(data.count)
+        return true
+    }
 
     func currentPath(for item: VexFSItem) throws -> String {
         let path = try backend.path(inode: item.record.inode)
@@ -40,19 +108,66 @@ final class VexFSVolume: FSVolume,
         if let item = itemCache[record.inode] {
             item.path = path
             item.record = record
+            item.recordValidatedAt = ProcessInfo.processInfo.systemUptime
+            item.cacheGeneration = observedCacheGeneration
             item.parentID = parentID
+            item.isUnlinked = false
             return item
         }
-        let item = VexFSItem(path: path, record: record, parentID: parentID)
+        let item = VexFSItem(path: path, record: record, parentID: parentID,
+                             cacheGeneration: observedCacheGeneration)
         itemCache[record.inode] = item
         return item
     }
 
-    func dropCachedItems(exceptRoot: Bool = true) {
+    func reclaimCachedItem(_ item: VexFSItem) {
+        clearReadCache(item)
         cacheLock.lock()
-        itemCache.removeAll(keepingCapacity: true)
-        if exceptRoot { itemCache[rootItem.record.inode] = rootItem }
-        cacheLock.unlock()
+        defer { cacheLock.unlock() }
+        guard item !== rootItem,
+              let cached = itemCache[item.record.inode],
+              cached === item else { return }
+        itemCache.removeValue(forKey: item.record.inode)
+    }
+
+    // record cache 只负责减少重复 stat。任何已经提交到数据库的元数据变更都要
+    // 精确失效相关 vnode，不能等待 250 ms TTL，否则 Bash 会在 mutation 返回
+    // 成功后立刻看到旧的 nlink、mtime 或 ctime。
+    func invalidateRecord(_ item: VexFSItem) {
+        item.lock.lock()
+        item.recordValidatedAt = 0
+        item.lock.unlock()
+    }
+
+    func recordDirectoryMutation(_ directory: VexFSItem) {
+        directory.lock.lock()
+        let wallClock = Int64(Date().timeIntervalSince1970 * 1000)
+        // SQLite 时间戳是毫秒级。同一毫秒内连续 mutation 时仍要让调用方
+        // 观察到单调推进，随后 TTL 刷新会与数据库权威记录重新对齐。
+        let modified = max(wallClock, directory.record.updated_at + 1)
+        let changed = max(wallClock, (directory.record.changed_at ??
+                                     directory.record.updated_at) + 1)
+        directory.record = VexFSStatRecord(
+            path: directory.path, inode: directory.record.inode,
+            kind: directory.record.kind, mode: directory.record.mode,
+            size: directory.record.size, version: directory.record.version,
+            created_at: directory.record.created_at,
+            accessed_at: directory.record.accessed_at,
+            updated_at: modified, changed_at: changed,
+            uid: directory.record.uid, gid: directory.record.gid,
+            link_count: directory.record.link_count)
+        directory.recordValidatedAt = ProcessInfo.processInfo.systemUptime
+        directory.lock.unlock()
+    }
+
+    func refreshRecord(_ item: VexFSItem, at path: String) throws {
+        let record = try backend.stat(path: path)
+        item.lock.lock()
+        item.path = path
+        item.record = record
+        item.recordValidatedAt = ProcessInfo.processInfo.systemUptime
+        item.cacheGeneration = observedCacheGeneration
+        item.lock.unlock()
     }
 
     func attributes(for item: VexFSItem,
@@ -65,19 +180,27 @@ final class VexFSVolume: FSVolume,
                                tv_nsec: Int((item.record.created_at % 1000) * 1_000_000))
         let updated = timespec(tv_sec: Int(item.record.updated_at / 1000),
                                tv_nsec: Int((item.record.updated_at % 1000) * 1_000_000))
+        let accessedMilliseconds = item.record.accessed_at ?? item.record.updated_at
+        let changedMilliseconds = item.record.changed_at ?? item.record.updated_at
+        let accessed = timespec(tv_sec: Int(accessedMilliseconds / 1000),
+                                tv_nsec: Int((accessedMilliseconds % 1000) * 1_000_000))
+        let changed = timespec(tv_sec: Int(changedMilliseconds / 1000),
+                               tv_nsec: Int((changedMilliseconds % 1000) * 1_000_000))
         if wanted(.type) { attributes.type = item.itemType }
         if wanted(.mode) { attributes.mode = item.record.mode }
-        if wanted(.linkCount) { attributes.linkCount = item.itemType == .directory ? 2 : 1 }
-        if wanted(.uid) { attributes.uid = getuid() }
-        if wanted(.gid) { attributes.gid = getgid() }
+        if wanted(.linkCount) {
+            attributes.linkCount = item.record.link_count ?? (item.itemType == .directory ? 2 : 1)
+        }
+        if wanted(.uid) { attributes.uid = item.record.uid ?? getuid() }
+        if wanted(.gid) { attributes.gid = item.record.gid ?? getgid() }
         if wanted(.flags) { attributes.flags = 0 }
         if wanted(.size) { attributes.size = item.record.size }
         if wanted(.allocSize) { attributes.allocSize = (item.record.size + 4095) / 4096 * 4096 }
         if wanted(.fileID) { attributes.fileID = item.itemID }
         if wanted(.parentID) { attributes.parentID = item.parentID }
-        if wanted(.accessTime) { attributes.accessTime = updated }
+        if wanted(.accessTime) { attributes.accessTime = accessed }
         if wanted(.modifyTime) { attributes.modifyTime = updated }
-        if wanted(.changeTime) { attributes.changeTime = updated }
+        if wanted(.changeTime) { attributes.changeTime = changed }
         if wanted(.birthTime) { attributes.birthTime = created }
         return attributes
     }
@@ -86,19 +209,44 @@ final class VexFSVolume: FSVolume,
                   replyHandler: @escaping ((any Error)?) -> Void) {
         guard let item = item as? VexFSItem else { return replyHandler(POSIXError(.EINVAL)) }
         if item.itemType == .directory { return replyHandler(nil) }
+        guard item.itemType == .file else { return replyHandler(POSIXError(.EINVAL)) }
+        let generation: UInt64
+        do { generation = try currentCacheGeneration() }
+        catch { return replyHandler(error) }
         item.lock.lock()
         defer { item.lock.unlock() }
         do {
             let writable = modes.contains(.write)
+            if writable {
+                clearReadCache(item)
+            }
+            if item.cacheGeneration != generation && item.dirtyGeneration == nil {
+                clearReadCache(item)
+                let path = try currentPath(for: item)
+                item.record = try backend.stat(path: path)
+                item.recordValidatedAt = ProcessInfo.processInfo.systemUptime
+                item.cacheGeneration = generation
+            }
             if let oldHandle = item.handle, writable && !item.handleWritable {
                 try backend.closeHandle(oldHandle, retain: true)
                 item.handle = nil
                 item.dirtyGeneration = nil
             }
             if item.handle == nil {
-                item.handle = try backend.openHandle(path: currentPath(for: item),
-                                                     flags: writable ? "rw" : "r")
-                item.handleWritable = writable
+                let path = try currentPath(for: item)
+                if !writable && item.record.size <= maximumReadCacheBytes {
+                    let data = try backend.readFile(path: path)
+                    if installReadCache(data, for: item) {
+                        item.handleWritable = false
+                    } else {
+                        item.handle = try backend.openHandle(path: path, flags: "r")
+                        item.handleWritable = false
+                    }
+                } else {
+                    item.handle = try backend.openHandle(path: path,
+                                                         flags: writable ? "rw" : "r")
+                    item.handleWritable = writable
+                }
             }
             replyHandler(nil)
         } catch { replyHandler(error) }
@@ -113,12 +261,29 @@ final class VexFSVolume: FSVolume,
         do {
             if let handle = item.handle {
                 if let generation = item.dirtyGeneration {
-                    _ = try backend.publish(handle: handle, generation: generation)
-                    item.record = try backend.stat(path: currentPath(for: item))
+                    let version = try backend.publishAndClose(handle: handle,
+                                                              generation: generation)
+                    item.handle = nil
+                    item.dirtyGeneration = nil
+                    if item.isUnlinked {
+                        // unlink 后目录项已经不存在，但打开的 vnode 仍必须能正常
+                        // publish 和 close。此时不能再通过路径刷新属性。
+                        item.record = VexFSStatRecord(
+                            path: item.path, inode: item.record.inode,
+                            kind: item.record.kind, mode: item.record.mode,
+                            size: item.record.size, version: UInt64(version),
+                            created_at: item.record.created_at,
+                            updated_at: Int64(Date().timeIntervalSince1970 * 1000),
+                            uid: item.record.uid, gid: item.record.gid, link_count: 0)
+                    } else {
+                        item.record = try backend.stat(path: currentPath(for: item))
+                    }
+                } else {
+                    try backend.closeHandle(handle, retain: true)
                 }
-                try backend.closeHandle(handle, retain: true)
             }
             item.handle = nil
+            clearReadCache(item)
             item.handleWritable = false
             item.dirtyGeneration = nil
             replyHandler(nil)
@@ -128,14 +293,18 @@ final class VexFSVolume: FSVolume,
     func read(from item: FSItem, at offset: off_t, length: Int,
               into buffer: FSMutableFileDataBuffer,
               replyHandler: @escaping (Int, (any Error)?) -> Void) {
-        guard let item = item as? VexFSItem, offset >= 0, length >= 0 else {
+        guard let item = item as? VexFSItem, item.itemType == .file,
+              offset >= 0, length >= 0 else {
             return replyHandler(0, POSIXError(.EINVAL))
         }
         item.lock.lock()
         defer { item.lock.unlock() }
         do {
             let data: Data
-            if let handle = item.handle {
+            if let cached = item.readCache, item.handle == nil {
+                let start = min(Int(offset), cached.count)
+                data = cached.subdata(in: start..<min(start + length, cached.count))
+            } else if let handle = item.handle {
                 data = try backend.readHandle(handle: handle, offset: UInt64(offset),
                                               length: UInt64(length))
             } else {
@@ -160,6 +329,7 @@ final class VexFSVolume: FSVolume,
         do {
             if item.handle == nil || !item.handleWritable {
                 if let old = item.handle { try backend.closeHandle(old, retain: true) }
+                clearReadCache(item)
                 item.handle = try backend.openHandle(path: currentPath(for: item), flags: "rw")
                 item.handleWritable = true
                 item.dirtyGeneration = nil
@@ -176,10 +346,10 @@ final class VexFSVolume: FSVolume,
         } catch { replyHandler(0, error) }
     }
 
-    var maximumLinkCount: Int { 1 }
+    var maximumLinkCount: Int { 65535 }
     var maximumNameLength: Int { 255 }
     var restrictsOwnershipChanges: Bool { true }
     var truncatesLongNames: Bool { false }
     var maximumFileSizeInBits: Int { 28 }
-    var maximumXattrSizeInBits: Int { 0 }
+    var maximumXattrSizeInBits: Int { 16 }
 }

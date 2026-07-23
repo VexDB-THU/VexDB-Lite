@@ -4,15 +4,17 @@
 # 用法:
 #   bash scripts/release.sh build [target] [arch]    # 远程 build + 拉回 dist/ (默认动作)
 #   bash scripts/release.sh package                  # 把 dist/<arch>/ 打成 tarball + SHA256SUMS
+#   bash scripts/release.sh test [target] [arch]     # 原生 Linux 验证（target: duck|sqlite|all）
 #   bash scripts/release.sh upload <tag>             # 上传 tarballs 到 GitHub Release
 #
-#   build target: duck | pg | all (default: all)
+#   build target: duck | pg | sqlite | all (default: all)
 #   build arch:   x86 | arm | all (default: all)
 #
 #   示例:
 #     bash scripts/release.sh                          # build 全量 (4 个产物)
 #     bash scripts/release.sh build duck arm           # 只 build ARM DuckDB
 #     bash scripts/release.sh package                  # 4 个 tarball 进 dist/release/
+#     bash scripts/release.sh test sqlite all          # 两个架构安装并验证 SQLite + VexFS 包
 #     bash scripts/release.sh upload v0.1.0            # 推送到 GitHub Release
 #
 # 凭证: 通过 SERVERS_FILE 环境变量指定凭证文件，或直接覆盖以下 *_HOST/*_USER/*_PASS。
@@ -35,6 +37,15 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # nested duckdb/ wrapper retired 2026-05-13 — repo root is now flat.
 PG_VEXDB_ROOT="${PG_VEXDB_ROOT:-$REPO_ROOT}"
 DIST_DIR="$REPO_ROOT/dist"
+VEXDB_LITE_RELEASE_VERSION="${VEXDB_LITE_RELEASE_VERSION:-0.1.0-dev}"
+SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+SOURCE_DIRTY=false
+[[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]] && SOURCE_DIRTY=true
+SOURCE_REVISION="$SOURCE_COMMIT"
+[[ "$SOURCE_DIRTY" == true ]] && SOURCE_REVISION="${SOURCE_REVISION}-dirty"
+VEXFS_RUNTIME_HEADER="$REPO_ROOT/agent_files/mount/common/include/vexfs_runtime_types.h"
+VEXFS_RUNTIME_ABI="$(sed -n 's/^#define VEXFS_RUNTIME_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' "$VEXFS_RUNTIME_HEADER")"
+[[ -n "$VEXFS_RUNTIME_ABI" ]] || { echo "无法读取 VexFS runtime ABI" >&2; exit 1; }
 
 # 远程 GitHub 不可达，cmake / DuckDB src 必须本地下载后 scp
 CMAKE_VER="3.28.6"
@@ -72,7 +83,7 @@ ARM_BOOST="${ARM_BOOST:-/path/to/boost}"
 CMD="${1:-build}"
 case "$CMD" in
     build|package|upload|test) shift ;;
-    duck|pg|all)               CMD="build" ;;
+    duck|pg|sqlite|all)        CMD="build" ;;
     *)                         CMD="build" ;;
 esac
 TARGET="${1:-all}"
@@ -100,6 +111,12 @@ info()  { printf '%s[release]%s %s\n' "$YEL" "$NC" "$*"; }
 ok()    { printf '%s[release]%s %s\n' "$GRN" "$NC" "$*"; }
 fail()  { printf '%s[release]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 section() { printf '\n%s━━━ %s ━━━%s\n' "$BLU" "$*" "$NC"; }
+
+require_clean_release_source() {
+    if [[ "$SOURCE_DIRTY" == true && "${VEXDB_LITE_ALLOW_DIRTY_RELEASE:-0}" != 1 ]]; then
+        fail "拒绝从脏工作树生成发行物；仅本地验证可设置 VEXDB_LITE_ALLOW_DIRTY_RELEASE=1"
+    fi
+}
 
 load_credentials() {
     local arch="${1:-all}"   # 只加载用到的架构凭证
@@ -162,12 +179,12 @@ rrsync_up() {
 prepare_local() {
     section "本地准备"
     for cmd in sshpass scp curl tar; do
-        command -v "$cmd" >/dev/null || fail "缺少命令: $cmd（brew install $cmd）"
+        command -v "$cmd" >/dev/null || fail "缺少命令: ${cmd}（brew install ${cmd}）"
     done
 
     [[ -d "$REPO_ROOT" ]] || fail "找不到 vexdb_lite 仓库: $REPO_ROOT"
 
-    load_credentials
+    load_credentials "$ARCH"
     mkdir -p "$DIST_DIR/x86_64-linux" "$DIST_DIR/aarch64-linux"
 
     [[ -f "$CMAKE_TARBALL" ]] || {
@@ -616,6 +633,102 @@ validate_pg() {
     ok "$arch vexdb_lite.so: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
 }
 
+# SQLite + VexFS Linux 发行物。和 DuckDB/PG 一样在 manylinux_2_28 容器中构建，
+# 避免绑定远程构建机的 glibc/libstdc++。fuse3-devel 只用于编译；用户机器运行时
+# 需要系统提供 libfuse3.so.3、fusermount3 和 /dev/fuse。
+build_sqlite_files() {
+    local arch=$1 image docker_pfx boost outarch outdir host_uid host_gid remote_home
+    if [[ "$arch" == "x86" ]]; then
+        image="quay.io/pypa/manylinux_2_28_x86_64"
+        # 不把 sudo 密码拼进远程命令。构建账号必须能直接运行 Docker，或只对
+        # Docker 配置免交互 sudo；否则这里明确失败。
+        docker_pfx="sudo -n docker"
+        boost="$X86_BOOST"
+        outarch=x86_64
+    else
+        image="quay.io/pypa/manylinux_2_28_aarch64"
+        docker_pfx="docker"
+        boost="$ARM_BOOST"
+        outarch=aarch64
+    fi
+    outdir="$DIST_DIR/${outarch}-linux/sqlite-files"
+    mkdir -p "$outdir/bin" "$outdir/lib"
+
+    section "$arch build SQLite + VexFS Files (manylinux container)"
+    rssh "$arch" "$docker_pfx image inspect $image >/dev/null 2>&1" \
+        || fail "$arch manylinux 镜像 $image 不在"
+    host_uid=$(rssh "$arch" 'id -u')
+    host_gid=$(rssh "$arch" 'id -g')
+    remote_home=$(rssh "$arch" 'printf %s "$HOME"')
+
+    rssh "$arch" "$docker_pfx run --rm \
+        -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
+        -v $boost:/opt/boost:ro \
+        -w /work \
+        $image \
+        bash -c 'set -e
+            export PATH=/opt/python/cp310-cp310/bin:\$PATH
+            dnf install -y fuse3-devel pkgconf-pkg-config >/dev/null
+            pip install --quiet -i https://mirrors.aliyun.com/pypi/simple cmake==3.29.6 2>/dev/null || \
+              pip install --quiet cmake==3.29.6
+            ${CLEAN_SQLITE_BUILD:+rm -rf build/sqlite-files-ml;}
+            cmake -S vexdb_sqlite -B build/sqlite-files-ml \
+              -DCMAKE_BUILD_TYPE=Release -DVEXDB_SQLITE_BUILD_TESTS=OFF \
+              -DVEXDB_BOOST_INC=/opt/boost \
+              -DVEXDB_LITE_VERSION=$VEXDB_LITE_RELEASE_VERSION \
+              -DVEXDB_SQLITE_GIT_HASH=$SOURCE_REVISION \
+              -DCMAKE_EXE_LINKER_FLAGS=\"-static-libstdc++ -static-libgcc\" \
+              -DCMAKE_SHARED_LINKER_FLAGS=\"-static-libstdc++ -static-libgcc\"
+            cmake --build build/sqlite-files-ml \
+              --target vexdb_cli vexfs_fuse vexdb_lite_loadable -j\$(nproc)
+            build/sqlite-files-ml/vexdb --version
+            DB=\$(mktemp /tmp/vexfs-release-smoke.XXXXXX.sqlite3)
+            build/sqlite-files-ml/vexfs-fuse --db \$DB --workspace release --self-test
+            rm -f \$DB \$DB-wal \$DB-shm
+            chown -R $host_uid:$host_gid build/sqlite-files-ml
+        '" || fail "$arch SQLite + VexFS manylinux build 失败"
+
+    local remote_build="$remote_home/$REMOTE_DIR/vexdb_lite/build/sqlite-files-ml"
+    for binary in vexdb vexfs-fuse vexdb_lite.so; do
+        rssh "$arch" "test -f '$remote_build/$binary'" \
+            || fail "$arch SQLite + VexFS 缺少产物 $binary"
+        _assert_glibcxx_remote "$arch" "$remote_build/$binary"
+    done
+    rssh "$arch" "set -e
+        file '$remote_build/vexdb' | grep -q ELF
+        file '$remote_build/vexfs-fuse' | grep -q ELF
+        file '$remote_build/vexdb_lite.so' | grep -q ELF
+        ldd '$remote_build/vexfs-fuse' | grep -q 'libfuse3.so.3'
+        ! readelf -d '$remote_build/vexdb' | grep -E '(RPATH|RUNPATH)' >/dev/null
+        ! readelf -d '$remote_build/vexfs-fuse' | grep -E '(RPATH|RUNPATH)' >/dev/null
+    " || fail "$arch SQLite + VexFS ELF/依赖校验失败"
+
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-files-ml/vexdb" "$outdir/bin/vexdb"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-files-ml/vexfs-fuse" "$outdir/bin/vexfs-fuse"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-files-ml/vexdb_lite.so" "$outdir/lib/vexdb_lite.so"
+    chmod 0755 "$outdir/bin/vexdb" "$outdir/bin/vexfs-fuse"
+    ln -sfn vexdb "$outdir/bin/vexfs"
+    install -m 0755 "$REPO_ROOT/agent_files/linux/package/install.sh" "$outdir/install.sh"
+    install -m 0755 "$REPO_ROOT/agent_files/linux/package/uninstall.sh" "$outdir/uninstall.sh"
+    install -m 0644 "$REPO_ROOT/agent_files/linux/package/使用说明.md" "$outdir/使用说明.md"
+    {
+        echo "product=vexdb-lite"
+        echo "component=sqlite-files"
+        echo "version=$VEXDB_LITE_RELEASE_VERSION"
+        echo "architecture=$outarch"
+        echo "mount_abi=$VEXFS_RUNTIME_ABI"
+        echo "source_commit=$SOURCE_COMMIT"
+        echo "source_dirty=$SOURCE_DIRTY"
+        echo "build_environment=manylinux_2_28"
+        echo "runtime_dependency=fuse3"
+    } > "$outdir/MANIFEST.txt"
+    (
+        cd "$outdir"
+        shasum -a 256 bin/vexdb bin/vexfs-fuse lib/vexdb_lite.so > SHA256SUMS.txt
+    )
+    ok "$arch SQLite + VexFS Files 已拉回 $outdir"
+}
+
 # ============================================================
 # Main
 # ============================================================
@@ -626,7 +739,7 @@ ARCHES=()
 
 cmd_build() {
     info "build 目标=$TARGET 架构=${ARCHES[*]}"
-    [[ "$TARGET" =~ ^(duck|pg|all)$ ]] || fail "target 必须为 duck/pg/all"
+    [[ "$TARGET" =~ ^(duck|pg|sqlite|all)$ ]] || fail "target 必须为 duck/pg/sqlite/all"
     [[ "$ARCH"   =~ ^(x86|arm|all)$ ]] || fail "arch 必须为 x86/arm/all"
 
     prepare_local
@@ -650,8 +763,15 @@ cmd_build() {
         done
     fi
 
+    # SQLite + VexFS：统一 CLI、SQLite loadable extension 和 libfuse3 helper。
+    if [[ "$TARGET" == "sqlite" || "$TARGET" == "all" ]]; then
+        section "SQLite + VexFS Files"
+        for arch in "${ARCHES[@]}"; do build_sqlite_files "$arch"; done
+    fi
+
     section "build 完成"
-    find "$DIST_DIR" -maxdepth 3 -type f \( -name "*.duckdb_extension" -o -name "vexdb_lite.so" \
+    find "$DIST_DIR" -maxdepth 4 -type f \( -name "*.duckdb_extension" -o -name "vexdb_lite.so" \
+        -o -name "vexdb_lite" -o -name "vexdb" -o -name "vexfs-fuse" \
         -o -name "*.control" -o -name "*.sql" \) -exec ls -lh {} \;
 }
 
@@ -661,6 +781,7 @@ cmd_build() {
 
 cmd_package() {
     section "Package"
+    require_clean_release_source
 
     # Pre-flight: 扫 dist 下所有 .duckdb_extension,校验 GLIBCXX 上限。
     # 即使上游 build 漏了 MANYLINUX=1 / 产物从别处拉来 / validate 被跳过,
@@ -741,6 +862,18 @@ cmd_package() {
                     vexdb_lite.so.debug
             fi
         done
+
+        # SQLite + VexFS：统一 CLI、libfuse3 helper、loadable extension 和普通用户安装说明。
+        local filesdir="$archdir/sqlite-files"
+        if [[ -x "$filesdir/bin/vexdb" && -x "$filesdir/bin/vexfs-fuse" &&
+              -f "$filesdir/lib/vexdb_lite.so" ]]; then
+            (
+                cd "$filesdir"
+                shasum -a 256 -c SHA256SUMS.txt >/dev/null
+            ) || fail "$arch SQLite + VexFS stage 哈希校验失败"
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-files-linux-${arch}.tar.gz" \
+                "$filesdir" bin lib install.sh uninstall.sh 使用说明.md MANIFEST.txt SHA256SUMS.txt
+        fi
     done
 
     # 防回归: 每个 tarball 都扫一遍,有 AppleDouble 直接 fail。
@@ -789,7 +922,15 @@ with tarfile.open(sys.argv[1]) as t:
 # 进制可用。
 
 cmd_test() {
-    local arch_arg="${1:-all}"
+    # 兼容旧用法 `test x86`（默认跑 DuckDB），同时支持
+    # `test sqlite x86` 和 `test all all`。
+    local test_target="duck" arch_arg="all"
+    if [[ "${1:-}" =~ ^(duck|sqlite|all)$ ]]; then
+        test_target="$1"
+        arch_arg="${2:-all}"
+    else
+        arch_arg="${1:-all}"
+    fi
     [[ "$arch_arg" =~ ^(x86|arm|all)$ ]] || fail "test arch 必须为 x86/arm/all"
 
     load_credentials "$arch_arg"
@@ -798,14 +939,67 @@ cmd_test() {
     [[ "$arch_arg" == "all" || "$arch_arg" == "x86" ]] && arches+=("x86")
     [[ "$arch_arg" == "all" || "$arch_arg" == "arm" ]] && arches+=("arm")
 
-    # 每个 DuckDB 版本各跑一遍 spec（用对应版本的 build/duck/<ver>/build 树）。
-    for dver in $DUCKDB_VERSIONS; do
-        for arch in "${arches[@]}"; do
-            section "$arch spec test $dver (manylinux container)"
-            _spec_test_manylinux "$arch" "$dver" || fail "$arch $dver spec test 失败"
+    if [[ "$test_target" == "duck" || "$test_target" == "all" ]]; then
+        # 每个 DuckDB 版本各跑一遍 spec（用对应版本的 build/duck/<ver>/build 树）。
+        for dver in $DUCKDB_VERSIONS; do
+            for arch in "${arches[@]}"; do
+                section "$arch spec test $dver (manylinux container)"
+                _spec_test_manylinux "$arch" "$dver" || fail "$arch $dver spec test 失败"
+            done
         done
-    done
-    ok "spec test 全过"
+        ok "DuckDB spec test 全过"
+    fi
+
+    if [[ "$test_target" == "sqlite" || "$test_target" == "all" ]]; then
+        for arch in "${arches[@]}"; do
+            section "$arch SQLite + VexFS 安装包测试（原生 Linux）"
+            _sqlite_files_package_test "$arch" || fail "$arch SQLite + VexFS 安装包测试失败"
+        done
+        ok "SQLite + VexFS 安装包测试全过"
+    fi
+}
+
+_sqlite_files_package_test() {
+    local arch=$1 outarch pkg pkg_name
+    [[ "$arch" == "x86" ]] && outarch="x86_64" || outarch="aarch64"
+    pkg="$RELEASE_DIR/vexdb-lite-sqlite-files-linux-${outarch}.tar.gz"
+    pkg_name="$(basename "$pkg")"
+    [[ -f "$pkg" ]] || fail "找不到 $pkg；请先运行 package"
+
+    # 上传到对应架构的真实 Linux 机器，在全新的 HOME 中走完整安装和卸载流程。
+    rscp_up "$arch" "$pkg"
+    rssh "$arch" "set -euo pipefail
+        package=\"\$HOME/$pkg_name\"
+        tmp=\$(mktemp -d \"\$HOME/vexdb-sqlite-files-package-test.XXXXXX\")
+        cleanup() { rm -rf \"\$tmp\" \"\$package\"; }
+        trap cleanup EXIT
+        mkdir -p \"\$tmp/package\" \"\$tmp/home\" \"\$tmp/data\"
+        tar xzf \"\$package\" -C \"\$tmp/package\"
+
+        export HOME=\"\$tmp/home\"
+        export XDG_DATA_HOME=\"\$tmp/data\"
+        export VEXDB_LITE_BIN_DIR=\"\$HOME/.local/bin\"
+        export VEXDB_LITE_LIB_DIR=\"\$HOME/.local/lib/vexdb-lite\"
+        bash \"\$tmp/package/install.sh\"
+
+        bin=\"\$VEXDB_LITE_BIN_DIR/vexdb\"
+        helper=\"\$VEXDB_LITE_BIN_DIR/vexfs-fuse\"
+        extension=\"\$VEXDB_LITE_LIB_DIR/vexdb_lite.so\"
+        db=\"\$XDG_DATA_HOME/package-test.sqlite3\"
+        \"\$bin\" --version
+        \"\$bin\" \"\$db\" 'SELECT sqlite_version(), vexdb_version();'
+        python3 -c 'import sqlite3,sys; db=sqlite3.connect(\":memory:\"); db.enable_load_extension(True); db.load_extension(sys.argv[1]); print(db.execute(\"SELECT vexdb_version()\").fetchone()[0])' \"\$extension\"
+        \"\$helper\" --db \"\$db\" --workspace package-test --self-test
+        \"\$bin\" fs --db \"\$db\" mkdir /package-test
+        printf 'package-smoke\\n' | \"\$bin\" fs --db \"\$db\" write /package-test/hello.txt
+        test \"\$(\"\$bin\" fs --db \"\$db\" cat /package-test/hello.txt)\" = package-smoke
+
+        bash \"\$tmp/package/uninstall.sh\"
+        test ! -e \"\$bin\"
+        test ! -e \"\$helper\"
+        test ! -e \"\$extension\"
+        test -f \"\$db\"
+    " || return 1
 }
 
 _spec_test_manylinux() {
@@ -848,6 +1042,7 @@ _spec_test_manylinux() {
 
 cmd_upload() {
     local tag="${1:-}"
+    [[ "$SOURCE_DIRTY" == false ]] || fail "拒绝从脏工作树上传 GitHub Release"
     [[ -n "$tag" ]] || fail "upload 必须提供 tag: bash scripts/release.sh upload v0.0.1"
     command -v gh >/dev/null || fail "缺少 gh CLI (brew install gh)"
     [[ -d "$RELEASE_DIR" ]] || fail "$RELEASE_DIR 不存在；先跑 package"
@@ -885,5 +1080,5 @@ case "$CMD" in
     package) cmd_package ;;
     upload)  cmd_upload "$@" ;;
     test)    cmd_test "$@" ;;
-    *)       fail "unknown command: $CMD（build|package|upload|test）" ;;
+    *)       fail "unknown command: ${CMD}（build|package|upload|test）" ;;
 esac

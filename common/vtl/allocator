@@ -31,6 +31,9 @@ inline void pfree(void *ptr) { std::free(ptr); }
 /* MemoryContextAlloc 由 vexdb-duck/include/duck_pg_shim.hpp:56 提供 (避免重定义).
  * 这里补 MemoryContextAllocZero — b042c2c827 引入, duck_pg_shim.hpp 未提供, 否则
  * 编 graph_index_algorithm.h:148 的 Vector<ItemPointerData> temp 时找不到. */
+#if defined(PG_VEXDB_TARGET_SQLITE)
+inline void *MemoryContextAlloc(MemoryContext /*ctx*/, size_t size) { return palloc(size); }
+#endif
 inline void *MemoryContextAllocZero(MemoryContext /*ctx*/, size_t size) { return palloc0(size); }
 inline void *palloc_aligned(size_t size, size_t align, int /*flags*/) {
     void *ptr = nullptr;
