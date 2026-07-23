@@ -4,7 +4,7 @@ description: VexFS 文件目录、事务、句柄写入、幂等请求和并发�
 steps:
 - query: SELECT vexfs_contract_version();
   expect:
-  - - 0.7.0
+  - - 0.9.0
 - query: SELECT vexfs_init();
   expect:
   - - 1
@@ -217,5 +217,64 @@ steps:
 - query: SELECT vexfs_snapshot_restore('default', 'spec-baseline', (SELECT head_commit FROM _vexfs_workspaces WHERE name='default'));
   expect_error: already matches
 - query: SELECT vexfs_snapshot_drop('default', 'spec-baseline');
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_quota_get('default'), '$.max_bytes'), json_extract(vexfs_quota_get('default'), '$.over_quota');
+  expect:
+  - - null
+    - 0
+- query: SELECT json_extract(vexfs_quota_set('default', NULL, NULL, 5), '$.max_file_bytes');
+  expect:
+  - - 5
+- query: SELECT vexfs_write('default', '/notes/hello.txt', '123456');
+  expect_error: maximum file size quota exceeded
+- query: SELECT CAST(vexfs_read('default', '/notes/hello.txt') AS TEXT), count(*) FROM _vexfs_file_versions WHERE inode_id=4;
+  expect:
+  - - hello
+    - 6
+- query: SELECT json_extract(vexfs_quota_set('default', NULL, NULL, NULL), '$.over_quota');
+  expect:
+  - - 0
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'one');
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'two');
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('default', 'gc-protected') > 0;
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'three');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'four');
+  expect:
+  - - 4
+- query: SELECT json_extract(vexfs_retention_set('default', 1, 0), '$.reclaimable_versions') >= 2;
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_gc_pause('default', 1), '$.gc_paused');
+  expect:
+  - - 1
+- query: SELECT vexfs_gc('default', 10000);
+  expect_error: GC is paused
+- query: SELECT json_extract(vexfs_gc_pause('default', 0), '$.gc_paused');
+  expect:
+  - - 0
+- query: SELECT json_extract(vexfs_gc('default', 10000), '$.deleted_versions') > 0;
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_gc('default', 10000), '$.remaining_reclaimable_versions');
+  expect:
+  - - 0
+- query: SELECT CAST(vexfs_read_version('default', '/notes/gc.txt', 2) AS TEXT), CAST(vexfs_read('default', '/notes/gc.txt') AS TEXT);
+  expect:
+  - - two
+    - four
+- query: SELECT json_extract(vexfs_check('default', 1), '$.ok'), json_extract(vexfs_check('default', 1), '$.issue_count');
+  expect:
+  - - 1
+    - 0
+- query: SELECT vexfs_snapshot_drop('default', 'gc-protected');
   expect:
   - - 1

@@ -255,7 +255,7 @@ write_manifest() {
         echo "product=VexDB-Lite"
         echo "filesystem=VexFS"
         echo "preview_version=$VERSION"
-        echo "contract_version=0.7.0"
+        echo "contract_version=0.9.0"
         echo "mount_abi_version=$RUNTIME_ABI"
         echo "platform=macOS"
         echo "minimum_macos=26.0"

@@ -623,7 +623,7 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
         staging.Row();
         const char *filename = sqlite3_db_filename(session->db, "main");
         const std::string contract_version = contract.ResultText();
-        const bool schema_ready = contract_version == "0.7.0";
+        const bool schema_ready = contract_version == "0.9.0";
         const std::string value =
             "{\"schema_version\":\"" + JsonEscape(contract_version) +
             "\",\"schema_ready\":" + (schema_ready ? "true" : "false") +
@@ -1339,6 +1339,104 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *
         call.Int64(3, expected_head);
         call.Row();
         *new_commit = call.ResultInt64();
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_quota_get(
+        vexfs_mount_session *session, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
+        Call call(session->db, "SELECT vexfs_quota_get(?1)");
+        call.Text(1, session->workspace.c_str());
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_quota_set(
+        vexfs_mount_session *session, int64_t max_bytes,
+        int64_t max_files, int64_t max_file_bytes,
+        vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (max_bytes < -1 || max_files < -1 || max_file_bytes < -1 || json == nullptr) {
+            throw CallError(SQLITE_RANGE,
+                            "quota values must be -1 (unlimited) or non-negative");
+        }
+        Call call(session->db, "SELECT vexfs_quota_set(?1,?2,?3,?4)");
+        call.Text(1, session->workspace.c_str());
+        if (max_bytes < 0) call.Null(2); else call.Int64(2, max_bytes);
+        if (max_files < 0) call.Null(3); else call.Int64(3, max_files);
+        if (max_file_bytes < 0) call.Null(4); else call.Int64(4, max_file_bytes);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_retention_get(
+        vexfs_mount_session *session, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
+        Call call(session->db, "SELECT vexfs_retention_get(?1)");
+        call.Text(1, session->workspace.c_str());
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_retention_set(
+        vexfs_mount_session *session, uint32_t keep_versions,
+        uint32_t keep_days, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
+        Call call(session->db, "SELECT vexfs_retention_set(?1,?2,?3)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, keep_versions);
+        call.Int64(3, keep_days);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_gc(
+        vexfs_mount_session *session, uint32_t batch,
+        vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (batch == 0 || batch > 10000 || json == nullptr) {
+            throw CallError(SQLITE_RANGE, "batch must be between 1 and 10000");
+        }
+        Call call(session->db, "SELECT vexfs_gc(?1,?2)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, batch);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_gc_pause(
+        vexfs_mount_session *session, int paused,
+        vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if ((paused != 0 && paused != 1) || json == nullptr) {
+            throw CallError(SQLITE_RANGE, "paused must be 0 or 1");
+        }
+        Call call(session->db, "SELECT vexfs_gc_pause(?1,?2)");
+        call.Text(1, session->workspace.c_str());
+        call.Int(2, paused);
+        call.Row();
+        CopyResult(call, json);
     });
 }
 

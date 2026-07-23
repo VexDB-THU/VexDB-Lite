@@ -247,6 +247,7 @@ if(VEXDB_SQLITE_DESKTOP)
         ${REPO_ROOT}/agent_files/cli/vexdb_main.cpp
         ${REPO_ROOT}/agent_files/cli/vexdb_shell_init.c
         ${REPO_ROOT}/agent_files/cli/vexfs_main.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_archive.cpp
         ${REPO_ROOT}/agent_files/cli/vexfs_platform_registry.cpp
         ${SQLITE_AMALG_DIR}/shell.c)
     set(VEXDB_CLI_PLATFORM_LIBS)

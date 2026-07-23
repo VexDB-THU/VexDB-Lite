@@ -33,7 +33,7 @@ from typing import Any, Callable
 
 MIB = 1024 * 1024
 MAX_FILE_BYTES = 128 * MIB
-CONTRACT_VERSION = "0.7.0"
+CONTRACT_VERSION = "0.9.0"
 
 
 class EvalFailure(AssertionError):
@@ -762,10 +762,12 @@ def version_history(ctx: Context) -> dict[str, Any]:
         ctx.equal(versions, [1, 2, 3], "文件版本单调增长")
         inode = db.json("SELECT vexfs_stat('default','/history')")["inode"]
         history = db.connection.execute(
-            "SELECT version_no,content,size FROM _vexfs_file_versions "
+            "SELECT version_no,size,manifest_id FROM _vexfs_file_versions "
             "WHERE inode_id=? ORDER BY version_no", (inode,)).fetchall()
-        ctx.equal(history, [(1, b"one", 3), (2, b"two", 3), (3, b"three", 5)],
-                  "历史版本内容")
+        ctx.equal([(row[0], row[1]) for row in history], [(1, 3), (2, 3), (3, 5)],
+                  "历史版本大小")
+        ctx.check(all(row[2] is not None for row in history),
+                  "canonical 版本均引用不可变 manifest")
         public_history = db.json("SELECT vexfs_history('default','/history')")
         ctx.equal([row["version"] for row in public_history], [3, 2, 1],
                   "公开历史版本倒序")
@@ -1013,7 +1015,10 @@ def open_unlink(ctx: Context) -> dict[str, Any]:
         ctx.expect_error(lambda: db.scalar("SELECT vexfs_stat('default','/open-unlink')"),
                          "path not found")
         ctx.equal(db.scalar(
-            "SELECT content FROM _vexfs_file_versions WHERE inode_id=? AND version_no=2", (inode,)),
+            "SELECT chunk.content FROM _vexfs_file_versions version "
+            "JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=version.manifest_id "
+            "JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id "
+            "WHERE version.inode_id=? AND version.version_no=2 AND entry.chunk_no=0", (inode,)),
             b"NEW", "删除 inode 的已发布历史完整")
         return {"inode": inode, "published_version": 2}
 
@@ -1317,21 +1322,23 @@ def integrity_checksum_and_aliases(ctx: Context) -> dict[str, Any]:
         deep = db.json("SELECT vexfs_check('default',1)")
         quick = db.json("SELECT vexfs_check('default',0)")
         ctx.check(deep["ok"] and quick["ok"], "干净 workspace 深度和快速检查通过")
-        ctx.equal(deep["content_model"], "full-blob-v1", "检查明确当前内容模型")
+        ctx.equal(deep["content_model"], "chunked-v1", "检查明确当前内容模型")
         ctx.equal(deep["checked"]["snapshots"], 1, "检查覆盖快照引用")
 
         db.connection.execute(
-            "UPDATE _vexfs_file_versions SET content=zeroblob(size) "
-            "WHERE inode_id=? AND version_no=1", (inode,))
+            "UPDATE _vexfs_chunks SET content=zeroblob(size) WHERE id=("
+            "SELECT entry.chunk_id FROM _vexfs_file_versions version "
+            "JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=version.manifest_id "
+            "WHERE version.inode_id=? AND version.version_no=1 AND entry.chunk_no=0)", (inode,))
         quick_after = db.json("SELECT vexfs_check('default',0)")
         ctx.check(quick_after["ok"], "快速检查明确不读取 BLOB 校验和")
         deep_after = db.json("SELECT vexfs_check('default',1)")
         codes = {issue["code"] for issue in deep_after["issues"]}
-        ctx.check(not deep_after["ok"] and "VEXFS_CHECKSUM_MISMATCH" in codes,
+        ctx.check(not deep_after["ok"] and "VEXFS_CHUNK_INVALID" in codes,
                   "深度检查发现同长度内容损坏")
         ctx.expect_error(
             lambda: db.scalar("SELECT vexfs_read('default','/checked.txt')"),
-            "checksum does not match")
+            "chunk is corrupt")
 
         cli = run_process(
             [str(ctx.cli), "--db", str(db.path), "--workspace", "default",
@@ -1385,6 +1392,362 @@ def integrity_structural_corruption(ctx: Context) -> dict[str, Any]:
                       for issue in report["issues"]),
                   "每个问题都包含对象、类型和建议动作")
         return {"issue_count": report["issue_count"], "codes": sorted(codes)}
+
+
+@case("maintenance.retention-gc", "maintenance",
+      "保留数、天数、快照、句柄、内容别名、活动挂载和分批 GC 的安全边界")
+def retention_gc(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        for value in ("one", "two", "three"):
+            db.scalar("SELECT vexfs_write('default','/history.txt',?)", (value,))
+        snapshot_commit = db.scalar(
+            "SELECT vexfs_snapshot_create('default','protected-version-3')")
+        db.scalar("SELECT vexfs_write('default','/history.txt','four')")
+        handle = db.scalar(
+            "SELECT vexfs_handle_open('default','/history.txt','r','gc-open')")
+        db.scalar("SELECT vexfs_restore_version('default','/history.txt',1,4)")
+        policy = db.json("SELECT vexfs_retention_set('default',1,0)")
+        ctx.equal(policy["keep_versions"], 1, "保留最近版本数")
+        ctx.equal(policy["keep_days"], 0, "关闭按天保留")
+        ctx.check(policy["reclaimable_versions"] >= 1, "存在可回收历史")
+
+        db.scalar("SELECT vexfs_mount_session_start('default','gc-mount')")
+        ctx.expect_error(lambda: db.scalar("SELECT vexfs_gc('default',1)"),
+                         "active mount session")
+        db.scalar("SELECT vexfs_mount_session_end('default','gc-mount')")
+        ctx.check(db.json("SELECT vexfs_gc_pause('default',1)")["gc_paused"],
+                  "显式暂停 GC")
+        ctx.expect_error(lambda: db.scalar("SELECT vexfs_gc('default',1)"),
+                         "GC is paused")
+        ctx.check(not db.json("SELECT vexfs_gc_pause('default',0)")["gc_paused"],
+                  "显式恢复 GC")
+
+        batches = 0
+        deleted = 0
+        while True:
+            result = db.json("SELECT vexfs_gc('default',1)")
+            batches += 1
+            deleted += result["deleted_versions"]
+            if not result["has_more"]:
+                break
+            ctx.check(batches < 100, "GC 必须在有界批次数内完成")
+        ctx.check(deleted >= 1, "GC 实际删除历史版本")
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read_version('default','/history.txt',3) AS TEXT)"),
+            "three", "快照引用版本未删除")
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read_version('default','/history.txt',4) AS TEXT)"),
+            "four", "打开句柄引用版本未删除")
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read('default','/history.txt') AS TEXT)"),
+            "one", "当前别名版本和 canonical 内容未删除")
+        check = db.json("SELECT vexfs_check('default',1)")
+        ctx.check(check["ok"], "GC 后深度检查通过")
+        db.scalar("SELECT vexfs_handle_close(?,0,'gc-close')", (handle,))
+        return {"snapshot_commit": snapshot_commit, "batches": batches,
+                "deleted_versions": deleted,
+                "remaining_versions": check["checked"]["versions"]}
+
+
+@case("limits.workspace-quota", "limits",
+      "文件数、当前字节、单文件配额在发布和快照恢复前原子检查")
+def workspace_quota(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        db.scalar("SELECT vexfs_write('default','/quota.txt','abc')")
+        inode = db.json("SELECT vexfs_stat('default','/quota.txt')")["inode"]
+        before_commit = db.scalar(
+            "SELECT head_commit FROM _vexfs_workspaces WHERE name='default'")
+        quota = db.json("SELECT vexfs_quota_set('default',3,1,3)")
+        ctx.equal((quota["live_bytes"], quota["live_files"]), (3, 1),
+                  "配额统计当前 live usage")
+        db.scalar("SELECT vexfs_link('default','/quota.txt','/quota-link.txt')")
+        ctx.equal(db.json("SELECT vexfs_quota_get('default')")["live_files"], 1,
+                  "hardlink 不重复计算文件数")
+        ctx.expect_error(
+            lambda: db.scalar("SELECT vexfs_write('default','/second.txt','x')"),
+            "file quota exceeded")
+        ctx.expect_error(
+            lambda: db.scalar("SELECT vexfs_write('default','/quota.txt','abcd')"),
+            "maximum file size quota exceeded")
+        ctx.equal(db.scalar("SELECT CAST(vexfs_read('default','/quota.txt') AS TEXT)"),
+                  "abc", "失败写入不改正文")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_file_versions WHERE inode_id=?", (inode,)),
+            1, "失败写入不产生版本")
+        ctx.equal(db.scalar(
+            "SELECT head_commit FROM _vexfs_workspaces WHERE name='default'"),
+            before_commit + 1, "只有 hardlink 成功操作产生 commit")
+
+        db.scalar("SELECT vexfs_quota_set('default',NULL,NULL,NULL)")
+        snapshot = db.scalar("SELECT vexfs_snapshot_create('default','large')")
+        db.scalar("SELECT vexfs_write('default','/quota.txt','x')")
+        current_head = db.scalar(
+            "SELECT head_commit FROM _vexfs_workspaces WHERE name='default'")
+        db.scalar("SELECT vexfs_quota_set('default',NULL,NULL,2)")
+        ctx.expect_error(lambda: db.scalar(
+            "SELECT vexfs_snapshot_restore('default','large',?)", (current_head,)),
+            "maximum file size quota")
+        ctx.equal(db.scalar("SELECT CAST(vexfs_read('default','/quota.txt') AS TEXT)"),
+                  "x", "失败快照恢复不修改工作区")
+        ctx.equal(db.scalar(
+            "SELECT head_commit FROM _vexfs_workspaces WHERE name='default'"),
+            current_head, "失败快照恢复不产生 commit")
+        return {"snapshot_commit": snapshot, "live_files": 1,
+                "rejected_operations": 3}
+
+
+@case("backup.logical-export-import", "backup",
+      "逻辑包记录、整包和 BLOB 校验，指定快照导出，导入原子发布")
+def logical_export_import(ctx: Context) -> dict[str, Any]:
+    with tempfile.TemporaryDirectory(prefix="vexfs-export-eval-") as directory:
+        base = Path(directory)
+        source_path = base / "source.sqlite3"
+        destination_path = base / "destination.sqlite3"
+        archive = base / "workspace.vexfs"
+        dirty_archive = base / "dirty-head.vexfs"
+        corrupt_archive = base / "corrupt.vexfs"
+        missing_source = base / "missing.sqlite3"
+        missing_source_archive = base / "missing-source.vexfs"
+        missing_export = run_process(
+            [str(ctx.cli), "--db", str(missing_source), "--workspace", "default",
+             "export", "--output", str(missing_source_archive)], check=False)
+        ctx.check(missing_export.returncode != 0 and not missing_source.exists() and
+                  not missing_source_archive.exists(),
+                  "不存在的源数据库导出失败且不创建空数据库或归档")
+        with Database(ctx, source_path) as source:
+            source.scalar("SELECT vexfs_mkdir('default','/project')")
+            source.scalar("SELECT vexfs_write('default','/project/data.bin',?)",
+                          (sqlite3.Binary(b"A" * min(ctx.mode.sequential_mib, 16) * MIB),))
+            source.scalar("SELECT vexfs_write('default','/project/version.txt','one')")
+            source.scalar("SELECT vexfs_write('default','/project/version.txt','two')")
+            inode = source.json(
+                "SELECT vexfs_stat('default','/project/version.txt')")["inode"]
+            source.scalar("SELECT vexfs_link('default','/project/version.txt',"
+                          "'/project/version-link.txt')")
+            source.scalar("SELECT vexfs_xattr_set('default',?,'user.export','value',0)",
+                          (inode,))
+            source.scalar("SELECT vexfs_acl_set('default',?,"
+                          "'[{\"principal\":\"alice\",\"effect\":\"allow\","
+                          "\"permissions\":\"read\",\"inherit\":1}]')", (inode,))
+            snapshot_commit = source.scalar(
+                "SELECT vexfs_snapshot_create('default','portable')")
+            source.scalar("SELECT vexfs_write('default','/project/version.txt','after')")
+            dirty_handle = source.scalar(
+                "SELECT vexfs_handle_open('default','/project/version.txt','rw','export-open')")
+            source.scalar(
+                "SELECT vexfs_handle_stage_write(?,0,'dirty','export-stage')",
+                (dirty_handle,))
+
+        prefix = [str(ctx.cli), "--db", str(source_path), "--workspace", "default"]
+        dirty_export = run_process(
+            prefix + ["export", "--output", str(dirty_archive)], check=False)
+        ctx.check(dirty_export.returncode != 0 and
+                  b"unpublished file handles" in dirty_export.stderr and
+                  not dirty_archive.exists(),
+                  "HEAD 导出拒绝未发布句柄且不留半个包")
+        export_started = time.perf_counter()
+        exported = json.loads(run_process(
+            prefix + ["export", "--snapshot", "portable", "--output", str(archive)]
+        ).stdout)
+        export_seconds = time.perf_counter() - export_started
+        ctx.equal(archive.stat().st_mode & 0o777, 0o600,
+                  "逻辑包默认只允许当前用户读写")
+        archive.chmod(0o400)
+        verified = json.loads(run_process(
+            [str(ctx.cli), "archive", "verify", str(archive)]).stdout)
+        ctx.check(verified["ok"], "逻辑包独立校验通过")
+        ctx.equal(exported["source_commit"], snapshot_commit, "导出固定快照 commit")
+        ctx.equal(exported["package_checksum"], verified["package_checksum"],
+                  "导出和校验整包 hash 一致")
+
+        import_started = time.perf_counter()
+        imported = json.loads(run_process(
+            [str(ctx.cli), "--db", str(destination_path), "--workspace", "restored",
+             "import", str(archive)]).stdout)
+        import_seconds = time.perf_counter() - import_started
+        ctx.budget("logical_export_seconds", export_seconds, 15.0)
+        ctx.budget("logical_import_seconds", import_seconds, 15.0)
+        with Database(ctx, destination_path, initialize=False) as destination:
+            ctx.equal(destination_path.stat().st_mode & 0o777, 0o600,
+                      "新目标数据库默认只允许当前用户读写")
+            ctx.equal(destination.scalar(
+                "SELECT CAST(vexfs_read('restored','/project/version.txt') AS TEXT)"),
+                "two", "指定快照内容导入")
+            left = destination.json(
+                "SELECT vexfs_stat('restored','/project/version.txt')")
+            right = destination.json(
+                "SELECT vexfs_stat('restored','/project/version-link.txt')")
+            ctx.equal((left["inode"], left["link_count"]),
+                      (right["inode"], 2), "hardlink 关系导入")
+            ctx.equal(destination.scalar(
+                "SELECT CAST(vexfs_read_version('restored','/project/version.txt',1) AS TEXT)"),
+                "one", "文件版本历史导入")
+            ctx.equal(destination.scalar(
+                "SELECT CAST(vexfs_xattr_get('restored',?,'user.export') AS TEXT)",
+                (left["inode"],)), "value", "xattr 导入")
+            ctx.equal(destination.json(
+                "SELECT vexfs_acl_get('restored',?)", (left["inode"],))[0]["principal"],
+                "alice", "ACL 导入")
+            ctx.check(destination.json("SELECT vexfs_check('restored',1)")["ok"],
+                      "导入后深度检查通过")
+
+        shutil.copyfile(archive, corrupt_archive)
+        tampered = sqlite3.connect(corrupt_archive)
+        tampered_row = tampered.execute(
+            "SELECT id FROM chunks WHERE size>0 ORDER BY id LIMIT 1").fetchone()
+        ctx.check(tampered_row is not None, "损坏测试找到 canonical 内容")
+        tampered.execute(
+            "UPDATE chunks SET content=zeroblob(size) WHERE id=?",
+            (tampered_row[0],))
+        tampered.commit()
+        tampered.close()
+        rejected = run_process(
+            [str(ctx.cli), "archive", "verify", str(corrupt_archive)], check=False)
+        ctx.check(rejected.returncode != 0 and b"checksum mismatch" in rejected.stderr,
+                  "内容损坏必须被校验拒绝")
+        rejected_import = run_process(
+            [str(ctx.cli), "--db", str(destination_path), "--workspace", "partial",
+             "import", str(corrupt_archive)], check=False)
+        ctx.check(rejected_import.returncode != 0, "损坏包导入失败")
+        with Database(ctx, destination_path, initialize=False) as destination:
+            ctx.equal(destination.scalar(
+                "SELECT count(*) FROM _vexfs_workspaces WHERE name='partial'"), 0,
+                "失败导入不发布半个 workspace")
+        corrupt_destination = base / "corrupt-destination.sqlite3"
+        rejected_new_database = run_process(
+            [str(ctx.cli), "--db", str(corrupt_destination), "--workspace", "partial",
+             "import", str(corrupt_archive)], check=False)
+        ctx.check(rejected_new_database.returncode != 0 and
+                  not corrupt_destination.exists(),
+                  "损坏包导入新目标失败时删除新建数据库")
+        return {"source_commit": snapshot_commit,
+                "archive_bytes": archive.stat().st_size,
+                "versions": verified["versions"],
+                "content_bytes": verified["content_bytes"],
+                "export_seconds": round(export_seconds, 6),
+                "import_seconds": round(import_seconds, 6),
+                "package_checksum": imported["package_checksum"]}
+
+
+@case("performance.quota-and-gc-scale", "performance",
+      "开启配额后的文件创建为常数时间计数，历史 GC 保持固定批次和受控内存")
+def quota_and_gc_scale(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        file_count = ctx.mode.small_files
+        db.scalar("SELECT vexfs_mkdir('default','/quota-scale')")
+        db.scalar("SELECT vexfs_quota_set('default',?,?,?)",
+                  (file_count + 1, file_count + 1, 1024))
+        started = time.perf_counter()
+        db.connection.execute("BEGIN")
+        try:
+            for index in range(file_count):
+                db.scalar("SELECT vexfs_write('default',?,'x')",
+                          (f"/quota-scale/f{index:06d}",))
+            db.connection.execute("COMMIT")
+        except Exception:
+            db.connection.execute("ROLLBACK")
+            raise
+        quota_seconds = time.perf_counter() - started
+        usage = db.json("SELECT vexfs_quota_get('default')")
+        ctx.equal(usage["live_files"], file_count, "规模写入文件计数")
+        ctx.equal(usage["live_bytes"], file_count, "规模写入字节计数")
+
+        versions = ctx.mode.random_ops
+        db.scalar("SELECT vexfs_quota_set('default',NULL,NULL,NULL)")
+        for index in range(versions):
+            db.scalar("SELECT vexfs_write('default','/gc-scale',?)",
+                      (f"value-{index:08d}",))
+        db.scalar("SELECT vexfs_retention_set('default',1,0)")
+        gc_started = time.perf_counter()
+        batches = 0
+        deleted = 0
+        while True:
+            result = db.json("SELECT vexfs_gc('default',128)")
+            batches += 1
+            deleted += result["deleted_versions"]
+            if not result["has_more"]:
+                break
+            ctx.check(batches <= (versions // 128) + 4, "GC 批次数受控")
+        gc_seconds = time.perf_counter() - gc_started
+        ctx.equal(deleted, versions - 1, "只保留当前版本")
+        ctx.check(db.json("SELECT vexfs_check('default',0)")["ok"],
+                  "规模 GC 后结构检查通过")
+        ctx.budget("quota_scale_seconds", quota_seconds,
+                   max(5.0, file_count / 300.0))
+        ctx.budget("gc_scale_seconds", gc_seconds,
+                   max(5.0, versions / 1000.0))
+        return {"files": file_count, "versions": versions,
+                "quota_seconds": round(quota_seconds, 6),
+                "quota_files_per_second": round(file_count / max(quota_seconds, 1e-9), 3),
+                "gc_seconds": round(gc_seconds, 6), "gc_batches": batches,
+                "deleted_versions": deleted}
+
+
+@case("storage.chunk-manifest-reuse", "storage",
+      "64 KiB manifest/chunk、随机覆盖复用未变化块、恢复别名和 GC 共享块安全")
+def chunk_manifest_reuse(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        chunk_bytes = 64 * 1024
+        original = b"".join(bytes([index + 1]) * chunk_bytes for index in range(4))
+        ctx.equal(db.scalar("SELECT vexfs_write('default','/chunked.bin',?)", (original,)),
+                  1, "创建四块 canonical 版本")
+        inode = db.json("SELECT vexfs_stat('default','/chunked.bin')")["inode"]
+        first_manifest = db.scalar(
+            "SELECT manifest_id FROM _vexfs_file_versions "
+            "WHERE inode_id=? AND version_no=1", (inode,))
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_manifest_chunks WHERE manifest_id=?",
+            (first_manifest,)), 4, "首版本 manifest 有四个块引用")
+
+        handle = db.scalar(
+            "SELECT vexfs_handle_open('default','/chunked.bin','rw','chunk-open')")
+        patch_offset = chunk_bytes + 123
+        patch = b"changed-block"
+        generation = db.scalar(
+            "SELECT vexfs_handle_stage_write(?,?,?,'chunk-patch')",
+            (handle, patch_offset, patch))
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_publish(?,?,'data','chunk-publish')",
+            (handle, generation)), 2, "随机覆盖发布第二版本")
+        db.scalar("SELECT vexfs_handle_close(?,0,'chunk-close')", (handle,))
+        second_manifest = db.scalar(
+            "SELECT manifest_id FROM _vexfs_file_versions "
+            "WHERE inode_id=? AND version_no=2", (inode,))
+        reused = db.scalar(
+            "SELECT count(*) FROM _vexfs_manifest_chunks first "
+            "JOIN _vexfs_manifest_chunks second "
+            "ON second.chunk_no=first.chunk_no AND second.chunk_id=first.chunk_id "
+            "WHERE first.manifest_id=? AND second.manifest_id=?",
+            (first_manifest, second_manifest))
+        ctx.equal(reused, 3, "只重写受影响的一块，其余三块复用")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_chunks WHERE inode_id=?", (inode,)), 5,
+            "两个四块版本只保存五个物理块")
+        expected = bytearray(original)
+        expected[patch_offset:patch_offset + len(patch)] = patch
+        ctx.equal(db.scalar("SELECT vexfs_read('default','/chunked.bin')"), bytes(expected),
+                  "分块随机覆盖后的完整内容")
+
+        ctx.equal(db.scalar(
+            "SELECT vexfs_restore_version('default','/chunked.bin',1,2)"), 3,
+            "恢复版本仍使用文件版本别名")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_manifests WHERE workspace_id=("
+            "SELECT id FROM _vexfs_workspaces WHERE name='default')"), 2,
+            "恢复别名不创建重复 manifest")
+        db.scalar("SELECT vexfs_retention_set('default',1,0)")
+        gc = db.json("SELECT vexfs_gc('default',100)")
+        ctx.equal(gc["deleted_versions"], 1, "GC 删除不再需要的覆盖版本")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_chunks WHERE inode_id=?", (inode,)), 4,
+            "GC 只删除覆盖版本独有块，保留共享块")
+        report = db.json("SELECT vexfs_check('default',1)")
+        ctx.check(report["ok"], "共享块 GC 后深度检查通过")
+        ctx.equal((report["checked"]["manifests"], report["checked"]["chunks"]),
+                  (1, 4), "检查报告包含真实 manifest 和物理块数量")
+        return {"logical_bytes": len(original), "chunk_bytes": chunk_bytes,
+                "reused_chunks": reused, "physical_chunks_before_gc": 5,
+                "physical_chunks_after_gc": 4}
 
 
 @case("recovery.initialization-failure-rollback", "recovery",
@@ -2414,6 +2777,10 @@ def performance_random_patches(ctx: Context) -> dict[str, Any]:
     expected: dict[int, bytes] = {}
     with Database(ctx) as db:
         db.scalar("SELECT vexfs_write('default','/random.bin',zeroblob(?))", (logical_size,))
+        inode = db.json("SELECT vexfs_stat('default','/random.bin')")["inode"]
+        base_manifest = db.scalar(
+            "SELECT manifest_id FROM _vexfs_file_versions "
+            "WHERE inode_id=? AND version_no=1", (inode,))
         handle = db.scalar(
             "SELECT vexfs_handle_open('default','/random.bin','rw','random-open')")
         started = time.perf_counter()
@@ -2436,14 +2803,45 @@ def performance_random_patches(ctx: Context) -> dict[str, Any]:
         ctx.equal(row[0], 1, "随机写 staging 行数")
         ctx.equal(row[1], logical_size, "随机写 logical_size")
         ctx.check(row[2] <= MAX_FILE_BYTES, "随机写 capacity")
+        publish_started = time.perf_counter()
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_publish(?,?,'data','random-publish')",
+            (handle, generation)), 2, "随机 patch 发布新版本")
+        publish_seconds = time.perf_counter() - publish_started
+        db.scalar("SELECT vexfs_handle_close(?,0,'random-close')", (handle,))
+        patched_manifest = db.scalar(
+            "SELECT manifest_id FROM _vexfs_file_versions "
+            "WHERE inode_id=? AND version_no=2", (inode,))
+        affected_chunks = {offset // (64 * 1024) for offset in expected}
+        total_chunks = logical_size // (64 * 1024)
+        reused_chunks = db.scalar(
+            "SELECT count(*) FROM _vexfs_manifest_chunks before "
+            "JOIN _vexfs_manifest_chunks after "
+            "ON after.chunk_no=before.chunk_no AND after.chunk_id=before.chunk_id "
+            "WHERE before.manifest_id=? AND after.manifest_id=?",
+            (base_manifest, patched_manifest))
+        ctx.equal(reused_chunks, total_chunks - len(affected_chunks),
+                  "随机发布只替换受影响的 64 KiB 块")
+        physical_chunks = db.scalar(
+            "SELECT count(*) FROM _vexfs_chunks WHERE inode_id=?", (inode,))
+        ctx.check(physical_chunks <= 1 + len(affected_chunks),
+                  "重复零块和未变化块不会重复保存")
+        for offset, data in list(expected.items())[-min(len(expected), 3):]:
+            ctx.equal(db.scalar(
+                "SELECT substr(vexfs_read('default','/random.bin'),?,?)",
+                (offset + 1, patch_size)), data, "发布后随机 patch 内容")
         ctx.budget("random_patch_seconds", seconds, 120.0)
+        ctx.budget("random_patch_publish_seconds", publish_seconds, 60.0)
         storage_before_checkpoint = db_storage(db.path)
         db.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         storage_after_checkpoint = db_storage(db.path)
         return {"writes": ctx.mode.random_writes, "unique_slots": len(expected),
                 "logical_bytes": logical_size, "capacity_bytes": row[2],
                 "generation": generation, "seconds": round(seconds, 6),
+                "publish_seconds": round(publish_seconds, 6),
                 "operations_per_second": round(ctx.mode.random_writes / max(seconds, 1e-9), 3),
+                "affected_chunks": len(affected_chunks), "reused_chunks": reused_chunks,
+                "physical_chunks": physical_chunks,
                 "request_rows": db.scalar("SELECT count(*) FROM _vexfs_requests"),
                 "storage_before_checkpoint": storage_before_checkpoint,
                 "storage_after_checkpoint": storage_after_checkpoint}
@@ -2522,7 +2920,7 @@ def performance_integrity_check(ctx: Context) -> dict[str, Any]:
         after_rss = self_max_rss_bytes()
         ctx.check(quick["ok"] and deep["ok"], "性能数据集检查通过")
         ctx.equal(deep["checked"]["content_bytes"], logical_bytes,
-                  "深度检查扫描所有 canonical BLOB")
+                  "深度检查扫描所有 canonical manifest/chunk")
         ctx.equal(deep["checked"]["versions"], file_count, "版本计数")
         ctx.budget("integrity_check_seconds", deep_seconds,
                    {"quick": 10.0, "full": 45.0, "stress": 90.0}[ctx.mode.name])
@@ -2581,8 +2979,11 @@ def maximum_file(ctx: Context) -> dict[str, Any]:
             ctx.equal(db.scalar("SELECT length(vexfs_read('default','/max.bin'))"),
                       MAX_FILE_BYTES, "复用内容的恢复版本可读")
             ctx.equal(db.scalar(
-                "SELECT sum(length(content)) FROM _vexfs_file_versions WHERE inode_id="
-                "(SELECT inode_id FROM _vexfs_dentries WHERE name='max.bin')"),
+                "SELECT sum(chunk.size) FROM _vexfs_file_versions version "
+                "JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=version.manifest_id "
+                "JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id "
+                "WHERE version.inode_id=(SELECT inode_id FROM _vexfs_dentries "
+                "WHERE name='max.bin')"),
                 2 * MAX_FILE_BYTES, "restore 不重复保存 128 MiB BLOB")
         storage_before_checkpoint = db_storage(db.path)
         db.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()

@@ -79,16 +79,16 @@ VexFS 的不变最终目标、阶段边界、完成条件和当前下一步统�
 
 SQLite MVP 没有数据库用户认证。该阶段的 principal 只能来自受签名 App/extension、当前 macOS 用户、security-scoped 数据库目录和数据库文件权限共同建立的本地身份边界；不能把 PostgreSQL 角色语义直接套到 SQLite。
 
-### 1.2 当前实现状态（2026-07-21）
+### 1.2 当前实现状态（2026-07-23）
 
-SQLite 合同为 `0.7.0`，runtime ABI 为 1。除单文件版本外，当前实现已经提供完整 workspace 时间点恢复：
+SQLite 合同为 `0.9.0`，runtime ABI 为 1。除单文件版本外，当前实现已经提供完整 workspace 时间点恢复：
 
 - 每个 workspace commit 增量保存 inode、dentry 和 xattr 状态；文件内容继续复用不可变 file version；
 - snapshot 是“名称 → 固定 workspace commit”的不可变书签，创建不复制目录树或文件内容；
 - `snapshot create/list/show/diff/drop/restore` 已同时进入 SQL、C ABI 和 CLI；
 - restore 覆盖目录创建、删除和移动，以及文件内容、mode、symlink target 和 xattr，并生成新的 workspace commit；
 - restore 必须带 expected-head；旧 head、并发 restore 和打开/retained handle 都会被拒绝，不能静默覆盖；
-- 产品尚未正式发版，当前只接受 `0.7.0` schema；其他版本明确拒绝且不改写数据库，不保留历史迁移代码；
+- 产品尚未正式发版，当前只接受 `0.9.0` schema；其他版本明确拒绝且不改写数据库，不保留历史迁移代码；
 - SQLite Online Backup 会同时保存 snapshot、历史树和未发布 staging；数据库重开后仍可 diff 和 restore；
 - 3,000 文件实测 snapshot create 约 0.16 ms、单文件变化 diff 约 0.65 s、完整 restore 约 1.47 s；10,000 文件压力档分别约 0.17 ms、6.83 s 和 15.42 s。
 
@@ -124,7 +124,7 @@ SQLite 合同为 `0.7.0`，runtime ABI 为 1。除单文件版本外，当前实
 
 已有的单文件版本能力包括：
 
-- 普通写入保存不可变完整内容并生成递增版本；
+- 普通写入生成不可变 manifest 和递增版本；manifest 按 64 KiB 块引用数据库内的物理 chunk；
 - `vexfs_history` 支持有上限的分页查询，`vexfs_read_version` 读取指定版本；
 - `vexfs_restore_version` 创建新版本，但复用目标版本的不可变内容，不复制大 BLOB；
 - 四参数恢复带 `expected_version`，当前版本已变化时返回冲突；
@@ -133,8 +133,20 @@ SQLite 合同为 `0.7.0`，runtime ABI 为 1。除单文件版本外，当前实
 - mount session 使用独占租约，崩溃遗留 staging 只能显式恢复，不能被新进程静默发布；
 - `doctor` 不创建、不迁移旧数据库，并能报告合同兼容性和升级需要；
 - SQLite 主库、WAL 和 SHM 默认限制为当前用户读写，CLI 提供稳定错误码和退出码。
+- workspace 配额已覆盖当前文件数、当前内容总字节和单文件字节。计数由数据库触发器维护，
+  写入、句柄 publish 和快照恢复在修改前检查，失败不会产生半个版本或 commit；hardlink 不重复计数；
+- retention 已支持最近版本数和天数。GC 只能显式分批执行，保护当前版本、快照、打开或保留
+  句柄以及恢复别名引用的 canonical 内容；活动挂载和 `gc pause` 都会阻止删除；
+- `vexdb fs export/import` 已提供 format v2 逻辑包。逻辑包使用独立 SQLite 容器保存跨后端
+  记录，不是源数据库副本；它包含 workspace 元数据、commit、inode/dentry 历史、文件版本、
+  manifest、chunk、快照、xattr、ACL 和 principal 表。每条记录、每个 chunk、整文件和整包都有
+  SHA-256；导入先在
+  `importing` 状态完成映射和深度检查，再在同一事务中原子发布；
+- export、`archive verify` 和 import 都逐个处理不超过 64 KiB 的 chunk，校验和导入
+  使用同一个事务快照。HEAD 导出遇到未发布句柄时拒绝，指定快照
+  导出不受后续写入影响。当前只实现 SQLite 读写该逻辑格式；PG/DuckDB 消费端尚未实现。
 
-当前已经是完整 workspace 时间点恢复，但还不是完整 POSIX 文件系统。SQLite 文件版本 SHA-256 和只读 check 已实现；principal 权限执行、ACL 授权、审计、配额、保留策略、GC、分块和去重仍未实现。四类时间戳和本地最小文件锁已经验证，但跨 gateway 锁、setuid/setgid/sticky bit 和特殊文件没有形成跨平台承诺。hardlink、owner/group 和便携 ACL 当前只能称为“数据库合同已实现并在部分平台接入”，不能称为完整身份权限系统。当前历史只追加、不自动回收；长期运行前必须补保留策略和 GC。snapshot 解决误改和任务检查点，SQLite Backup 才是独立备份，两者不能混为一谈。
+当前已经是完整 workspace 时间点恢复，但还不是完整 POSIX 文件系统。SQLite 文件版本 SHA-256、只读 check、live quota、retention、显式 GC、逻辑导入导出和 `chunked-v1` 内容模型已实现；principal 权限执行、ACL 授权、审计、history/staging/index/total quota 和跨文件通用去重仍未实现。四类时间戳和本地最小文件锁已经验证，但跨 gateway 锁、setuid/setgid/sticky bit 和特殊文件没有形成跨平台承诺。hardlink、owner/group 和便携 ACL 当前只能称为“数据库合同已实现并在部分平台接入”，不能称为完整身份权限系统。GC 回收的是数据库可复用页，不会自动执行 `VACUUM` 缩小 SQLite 文件。snapshot 解决误改和任务检查点，SQLite Backup 才是独立备份，两者不能混为一谈。
 
 当前符号链接采用 POSIX 行为：target 是原样字符串，可以指向挂载目录外部。它解决兼容性，但不提供路径隔离；需要隔离时仍由 Agent sandbox 负责。未来可以增加可选的 `internal` 策略，但当前版本没有实现该策略。
 
@@ -752,7 +764,7 @@ VexFS 使用四层数据保护：
 | FR-DB-004 | P0 | 适配器不得直接读写数据库物理文件。 |
 | FR-DB-005 | P0 | 宿主不允许时，不得创建线程、后台任务或外部文件。 |
 | FR-DB-006 | P0 | PostgreSQL 必须使用 role、MVCC、WAL 和数据库锁能力。 |
-| FR-DB-007 | P0 | SQLite 必须正确处理单 writer、busy、savepoint、WAL/reopen 和 Backup API。mount staging 的热点元数据必须与大内容 BLOB 分开；旧内联布局要能原子迁移。 |
+| FR-DB-007 | P0 | SQLite 必须正确处理单 writer、busy、savepoint、WAL/reopen 和 Backup API。mount staging 的热点元数据必须与内容块分开；正式发版前的旧实验 schema 明确拒绝，不保留迁移代码。 |
 | FR-DB-008 | P1 | DuckDB 必须正确处理单进程写入、乐观冲突、checkpoint 和 reopen；默认先支持 SQL/CLI/worktree，可写 mount 只允许 gateway 成为唯一写进程或宿主提供可验证的多进程写入能力。 |
 | FR-DB-009 | P1 | 同一组合同 spec 必须在所有已支持引擎运行。 |
 
@@ -849,7 +861,7 @@ SELECT * FROM vexfs_stat('workspace', '/reports/final.md');
 
 ### 12.4 版本和快照
 
-SQLite `0.7.0` 当前已经实现文件版本和 workspace 快照：
+SQLite `0.9.0` 当前已经实现文件版本和 workspace 快照：
 
 ```sql
 SELECT vexfs_history('workspace', '/reports/final.md');
@@ -861,7 +873,9 @@ SELECT vexfs_restore_version('workspace', '/reports/final.md', 2, :expected_vers
 
 四参数 `vexfs_history` 返回 `{"entries": [...], "next_before": ...}`，按版本倒序；每页最多 1000 条，CLI 默认 100 条。两参数形式为兼容入口，返回 JSON 数组并固定最多 100 条。每项包含 `version`、`commit`、`parent_commit`、`size`、`checksum`、`created_at`、`message` 和 `current`。`checksum` 是小写 SHA-256；文件和符号链接的 `vexfs_stat` 也返回当前版本的 `checksum`，目录返回 `null`。
 
-恢复成功返回新版本号。恢复必须使用带 `expected_version` 的四参数接口，不能省略并发检查。恢复版本只引用目标版本的不可变内容，历史中仍保留一条新的 version 和 commit；这不是通用内容去重，普通写入仍保存完整内容。
+恢复成功返回新版本号。恢复必须使用带 `expected_version` 的四参数接口，不能省略并发检查。
+恢复版本只引用同 inode 目标 canonical 版本，历史中仍保留一条新的 version 和 commit；普通
+写入可以复用该 inode 上一版本未变化的物理块，但当前不做跨 inode、跨文件的通用去重。
 
 workspace 快照当前公开合同：
 
@@ -900,8 +914,8 @@ COMMIT;
 ### 12.7 检查、配额和迁移
 
 ```sql
-SELECT vexfs_check('workspace', 1); -- 深度检查，包含所有 canonical BLOB 的 SHA-256
-SELECT vexfs_check('workspace', 0); -- 快速检查，只检查结构、引用和 BLOB 长度
+SELECT vexfs_check('workspace', 1); -- 深度检查，包含逐块和整文件 SHA-256
+SELECT vexfs_check('workspace', 0); -- 快速检查，只检查结构、引用、顺序和块长度
 SELECT * FROM vexfs_repair_plan('workspace');
 SELECT vexfs_gc('workspace', 1000);
 SELECT vexfs_quota_set('workspace', :max_bytes, :max_files, :max_file_bytes);
@@ -910,14 +924,30 @@ SELECT * FROM vexfs_export_begin('workspace', 'snapshot-name');
 SELECT vexfs_import_begin('new-workspace', :format_version);
 ```
 
-SQLite `0.7.0` 已实现只读的 `vexfs_check`。它返回 JSON，检查 SQLite 自身、workspace root、
-inode、dentry、可达性、commit 父链、snapshot、当前和历史版本引用、版本别名、BLOB 长度、
+SQLite `0.9.0` 已实现只读的 `vexfs_check`。它返回 JSON，检查 SQLite 自身、workspace root、
+inode、dentry、可达性、commit 父链、snapshot、当前和历史版本引用、版本别名、manifest/chunk、
 staging 和 handle。深度模式额外按 64 KiB 流式计算 SHA-256，不把全部历史内容载入内存。
 每个问题包含稳定的 `code`、对象、类型、说明和建议动作，最多返回 1000 个问题并报告完整
-问题数。当前内容模型是 `full-blob-v1`，尚未存在的 chunk/manifest 不会被假装成已检查。
+问题数。当前内容模型是 `chunked-v1`；quick 检查 manifest、块数量、顺序、大小和引用，deep
+再逐块验证 SHA-256 以及整文件 SHA-256。
 
 对应 CLI 是 `vexdb fs check`，默认深度检查；`--quick` 跳过内容哈希，`--json` 输出原始
 JSON。发现损坏时仍输出报告并返回退出码 8。当前没有自动 repair；检查不能修改或填补内容。
+
+SQLite `0.9.0` 同时公开：
+
+```sql
+SELECT vexfs_quota_get('workspace');
+SELECT vexfs_quota_set('workspace', :max_bytes, :max_files, :max_file_bytes);
+SELECT vexfs_retention_get('workspace');
+SELECT vexfs_retention_set('workspace', :keep_versions, :keep_days);
+SELECT vexfs_gc_pause('workspace', 1);
+SELECT vexfs_gc('workspace', 1000);
+```
+
+配额参数使用 SQL `NULL` 表示不限额，`0` 表示真实的零配额。降低配额后可以继续做减少用量的
+操作，但不能增加超额用量。GC 不自动运行；每次最多删除调用者给定的批量，并返回是否还有可
+回收版本。CLI 对应 `quota show/set`、`retention show/set`、`gc pause/resume` 和 `gc --batch`。
 
 ## 13. 权限规则
 
@@ -1043,7 +1073,17 @@ worktree 清单不保存凭证，也不能被数据库扩展信任为权限依�
 
 ### 15.5 逻辑导出格式
 
-逻辑包至少包含：
+SQLite `0.9.0` 已实现 `.vexfs` format v2。它使用独立 SQLite 文件作为逻辑记录容器，
+不复制源数据库的业务表、连接信息、密码、WAL 或内部运行句柄。当前命令：
+
+```bash
+vexdb fs export --output workspace.vexfs
+vexdb fs export --snapshot before-change --output workspace.vexfs
+vexdb fs archive verify workspace.vexfs
+vexdb fs --db target.sqlite3 --workspace restored import workspace.vexfs
+```
+
+逻辑包包含：
 
 - format version；
 - workspace metadata；
@@ -1054,6 +1094,17 @@ worktree 清单不保存凭证，也不能被数据库扩展信任为权限依�
 - 每条记录 checksum；
 - 整包 checksum；
 - 导出完成标记。
+
+format v2 导出选择 HEAD 或一个固定快照，并保留该 commit 祖先链内仍可恢复的文件版本和
+workspace 历史。canonical 内容保持 manifest + 64 KiB chunk，恢复别名保持对同 inode canonical 版本的引用。
+记录 hash 覆盖记录全部字段，内容 hash 复用文件版本 SHA-256，整包 hash 覆盖 manifest 和
+全部有序记录 hash。校验逐个读取不超过 64 KiB 的 chunk，不把整个工作区载入内存。
+
+导入目标 workspace 必须不存在。导入先创建同一事务内不可见的 `importing` workspace，映射
+commit/inode/manifest ID，重建 chunk 引用、当前树和历史，运行深度 `vexfs_check`，成功后才切换成 `active` 并提交。
+任何格式、结构、记录、内容、整包 hash 或深度检查失败都会回滚，目标名称不会留下半成品。
+SQLite 到 SQLite 采用 principal 原值映射；未来 PG/DuckDB 导入必须在 format v2 principal
+表之上增加显式目标身份映射，不能自动扩大权限。
 
 ## 16. 三端能力矩阵
 

@@ -74,6 +74,11 @@ vexdb fs snapshot restore before-agent --dry-run
 vexdb fs snapshot restore before-agent
 vexdb fs check              # 深度检查结构、历史和内容 SHA-256
 vexdb fs check --quick      # 只检查结构和引用
+vexdb fs quota show         # 查看 live 文件数、字节和上限
+vexdb fs retention show     # 查看保留策略和可回收历史
+vexdb fs gc --batch 1000    # 显式分批清理无引用历史
+vexdb fs export --snapshot before-agent --output workspace.vexfs
+vexdb fs archive verify workspace.vexfs
 ```
 
 已挂载 workspace 会在恢复时自动安全卸载并挂回原目录；正常卸载失败时不会开始恢复。

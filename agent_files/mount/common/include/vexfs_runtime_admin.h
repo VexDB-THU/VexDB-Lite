@@ -71,6 +71,29 @@ vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *session,
                                                 const char *name, int64_t expected_head,
                                                 int64_t *new_commit,
                                                 vexfs_mount_error *error);
+// Quota values use -1 for unlimited and non-negative values for a hard limit.
+vexfs_mount_status vexfs_mount_quota_get(vexfs_mount_session *session,
+                                         vexfs_mount_bytes *json,
+                                         vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_quota_set(vexfs_mount_session *session,
+                                         int64_t max_bytes, int64_t max_files,
+                                         int64_t max_file_bytes,
+                                         vexfs_mount_bytes *json,
+                                         vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_retention_get(vexfs_mount_session *session,
+                                             vexfs_mount_bytes *json,
+                                             vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_retention_set(vexfs_mount_session *session,
+                                             uint32_t keep_versions,
+                                             uint32_t keep_days,
+                                             vexfs_mount_bytes *json,
+                                             vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_gc_pause(vexfs_mount_session *session, int paused,
+                                        vexfs_mount_bytes *json,
+                                        vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_gc(vexfs_mount_session *session, uint32_t batch,
+                                  vexfs_mount_bytes *json,
+                                  vexfs_mount_error *error);
 
 #ifdef __cplusplus
 }

@@ -4,8 +4,10 @@ set -euo pipefail
 VEXFS="${1:?usage: vexfs_cli_smoke.sh /path/to/vexfs}"
 TMP_DIR="$(mktemp -d -t vexfs-cli-smoke)"
 DB="$TMP_DIR/vexfs.sqlite3"
+DEST_DB="$TMP_DIR/restored.sqlite3"
+ARCHIVE="$TMP_DIR/workspace.vexfs"
 cleanup() {
-    rm -f "$DB" "$DB-wal" "$DB-shm"
+    rm -f "$DB" "$DB-wal" "$DB-shm" "$DEST_DB" "$DEST_DB-wal" "$DEST_DB-shm" "$ARCHIVE"
     rmdir "$TMP_DIR" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -99,13 +101,54 @@ printf '%s' "$CHECK" | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["mode"] == "deep"; assert value["checked"]["versions"] >= 5'
 "$VEXFS" --db "$DB" --workspace smoke check --quick | grep -q '^OK '
 
+"$VEXFS" --db "$DB" --workspace smoke quota show | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["max_bytes"] is None; assert value["live_files"] > 0'
+"$VEXFS" --db "$DB" --workspace smoke quota set \
+    --max-bytes unlimited --max-files unlimited --max-file-bytes 4 >/dev/null
+set +e
+printf '12345' | "$VEXFS" --db "$DB" --workspace smoke write /agent/version.txt >/dev/null 2>&1
+QUOTA_STATUS=$?
+set -e
+[ "$QUOTA_STATUS" -eq 6 ]
+[ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/version.txt)" = "alpha" ]
+"$VEXFS" --db "$DB" --workspace smoke quota set \
+    --max-bytes unlimited --max-files unlimited --max-file-bytes unlimited >/dev/null
+
+"$VEXFS" --db "$DB" --workspace smoke retention set --keep-versions 1 --keep-days 0 |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["reclaimable_versions"] > 0'
+"$VEXFS" --db "$DB" --workspace smoke gc pause |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["gc_paused"] is True'
+set +e
+"$VEXFS" --db "$DB" --workspace smoke gc --batch 1 >/dev/null 2>&1
+PAUSED_GC_STATUS=$?
+set -e
+[ "$PAUSED_GC_STATUS" -eq 7 ]
+"$VEXFS" --db "$DB" --workspace smoke gc resume |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["gc_paused"] is False'
+"$VEXFS" --db "$DB" --workspace smoke gc --batch 1 |
+    /usr/bin/python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["deleted_versions"] == 1; assert value["has_more"] is True'
+while "$VEXFS" --db "$DB" --workspace smoke gc --batch 1000 |
+    /usr/bin/python3 -c 'import json,sys; raise SystemExit(0 if json.load(sys.stdin)["has_more"] else 1)'
+do :; done
+"$VEXFS" --db "$DB" --workspace smoke --json check |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+
+"$VEXFS" --db "$DB" --workspace smoke export --output "$ARCHIVE" |
+    /usr/bin/python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["format_version"] == 2; assert len(value["package_checksum"]) == 64'
+"$VEXFS" archive verify "$ARCHIVE" |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+"$VEXFS" --db "$DEST_DB" --workspace restored import "$ARCHIVE" >/dev/null
+[ "$("$VEXFS" --db "$DEST_DB" --workspace restored cat /agent/task.txt)" = "hello from cli" ]
+"$VEXFS" --db "$DEST_DB" --workspace restored --json check |
+    /usr/bin/python3 -c 'import json,sys; assert json.load(sys.stdin)["ok"] is True'
+
 set +e
 DOCTOR="$("$VEXFS" --db "$DB" --workspace smoke --json doctor)"
 DOCTOR_STATUS=$?
 set -e
 [ "$DOCTOR_STATUS" -eq 0 ] || [ "$DOCTOR_STATUS" -eq 1 ]
 printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["database"]["schema_version"] == "0.7.0"'
+    'import json,sys; value=json.load(sys.stdin); assert value["database"]["schema_version"] == "0.9.0"'
 
 MOUNTS="$("$VEXFS" --json mount status)"
 printf '%s' "$MOUNTS" | /usr/bin/python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), list)'

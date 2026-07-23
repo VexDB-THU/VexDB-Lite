@@ -565,9 +565,10 @@ SELECT vexfs_retention_set('workspace', keep_versions => 20, keep_days => 30);
 
 repair 必须先给出计划。缺失文件块时不能填空内容后报告成功。
 
-SQLite 当前实现只读 check，没有 repair。默认 CLI 使用 deep；每个 canonical 完整 BLOB 按
-64 KiB 流式读取。版本恢复生成的 alias 必须直接引用 canonical 版本，并复制相同的 size 和
-SHA-256。当前仍是 `full-blob-v1`，chunk/manifest 要等后续内容模型落地后再加入检查项。
+SQLite 当前实现只读 check，没有 repair。默认 CLI 使用 deep。当前 `chunked-v1` 中，canonical
+版本引用不可变 manifest，manifest 再按顺序引用不超过 64 KiB 的物理 chunk；版本恢复生成的
+alias 必须直接引用同 inode 的 canonical 版本，并复制相同的 size 和 SHA-256。quick 检查引用、
+块数量、顺序和大小，deep 再逐块及整文件计算 SHA-256，全程不组装完整历史文件。
 
 ### 5.7 Worktree changeset
 
@@ -805,25 +806,33 @@ vexfs_dentry_versions
 vexfs_manifests
   workspace_id
   manifest_id
+  inode_id
   file_size
   block_size
+  chunk_count
   checksum
 
 vexfs_chunks
   workspace_id
-  manifest_id
-  chunk_no
+  chunk_id
+  inode_id
+  size
   data_blob
   checksum
+
+vexfs_manifest_chunks
+  manifest_id
+  chunk_no
+  chunk_id
 ```
 
 规则：
 
-- 默认块大小建议 64 KiB；
-- 小文件允许内联；
+- SQLite `chunked-v1` 固定使用 64 KiB 块，空文件使用零块 manifest；
 - manifest 发布后不可修改；
-- 随机写只产生受影响的新块；
-- 第一版不做跨文件去重；
+- 物理 chunk 发布后不可修改；同 inode 的版本可以复用未变化的物理块；
+- 随机写只产生受影响的新块；版本恢复使用 alias，不复制 manifest 或 chunk；
+- 当前不做跨 inode/跨文件去重；
 - 文件内容全部由数据库 BLOB 管理。
 
 ### 8.5 快照

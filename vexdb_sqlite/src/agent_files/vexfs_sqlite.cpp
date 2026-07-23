@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -27,8 +28,9 @@
 
 namespace {
 
-constexpr const char *kContractVersion = "0.7.0";
+constexpr const char *kContractVersion = "0.9.0";
 constexpr sqlite3_int64 kMaxStagedBytes = 128LL * 1024LL * 1024LL;
+constexpr sqlite3_int64 kContentChunkBytes = 64LL * 1024LL;
 constexpr sqlite3_int64 kInitialStagingCapacity = 64LL * 1024LL;
 constexpr sqlite3_int64 kEmptyFileStagingCapacity = 4LL * 1024LL;
 constexpr sqlite3_int64 kMaxXattrBytes = 64LL * 1024LL;
@@ -54,6 +56,12 @@ class SqlError : public std::runtime_error {
 
   private:
     int code_;
+};
+
+struct BlobCloser {
+    void operator()(sqlite3_blob *blob) const {
+        if (blob != nullptr) sqlite3_blob_close(blob);
+    }
 };
 
 class Statement {
@@ -105,6 +113,11 @@ class Statement {
         if (rc != SQLITE_DONE) Throw("step", rc);
     }
 
+    void Reset() {
+        Check(sqlite3_reset(stmt_), "reset");
+        Check(sqlite3_clear_bindings(stmt_), "clear bindings");
+    }
+
     sqlite3_int64 Int64(int column) const { return sqlite3_column_int64(stmt_, column); }
     int Int(int column) const { return sqlite3_column_int(stmt_, column); }
     int Type(int column) const { return sqlite3_column_type(stmt_, column); }
@@ -134,32 +147,6 @@ class Statement {
 
     sqlite3 *db_ = nullptr;
     sqlite3_stmt *stmt_ = nullptr;
-};
-
-class ReadOnlyBlob {
-  public:
-    ReadOnlyBlob(sqlite3 *db, sqlite3_int64 rowid) {
-        const int rc = sqlite3_blob_open(db, "main", "_vexfs_file_versions", "content",
-                                         rowid, 0, &blob_);
-        if (rc != SQLITE_OK) throw SqlError("cannot open version BLOB", rc);
-    }
-
-    ~ReadOnlyBlob() {
-        if (blob_ != nullptr) sqlite3_blob_close(blob_);
-    }
-
-    int size() const { return sqlite3_blob_bytes(blob_); }
-
-    void Read(void *output, int bytes, int offset) {
-        const int rc = sqlite3_blob_read(blob_, output, bytes, offset);
-        if (rc != SQLITE_OK) throw SqlError("cannot read version BLOB", rc);
-    }
-
-    ReadOnlyBlob(const ReadOnlyBlob &) = delete;
-    ReadOnlyBlob &operator=(const ReadOnlyBlob &) = delete;
-
-  private:
-    sqlite3_blob *blob_ = nullptr;
 };
 
 void Exec(sqlite3 *db, const char *sql) {
@@ -418,22 +405,44 @@ GrepIndexState GetGrepIndexState(sqlite3 *db) {
     return found == g_grep_index_connections.end() ? GrepIndexState::kDisabled : found->second;
 }
 
+std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_id,
+                                              sqlite3_int64 version);
+
 void RebuildGrepIndex(sqlite3 *db) {
     Savepoint savepoint(db, "vexfs_grep_index_rebuild");
-    Exec(db, R"SQL(
-DELETE FROM _vexfs_content_fts;
-INSERT INTO _vexfs_content_fts(rowid,workspace_id,inode_id,version_no,content)
-SELECT inode.id,inode.workspace_id,inode.id,inode.current_version,
-       CAST(CASE WHEN version.source_version_no IS NULL
-                 THEN version.content ELSE source.content END AS TEXT)
-FROM _vexfs_inodes inode
-JOIN _vexfs_file_versions version
-  ON version.inode_id=inode.id AND version.version_no=inode.current_version
-LEFT JOIN _vexfs_file_versions source
-  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
-WHERE inode.kind='file' AND inode.deleted_at IS NULL;
-INSERT OR REPLACE INTO _vexfs_meta(key,value) VALUES('grep_index_dirty','0');
+    Exec(db, "DELETE FROM _vexfs_content_fts");
+    struct IndexedFile {
+        sqlite3_int64 inode_id;
+        sqlite3_int64 workspace_id;
+        sqlite3_int64 version;
+    };
+    std::vector<IndexedFile> files;
+    {
+        Statement rows(db, R"SQL(
+SELECT id,workspace_id,current_version FROM _vexfs_inodes
+WHERE kind='file' AND deleted_at IS NULL
 )SQL");
+        while (rows.Row()) {
+            files.push_back({rows.Int64(0), rows.Int64(1), rows.Int64(2)});
+        }
+    }
+    Statement insert(db, R"SQL(
+INSERT INTO _vexfs_content_fts(rowid,workspace_id,inode_id,version_no,content)
+VALUES(?1,?2,?1,?3,?4)
+)SQL");
+    for (const IndexedFile &file : files) {
+        const std::vector<unsigned char> content =
+            ReadVersionContent(db, file.inode_id, file.version);
+        insert.BindInt64(1, file.inode_id);
+        insert.BindInt64(2, file.workspace_id);
+        insert.BindInt64(3, file.version);
+        insert.BindText(4, content.empty() ? std::string() :
+            std::string(reinterpret_cast<const char *>(content.data()), content.size()));
+        insert.Done();
+        insert.Reset();
+    }
+    Exec(db, "INSERT OR REPLACE INTO _vexfs_meta(key,value) "
+             "VALUES('grep_index_dirty','0')");
     savepoint.Release();
 }
 
@@ -526,9 +535,21 @@ CREATE TABLE IF NOT EXISTS _vexfs_meta(
 CREATE TABLE IF NOT EXISTS _vexfs_workspaces(
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
+    state TEXT NOT NULL DEFAULT 'active' CHECK(state IN ('active','importing')),
     root_inode INTEGER,
     head_commit INTEGER,
     history_floor_commit INTEGER,
+    retention_keep_versions INTEGER NOT NULL DEFAULT 32
+        CHECK(retention_keep_versions >= 0),
+    retention_keep_days INTEGER NOT NULL DEFAULT 30
+        CHECK(retention_keep_days >= 0),
+    gc_paused INTEGER NOT NULL DEFAULT 0 CHECK(gc_paused IN (0,1)),
+    quota_max_bytes INTEGER CHECK(quota_max_bytes IS NULL OR quota_max_bytes >= 0),
+    quota_max_files INTEGER CHECK(quota_max_files IS NULL OR quota_max_files >= 0),
+    quota_max_file_bytes INTEGER
+        CHECK(quota_max_file_bytes IS NULL OR quota_max_file_bytes >= 0),
+    live_files INTEGER NOT NULL DEFAULT 0 CHECK(live_files >= 0),
+    live_bytes INTEGER NOT NULL DEFAULT 0 CHECK(live_bytes >= 0),
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
 CREATE TABLE IF NOT EXISTS _vexfs_inodes(
@@ -549,6 +570,35 @@ CREATE TABLE IF NOT EXISTS _vexfs_inodes(
 );
 CREATE INDEX IF NOT EXISTS _vexfs_inodes_workspace_idx
     ON _vexfs_inodes(workspace_id, id);
+CREATE TRIGGER IF NOT EXISTS _vexfs_quota_inode_insert
+AFTER INSERT ON _vexfs_inodes
+WHEN NEW.kind<>'directory' AND NEW.deleted_at IS NULL BEGIN
+    UPDATE _vexfs_workspaces
+    SET live_files=live_files+1,live_bytes=live_bytes+NEW.size
+    WHERE id=NEW.workspace_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_quota_inode_update
+AFTER UPDATE ON _vexfs_inodes BEGIN
+    UPDATE _vexfs_workspaces
+    SET live_files=live_files-CASE WHEN OLD.kind<>'directory' AND OLD.deleted_at IS NULL
+                                  THEN 1 ELSE 0 END,
+        live_bytes=live_bytes-CASE WHEN OLD.kind<>'directory' AND OLD.deleted_at IS NULL
+                                  THEN OLD.size ELSE 0 END
+    WHERE id=OLD.workspace_id;
+    UPDATE _vexfs_workspaces
+    SET live_files=live_files+CASE WHEN NEW.kind<>'directory' AND NEW.deleted_at IS NULL
+                                  THEN 1 ELSE 0 END,
+        live_bytes=live_bytes+CASE WHEN NEW.kind<>'directory' AND NEW.deleted_at IS NULL
+                                  THEN NEW.size ELSE 0 END
+    WHERE id=NEW.workspace_id;
+END;
+CREATE TRIGGER IF NOT EXISTS _vexfs_quota_inode_delete
+AFTER DELETE ON _vexfs_inodes
+WHEN OLD.kind<>'directory' AND OLD.deleted_at IS NULL BEGIN
+    UPDATE _vexfs_workspaces
+    SET live_files=live_files-1,live_bytes=live_bytes-OLD.size
+    WHERE id=OLD.workspace_id;
+END;
 CREATE TABLE IF NOT EXISTS _vexfs_dentries(
     workspace_id INTEGER NOT NULL,
     parent_inode INTEGER NOT NULL,
@@ -565,16 +615,46 @@ CREATE TABLE IF NOT EXISTS _vexfs_commits(
     message TEXT NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
+CREATE TABLE IF NOT EXISTS _vexfs_manifests(
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL,
+    file_size INTEGER NOT NULL CHECK(file_size >= 0),
+    chunk_size INTEGER NOT NULL CHECK(chunk_size = 65536),
+    chunk_count INTEGER NOT NULL CHECK(chunk_count >= 0),
+    checksum TEXT NOT NULL CHECK(length(checksum)=64),
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_chunks(
+    id INTEGER PRIMARY KEY,
+    workspace_id INTEGER NOT NULL,
+    inode_id INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    size INTEGER NOT NULL CHECK(size >= 0 AND size <= 65536),
+    checksum TEXT NOT NULL CHECK(length(checksum)=64),
+    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+);
+CREATE TABLE IF NOT EXISTS _vexfs_manifest_chunks(
+    manifest_id INTEGER NOT NULL,
+    chunk_no INTEGER NOT NULL CHECK(chunk_no >= 0),
+    chunk_id INTEGER NOT NULL,
+    PRIMARY KEY(manifest_id, chunk_no)
+);
+CREATE INDEX IF NOT EXISTS _vexfs_chunks_manifest_idx
+    ON _vexfs_manifest_chunks(manifest_id, chunk_no);
+CREATE INDEX IF NOT EXISTS _vexfs_manifest_chunks_chunk_idx
+    ON _vexfs_manifest_chunks(chunk_id);
 CREATE TABLE IF NOT EXISTS _vexfs_file_versions(
     id INTEGER PRIMARY KEY,
     inode_id INTEGER NOT NULL,
     version_no INTEGER NOT NULL,
     commit_id INTEGER NOT NULL,
-    content BLOB NOT NULL,
+    manifest_id INTEGER,
     size INTEGER NOT NULL,
     checksum TEXT NOT NULL CHECK(length(checksum)=64),
     source_version_no INTEGER,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    CHECK((manifest_id IS NOT NULL AND source_version_no IS NULL) OR
+          (manifest_id IS NULL AND source_version_no IS NOT NULL)),
     UNIQUE(inode_id, version_no)
 );
 CREATE TABLE IF NOT EXISTS _vexfs_xattrs(
@@ -642,7 +722,8 @@ CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
-INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.7.0');
+INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.9.0');
+INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('content_model', 'chunked-v1');
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'split-v1');
 )SQL");
     CreateHistorySchema(db);
@@ -798,7 +879,7 @@ struct Workspace {
 Workspace FindWorkspace(sqlite3 *db, const std::string &name) {
     Statement statement(db,
         "SELECT id, root_inode, COALESCE(head_commit, 0) "
-        "FROM _vexfs_workspaces WHERE name = ?1");
+        "FROM _vexfs_workspaces WHERE name = ?1 AND state='active'");
     statement.BindText(1, name);
     if (!statement.Row()) throw SqlError("workspace not found: " + name, SQLITE_NOTFOUND);
     return {statement.Int64(0), statement.Int64(1), statement.Int64(2)};
@@ -819,25 +900,102 @@ struct Node {
     sqlite3_int64 changed_at = 0;
 };
 
+struct QuotaPolicy {
+    sqlite3_int64 max_bytes = -1;
+    sqlite3_int64 max_files = -1;
+    sqlite3_int64 max_file_bytes = -1;
+};
+
+struct QuotaStats {
+    sqlite3_int64 live_files = 0;
+    sqlite3_int64 live_bytes = 0;
+    sqlite3_int64 largest_file_bytes = 0;
+};
+
+QuotaPolicy ReadQuotaPolicy(sqlite3 *db, sqlite3_int64 workspace_id) {
+    Statement statement(db,
+        "SELECT quota_max_bytes,quota_max_files,quota_max_file_bytes "
+        "FROM _vexfs_workspaces WHERE id=?1");
+    statement.BindInt64(1, workspace_id);
+    if (!statement.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    return {
+        statement.Type(0) == SQLITE_NULL ? -1 : statement.Int64(0),
+        statement.Type(1) == SQLITE_NULL ? -1 : statement.Int64(1),
+        statement.Type(2) == SQLITE_NULL ? -1 : statement.Int64(2),
+    };
+}
+
+void CheckQuotaForNewInode(sqlite3 *db, sqlite3_int64 workspace_id,
+                           const char *kind) {
+    if (std::strcmp(kind, "directory") == 0) return;
+    Statement usage(db,
+        "SELECT quota_max_files,live_files FROM _vexfs_workspaces WHERE id=?1");
+    usage.BindInt64(1, workspace_id);
+    if (!usage.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    if (usage.Type(0) != SQLITE_NULL && usage.Int64(1) >= usage.Int64(0)) {
+        throw SqlError("workspace file quota exceeded", SQLITE_FULL);
+    }
+}
+
+void CheckQuotaForContentSize(sqlite3 *db, sqlite3_int64 workspace_id,
+                              sqlite3_int64 inode_id, sqlite3_int64 new_size) {
+    if (new_size < 0) throw SqlError("file size must be non-negative", SQLITE_RANGE);
+    const QuotaPolicy policy = ReadQuotaPolicy(db, workspace_id);
+    Statement usage(db, R"SQL(
+SELECT live_bytes,
+       COALESCE((SELECT size FROM _vexfs_inodes
+                 WHERE id=?2 AND workspace_id=?1 AND deleted_at IS NULL
+                   AND kind<>'directory'),0),
+       EXISTS(SELECT 1 FROM _vexfs_inodes
+              WHERE id=?2 AND workspace_id=?1 AND deleted_at IS NULL
+                AND kind<>'directory')
+FROM _vexfs_workspaces
+WHERE id=?1
+)SQL");
+    usage.BindInt64(1, workspace_id);
+    usage.BindInt64(2, inode_id);
+    if (!usage.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    const bool is_live = usage.Int(2) != 0;
+    const sqlite3_int64 old_size = is_live ? usage.Int64(1) : 0;
+
+    // Lowering a quota below current usage must not strand the workspace. Writes that
+    // shrink a file remain legal until usage is back under the configured limit.
+    if (policy.max_file_bytes >= 0 && new_size > policy.max_file_bytes &&
+        (!is_live || new_size >= old_size)) {
+        throw SqlError("maximum file size quota exceeded", SQLITE_FULL);
+    }
+    if (policy.max_bytes >= 0 && is_live && new_size >= old_size) {
+        const sqlite3_int64 unchanged_bytes = usage.Int64(0) - old_size;
+        if (new_size > policy.max_bytes ||
+            unchanged_bytes > policy.max_bytes - new_size) {
+            throw SqlError("workspace byte quota exceeded", SQLITE_FULL);
+        }
+    }
+}
+
 struct VersionStorage {
-    sqlite3_int64 rowid = 0;
+    sqlite3_int64 manifest_id = 0;
     sqlite3_int64 size = 0;
     sqlite3_int64 canonical_version = 0;
+    sqlite3_int64 chunk_count = 0;
     std::string checksum;
 };
 
 VersionStorage ResolveVersionStorage(sqlite3 *db, sqlite3_int64 inode_id,
                                      sqlite3_int64 version) {
     Statement statement(db, R"SQL(
-SELECT CASE WHEN v.source_version_no IS NULL THEN v.rowid ELSE source.rowid END,
+SELECT CASE WHEN v.source_version_no IS NULL THEN v.manifest_id ELSE source.manifest_id END,
        v.size,
        COALESCE(v.source_version_no,v.version_no),
-       CASE WHEN v.source_version_no IS NULL THEN v.size ELSE source.size END,
+       manifest.file_size,
        v.checksum,
-       CASE WHEN v.source_version_no IS NULL THEN v.checksum ELSE source.checksum END
+       CASE WHEN v.source_version_no IS NULL THEN v.checksum ELSE source.checksum END,
+       manifest.checksum,manifest.chunk_size,manifest.chunk_count
 FROM _vexfs_file_versions v
 LEFT JOIN _vexfs_file_versions source
   ON source.inode_id=v.inode_id AND source.version_no=v.source_version_no
+LEFT JOIN _vexfs_manifests manifest
+  ON manifest.id=CASE WHEN v.source_version_no IS NULL THEN v.manifest_id ELSE source.manifest_id END
 WHERE v.inode_id=?1 AND v.version_no=?2
 )SQL");
     statement.BindInt64(1, inode_id);
@@ -845,12 +1003,15 @@ WHERE v.inode_id=?1 AND v.version_no=?2
     if (!statement.Row()) {
         throw SqlError("file version not found: " + std::to_string(version), SQLITE_NOTFOUND);
     }
-    if (statement.Type(0) == SQLITE_NULL || statement.Int64(1) < 0 ||
-        statement.Int64(1) != statement.Int64(3) || statement.Text(4).size() != 64 ||
-        statement.Text(4) != statement.Text(5)) {
+    if (statement.Type(0) == SQLITE_NULL || statement.Int64(0) <= 0 ||
+        statement.Int64(1) < 0 || statement.Int64(1) != statement.Int64(3) ||
+        statement.Text(4).size() != 64 || statement.Text(4) != statement.Text(5) ||
+        statement.Text(4) != statement.Text(6) ||
+        statement.Int64(7) != kContentChunkBytes || statement.Int64(8) < 0) {
         throw SqlError("file version content reference is corrupt", SQLITE_CORRUPT);
     }
-    return {statement.Int64(0), statement.Int64(1), statement.Int64(2), statement.Text(4)};
+    return {statement.Int64(0), statement.Int64(1), statement.Int64(2),
+            statement.Int64(8), statement.Text(4)};
 }
 
 std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_id,
@@ -859,18 +1020,36 @@ std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_i
     if (storage.size > kMaxStagedBytes) {
         throw SqlError("file version is larger than 128 MiB", SQLITE_CORRUPT);
     }
-    ReadOnlyBlob blob(db, storage.rowid);
-    if (blob.size() != storage.size) {
-        throw SqlError("file version size does not match content", SQLITE_CORRUPT);
-    }
     std::vector<unsigned char> content(static_cast<size_t>(storage.size));
-    constexpr int kChunkSize = 64 * 1024;
-    for (sqlite3_int64 offset = 0; offset < storage.size; offset += kChunkSize) {
-        const int bytes = static_cast<int>(
-            std::min<sqlite3_int64>(kChunkSize, storage.size - offset));
-        blob.Read(content.data() + offset, bytes, static_cast<int>(offset));
+    Statement chunks(db, R"SQL(
+SELECT chunk_no,content,size,checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
+)SQL");
+    chunks.BindInt64(1, storage.manifest_id);
+    vexfs::Sha256 file_hash;
+    sqlite3_int64 offset = 0;
+    sqlite3_int64 expected_chunk = 0;
+    while (chunks.Row()) {
+        const std::vector<unsigned char> chunk = chunks.Blob(1);
+        const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
+            kContentChunkBytes, storage.size - offset);
+        if (chunks.Int64(0) != expected_chunk || expected_size <= 0 ||
+            chunks.Int64(2) != expected_size ||
+            static_cast<sqlite3_int64>(chunk.size()) != expected_size ||
+            chunks.Text(3).size() != 64 ||
+            vexfs::Sha256Hex(chunk.data(), chunk.size()) != chunks.Text(3)) {
+            throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
+        }
+        std::copy(chunk.begin(), chunk.end(), content.begin() + offset);
+        file_hash.Update(chunk.data(), chunk.size());
+        offset += expected_size;
+        ++expected_chunk;
     }
-    if (vexfs::Sha256Hex(content.data(), content.size()) != storage.checksum) {
+    if (offset != storage.size || expected_chunk != storage.chunk_count ||
+        expected_chunk != (storage.size + kContentChunkBytes - 1) / kContentChunkBytes ||
+        vexfs::Hex(file_hash.Finish()) != storage.checksum) {
         throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
     }
     return content;
@@ -1078,6 +1257,7 @@ sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::s
 }
 
 sqlite3_int64 CreateInode(sqlite3 *db, sqlite3_int64 workspace_id, const char *kind, int mode) {
+    CheckQuotaForNewInode(db, workspace_id, kind);
     Statement insert(db,
         "INSERT INTO _vexfs_inodes(workspace_id, kind, mode, owner_principal, uid, gid, current_version) "
         "VALUES(?1, ?2, ?3, 'local', ?4, ?5, ?6)");
@@ -1146,22 +1326,21 @@ void UpdateGrepIndexFromVersion(sqlite3 *db, sqlite3_int64 workspace_id,
     Statement remove(db, "DELETE FROM _vexfs_content_fts WHERE rowid=?1");
     remove.BindInt64(1, inode_id);
     remove.Done();
+    Statement live(db, "SELECT 1 FROM _vexfs_inodes WHERE id=?1 AND workspace_id=?2 "
+                       "AND kind='file' AND deleted_at IS NULL");
+    live.BindInt64(1, inode_id);
+    live.BindInt64(2, workspace_id);
+    if (!live.Row()) return;
+    const std::vector<unsigned char> content = ReadVersionContent(db, inode_id, version);
     Statement insert(db, R"SQL(
 INSERT INTO _vexfs_content_fts(rowid,workspace_id,inode_id,version_no,content)
-SELECT inode.id,inode.workspace_id,inode.id,version.version_no,
-       CAST(CASE WHEN version.source_version_no IS NULL
-                 THEN version.content ELSE source.content END AS TEXT)
-FROM _vexfs_inodes inode
-JOIN _vexfs_file_versions version
-  ON version.inode_id=inode.id AND version.version_no=?3
-LEFT JOIN _vexfs_file_versions source
-  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
-WHERE inode.id=?2 AND inode.workspace_id=?1 AND inode.kind='file'
-  AND inode.deleted_at IS NULL
+VALUES(?1,?2,?1,?3,?4)
 )SQL");
-    insert.BindInt64(1, workspace_id);
-    insert.BindInt64(2, inode_id);
+    insert.BindInt64(1, inode_id);
+    insert.BindInt64(2, workspace_id);
     insert.BindInt64(3, version);
+    insert.BindText(4, content.empty() ? std::string() :
+        std::string(reinterpret_cast<const char *>(content.data()), content.size()));
     insert.Done();
 }
 
@@ -1189,10 +1368,93 @@ WHERE rowid IN (
     remove.Done();
 }
 
+sqlite3_int64 StoreManifest(sqlite3 *db, sqlite3_int64 workspace_id,
+                            sqlite3_int64 inode_id,
+                            sqlite3_int64 previous_manifest,
+                            const std::vector<unsigned char> &content,
+                            const std::string &checksum) {
+    const sqlite3_int64 size = static_cast<sqlite3_int64>(content.size());
+    const sqlite3_int64 chunk_count =
+        (size + kContentChunkBytes - 1) / kContentChunkBytes;
+    Statement manifest(db, R"SQL(
+INSERT INTO _vexfs_manifests(workspace_id,file_size,chunk_size,chunk_count,checksum)
+VALUES(?1,?2,?3,?4,?5)
+)SQL");
+    manifest.BindInt64(1, workspace_id);
+    manifest.BindInt64(2, size);
+    manifest.BindInt64(3, kContentChunkBytes);
+    manifest.BindInt64(4, chunk_count);
+    manifest.BindText(5, checksum);
+    manifest.Done();
+    const sqlite3_int64 manifest_id = sqlite3_last_insert_rowid(db);
+
+    Statement previous(db, R"SQL(
+SELECT chunk.id,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 AND entry.chunk_no=?2 AND chunk.inode_id=?3
+)SQL");
+    Statement chunk(db, R"SQL(
+INSERT INTO _vexfs_chunks(workspace_id,inode_id,content,size,checksum)
+VALUES(?1,?2,?3,?4,?5)
+)SQL");
+    Statement entry(db, R"SQL(
+INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
+VALUES(?1,?2,?3)
+)SQL");
+    std::unordered_map<std::string, sqlite3_int64> new_chunks;
+    for (sqlite3_int64 chunk_no = 0, offset = 0; offset < size;
+         ++chunk_no, offset += kContentChunkBytes) {
+        const size_t bytes = static_cast<size_t>(std::min<sqlite3_int64>(
+            kContentChunkBytes, size - offset));
+        std::vector<unsigned char> data(
+            content.begin() + offset, content.begin() + offset + bytes);
+        const std::string chunk_checksum = vexfs::Sha256Hex(data.data(), data.size());
+        sqlite3_int64 chunk_id = 0;
+        if (previous_manifest > 0) {
+            previous.BindInt64(1, previous_manifest);
+            previous.BindInt64(2, chunk_no);
+            previous.BindInt64(3, inode_id);
+            if (previous.Row() && previous.Int64(2) == static_cast<sqlite3_int64>(bytes) &&
+                previous.Text(3) == chunk_checksum && previous.Blob(1) == data) {
+                chunk_id = previous.Int64(0);
+            }
+            previous.Reset();
+        }
+        const std::string reuse_key = std::to_string(bytes) + ":" + chunk_checksum;
+        if (chunk_id == 0) {
+            const auto reused = new_chunks.find(reuse_key);
+            if (reused != new_chunks.end()) chunk_id = reused->second;
+        }
+        if (chunk_id == 0) {
+            chunk.BindInt64(1, workspace_id);
+            chunk.BindInt64(2, inode_id);
+            chunk.BindBlob(3, data);
+            chunk.BindInt64(4, static_cast<sqlite3_int64>(bytes));
+            chunk.BindText(5, chunk_checksum);
+            chunk.Done();
+            chunk_id = sqlite3_last_insert_rowid(db);
+            new_chunks.emplace(reuse_key, chunk_id);
+            chunk.Reset();
+        }
+        entry.BindInt64(1, manifest_id);
+        entry.BindInt64(2, chunk_no);
+        entry.BindInt64(3, chunk_id);
+        entry.Done();
+        entry.Reset();
+    }
+    return manifest_id;
+}
+
 sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &node,
                            const std::vector<unsigned char> &content,
                            const std::string &message) {
     Savepoint savepoint(db, "vexfs_store_version");
+    AcquireWriteLock(db);
+    const sqlite3_int64 previous_manifest = node.version > 0
+        ? ResolveVersionStorage(db, node.id, node.version).manifest_id : 0;
+    CheckQuotaForContentSize(db, workspace.id, node.id,
+                             static_cast<sqlite3_int64>(content.size()));
     const sqlite3_int64 version = node.version + 1;
     Statement advance(db,
         "UPDATE _vexfs_inodes SET size=?1, current_version=?2, "
@@ -1210,14 +1472,16 @@ sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &
 
     const sqlite3_int64 commit = CreateCommit(db, workspace, message);
     const std::string checksum = vexfs::Sha256Hex(content.data(), content.size());
+    const sqlite3_int64 manifest_id = StoreManifest(
+        db, workspace.id, node.id, previous_manifest, content, checksum);
     Statement insert(db,
         "INSERT INTO _vexfs_file_versions"
-        "(inode_id,version_no,commit_id,content,size,checksum) "
+        "(inode_id,version_no,commit_id,manifest_id,size,checksum) "
         "VALUES(?1,?2,?3,?4,?5,?6)");
     insert.BindInt64(1, node.id);
     insert.BindInt64(2, version);
     insert.BindInt64(3, commit);
-    insert.BindBlob(4, content);
+    insert.BindInt64(4, manifest_id);
     insert.BindInt64(5, static_cast<sqlite3_int64>(content.size()));
     insert.BindText(6, checksum);
     insert.Done();
@@ -1232,6 +1496,7 @@ sqlite3_int64 StoreVersionFromVersion(sqlite3 *db, const Workspace &workspace, c
     Savepoint savepoint(db, "vexfs_restore_version");
     AcquireWriteLock(db);
     const VersionStorage source = ResolveVersionStorage(db, node.id, source_version);
+    CheckQuotaForContentSize(db, workspace.id, node.id, source.size);
     const sqlite3_int64 version = node.version + 1;
     Statement advance(db,
         "UPDATE _vexfs_inodes SET size=?1, current_version=?2, "
@@ -1249,8 +1514,8 @@ sqlite3_int64 StoreVersionFromVersion(sqlite3 *db, const Workspace &workspace, c
     const sqlite3_int64 commit = CreateCommit(db, workspace, message);
     Statement insert(db,
         "INSERT INTO _vexfs_file_versions"
-        "(inode_id,version_no,commit_id,content,size,checksum,source_version_no) "
-        "VALUES(?1,?2,?3,X'',?4,?5,?6)");
+        "(inode_id,version_no,commit_id,manifest_id,size,checksum,source_version_no) "
+        "VALUES(?1,?2,?3,NULL,?4,?5,?6)");
     insert.BindInt64(1, node.id);
     insert.BindInt64(2, version);
     insert.BindInt64(3, commit);
@@ -1677,6 +1942,167 @@ void CreateStaging(sqlite3 *db, const Handle &handle,
     }
 }
 
+void CreateStagingFromVersion(sqlite3 *db, const Handle &handle, const Node &node) {
+    if (node.version <= 0 || node.size == 0) {
+        CreateStaging(db, handle, {});
+        return;
+    }
+    const VersionStorage storage = ResolveVersionStorage(db, node.id, node.version);
+    if (storage.size != node.size) {
+        throw SqlError("current file size does not match manifest", SQLITE_CORRUPT);
+    }
+    sqlite3_int64 capacity = storage.size;
+    if (handle.writable && capacity < kInitialStagingCapacity) {
+        capacity = kInitialStagingCapacity;
+    }
+    Statement insert(db,
+        "INSERT INTO _vexfs_staging(handle_id,generation,content,logical_size,capacity) "
+        "VALUES(?1,?2,X'',?4,?3)");
+    insert.BindText(1, handle.id);
+    insert.BindInt64(2, handle.dirty_generation);
+    insert.BindInt64(3, capacity);
+    insert.BindInt64(4, storage.size);
+    insert.Done();
+    Statement data(db,
+        "INSERT INTO _vexfs_staging_data(handle_id,content) VALUES(?1,zeroblob(?2))");
+    data.BindText(1, handle.id);
+    data.BindInt64(2, capacity);
+    data.Done();
+    const StagingInfo staging = FindStaging(db, handle);
+    Statement chunks(db, R"SQL(
+SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
+)SQL");
+    chunks.BindInt64(1, storage.manifest_id);
+    vexfs::Sha256 file_hash;
+    sqlite3_int64 offset = 0;
+    sqlite3_int64 chunk_no = 0;
+    while (chunks.Row()) {
+        const std::vector<unsigned char> chunk = chunks.Blob(1);
+        const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
+            kContentChunkBytes, storage.size - offset);
+        if (chunks.Int64(0) != chunk_no || expected_size <= 0 ||
+            chunks.Int64(2) != expected_size ||
+            static_cast<sqlite3_int64>(chunk.size()) != expected_size ||
+            vexfs::Sha256Hex(chunk.data(), chunk.size()) != chunks.Text(3)) {
+            throw SqlError("current file manifest chunk is corrupt", SQLITE_CORRUPT);
+        }
+        WriteBlob(db, staging.rowid, offset, chunk.data(), expected_size);
+        file_hash.Update(chunk.data(), chunk.size());
+        offset += expected_size;
+        ++chunk_no;
+    }
+    if (offset != storage.size || chunk_no != storage.chunk_count ||
+        vexfs::Hex(file_hash.Finish()) != storage.checksum) {
+        throw SqlError("current file manifest checksum mismatch", SQLITE_CORRUPT);
+    }
+}
+
+sqlite3_int64 StoreManifestFromStaging(sqlite3 *db, sqlite3_int64 workspace_id,
+                                       sqlite3_int64 inode_id,
+                                       sqlite3_int64 previous_manifest,
+                                       const StagingInfo &staging,
+                                       std::string *checksum_out) {
+    if (staging.logical_size < 0 || staging.logical_size > staging.capacity ||
+        staging.logical_size > kMaxStagedBytes) {
+        throw SqlError("staging size is corrupt", SQLITE_CORRUPT);
+    }
+    sqlite3_blob *raw_blob = nullptr;
+    int rc = sqlite3_blob_open(db, "main", "_vexfs_staging_data", "content",
+                               staging.rowid, 0, &raw_blob);
+    if (rc != SQLITE_OK) throw SqlError("cannot open staging BLOB", rc);
+    std::unique_ptr<sqlite3_blob, BlobCloser> blob(raw_blob);
+    if (sqlite3_blob_bytes(blob.get()) != staging.capacity) {
+        throw SqlError("staging capacity does not match BLOB", SQLITE_CORRUPT);
+    }
+    std::vector<unsigned char> buffer(static_cast<size_t>(kContentChunkBytes));
+    std::vector<std::string> chunk_checksums;
+    vexfs::Sha256 file_hash;
+    for (sqlite3_int64 offset = 0; offset < staging.logical_size;
+         offset += kContentChunkBytes) {
+        const int bytes = static_cast<int>(std::min<sqlite3_int64>(
+            kContentChunkBytes, staging.logical_size - offset));
+        rc = sqlite3_blob_read(blob.get(), buffer.data(), bytes, static_cast<int>(offset));
+        if (rc != SQLITE_OK) throw SqlError("cannot read staging BLOB", rc);
+        file_hash.Update(buffer.data(), static_cast<size_t>(bytes));
+        chunk_checksums.push_back(vexfs::Sha256Hex(buffer.data(), static_cast<size_t>(bytes)));
+    }
+    const std::string checksum = vexfs::Hex(file_hash.Finish());
+    const sqlite3_int64 chunk_count = static_cast<sqlite3_int64>(chunk_checksums.size());
+    Statement manifest(db, R"SQL(
+INSERT INTO _vexfs_manifests(workspace_id,file_size,chunk_size,chunk_count,checksum)
+VALUES(?1,?2,?3,?4,?5)
+)SQL");
+    manifest.BindInt64(1, workspace_id);
+    manifest.BindInt64(2, staging.logical_size);
+    manifest.BindInt64(3, kContentChunkBytes);
+    manifest.BindInt64(4, chunk_count);
+    manifest.BindText(5, checksum);
+    manifest.Done();
+    const sqlite3_int64 manifest_id = sqlite3_last_insert_rowid(db);
+    Statement previous(db, R"SQL(
+SELECT chunk.id,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 AND entry.chunk_no=?2 AND chunk.inode_id=?3
+)SQL");
+    Statement chunk(db, R"SQL(
+INSERT INTO _vexfs_chunks(workspace_id,inode_id,content,size,checksum)
+VALUES(?1,?2,?3,?4,?5)
+)SQL");
+    Statement entry(db, R"SQL(
+INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
+VALUES(?1,?2,?3)
+)SQL");
+    std::unordered_map<std::string, sqlite3_int64> new_chunks;
+    for (sqlite3_int64 chunk_no = 0, offset = 0; chunk_no < chunk_count;
+         ++chunk_no, offset += kContentChunkBytes) {
+        const int bytes = static_cast<int>(std::min<sqlite3_int64>(
+            kContentChunkBytes, staging.logical_size - offset));
+        rc = sqlite3_blob_read(blob.get(), buffer.data(), bytes, static_cast<int>(offset));
+        if (rc != SQLITE_OK) throw SqlError("cannot reread staging BLOB", rc);
+        std::vector<unsigned char> content(buffer.begin(), buffer.begin() + bytes);
+        const std::string &chunk_checksum =
+            chunk_checksums[static_cast<size_t>(chunk_no)];
+        sqlite3_int64 chunk_id = 0;
+        if (previous_manifest > 0) {
+            previous.BindInt64(1, previous_manifest);
+            previous.BindInt64(2, chunk_no);
+            previous.BindInt64(3, inode_id);
+            if (previous.Row() && previous.Int64(2) == bytes &&
+                previous.Text(3) == chunk_checksum && previous.Blob(1) == content) {
+                chunk_id = previous.Int64(0);
+            }
+            previous.Reset();
+        }
+        const std::string reuse_key = std::to_string(bytes) + ":" + chunk_checksum;
+        if (chunk_id == 0) {
+            const auto reused = new_chunks.find(reuse_key);
+            if (reused != new_chunks.end()) chunk_id = reused->second;
+        }
+        if (chunk_id == 0) {
+            chunk.BindInt64(1, workspace_id);
+            chunk.BindInt64(2, inode_id);
+            chunk.BindBlob(3, content);
+            chunk.BindInt64(4, bytes);
+            chunk.BindText(5, chunk_checksum);
+            chunk.Done();
+            chunk_id = sqlite3_last_insert_rowid(db);
+            new_chunks.emplace(reuse_key, chunk_id);
+            chunk.Reset();
+        }
+        entry.BindInt64(1, manifest_id);
+        entry.BindInt64(2, chunk_no);
+        entry.BindInt64(3, chunk_id);
+        entry.Done();
+        entry.Reset();
+    }
+    *checksum_out = checksum;
+    return manifest_id;
+}
+
 sqlite3_int64 StageWrite(sqlite3 *db, const Handle &handle, sqlite3_int64 offset,
                          const std::vector<unsigned char> &patch) {
     if (patch.empty()) return handle.dirty_generation;
@@ -1730,18 +2156,6 @@ sqlite3_int64 TruncateStaging(sqlite3 *db, const Handle &handle, sqlite3_int64 s
     return generation;
 }
 
-std::vector<unsigned char> ReadStaging(sqlite3 *db, const Handle &handle,
-                                       sqlite3_int64 generation) {
-    Statement statement(db,
-        "SELECT substr(d.content,1,s.logical_size) FROM _vexfs_staging s "
-        "JOIN _vexfs_staging_data d ON d.handle_id=s.handle_id "
-        "WHERE s.handle_id=?1 AND s.generation=?2");
-    statement.BindText(1, handle.id);
-    statement.BindInt64(2, generation);
-    if (!statement.Row()) throw SqlError("staged generation is stale or missing", SQLITE_NOTFOUND);
-    return statement.Blob(0);
-}
-
 std::vector<unsigned char> ReadStagingRange(sqlite3 *db, const Handle &handle,
                                             sqlite3_int64 offset, sqlite3_int64 length) {
     Statement statement(db,
@@ -1775,7 +2189,55 @@ Node NodeById(sqlite3 *db, sqlite3_int64 id, bool include_deleted = false) {
     return {statement.Int64(0), statement.Text(1), statement.Int64(2),
             statement.Int64(3), statement.Int(4), statement.Text(5), statement.Int64(6),
             statement.Int64(7), statement.Int64(8), statement.Int64(9),
-            statement.Int64(10), statement.Int64(11)};
+             statement.Int64(10), statement.Int64(11)};
+}
+
+sqlite3_int64 StoreVersionFromStaging(sqlite3 *db, const Workspace &workspace,
+                                      const Node &node, const Handle &handle,
+                                      sqlite3_int64 generation,
+                                      const std::string &message) {
+    Savepoint savepoint(db, "vexfs_store_staged_version");
+    AcquireWriteLock(db);
+    const StagingInfo staging = FindStaging(db, handle);
+    if (staging.generation != generation) {
+        throw SqlError("staged generation is stale or missing", SQLITE_NOTFOUND);
+    }
+    const sqlite3_int64 previous_manifest = node.version > 0
+        ? ResolveVersionStorage(db, node.id, node.version).manifest_id : 0;
+    CheckQuotaForContentSize(db, workspace.id, node.id, staging.logical_size);
+    const sqlite3_int64 version = node.version + 1;
+    Statement advance(db,
+        "UPDATE _vexfs_inodes SET size=?1,current_version=?2,"
+        "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER),"
+        "changed_at=CAST(unixepoch('subsec')*1000 AS INTEGER) "
+        "WHERE id=?3 AND current_version=?4");
+    advance.BindInt64(1, staging.logical_size);
+    advance.BindInt64(2, version);
+    advance.BindInt64(3, node.id);
+    advance.BindInt64(4, node.version);
+    advance.Done();
+    if (sqlite3_changes64(db) != 1) {
+        throw SqlError("version conflict: file changed before publish", SQLITE_CONSTRAINT);
+    }
+    const sqlite3_int64 commit = CreateCommit(db, workspace, message);
+    std::string checksum;
+    const sqlite3_int64 manifest_id = StoreManifestFromStaging(
+        db, workspace.id, node.id, previous_manifest, staging, &checksum);
+    Statement insert(db, R"SQL(
+INSERT INTO _vexfs_file_versions(
+ inode_id,version_no,commit_id,manifest_id,size,checksum)
+VALUES(?1,?2,?3,?4,?5,?6)
+)SQL");
+    insert.BindInt64(1, node.id);
+    insert.BindInt64(2, version);
+    insert.BindInt64(3, commit);
+    insert.BindInt64(4, manifest_id);
+    insert.BindInt64(5, staging.logical_size);
+    insert.BindText(6, checksum);
+    insert.Done();
+    UpdateGrepIndexFromVersion(db, workspace.id, node.id, version);
+    savepoint.Release();
+    return version;
 }
 
 sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation) {
@@ -1791,10 +2253,10 @@ sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation
     if (node.version != handle.expected_version) {
         throw SqlError("write conflict: file changed after handle_open", SQLITE_CONSTRAINT);
     }
-    const std::vector<unsigned char> content = ReadStaging(db, handle, generation);
     Workspace workspace = WorkspaceById(db, handle.workspace_id);
     Savepoint savepoint(db, "vexfs_publish_handle");
-    const sqlite3_int64 version = StoreVersion(db, workspace, node, content, "handle publish");
+    const sqlite3_int64 version = StoreVersionFromStaging(
+        db, workspace, node, handle, generation, "handle publish");
 
     Statement update(db,
         "UPDATE _vexfs_handles SET expected_version = ?1, published_generation = ?2, "
@@ -2110,14 +2572,10 @@ WITH RECURSIVE tree(inode_id,path,kind,current_version,size) AS (
   JOIN _vexfs_inodes child ON child.id=d.inode_id AND child.deleted_at IS NULL
   WHERE tree.kind='directory'
 )
-SELECT tree.path,tree.inode_id,tree.current_version,tree.size,
-       CASE WHEN version.source_version_no IS NULL THEN version.content ELSE source.content END,
-       version.checksum
+SELECT tree.path,tree.inode_id,tree.current_version,tree.size,version.checksum
 FROM tree
 JOIN _vexfs_file_versions version
   ON version.inode_id=tree.inode_id AND version.version_no=tree.current_version
-LEFT JOIN _vexfs_file_versions source
-  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
 WHERE tree.kind='file'
 )SQL";
         constexpr const char *indexed_query = R"SQL(
@@ -2138,15 +2596,11 @@ ancestors(inode_id,parent_inode,path,depth) AS (
 paths(inode_id,path) AS MATERIALIZED (
   SELECT inode_id,'/'||path FROM ancestors WHERE parent_inode=?3
 )
-SELECT paths.path,inode.id,inode.current_version,inode.size,
-       CASE WHEN version.source_version_no IS NULL THEN version.content ELSE source.content END,
-       version.checksum
+SELECT paths.path,inode.id,inode.current_version,inode.size,version.checksum
 FROM paths
 JOIN _vexfs_inodes inode ON inode.id=paths.inode_id AND inode.deleted_at IS NULL
 JOIN _vexfs_file_versions version
   ON version.inode_id=inode.id AND version.version_no=inode.current_version
-LEFT JOIN _vexfs_file_versions source
-  ON source.inode_id=version.inode_id AND source.version_no=version.source_version_no
 WHERE inode.kind='file' AND
       (?2='/' OR paths.path=?2 OR substr(paths.path,1,length(?2)+1)=?2||'/')
 )SQL";
@@ -2174,16 +2628,16 @@ WHERE inode.kind='file' AND
         while (files.Row()) {
             ++files_scanned;
             const sqlite3_int64 expected_size = files.Int64(3);
-            if (expected_size < 0 || expected_size > kMaxStagedBytes ||
-                files.Type(4) == SQLITE_NULL) {
+            if (expected_size < 0 || expected_size > kMaxStagedBytes) {
                 throw SqlError("current file content reference is corrupt", SQLITE_CORRUPT);
             }
-            const std::vector<unsigned char> content = files.Blob(4);
+            const std::vector<unsigned char> content =
+                ReadVersionContent(db, files.Int64(1), files.Int64(2));
             if (static_cast<sqlite3_int64>(content.size()) != expected_size) {
                 throw SqlError("current file size does not match content", SQLITE_CORRUPT);
             }
-            if (!IsSha256(files.Text(5)) ||
-                vexfs::Sha256Hex(content.data(), content.size()) != files.Text(5)) {
+            if (!IsSha256(files.Text(4)) ||
+                vexfs::Sha256Hex(content.data(), content.size()) != files.Text(4)) {
                 throw SqlError("current file checksum does not match content", SQLITE_CORRUPT);
             }
             bytes_scanned += expected_size;
@@ -2348,37 +2802,68 @@ void CompareVersionsFunction(sqlite3_context *context, int, sqlite3_value **valu
         const sqlite3_int64 to_version = RequiredPositiveInteger(values[3], "to version");
         const VersionStorage from = ResolveVersionStorage(db, node.id, from_version);
         const VersionStorage to = ResolveVersionStorage(db, node.id, to_version);
-        ReadOnlyBlob from_blob(db, from.rowid);
-        ReadOnlyBlob to_blob(db, to.rowid);
-        if (from_blob.size() != from.size || to_blob.size() != to.size) {
-            throw SqlError("file version size does not match content", SQLITE_CORRUPT);
-        }
-        std::array<unsigned char, 64 * 1024> from_chunk{};
-        std::array<unsigned char, 64 * 1024> to_chunk{};
+        Statement from_rows(db, R"SQL(
+SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
+)SQL");
+        Statement to_rows(db, R"SQL(
+SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
+)SQL");
+        from_rows.BindInt64(1, from.manifest_id);
+        to_rows.BindInt64(1, to.manifest_id);
         vexfs::Sha256 from_hash;
         vexfs::Sha256 to_hash;
         bool changed = from.size != to.size;
         bool binary = false;
-        const sqlite3_int64 maximum = std::max(from.size, to.size);
-        for (sqlite3_int64 offset = 0; offset < maximum; offset += from_chunk.size()) {
-            const int from_bytes = static_cast<int>(std::min<sqlite3_int64>(
-                from_chunk.size(), std::max<sqlite3_int64>(0, from.size - offset)));
-            const int to_bytes = static_cast<int>(std::min<sqlite3_int64>(
-                to_chunk.size(), std::max<sqlite3_int64>(0, to.size - offset)));
-            if (from_bytes > 0) from_blob.Read(from_chunk.data(), from_bytes, static_cast<int>(offset));
-            if (to_bytes > 0) to_blob.Read(to_chunk.data(), to_bytes, static_cast<int>(offset));
-            from_hash.Update(from_chunk.data(), static_cast<size_t>(from_bytes));
-            to_hash.Update(to_chunk.data(), static_cast<size_t>(to_bytes));
+        sqlite3_int64 chunk_no = 0;
+        sqlite3_int64 from_chunks = 0;
+        sqlite3_int64 to_chunks = 0;
+        sqlite3_int64 from_bytes_total = 0;
+        sqlite3_int64 to_bytes_total = 0;
+        while (true) {
+            const bool has_from = from_rows.Row();
+            const bool has_to = to_rows.Row();
+            if (!has_from && !has_to) break;
+            std::vector<unsigned char> from_chunk;
+            std::vector<unsigned char> to_chunk;
+            if (has_from) {
+                from_chunk = from_rows.Blob(1);
+                if (from_rows.Int64(0) != chunk_no ||
+                    from_rows.Int64(2) != static_cast<sqlite3_int64>(from_chunk.size()) ||
+                    from_chunk.empty() || from_chunk.size() > kContentChunkBytes ||
+                    vexfs::Sha256Hex(from_chunk.data(), from_chunk.size()) != from_rows.Text(3)) {
+                    throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
+                }
+                from_hash.Update(from_chunk.data(), from_chunk.size());
+                from_bytes_total += static_cast<sqlite3_int64>(from_chunk.size());
+                ++from_chunks;
+            }
+            if (has_to) {
+                to_chunk = to_rows.Blob(1);
+                if (to_rows.Int64(0) != chunk_no ||
+                    to_rows.Int64(2) != static_cast<sqlite3_int64>(to_chunk.size()) ||
+                    to_chunk.empty() || to_chunk.size() > kContentChunkBytes ||
+                    vexfs::Sha256Hex(to_chunk.data(), to_chunk.size()) != to_rows.Text(3)) {
+                    throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
+                }
+                to_hash.Update(to_chunk.data(), to_chunk.size());
+                to_bytes_total += static_cast<sqlite3_int64>(to_chunk.size());
+                ++to_chunks;
+            }
             binary = binary ||
-                std::find(from_chunk.begin(), from_chunk.begin() + from_bytes, 0) !=
-                    from_chunk.begin() + from_bytes ||
-                std::find(to_chunk.begin(), to_chunk.begin() + to_bytes, 0) !=
-                    to_chunk.begin() + to_bytes;
-            if (!changed && (from_bytes != to_bytes ||
-                !std::equal(from_chunk.begin(), from_chunk.begin() + from_bytes,
-                            to_chunk.begin()))) changed = true;
+                std::find(from_chunk.begin(), from_chunk.end(), 0) != from_chunk.end() ||
+                std::find(to_chunk.begin(), to_chunk.end(), 0) != to_chunk.end();
+            if (!changed && from_chunk != to_chunk) changed = true;
+            ++chunk_no;
         }
-        if (vexfs::Hex(from_hash.Finish()) != from.checksum ||
+        if (from_bytes_total != from.size || to_bytes_total != to.size ||
+            from_chunks != from.chunk_count || to_chunks != to.chunk_count ||
+            vexfs::Hex(from_hash.Finish()) != from.checksum ||
             vexfs::Hex(to_hash.Finish()) != to.checksum) {
             throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
         }
@@ -2464,6 +2949,8 @@ struct CheckReport {
     sqlite3_int64 inodes = 0;
     sqlite3_int64 dentries = 0;
     sqlite3_int64 versions = 0;
+    sqlite3_int64 manifests = 0;
+    sqlite3_int64 chunks = 0;
     sqlite3_int64 content_bytes = 0;
     sqlite3_int64 commits = 0;
     sqlite3_int64 snapshots = 0;
@@ -2489,18 +2976,37 @@ bool IsSha256(const std::string &value) {
     });
 }
 
-std::string HashVersionBlob(sqlite3 *db, sqlite3_int64 rowid, sqlite3_int64 expected_size) {
-    ReadOnlyBlob blob(db, rowid);
-    if (blob.size() != expected_size) {
-        throw SqlError("file version size does not match content", SQLITE_CORRUPT);
-    }
+std::string HashManifest(sqlite3 *db, sqlite3_int64 manifest_id,
+                         sqlite3_int64 expected_size,
+                         sqlite3_int64 expected_chunk_count) {
+    Statement rows(db, R"SQL(
+SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
+)SQL");
+    rows.BindInt64(1, manifest_id);
     vexfs::Sha256 hash;
-    std::array<unsigned char, 64 * 1024> chunk{};
-    for (sqlite3_int64 offset = 0; offset < expected_size; offset += chunk.size()) {
-        const int bytes = static_cast<int>(std::min<sqlite3_int64>(
-            static_cast<sqlite3_int64>(chunk.size()), expected_size - offset));
-        blob.Read(chunk.data(), bytes, static_cast<int>(offset));
-        hash.Update(chunk.data(), static_cast<size_t>(bytes));
+    sqlite3_int64 chunk_no = 0;
+    sqlite3_int64 total = 0;
+    while (rows.Row()) {
+        const std::vector<unsigned char> content = rows.Blob(1);
+        const sqlite3_int64 expected_chunk_size = std::min<sqlite3_int64>(
+            kContentChunkBytes, expected_size - total);
+        if (rows.Int64(0) != chunk_no || expected_chunk_size <= 0 ||
+            rows.Int64(2) != expected_chunk_size ||
+            static_cast<sqlite3_int64>(content.size()) != expected_chunk_size ||
+            !IsSha256(rows.Text(3)) ||
+            vexfs::Sha256Hex(content.data(), content.size()) != rows.Text(3)) {
+            throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
+        }
+        hash.Update(content.data(), content.size());
+        total += expected_chunk_size;
+        ++chunk_no;
+    }
+    if (total != expected_size || chunk_no != expected_chunk_count ||
+        chunk_no != (expected_size + kContentChunkBytes - 1) / kContentChunkBytes) {
+        throw SqlError("file manifest chunk count or size is corrupt", SQLITE_CORRUPT);
     }
     return vexfs::Hex(hash.Finish());
 }
@@ -2522,10 +3028,12 @@ std::string CheckReportJson(const CheckReport &report, const std::string &worksp
     return "{\"ok\":" + std::string(report.total_issues == 0 ? "true" : "false") +
         ",\"workspace\":\"" + JsonEscape(workspace) +
         "\",\"mode\":\"" + (deep ? "deep" : "quick") +
-        "\",\"content_model\":\"full-blob-v1\",\"checked\":{" +
+        "\",\"content_model\":\"chunked-v1\",\"checked\":{" +
         "\"inodes\":" + std::to_string(report.inodes) +
         ",\"dentries\":" + std::to_string(report.dentries) +
         ",\"versions\":" + std::to_string(report.versions) +
+        ",\"manifests\":" + std::to_string(report.manifests) +
+        ",\"chunks\":" + std::to_string(report.chunks) +
         ",\"content_bytes\":" + std::to_string(report.content_bytes) +
         ",\"commits\":" + std::to_string(report.commits) +
         ",\"snapshots\":" + std::to_string(report.snapshots) +
@@ -2638,6 +3146,25 @@ void CheckFunction(sqlite3_context *context, int, sqlite3_value **values) {
                                          rows.Int(4) != 0};
             }
         }
+        {
+            sqlite3_int64 actual_files = 0;
+            sqlite3_int64 actual_bytes = 0;
+            for (const auto &entry : inodes) {
+                if (!entry.second.deleted && entry.second.kind != "directory") {
+                    ++actual_files;
+                    actual_bytes += entry.second.size;
+                }
+            }
+            Statement stored(db,
+                "SELECT live_files,live_bytes FROM _vexfs_workspaces WHERE id=?1");
+            stored.BindInt64(1, workspace.id);
+            if (!stored.Row() || stored.Int64(0) != actual_files ||
+                stored.Int64(1) != actual_bytes) {
+                report.Add("VEXFS_QUOTA_USAGE_MISMATCH", "workspace:" + workspace_name,
+                           "quota", "stored live usage counters do not match active inodes",
+                           "restore a verified backup or rebuild quota counters offline");
+            }
+        }
         const auto root = inodes.find(workspace.root_inode);
         if (root == inodes.end() || root->second.deleted || root->second.kind != "directory") {
             report.Add("VEXFS_ROOT_INVALID", "inode:" + std::to_string(workspace.root_inode),
@@ -2716,28 +3243,51 @@ void CheckFunction(sqlite3_context *context, int, sqlite3_value **values) {
         }
 
         struct VersionCheck {
-            sqlite3_int64 rowid = 0;
+            sqlite3_int64 id = 0;
+            sqlite3_int64 manifest = 0;
             sqlite3_int64 commit = 0;
             sqlite3_int64 size = 0;
-            sqlite3_int64 content_size = 0;
             sqlite3_int64 source = 0;
+            sqlite3_int64 manifest_size = -1;
+            sqlite3_int64 chunk_size = -1;
+            sqlite3_int64 chunk_count = -1;
+            sqlite3_int64 actual_chunk_count = -1;
+            sqlite3_int64 actual_chunk_bytes = -1;
+            sqlite3_int64 minimum_chunk = -1;
+            sqlite3_int64 maximum_chunk = -1;
             std::string checksum;
+            std::string manifest_checksum;
         };
         std::map<std::pair<sqlite3_int64, sqlite3_int64>, VersionCheck> versions;
         {
             Statement rows(db, R"SQL(
-SELECT v.rowid,v.inode_id,v.version_no,v.commit_id,v.size,length(v.content),
-       COALESCE(v.source_version_no,0),v.checksum
+SELECT v.id,v.inode_id,v.version_no,v.commit_id,v.size,
+       COALESCE(v.source_version_no,0),v.checksum,COALESCE(v.manifest_id,0),
+       COALESCE(manifest.file_size,-1),COALESCE(manifest.chunk_size,-1),
+       COALESCE(manifest.chunk_count,-1),COALESCE(chunk_stats.actual_count,-1),
+       COALESCE(chunk_stats.actual_bytes,-1),COALESCE(chunk_stats.minimum_chunk,-1),
+       COALESCE(chunk_stats.maximum_chunk,-1),COALESCE(manifest.checksum,'')
 FROM _vexfs_file_versions v
 JOIN _vexfs_inodes i ON i.id=v.inode_id
+LEFT JOIN _vexfs_manifests manifest ON manifest.id=v.manifest_id
+LEFT JOIN (
+ SELECT entry.manifest_id,count(*) actual_count,COALESCE(sum(chunk.size),0) actual_bytes,
+        min(entry.chunk_no) minimum_chunk,max(entry.chunk_no) maximum_chunk
+ FROM _vexfs_manifest_chunks entry
+ JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+ GROUP BY entry.manifest_id
+) chunk_stats ON chunk_stats.manifest_id=manifest.id
 WHERE i.workspace_id=?1
 ORDER BY v.inode_id,v.version_no
 )SQL");
             rows.BindInt64(1, workspace.id);
             while (rows.Row()) {
                 ++report.versions;
-                VersionCheck version{rows.Int64(0), rows.Int64(3), rows.Int64(4),
-                                     rows.Int64(5), rows.Int64(6), rows.Text(7)};
+                VersionCheck version{rows.Int64(0), rows.Int64(7), rows.Int64(3),
+                                     rows.Int64(4), rows.Int64(5), rows.Int64(8),
+                                     rows.Int64(9), rows.Int64(10), rows.Int64(11),
+                                     rows.Int64(12), rows.Int64(13), rows.Int64(14),
+                                     rows.Text(6), rows.Text(15)};
                 versions[{rows.Int64(1), rows.Int64(2)}] = std::move(version);
             }
         }
@@ -2775,28 +3325,40 @@ ORDER BY v.inode_id,v.version_no
             }
             if (version.source == 0) {
                 report.content_bytes += std::max<sqlite3_int64>(version.size, 0);
-                if (version.content_size != version.size) {
-                    report.Add("VEXFS_CONTENT_SIZE_MISMATCH", object, "content",
-                               "stored BLOB length does not match version size",
+                const sqlite3_int64 expected_chunks = version.size < 0 ? -1 :
+                    (version.size + kContentChunkBytes - 1) / kContentChunkBytes;
+                if (version.manifest <= 0 || version.manifest_size != version.size ||
+                    version.chunk_size != kContentChunkBytes ||
+                    version.chunk_count != expected_chunks ||
+                    (expected_chunks == 0 && version.actual_chunk_count != -1) ||
+                    (expected_chunks > 0 &&
+                     (version.actual_chunk_count != expected_chunks ||
+                      version.actual_chunk_bytes != version.size ||
+                      version.minimum_chunk != 0 ||
+                      version.maximum_chunk != expected_chunks - 1)) ||
+                    version.manifest_checksum != version.checksum) {
+                    report.Add("VEXFS_MANIFEST_MISMATCH", object, "manifest",
+                               "manifest metadata does not match its canonical version",
                                "restore this file version from a verified snapshot or backup");
                 } else if (deep && IsSha256(version.checksum)) {
                     try {
-                        const std::string actual = HashVersionBlob(db, version.rowid, version.size);
+                        const std::string actual = HashManifest(
+                            db, version.manifest, version.size, version.chunk_count);
                         if (actual != version.checksum) {
                             report.Add("VEXFS_CHECKSUM_MISMATCH", object, "content",
-                                       "stored BLOB does not match its SHA-256",
+                                       "manifest chunks do not match the file SHA-256",
                                        "restore this file version from a verified snapshot or backup");
                         }
                     } catch (const SqlError &error) {
-                        report.Add("VEXFS_CONTENT_UNREADABLE", object, "content", error.what(),
+                        report.Add("VEXFS_CHUNK_INVALID", object, "chunk", error.what(),
                                    "restore this file version from a verified snapshot or backup");
                     }
                 }
             } else {
                 const auto source = versions.find({inode, version.source});
-                if (version.content_size != 0) {
-                    report.Add("VEXFS_ALIAS_HAS_CONTENT", object, "content",
-                               "version alias unexpectedly stores its own BLOB",
+                if (version.manifest != 0) {
+                    report.Add("VEXFS_ALIAS_HAS_MANIFEST", object, "manifest",
+                               "version alias unexpectedly stores its own manifest",
                                "restore version history from a verified backup");
                 }
                 if (source == versions.end() || source->second.source != 0) {
@@ -2809,6 +3371,76 @@ ORDER BY v.inode_id,v.version_no
                                "version alias metadata differs from its source",
                                "restore version history from a verified backup");
                 }
+            }
+        }
+        {
+            Statement rows(db,
+                "SELECT id FROM _vexfs_manifests WHERE workspace_id=?1");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) ++report.manifests;
+        }
+        {
+            Statement rows(db, R"SQL(
+SELECT id FROM _vexfs_chunks WHERE workspace_id=?1
+)SQL");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) ++report.chunks;
+        }
+        {
+            Statement rows(db, R"SQL(
+SELECT manifest.id FROM _vexfs_manifests manifest
+WHERE manifest.workspace_id=?1 AND NOT EXISTS(
+  SELECT 1 FROM _vexfs_file_versions version
+  WHERE version.manifest_id=manifest.id AND version.source_version_no IS NULL)
+)SQL");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                report.Add("VEXFS_MANIFEST_UNREFERENCED",
+                           "manifest:" + std::to_string(rows.Int64(0)), "manifest",
+                           "manifest is not referenced by a canonical file version",
+                           "restore from backup or remove the unreachable manifest offline");
+            }
+        }
+        {
+            Statement rows(db, R"SQL(
+SELECT version.id,manifest.id FROM _vexfs_file_versions version
+JOIN _vexfs_inodes inode ON inode.id=version.inode_id
+JOIN _vexfs_manifests manifest ON manifest.id=version.manifest_id
+WHERE inode.workspace_id=?1 AND manifest.workspace_id<>?1
+)SQL");
+            rows.BindInt64(1, workspace.id);
+            while (rows.Row()) {
+                report.Add("VEXFS_MANIFEST_WORKSPACE_MISMATCH",
+                           "version-row:" + std::to_string(rows.Int64(0)), "manifest",
+                           "file version references another workspace manifest",
+                           "restore this file version from a verified backup");
+            }
+        }
+        {
+            Statement rows(db, R"SQL(
+SELECT chunk.id FROM _vexfs_chunks chunk
+WHERE NOT EXISTS(SELECT 1 FROM _vexfs_manifest_chunks entry
+                 WHERE entry.chunk_id=chunk.id)
+)SQL");
+            while (rows.Row()) {
+                report.Add("VEXFS_CHUNK_UNREFERENCED",
+                           "chunk:" + std::to_string(rows.Int64(0)), "chunk",
+                           "chunk object is not referenced by any manifest",
+                           "restore content tables from a verified backup");
+            }
+        }
+        {
+            Statement rows(db, R"SQL(
+SELECT entry.rowid FROM _vexfs_manifest_chunks entry
+LEFT JOIN _vexfs_manifests manifest ON manifest.id=entry.manifest_id
+LEFT JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE manifest.id IS NULL OR chunk.id IS NULL
+)SQL");
+            while (rows.Row()) {
+                report.Add("VEXFS_MANIFEST_CHUNK_REFERENCE_INVALID",
+                           "manifest-chunk:" + std::to_string(rows.Int64(0)), "chunk",
+                           "manifest chunk entry references a missing object",
+                           "restore content tables from a verified backup");
             }
         }
         for (const auto &entry : inodes) {
@@ -3531,6 +4163,43 @@ struct SnapshotTreeNode {
 
 using SnapshotTree = std::map<std::string, SnapshotTreeNode>;
 
+QuotaStats SnapshotQuotaStats(const SnapshotTree &tree) {
+    QuotaStats result;
+    std::unordered_set<sqlite3_int64> counted;
+    for (const auto &[path, node] : tree) {
+        (void)path;
+        if (node.kind == "directory" || !counted.insert(node.inode).second) continue;
+        ++result.live_files;
+        if (node.size > std::numeric_limits<sqlite3_int64>::max() - result.live_bytes) {
+            throw SqlError("snapshot byte usage is too large", SQLITE_TOOBIG);
+        }
+        result.live_bytes += node.size;
+        result.largest_file_bytes = std::max(result.largest_file_bytes, node.size);
+    }
+    return result;
+}
+
+void CheckQuotaForSnapshotRestore(sqlite3 *db, const Workspace &workspace,
+                                  const SnapshotTree &current,
+                                  const SnapshotTree &target) {
+    const QuotaPolicy policy = ReadQuotaPolicy(db, workspace.id);
+    const QuotaStats before = SnapshotQuotaStats(current);
+    const QuotaStats after = SnapshotQuotaStats(target);
+    if (policy.max_files >= 0 && after.live_files > policy.max_files &&
+        after.live_files >= before.live_files) {
+        throw SqlError("snapshot exceeds workspace file quota", SQLITE_FULL);
+    }
+    if (policy.max_bytes >= 0 && after.live_bytes > policy.max_bytes &&
+        after.live_bytes >= before.live_bytes) {
+        throw SqlError("snapshot exceeds workspace byte quota", SQLITE_FULL);
+    }
+    if (policy.max_file_bytes >= 0 &&
+        after.largest_file_bytes > policy.max_file_bytes &&
+        after.largest_file_bytes >= before.largest_file_bytes) {
+        throw SqlError("snapshot exceeds maximum file size quota", SQLITE_FULL);
+    }
+}
+
 void ResolveSnapshotCanonicalVersions(sqlite3 *db, SnapshotTree &tree) {
     std::string requested = "[";
     bool first = true;
@@ -4050,6 +4719,506 @@ void SnapshotDropFunction(sqlite3_context *context, int, sqlite3_value **values)
     });
 }
 
+QuotaStats ReadQuotaStats(sqlite3 *db, sqlite3_int64 workspace_id) {
+    Statement statement(db, R"SQL(
+SELECT workspace.live_files,workspace.live_bytes,
+       COALESCE((SELECT max(size) FROM _vexfs_inodes
+                 WHERE workspace_id=?1 AND deleted_at IS NULL AND kind<>'directory'),0)
+FROM _vexfs_workspaces workspace WHERE workspace.id=?1
+)SQL");
+    statement.BindInt64(1, workspace_id);
+    statement.Row();
+    return {statement.Int64(0), statement.Int64(1), statement.Int64(2)};
+}
+
+std::string NullableQuotaJson(sqlite3_int64 value) {
+    return value < 0 ? "null" : std::to_string(value);
+}
+
+std::string QuotaJson(const std::string &workspace_name,
+                      const QuotaPolicy &policy, const QuotaStats &stats) {
+    const bool over_bytes = policy.max_bytes >= 0 && stats.live_bytes > policy.max_bytes;
+    const bool over_files = policy.max_files >= 0 && stats.live_files > policy.max_files;
+    const bool over_file_bytes = policy.max_file_bytes >= 0 &&
+        stats.largest_file_bytes > policy.max_file_bytes;
+    return "{\"workspace\":\"" + JsonEscape(workspace_name) +
+        "\",\"max_bytes\":" + NullableQuotaJson(policy.max_bytes) +
+        ",\"max_files\":" + NullableQuotaJson(policy.max_files) +
+        ",\"max_file_bytes\":" + NullableQuotaJson(policy.max_file_bytes) +
+        ",\"live_bytes\":" + std::to_string(stats.live_bytes) +
+        ",\"live_files\":" + std::to_string(stats.live_files) +
+        ",\"largest_file_bytes\":" + std::to_string(stats.largest_file_bytes) +
+        ",\"over_quota\":" +
+            ((over_bytes || over_files || over_file_bytes) ? "true" : "false") + "}";
+}
+
+sqlite3_int64 OptionalQuotaValue(sqlite3_value *value, const char *name) {
+    if (sqlite3_value_type(value) == SQLITE_NULL) return -1;
+    return RequiredNonnegativeInteger(value, name);
+}
+
+void QuotaGetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        const std::string json = QuotaJson(
+            workspace_name, ReadQuotaPolicy(db, workspace.id),
+            ReadQuotaStats(db, workspace.id));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void QuotaSetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const sqlite3_int64 max_bytes = OptionalQuotaValue(values[1], "max_bytes");
+        const sqlite3_int64 max_files = OptionalQuotaValue(values[2], "max_files");
+        const sqlite3_int64 max_file_bytes =
+            OptionalQuotaValue(values[3], "max_file_bytes");
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+
+        Savepoint savepoint(db, "vexfs_quota_set");
+        AcquireWriteLock(db);
+        Statement update(db, R"SQL(
+UPDATE _vexfs_workspaces
+SET quota_max_bytes=?1,quota_max_files=?2,quota_max_file_bytes=?3
+WHERE id=?4
+)SQL");
+        if (max_bytes < 0) update.BindNull(1); else update.BindInt64(1, max_bytes);
+        if (max_files < 0) update.BindNull(2); else update.BindInt64(2, max_files);
+        if (max_file_bytes < 0) update.BindNull(3);
+        else update.BindInt64(3, max_file_bytes);
+        update.BindInt64(4, workspace.id);
+        update.Done();
+        savepoint.Release();
+
+        const QuotaPolicy policy{max_bytes, max_files, max_file_bytes};
+        const std::string json = QuotaJson(
+            workspace_name, policy, ReadQuotaStats(db, workspace.id));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+struct RetentionPolicy {
+    sqlite3_int64 keep_versions = 0;
+    sqlite3_int64 keep_days = 0;
+    bool gc_paused = false;
+};
+
+struct RetentionStats {
+    sqlite3_int64 live_files = 0;
+    sqlite3_int64 live_bytes = 0;
+    sqlite3_int64 versions = 0;
+    sqlite3_int64 stored_version_bytes = 0;
+    sqlite3_int64 live_storage_bytes = 0;
+    sqlite3_int64 reclaimable_versions = 0;
+    sqlite3_int64 reclaimable_bytes = 0;
+};
+
+RetentionPolicy ReadRetentionPolicy(sqlite3 *db, const Workspace &workspace) {
+    Statement statement(db,
+        "SELECT retention_keep_versions,retention_keep_days,gc_paused "
+        "FROM _vexfs_workspaces WHERE id=?1");
+    statement.BindInt64(1, workspace.id);
+    if (!statement.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    return {statement.Int64(0), statement.Int64(1), statement.Int(2) != 0};
+}
+
+void PrepareRetentionKeepSet(sqlite3 *db, const Workspace &workspace,
+                             const RetentionPolicy &policy) {
+    Exec(db, R"SQL(
+CREATE TEMP TABLE IF NOT EXISTS _vexfs_gc_keep_versions(
+    inode_id INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    PRIMARY KEY(inode_id,version_no)
+);
+DELETE FROM _vexfs_gc_keep_versions;
+)SQL");
+
+    Statement current(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+SELECT id,current_version,'current'
+FROM _vexfs_inodes
+WHERE workspace_id=?1 AND deleted_at IS NULL AND kind<>'directory' AND current_version>0
+)SQL");
+    current.BindInt64(1, workspace.id);
+    current.Done();
+
+    Statement handles(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+SELECT inode_id,expected_version,'handle'
+FROM _vexfs_handles
+WHERE workspace_id=?1 AND state IN ('open','retained') AND expected_version>0
+)SQL");
+    handles.BindInt64(1, workspace.id);
+    handles.Done();
+
+    if (policy.keep_versions > 0) {
+        Statement recent(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+SELECT inode_id,version_no,'recent'
+FROM (
+  SELECT v.inode_id,v.version_no,
+         ROW_NUMBER() OVER(PARTITION BY v.inode_id ORDER BY v.version_no DESC) AS rank
+  FROM _vexfs_file_versions v
+  JOIN _vexfs_inodes i ON i.id=v.inode_id
+  WHERE i.workspace_id=?1
+)
+WHERE rank<=?2
+)SQL");
+        recent.BindInt64(1, workspace.id);
+        recent.BindInt64(2, policy.keep_versions);
+        recent.Done();
+    }
+
+    if (policy.keep_days > 0) {
+        Statement recent_days(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+SELECT v.inode_id,v.version_no,'age'
+FROM _vexfs_file_versions v
+JOIN _vexfs_inodes i ON i.id=v.inode_id
+WHERE i.workspace_id=?1
+  AND v.created_at>=CAST(unixepoch('subsec')*1000 AS INTEGER)-(?2*86400000)
+)SQL");
+        recent_days.BindInt64(1, workspace.id);
+        recent_days.BindInt64(2, policy.keep_days);
+        recent_days.Done();
+    }
+
+    // 快照恢复按每个 inode 在目标 commit 之前的最后一条完整状态重建。
+    // 先排名再过滤 deleted，避免把快照中已经删除的 inode 的更早版本误保留。
+    Statement snapshots(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+WITH ranked AS (
+  SELECT snapshot.id AS snapshot_id,state.inode_id,state.current_version,state.deleted_at,
+         ROW_NUMBER() OVER(
+           PARTITION BY snapshot.id,state.inode_id ORDER BY state.commit_id DESC) AS rank
+  FROM _vexfs_snapshots snapshot
+  JOIN _vexfs_inode_states state
+    ON state.workspace_id=snapshot.workspace_id AND state.commit_id<=snapshot.commit_id
+  WHERE snapshot.workspace_id=?1 AND state.kind<>'directory' AND state.current_version>0
+)
+SELECT inode_id,current_version,'snapshot'
+FROM ranked WHERE rank=1 AND deleted_at IS NULL
+)SQL");
+    snapshots.BindInt64(1, workspace.id);
+    snapshots.Done();
+
+    // restore 生成的版本是不可变内容的别名。任何被保留的别名都必须继续保留
+    // 它最终指向的 canonical manifest；循环也兼容未来出现多级别名的情况。
+    while (true) {
+        Statement sources(db, R"SQL(
+INSERT OR IGNORE INTO _vexfs_gc_keep_versions(inode_id,version_no,reason)
+SELECT version.inode_id,version.source_version_no,'source'
+FROM _vexfs_file_versions version
+JOIN _vexfs_gc_keep_versions kept
+  ON kept.inode_id=version.inode_id AND kept.version_no=version.version_no
+WHERE version.source_version_no IS NOT NULL
+)SQL");
+        sources.Done();
+        if (sqlite3_changes64(db) == 0) break;
+    }
+}
+
+RetentionStats ReadRetentionStats(sqlite3 *db, const Workspace &workspace) {
+    RetentionStats result;
+    {
+        Statement current(db,
+            "SELECT live_files,live_bytes FROM _vexfs_workspaces WHERE id=?1");
+        current.BindInt64(1, workspace.id);
+        current.Row();
+        result.live_files = current.Int64(0);
+        result.live_bytes = current.Int64(1);
+    }
+    {
+        Statement versions(db, R"SQL(
+SELECT (SELECT count(*) FROM _vexfs_file_versions v
+        JOIN _vexfs_inodes i ON i.id=v.inode_id WHERE i.workspace_id=?1),
+       COALESCE((SELECT sum(size) FROM _vexfs_chunks WHERE workspace_id=?1),0)
+)SQL");
+        versions.BindInt64(1, workspace.id);
+        versions.Row();
+        result.versions = versions.Int64(0);
+        result.stored_version_bytes = versions.Int64(1);
+    }
+    {
+        Statement live_storage(db, R"SQL(
+WITH live_manifests AS (
+  SELECT DISTINCT source.manifest_id
+  FROM _vexfs_inodes inode
+  JOIN _vexfs_file_versions current
+    ON current.inode_id=inode.id AND current.version_no=inode.current_version
+  JOIN _vexfs_file_versions source
+    ON source.inode_id=current.inode_id
+   AND source.version_no=COALESCE(current.source_version_no,current.version_no)
+  WHERE inode.workspace_id=?1 AND inode.deleted_at IS NULL AND inode.kind<>'directory'
+), live_chunks AS (
+  SELECT DISTINCT entry.chunk_id FROM live_manifests live
+  JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=live.manifest_id
+)
+SELECT COALESCE(sum(chunk.size),0)
+FROM live_chunks live JOIN _vexfs_chunks chunk ON chunk.id=live.chunk_id
+)SQL");
+        live_storage.BindInt64(1, workspace.id);
+        live_storage.Row();
+        result.live_storage_bytes = live_storage.Int64(0);
+    }
+    {
+        Statement reclaimable(db, R"SQL(
+WITH reclaimable_versions AS MATERIALIZED (
+ SELECT v.id,v.manifest_id
+ FROM _vexfs_file_versions v
+ JOIN _vexfs_inodes i ON i.id=v.inode_id
+ LEFT JOIN _vexfs_gc_keep_versions kept
+   ON kept.inode_id=v.inode_id AND kept.version_no=v.version_no
+ WHERE i.workspace_id=?1 AND kept.inode_id IS NULL
+), reclaimable_manifests AS MATERIALIZED (
+ SELECT manifest_id FROM reclaimable_versions WHERE manifest_id IS NOT NULL
+), reclaimable_chunks AS (
+ SELECT DISTINCT entry.chunk_id FROM _vexfs_manifest_chunks entry
+ JOIN reclaimable_manifests manifest ON manifest.manifest_id=entry.manifest_id
+ WHERE NOT EXISTS(
+  SELECT 1 FROM _vexfs_manifest_chunks retained
+  WHERE retained.chunk_id=entry.chunk_id
+    AND retained.manifest_id NOT IN (SELECT manifest_id FROM reclaimable_manifests))
+)
+SELECT (SELECT count(*) FROM reclaimable_versions),
+       COALESCE((SELECT sum(chunk.size) FROM reclaimable_chunks item
+                 JOIN _vexfs_chunks chunk ON chunk.id=item.chunk_id),0)
+)SQL");
+        reclaimable.BindInt64(1, workspace.id);
+        reclaimable.Row();
+        result.reclaimable_versions = reclaimable.Int64(0);
+        result.reclaimable_bytes = reclaimable.Int64(1);
+    }
+    return result;
+}
+
+std::string RetentionJson(const std::string &workspace_name,
+                          const RetentionPolicy &policy,
+                          const RetentionStats &stats) {
+    const sqlite3_int64 retained_history = std::max<sqlite3_int64>(
+        0, stats.stored_version_bytes - stats.live_storage_bytes);
+    return "{\"workspace\":\"" + JsonEscape(workspace_name) +
+        "\",\"keep_versions\":" + std::to_string(policy.keep_versions) +
+        ",\"keep_days\":" + std::to_string(policy.keep_days) +
+        ",\"gc_paused\":" + (policy.gc_paused ? "true" : "false") +
+        ",\"live_files\":" + std::to_string(stats.live_files) +
+        ",\"live_bytes\":" + std::to_string(stats.live_bytes) +
+        ",\"stored_versions\":" + std::to_string(stats.versions) +
+        ",\"stored_version_bytes\":" + std::to_string(stats.stored_version_bytes) +
+        ",\"retained_history_bytes\":" + std::to_string(retained_history) +
+        ",\"reclaimable_versions\":" + std::to_string(stats.reclaimable_versions) +
+        ",\"reclaimable_bytes\":" + std::to_string(stats.reclaimable_bytes) + "}";
+}
+
+void RetentionGetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        const RetentionPolicy policy = ReadRetentionPolicy(db, workspace);
+        PrepareRetentionKeepSet(db, workspace, policy);
+        const std::string json = RetentionJson(
+            workspace_name, policy, ReadRetentionStats(db, workspace));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void RetentionSetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const sqlite3_int64 keep_versions =
+            RequiredNonnegativeInteger(values[1], "keep_versions");
+        const sqlite3_int64 keep_days = RequiredNonnegativeInteger(values[2], "keep_days");
+        if (keep_versions > 1000000) {
+            throw SqlError("keep_versions must be at most 1000000", SQLITE_RANGE);
+        }
+        if (keep_days > 36500) {
+            throw SqlError("keep_days must be at most 36500", SQLITE_RANGE);
+        }
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        Statement update(db,
+            "UPDATE _vexfs_workspaces SET retention_keep_versions=?1,retention_keep_days=?2 "
+            "WHERE id=?3");
+        update.BindInt64(1, keep_versions);
+        update.BindInt64(2, keep_days);
+        update.BindInt64(3, workspace.id);
+        update.Done();
+        const RetentionPolicy policy = ReadRetentionPolicy(db, workspace);
+        PrepareRetentionKeepSet(db, workspace, policy);
+        const std::string json = RetentionJson(
+            workspace_name, policy, ReadRetentionStats(db, workspace));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void GcPauseFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        if (sqlite3_value_type(values[1]) != SQLITE_INTEGER ||
+            (sqlite3_value_int(values[1]) != 0 && sqlite3_value_int(values[1]) != 1)) {
+            throw SqlError("paused must be 0 or 1", SQLITE_MISMATCH);
+        }
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        Savepoint savepoint(db, "vexfs_gc_pause");
+        AcquireWriteLock(db);
+        Statement update(db,
+            "UPDATE _vexfs_workspaces SET gc_paused=?1 WHERE id=?2");
+        update.BindInt(1, sqlite3_value_int(values[1]));
+        update.BindInt64(2, workspace.id);
+        update.Done();
+        savepoint.Release();
+        const RetentionPolicy policy = ReadRetentionPolicy(db, workspace);
+        PrepareRetentionKeepSet(db, workspace, policy);
+        const std::string json = RetentionJson(
+            workspace_name, policy, ReadRetentionStats(db, workspace));
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void GcFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const sqlite3_int64 batch = RequiredPositiveInteger(values[1], "batch");
+        if (batch > 10000) throw SqlError("batch must be at most 10000", SQLITE_RANGE);
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+
+        Savepoint savepoint(db, "vexfs_gc");
+        AcquireWriteLock(db);
+        {
+            Statement mounted(db,
+                "SELECT 1 FROM _vexfs_mount_sessions WHERE workspace_id=?1 "
+                "AND lease_until>CAST(unixepoch('subsec')*1000 AS INTEGER) LIMIT 1");
+            mounted.BindInt64(1, workspace.id);
+            if (mounted.Row()) {
+                throw SqlError("workspace has an active mount session; unmount before GC",
+                               SQLITE_BUSY);
+            }
+        }
+        const RetentionPolicy policy = ReadRetentionPolicy(db, workspace);
+        if (policy.gc_paused) throw SqlError("workspace GC is paused", SQLITE_BUSY);
+        PrepareRetentionKeepSet(db, workspace, policy);
+
+        Exec(db, R"SQL(
+CREATE TEMP TABLE IF NOT EXISTS _vexfs_gc_delete_versions(
+    id INTEGER PRIMARY KEY,
+    inode_id INTEGER NOT NULL,
+    version_no INTEGER NOT NULL,
+    manifest_id INTEGER NOT NULL,
+    stored_bytes INTEGER NOT NULL
+);
+DELETE FROM _vexfs_gc_delete_versions;
+)SQL");
+        Statement candidates(db, R"SQL(
+INSERT INTO _vexfs_gc_delete_versions(id,inode_id,version_no,manifest_id,stored_bytes)
+SELECT version.id,version.inode_id,version.version_no,
+       COALESCE(version.manifest_id,0),COALESCE(manifest.file_size,0)
+FROM _vexfs_file_versions version
+JOIN _vexfs_inodes inode ON inode.id=version.inode_id
+LEFT JOIN _vexfs_manifests manifest ON manifest.id=version.manifest_id
+LEFT JOIN _vexfs_gc_keep_versions kept
+  ON kept.inode_id=version.inode_id AND kept.version_no=version.version_no
+WHERE inode.workspace_id=?1 AND kept.inode_id IS NULL
+  AND (version.source_version_no IS NOT NULL OR NOT EXISTS (
+    SELECT 1 FROM _vexfs_file_versions alias
+    WHERE alias.inode_id=version.inode_id
+      AND alias.source_version_no=version.version_no
+  ))
+ORDER BY version.source_version_no IS NULL,version.created_at,version.id
+LIMIT ?2
+)SQL");
+        candidates.BindInt64(1, workspace.id);
+        candidates.BindInt64(2, batch);
+        candidates.Done();
+
+        sqlite3_int64 deleted_versions = 0;
+        sqlite3_int64 reclaimed_bytes = 0;
+        {
+            Statement count(db,
+                "SELECT count(*) FROM _vexfs_gc_delete_versions");
+            count.Row();
+            deleted_versions = count.Int64(0);
+        }
+        {
+            Statement bytes(db, R"SQL(
+SELECT COALESCE(sum(chunk.size),0)
+FROM _vexfs_chunks chunk
+WHERE EXISTS(
+  SELECT 1 FROM _vexfs_manifest_chunks removed
+  JOIN _vexfs_gc_delete_versions candidate
+    ON candidate.manifest_id=removed.manifest_id
+  WHERE removed.chunk_id=chunk.id AND candidate.manifest_id<>0)
+AND NOT EXISTS(
+  SELECT 1 FROM _vexfs_manifest_chunks retained
+  WHERE retained.chunk_id=chunk.id AND retained.manifest_id NOT IN(
+    SELECT manifest_id FROM _vexfs_gc_delete_versions WHERE manifest_id<>0))
+)SQL");
+            bytes.Row();
+            reclaimed_bytes = bytes.Int64(0);
+        }
+        if (deleted_versions > 0) {
+            // 每条 inode state 都是完整状态。若它引用本批删除的版本，它既不是当前
+            // 状态，也不是任何快照的边界状态；对应版本已在 keep set 中排除证明。
+            Statement states(db, R"SQL(
+DELETE FROM _vexfs_inode_states
+WHERE workspace_id=?1 AND EXISTS (
+  SELECT 1 FROM _vexfs_gc_delete_versions removed
+  WHERE removed.inode_id=_vexfs_inode_states.inode_id
+    AND removed.version_no=_vexfs_inode_states.current_version
+)
+)SQL");
+            states.BindInt64(1, workspace.id);
+            states.Done();
+            Exec(db, R"SQL(
+DELETE FROM _vexfs_file_versions
+WHERE id IN (SELECT id FROM _vexfs_gc_delete_versions);
+DELETE FROM _vexfs_manifest_chunks
+WHERE manifest_id IN (
+  SELECT manifest_id FROM _vexfs_gc_delete_versions WHERE manifest_id<>0
+);
+DELETE FROM _vexfs_manifests
+WHERE id IN (
+  SELECT manifest_id FROM _vexfs_gc_delete_versions WHERE manifest_id<>0
+);
+DELETE FROM _vexfs_chunks
+WHERE workspace_id=(SELECT workspace_id FROM _vexfs_inodes
+                    WHERE id=(SELECT inode_id FROM _vexfs_gc_delete_versions LIMIT 1))
+  AND NOT EXISTS(SELECT 1 FROM _vexfs_manifest_chunks entry
+                 WHERE entry.chunk_id=_vexfs_chunks.id);
+)SQL");
+        }
+
+        PrepareRetentionKeepSet(db, workspace, policy);
+        const RetentionStats remaining = ReadRetentionStats(db, workspace);
+        const std::string json = "{\"workspace\":\"" + JsonEscape(workspace_name) +
+            "\",\"batch\":" + std::to_string(batch) +
+            ",\"deleted_versions\":" + std::to_string(deleted_versions) +
+            ",\"reclaimed_bytes\":" + std::to_string(reclaimed_bytes) +
+            ",\"remaining_versions\":" + std::to_string(remaining.versions) +
+            ",\"remaining_reclaimable_versions\":" +
+                std::to_string(remaining.reclaimable_versions) +
+            ",\"remaining_reclaimable_bytes\":" +
+                std::to_string(remaining.reclaimable_bytes) +
+            ",\"has_more\":" +
+                (remaining.reclaimable_versions == 0 ? "false" : "true") + "}";
+        savepoint.Release();
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
 void RestoreWorkspaceTree(sqlite3 *db, const Workspace &workspace, sqlite3_int64 commit) {
     Statement clear_acl(db,
         "DELETE FROM _vexfs_acl_entries WHERE workspace_id=?1");
@@ -4197,8 +5366,8 @@ WITH ranked AS MATERIALIZED (
   FROM _vexfs_inode_states s WHERE s.workspace_id=?1 AND s.commit_id<=?2),
 latest AS MATERIALIZED (SELECT * FROM ranked WHERE vexfs_rank=1)
 INSERT INTO _vexfs_file_versions(
- inode_id,version_no,commit_id,content,size,checksum,source_version_no)
-SELECT inode.id,inode.current_version,?3,X'',target.size,source.checksum,
+ inode_id,version_no,commit_id,manifest_id,size,checksum,source_version_no)
+SELECT inode.id,inode.current_version,?3,NULL,target.size,source.checksum,
        COALESCE(source.source_version_no,source.version_no)
 FROM _vexfs_inodes inode
 JOIN latest target ON target.inode_id=inode.id AND target.deleted_at IS NULL
@@ -4251,6 +5420,7 @@ void SnapshotRestoreFunction(sqlite3_context *context, int, sqlite3_value **valu
         if (SnapshotDiffJson(current, target) == "[]") {
             throw SqlError("snapshot already matches current workspace", SQLITE_MISMATCH);
         }
+        CheckQuotaForSnapshotRestore(db, workspace, current, target);
         RestoreWorkspaceTree(db, workspace, snapshot.commit);
         PrepareRestoredVersionAliases(db, workspace, snapshot.commit);
         const sqlite3_int64 commit = CreateCommit(db, workspace, "restore snapshot " + name);
@@ -4518,7 +5688,8 @@ void HandleOpenFunction(sqlite3_context *context, int argument_count, sqlite3_va
 
         Handle handle{handle_id, workspace.id, node.id, writable, node.version,
                       dirty_generation, 0, "open", owner_session};
-        CreateStaging(db, handle, truncate ? std::vector<unsigned char>() : ReadNode(db, node));
+        if (truncate) CreateStaging(db, handle, {});
+        else CreateStagingFromVersion(db, handle, node);
         StoreRequestText(db, request_id, "handle_open", fingerprint, handle_id);
         sqlite3_result_text(context, handle_id.data(), static_cast<int>(handle_id.size()), SQLITE_TRANSIENT);
     });
@@ -4550,6 +5721,10 @@ void HandleStageWriteFunction(sqlite3_context *context, int, sqlite3_value **val
         if (patch.size() > static_cast<size_t>(kMaxStagedBytes - offset)) {
             throw SqlError("staged file is larger than 128 MiB", SQLITE_TOOBIG);
         }
+        const StagingInfo staging = FindStaging(db, handle);
+        const sqlite3_int64 staged_size = std::max<sqlite3_int64>(
+            staging.logical_size, offset + static_cast<sqlite3_int64>(patch.size()));
+        CheckQuotaForContentSize(db, handle.workspace_id, handle.inode_id, staged_size);
         const sqlite3_int64 generation = StageWrite(db, handle, offset, patch);
         StoreRequestInteger(db, request_id, "handle_stage_write", fingerprint, generation);
         sqlite3_result_int64(context, generation);
@@ -4587,29 +5762,28 @@ void HandleAppendFunction(sqlite3_context *context, int, sqlite3_value **values)
             suffix.size() > static_cast<size_t>(kMaxStagedBytes - node.size)) {
             throw SqlError("file is larger than the Phase 0 limit (128 MiB)", SQLITE_TOOBIG);
         }
-        std::vector<unsigned char> content = ReadNode(db, node);
-        content.insert(content.end(), suffix.begin(), suffix.end());
-        const sqlite3_int64 version = StoreVersion(
-            db, workspace, node, content, "append handle");
-
-        StagingInfo staging = EnsureStagingCapacity(
-            db, handle, FindStaging(db, handle), static_cast<sqlite3_int64>(content.size()));
-        if (!content.empty()) {
-            WriteBlob(db, staging.rowid, 0, content.data(),
-                      static_cast<sqlite3_int64>(content.size()));
+        CheckQuotaForContentSize(
+            db, workspace.id, node.id,
+            node.size + static_cast<sqlite3_int64>(suffix.size()));
+        // O_APPEND is serialized against the current inode version, not the version
+        // that happened to be current when this handle was opened. Refresh this
+        // handle's clean staging view so concurrent appenders merge instead of
+        // reporting a normal write conflict.
+        {
+            Statement remove_data(db,
+                "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+            remove_data.BindText(1, handle.id);
+            remove_data.Done();
+            Statement remove_meta(db,
+                "DELETE FROM _vexfs_staging WHERE handle_id=?1");
+            remove_meta.BindText(1, handle.id);
+            remove_meta.Done();
         }
-        Statement stage(db,
-            "UPDATE _vexfs_staging SET logical_size=?1,"
-            "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE handle_id=?2");
-        stage.BindInt64(1, static_cast<sqlite3_int64>(content.size()));
-        stage.BindText(2, handle.id);
-        stage.Done();
-        Statement update(db,
-            "UPDATE _vexfs_handles SET expected_version=?1,"
-            "updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE id=?2");
-        update.BindInt64(1, version);
-        update.BindText(2, handle.id);
-        update.Done();
+        handle.expected_version = node.version;
+        CreateStagingFromVersion(db, handle, node);
+        const sqlite3_int64 generation = StageWrite(db, handle, node.size, suffix);
+        handle.dirty_generation = generation;
+        const sqlite3_int64 version = PublishHandle(db, handle, generation);
         StoreRequestInteger(db, request_id, "handle_append", fingerprint, version);
         savepoint.Release();
         sqlite3_result_int64(context, version);
@@ -4635,6 +5809,10 @@ void HandleTruncateFunction(sqlite3_context *context, int, sqlite3_value **value
         const Handle handle = FindHandle(db, handle_id);
         if (handle.state != "open") throw SqlError("handle is not open", SQLITE_NOTFOUND);
         if (!handle.writable) throw SqlError("handle is read-only", SQLITE_READONLY);
+        if (size < 0 || size > kMaxStagedBytes) {
+            throw SqlError("truncate size is out of range", SQLITE_RANGE);
+        }
+        CheckQuotaForContentSize(db, handle.workspace_id, handle.inode_id, size);
         const sqlite3_int64 generation = TruncateStaging(db, handle, size);
         StoreRequestInteger(db, request_id, "handle_truncate", fingerprint, generation);
         sqlite3_result_int64(context, generation);
@@ -5007,6 +6185,12 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_snapshot_diff", 3, SnapshotDiffFunction, SQLITE_UTF8},
         {"vexfs_snapshot_drop", 2, SnapshotDropFunction, SQLITE_UTF8},
         {"vexfs_snapshot_restore", 3, SnapshotRestoreFunction, SQLITE_UTF8},
+        {"vexfs_quota_get", 1, QuotaGetFunction, SQLITE_UTF8},
+        {"vexfs_quota_set", 4, QuotaSetFunction, SQLITE_UTF8},
+        {"vexfs_retention_get", 1, RetentionGetFunction, SQLITE_UTF8},
+        {"vexfs_retention_set", 3, RetentionSetFunction, SQLITE_UTF8},
+        {"vexfs_gc_pause", 2, GcPauseFunction, SQLITE_UTF8},
+        {"vexfs_gc", 2, GcFunction, SQLITE_UTF8},
         {"vexfs_move", 3, RenameFunction, SQLITE_UTF8},
         {"vexfs_rename", 4, RenameFunction, SQLITE_UTF8},
         {"vexfs_remove", 3, RemoveFunction, SQLITE_UTF8},

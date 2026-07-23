@@ -216,7 +216,7 @@ int main(int argc, char **argv) {
     vexfs_mount_bytes diagnostics{};
     if (vexfs_mount_diagnostics(session, &diagnostics, &error) != VEXFS_MOUNT_OK)
         return Fail("diagnostics", error);
-    if (!Contains(diagnostics, "\"schema_version\":\"0.7.0\"") ||
+    if (!Contains(diagnostics, "\"schema_version\":\"0.9.0\"") ||
         !Contains(diagnostics, "\"workspace_exists\":1"))
         return Fail("diagnostics content", error);
     vexfs_mount_free(diagnostics.data);
@@ -580,6 +580,71 @@ int main(int argc, char **argv) {
     if (vexfs_mount_read_file(session, "/agent/sync.txt", &content, &error) != VEXFS_MOUNT_OK ||
         !Equals(content, "ABC")) return Fail("persistent synchronized content", error);
     vexfs_mount_free(content.data);
+
+    vexfs_mount_bytes quota{};
+    if (vexfs_mount_quota_get(session, &quota, &error) != VEXFS_MOUNT_OK ||
+        !Contains(quota, "\"max_bytes\":null") ||
+        JsonInteger(quota, "live_files") <= 0)
+        return Fail("quota get", error);
+    vexfs_mount_free(quota.data);
+    quota = {};
+    if (vexfs_mount_quota_set(session, -1, -1, 3, &quota, &error) != VEXFS_MOUNT_OK ||
+        !Contains(quota, "\"max_file_bytes\":3"))
+        return Fail("quota set", error);
+    vexfs_mount_free(quota.data);
+    if (vexfs_mount_write_file(session, "/agent/versioned.txt", "four", 4,
+                               &version, &error) != VEXFS_MOUNT_NO_SPACE)
+        return Fail("quota must reject oversized publish", error);
+    content = {};
+    if (vexfs_mount_read_file(session, "/agent/versioned.txt", &content, &error) !=
+            VEXFS_MOUNT_OK || !Equals(content, "old"))
+        return Fail("quota rejection must be atomic", error);
+    vexfs_mount_free(content.data);
+    quota = {};
+    if (vexfs_mount_quota_set(session, -1, -1, -1, &quota, &error) != VEXFS_MOUNT_OK)
+        return Fail("quota reset", error);
+    vexfs_mount_free(quota.data);
+
+    if (vexfs_mount_write_file(session, "/agent/gc.txt", "one", 3,
+                               &version, &error) != VEXFS_MOUNT_OK ||
+        vexfs_mount_write_file(session, "/agent/gc.txt", "two", 3,
+                               &version, &error) != VEXFS_MOUNT_OK ||
+        vexfs_mount_write_file(session, "/agent/gc.txt", "three", 5,
+                               &version, &error) != VEXFS_MOUNT_OK)
+        return Fail("retention seed", error);
+    vexfs_mount_bytes retention{};
+    if (vexfs_mount_retention_set(session, 1, 0, &retention, &error) != VEXFS_MOUNT_OK ||
+        JsonInteger(retention, "reclaimable_versions") < 2)
+        return Fail("retention set", error);
+    vexfs_mount_free(retention.data);
+    retention = {};
+    if (vexfs_mount_gc_pause(session, 1, &retention, &error) != VEXFS_MOUNT_OK ||
+        !Contains(retention, "\"gc_paused\":true"))
+        return Fail("GC pause", error);
+    vexfs_mount_free(retention.data);
+    vexfs_mount_bytes gc{};
+    if (vexfs_mount_gc(session, 1, &gc, &error) != VEXFS_MOUNT_BUSY)
+        return Fail("paused GC must be busy", error);
+    retention = {};
+    if (vexfs_mount_gc_pause(session, 0, &retention, &error) != VEXFS_MOUNT_OK ||
+        !Contains(retention, "\"gc_paused\":false"))
+        return Fail("GC resume", error);
+    vexfs_mount_free(retention.data);
+    gc = {};
+    if (vexfs_mount_gc(session, 1, &gc, &error) != VEXFS_MOUNT_OK ||
+        JsonInteger(gc, "deleted_versions") != 1 ||
+        !Contains(gc, "\"has_more\":true"))
+        return Fail("bounded GC", error);
+    vexfs_mount_free(gc.data);
+    gc = {};
+    if (vexfs_mount_gc(session, 1000, &gc, &error) != VEXFS_MOUNT_OK ||
+        JsonInteger(gc, "remaining_reclaimable_versions") != 0)
+        return Fail("complete GC", error);
+    vexfs_mount_free(gc.data);
+    retention = {};
+    if (vexfs_mount_retention_set(session, 32, 30, &retention, &error) != VEXFS_MOUNT_OK)
+        return Fail("retention reset", error);
+    vexfs_mount_free(retention.data);
     vexfs_mount_session_close(session);
 
     // 独占挂载进程崩溃后，新 session 自动认领并发布该 session 已提交的 staging。
@@ -740,9 +805,13 @@ int main(int argc, char **argv) {
         return Fail("deep integrity check", error);
     vexfs_mount_free(check.data);
     if (!Execute(path,
-            "UPDATE _vexfs_file_versions SET content=X'424144' "
-            "WHERE inode_id=(SELECT inode_id FROM _vexfs_dentries WHERE name='crash.txt') "
-            "AND version_no=(SELECT current_version FROM _vexfs_inodes WHERE id=inode_id)"))
+            "UPDATE _vexfs_chunks SET content=X'424144' WHERE id=("
+            "SELECT entry.chunk_id FROM _vexfs_file_versions version "
+            "JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=version.manifest_id "
+            "JOIN _vexfs_dentries dentry ON dentry.inode_id=version.inode_id "
+            "JOIN _vexfs_inodes inode ON inode.id=version.inode_id "
+            "WHERE dentry.name='crash.txt' AND version.version_no=inode.current_version "
+            "AND entry.chunk_no=0)"))
         return Fail("inject checksum corruption", error);
     check = {};
     if (vexfs_mount_check(session, VEXFS_MOUNT_CHECK_QUICK, &check, &error) !=
@@ -753,7 +822,7 @@ int main(int argc, char **argv) {
     check = {};
     if (vexfs_mount_check(session, 0, &check, &error) != VEXFS_MOUNT_OK ||
         !Contains(check, "\"ok\":false") ||
-        !Contains(check, "VEXFS_CHECKSUM_MISMATCH"))
+        !Contains(check, "VEXFS_CHUNK_INVALID"))
         return Fail("checksum corruption report", error);
     vexfs_mount_free(check.data);
     content = {};

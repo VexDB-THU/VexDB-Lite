@@ -21,7 +21,7 @@ cp "$VEXDB" "$VEXFS_EXE"
 
 RESULT="$("$VEXDB" "$DB" \
     "SELECT vexfs_contract_version(), vexdb_l2_distance('[1,2]','[4,6]');")"
-[ "$RESULT" = "0.7.0|5.0" ]
+[ "$RESULT" = "0.9.0|5.0" ]
 
 "$VEXDB" "$DB" \
     "CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(embedding FLOAT[2], metric=l2); \

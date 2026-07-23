@@ -1,4 +1,5 @@
 #include "vexfs_runtime_admin.h"
+#include "vexfs_archive.h"
 #include "vexfs_platform.h"
 
 #include <cerrno>
@@ -47,6 +48,16 @@ void Usage(std::ostream &output) {
         "                               Manage the optional trigram text index\n"
         "  check [--quick]              Verify workspace metadata and content\n"
         "                               --quick skips SHA-256 BLOB hashing\n"
+        "  quota show                   Show current usage and hard limits\n"
+        "  quota set --max-bytes N|unlimited --max-files N|unlimited\n"
+        "            --max-file-bytes N|unlimited\n"
+        "                               Set workspace quota (sizes are bytes)\n"
+        "  retention show               Show history retention and storage usage\n"
+        "  retention set --keep-versions N --keep-days N\n"
+        "                               Set explicit history retention policy\n"
+        "  gc [--batch N]               Delete one bounded batch of unreferenced history\n"
+        "                               Current files, snapshots and handles are protected\n"
+        "  gc pause|resume              Pause or resume history deletion\n"
         "  stat PATH                    Print file metadata as JSON\n"
         "  history PATH [--limit N] [--before N] [--json]\n"
         "                               List one page of file versions\n"
@@ -63,6 +74,10 @@ void Usage(std::ostream &output) {
         "  snapshot restore NAME [--dry-run] [--force-unmount]\n"
         "                               Restore the complete tree as a new commit\n"
         "  snapshot drop NAME           Delete a snapshot name, not its history\n"
+        "  export --output FILE [--snapshot NAME]\n"
+        "                               Export a checked logical workspace package\n"
+        "  import FILE                  Verify and atomically publish a new workspace\n"
+        "  archive verify FILE          Verify package records and content checksums\n"
         "  mv SOURCE DESTINATION        Move a file or directory\n"
         "  ln SOURCE DESTINATION        Create a hard link to a regular file\n"
         "  chown UID:GID PATH            Store owner IDs (- keeps an ID)\n"
@@ -340,6 +355,11 @@ int64_t NonnegativeInteger(const std::string &value, const std::string &name) {
         throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, name + " must be a non-negative integer");
     }
     return static_cast<int64_t>(result);
+}
+
+int64_t QuotaValue(const std::string &value, const std::string &name) {
+    if (value == "unlimited") return -1;
+    return NonnegativeInteger(value, name);
 }
 
 int64_t OwnerId(const std::string &value, const std::string &name) {
@@ -798,6 +818,31 @@ int Run(const Options &options) {
         if (options.arguments.size() != 1) throw std::runtime_error("doctor accepts only global options");
         return RunDoctor(options);
     }
+    if (command == "export") {
+        const ParsedCommand parsed = ParseCommand(
+            options.arguments, {"--output", "--snapshot"}, {});
+        if (!parsed.positional.empty()) {
+            throw std::runtime_error("export accepts --output FILE and optional --snapshot NAME");
+        }
+        const std::string output = parsed.Value("--output");
+        const std::string snapshot = parsed.Value("--snapshot", false);
+        std::cout << vexfs_cli::ExportArchive(
+            options.database, options.workspace, snapshot, output) << '\n';
+        return 0;
+    }
+    if (command == "import") {
+        if (options.arguments.size() != 2) throw std::runtime_error("import needs FILE");
+        std::cout << vexfs_cli::ImportArchive(
+            options.database, options.workspace, options.arguments[1]) << '\n';
+        return 0;
+    }
+    if (command == "archive") {
+        if (options.arguments.size() != 3 || options.arguments[1] != "verify") {
+            throw std::runtime_error("archive needs verify FILE");
+        }
+        std::cout << vexfs_cli::VerifyArchive(options.arguments[2]) << '\n';
+        return 0;
+    }
 
     // check 必须保持只读边界：不创建数据库、workspace、WAL/SHM，也不发布 staging。
     Session session(options, command != "check");
@@ -871,6 +916,86 @@ int Run(const Options &options) {
         const std::string value = BytesToString(&json);
         if (options.json) std::cout << value << '\n'; else PrintCheck(value);
         return JsonBoolean(value, "ok") ? 0 : ExitCode(VEXFS_MOUNT_CORRUPTION);
+    } else if (command == "quota") {
+        if (options.arguments.size() < 2)
+            throw std::runtime_error("quota needs show or set");
+        const std::string &action = options.arguments[1];
+        vexfs_mount_bytes json{};
+        if (action == "show") {
+            if (options.arguments.size() != 2)
+                throw std::runtime_error("quota show accepts no arguments");
+            Check(vexfs_mount_quota_get(session.get(), &json, &error), error);
+        } else if (action == "set") {
+            const ParsedCommand parsed = ParseCommand(
+                options.arguments,
+                {"--max-bytes", "--max-files", "--max-file-bytes"}, {});
+            if (parsed.positional.size() != 1 || parsed.positional[0] != "set") {
+                throw std::runtime_error(
+                    "quota set needs --max-bytes, --max-files and --max-file-bytes");
+            }
+            const int64_t max_bytes = QuotaValue(
+                parsed.Value("--max-bytes"), "max-bytes");
+            const int64_t max_files = QuotaValue(
+                parsed.Value("--max-files"), "max-files");
+            const int64_t max_file_bytes = QuotaValue(
+                parsed.Value("--max-file-bytes"), "max-file-bytes");
+            Check(vexfs_mount_quota_set(session.get(), max_bytes, max_files,
+                                        max_file_bytes, &json, &error), error);
+        } else {
+            throw std::runtime_error("unknown quota command: " + action);
+        }
+        std::cout << BytesToString(&json) << '\n';
+    } else if (command == "retention") {
+        if (options.arguments.size() < 2)
+            throw std::runtime_error("retention needs show or set");
+        const std::string &action = options.arguments[1];
+        vexfs_mount_bytes json{};
+        if (action == "show") {
+            if (options.arguments.size() != 2)
+                throw std::runtime_error("retention show accepts no arguments");
+            Check(vexfs_mount_retention_get(session.get(), &json, &error), error);
+        } else if (action == "set") {
+            const ParsedCommand parsed = ParseCommand(
+                options.arguments, {"--keep-versions", "--keep-days"}, {});
+            if (parsed.positional.size() != 1 || parsed.positional[0] != "set") {
+                throw std::runtime_error(
+                    "retention set needs --keep-versions N and --keep-days N");
+            }
+            const int64_t keep_versions = NonnegativeInteger(
+                parsed.Value("--keep-versions"), "keep-versions");
+            const int64_t keep_days = NonnegativeInteger(
+                parsed.Value("--keep-days"), "keep-days");
+            if (keep_versions > 1000000 || keep_days > 36500) {
+                throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                    "keep-versions must be at most 1000000 and keep-days at most 36500");
+            }
+            Check(vexfs_mount_retention_set(
+                session.get(), static_cast<uint32_t>(keep_versions),
+                static_cast<uint32_t>(keep_days), &json, &error), error);
+        } else {
+            throw std::runtime_error("unknown retention command: " + action);
+        }
+        std::cout << BytesToString(&json) << '\n';
+    } else if (command == "gc") {
+        if (options.arguments.size() == 2 &&
+            (options.arguments[1] == "pause" || options.arguments[1] == "resume")) {
+            vexfs_mount_bytes json{};
+            Check(vexfs_mount_gc_pause(session.get(), options.arguments[1] == "pause",
+                                       &json, &error), error);
+            std::cout << BytesToString(&json) << '\n';
+            return 0;
+        }
+        const ParsedCommand parsed = ParseCommand(options.arguments, {"--batch"}, {});
+        if (!parsed.positional.empty())
+            throw std::runtime_error("gc accepts only --batch N");
+        const std::string batch_value = parsed.Value("--batch", false);
+        const int64_t batch = batch_value.empty() ? 1000 :
+            PositiveInteger(batch_value, "batch");
+        if (batch > 10000)
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, "batch must be at most 10000");
+        vexfs_mount_bytes json{};
+        Check(vexfs_mount_gc(session.get(), static_cast<uint32_t>(batch), &json, &error), error);
+        std::cout << BytesToString(&json) << '\n';
     } else if (command == "stat") {
         if (options.arguments.size() != 2) throw std::runtime_error("stat needs PATH");
         vexfs_mount_bytes json{};

@@ -90,14 +90,14 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 - 不为了宣传“更快 grep”而阻塞挂载正确性、备份和跨机器工作区；
 - 不在核心文件合同中加入 Agent 专用的 prompt、memory 或语义字段。
 
-## 5. 当前基线：2026-07-22
+## 5. 当前基线：2026-07-23
 
 | 范围 | 当前事实 | 主要缺口 |
 |---|---|---|
-| 统一合同 | SQLite 合同 `0.7.0`，runtime ABI 1；SQL、C ABI、CLI、mount runtime 已连通；已增加跨平台一致性合同和结构化错误状态 | PostgreSQL、DuckDB 尚未实现 VexFS adapter |
+| 统一合同 | SQLite 合同 `0.9.0`，runtime ABI 1；SQL、C ABI、CLI、mount runtime 已连通；已增加跨平台一致性合同和结构化错误状态 | PostgreSQL、DuckDB 尚未实现 VexFS adapter |
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试 | ACL 还没有完整授权执行和继承；特殊文件不支持 |
-| 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、SQLite Backup 已实现 | retention、GC、配额、审计、逻辑导入导出未完成 |
-| 长期校验 | 每个文件版本持久化 SHA-256；只读 `vexfs_check` / `vexdb fs check` 已覆盖结构、历史、快照、staging、BLOB 长度和流式内容校验 | 自动 repair 不在当前范围；chunk/manifest 尚未落地 |
+| 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、SQLite Backup、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 审计、自动维护、history/staging/index/total quota、PG/DuckDB 导入端未完成 |
+| 长期校验 | `chunked-v1` 使用不可变 manifest、64 KiB 块和逐块/整文件 SHA-256；只读 check 覆盖结构、引用、顺序、大小和流式内容校验 | 自动 repair 和跨文件通用去重不在当前范围 |
 | macOS | preview.17 已通过 Apple 公证并 staple；本机安装后 Gatekeeper、FSKit 注册、Bash、Git、Python、Node.js、Go、Rust、并发 append、进程锁、打开文件生命周期和强制卸载全部通过 | 尚缺另一台没有源码和 Xcode 构建记录的干净 Mac 验证 |
 | Linux | libfuse3 真实挂载已通过 root 和普通用户；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 缓存/TTL、更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
@@ -113,7 +113,9 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 1. **已完成代码修复**：零用例失败、`PASS_WITH_SKIPS`、`--fail-on-skip`、显式 package/mount CLI 绑定、runtime ABI 单一来源、旧 schema 明确拒绝、数据库符号链接拒绝、备份目标 0600、安装哈希/签名/ABI/合同校验；
 2. **已完成本地交付验证**：当前源码 ad-hoc 包通过 64 项文档 smoke 和 2 个 package Gate；这只证明本地包结构与功能，不替代 Developer ID、公证和真实 FSKit；
 3. **待完成发行证明**：提交当前实现后，从干净 commit 重新 Developer ID 签名、公证，并在启用 FSKit 的 Mac 上用本包 CLI 运行 `--fail-on-skip` 的真实 mount Gate；
-4. **随后进入长期安全**：checksum/check 已完成；继续 retention/GC、配额、逻辑 export/import，再做 chunk + manifest 和 append 合并发布。
+4. **长期安全与分块内容模型已完成**：checksum/check、retention/GC、live quota、SQLite format v2
+   逻辑 export/import、chunk + manifest 和 append 合并发布已进入 spec、runtime/CLI smoke 和 eval；
+   下一步回到当前代码签名、公证和新的干净安装包回归。
 
 当前不提前开发 PostgreSQL、DuckDB 或 Windows adapter。
 
@@ -131,8 +133,47 @@ vexdb fs --workspace workspace snapshot restore before-refactor
   观测到的额外 RSS 峰值增长为 0；
 - 报告：`vexdb_sqlite/build/eval/vexfs/20260722T104155.646993Z-quick-20260718/report.json`。
 
-这不是 repair，也不是 chunk 校验。当前内容模型明确报告为 `full-blob-v1`；下一项是
-retention/GC，之后才是 quota、export/import 和 chunk/manifest。
+这是合同 `0.7.0` 当时的证据；当前 `0.9.0` 已由下方 `chunked-v1` 证据替代，但自动 repair 仍不在范围内。
+
+### 5.3 长期安全最小集合完成证据
+
+2026-07-23 SQLite 合同升到 `0.8.0`，旧 schema 明确拒绝且不迁移：
+
+- quota 覆盖最大 live bytes、live files 和单文件 bytes；数据库触发器维护 O(1) live 计数；
+- retention 支持最近版本数和天数；GC 显式分批，保护 current、snapshot、handle 和 alias source，
+  活动挂载以及 `gc pause` 会阻止删除；
+- `.vexfs` format v1 是独立逻辑记录容器，不是原 SQLite 数据库副本；包含 commit、inode、
+  dentry、文件版本、快照、xattr、ACL、principal 和逐记录/内容/整包 SHA-256；
+- 导入在一个事务内使用 `importing` 隐藏状态，完成整包校验、ID 映射和深度 check 后才原子发布；
+- quick 性能 eval 中，开启配额创建 250 个 1-byte 文件为 0.101915 秒，即 2,453.024 files/s；
+  300 个历史版本按 128 条分批 GC 为 0.015086 秒，共 3 批，删除 299 个版本；
+- 8 MiB canonical 内容的固定快照导出、独立 verify、导入、hardlink/版本/xattr/ACL 对比以及
+  内容损坏和半成品注入测试通过；export、verify、import 的 BLOB 路径固定使用 1 MiB 缓冲。
+
+GC 删除记录后只让 SQLite 页面可复用，不自动 `VACUUM`；format v1 当前只有 SQLite producer/
+consumer，PG/DuckDB adapter 尚未开始。完整证据见
+`docs/reports/2026-07-23_vexfs-retention-quota-logical-archive.md`。
+
+### 5.4 chunk + manifest 完成证据
+
+2026-07-23 SQLite 合同升到 `0.9.0`，逻辑归档升到 format v2：
+
+- canonical 文件版本只引用不可变 manifest，不再在版本行保存整文件 BLOB；
+- manifest 固定 64 KiB 逻辑块，物理 chunk object 可以被同 inode 的多个版本和多个块位置复用；
+- 挂载打开从 chunk 流式写入 staging，publish 两遍扫描 staging 后流式生成 manifest/chunk，固定
+  64 KiB 工作缓冲；不会额外组装 128 MiB 整文件；
+- 随机覆盖只新建受影响块；恢复版本继续使用版本别名，不新建 manifest；GC 只删除没有任何
+  manifest 引用的物理块；
+- quick check 验证 manifest 引用、块数量、顺序、大小和可达性，deep check 再验证逐块和整文件
+  SHA-256；
+- `.vexfs` format v2 携带 manifest/chunk 记录，verify/import 均逐块处理，导入会恢复块复用；
+- 8 MiB、100 次 4 KiB 随机修改样本中，71 个 64 KiB 块受影响，57 个块直接复用，两个版本最终
+  只保存 72 个物理块；发布耗时 0.370 秒；
+- 最终 quick eval 为 57 passed、0 failed、18 个平台条件 skipped、2,863 checks，耗时 24.824 秒；
+  SQLite spec、runtime smoke、VexFS CLI smoke 和 VexDB unified CLI smoke 全部通过。
+
+当前仍没有跨文件通用去重、自动 repair、自动 GC 或在线 VACUUM。完整证据见
+`docs/reports/2026-07-23_vexfs-chunk-manifest-v2.md`。
 
 ## 6. 阶段路线图
 
