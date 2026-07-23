@@ -98,7 +98,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试 | ACL 还没有完整授权执行和继承；特殊文件不支持 |
 | 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、SQLite Backup、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 审计、自动维护、history/staging/index/total quota、PG/DuckDB 导入端未完成 |
 | 长期校验 | `chunked-v1` 使用不可变 manifest、64 KiB 块和逐块/整文件 SHA-256；只读 check 覆盖结构、引用、顺序、大小和流式内容校验 | 自动 repair 和跨文件通用去重不在当前范围 |
-| macOS | preview.20 已从干净 commit `4f53577884` 构建，通过 Apple 公证并 staple；本机安装后 Gatekeeper、FSKit 注册和 13 个真实挂载 Gate 全部通过 | 尚缺另一台没有源码和 Xcode 构建记录的干净 Mac 验证 |
+| macOS | preview.22 已从干净 commit `8a8b0c139a` 构建并通过 Apple 公证；本机 13 个真实挂载 Gate 通过，另一台无源码 M1 macOS 26.5.2 的 30 项安装后 smoke 也通过 | macOS 26.0–26.4 与 x86_64 尚未独立发行验证；构建机 26.3.1(a) 的 Code Signing 子系统当前异常 |
 | Linux | libfuse3 真实挂载已通过 root 和普通用户；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 缓存/TTL、更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
 | 远程共享 | 统一合同为 PostgreSQL 预留 | 还不能让另一台电脑挂载同一个远程工作区 |
@@ -112,12 +112,12 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 
 1. **已完成代码修复**：零用例失败、`PASS_WITH_SKIPS`、`--fail-on-skip`、显式 package/mount CLI 绑定、runtime ABI 单一来源、旧 schema 明确拒绝、数据库符号链接拒绝、备份目标 0600、安装哈希/签名/ABI/合同校验；
 2. **已完成本地交付验证**：当前源码 ad-hoc 包通过 64 项文档 smoke 和 2 个 package Gate；这只证明本地包结构与功能，不替代 Developer ID、公证和真实 FSKit；
-3. **已完成本机发行证明**：preview.20 从干净 commit 重新 Developer ID 签名、公证，并在
-   启用 FSKit 的 Mac 上用本包 CLI 逐项运行 `--fail-on-skip` 的 13 个真实 mount Gate；只剩
-   另一台干净 Mac 分发验证；
+3. **已完成 macOS arm64 发行证明**：preview.22 从干净 commit 重新 Developer ID 签名、公证，
+   本机 13 个真实 mount Gate 通过；另一台没有源码和完整 Xcode 的 M1 也完成安装、真实挂载、
+   Git、快照、deep check 和 archive v2 的 30 项 smoke；
 4. **长期安全与分块内容模型已完成**：checksum/check、retention/GC、live quota、SQLite format v2
    逻辑 export/import、chunk + manifest 和 append 合并发布已进入 spec、runtime/CLI smoke 和 eval；
-   下一步先完成另一台干净 Mac 分发验证，再集中解决小文件写入性能。
+   下一步集中解决小文件写入性能，并补 macOS x86_64 交付验证。
 
 当前不提前开发 PostgreSQL、DuckDB 或 Windows adapter。
 
@@ -408,16 +408,19 @@ owner、文件历史、macOS 快照在 Linux 恢复、Linux 快照在 macOS 恢�
 
 macOS 完成 Apple 公证、干净机器安装和 extension 启用流程；Linux 完成普通用户依赖检查、x86_64/AArch64 包和卸载。安装说明必须与压缩包或安装包一起交付。
 
-状态（2026-07-23）：**进行中**。当前 `preview.20` 已从干净 commit `4f53577884` 重新构建、
-签名、公证、安装并通过本机真实 FSKit Gate；只剩额外干净 Mac 分发验证。
+状态（2026-07-23）：**进行中**。macOS arm64 已由 `preview.22` 从干净 commit
+`8a8b0c139a` 完成交付闭环；N4 剩余主要缺口是 macOS x86_64 和更多 Linux 发行版验证。
 
-- preview.20 使用 `Developer ID Application: Jian ming Wu (BB5VK42K87)` 签名，Apple 公证
-  submission ID 为 `e2883581-7e4a-488a-9087-8c64d4ccded3`；staple、Gatekeeper、解压复验、
+- preview.22 使用 `Developer ID Application: Jian ming Wu (BB5VK42K87)` 签名，Apple 公证
+  submission ID 为 `406b904b-6b01-4ae7-8283-4db6c909c5cc`；staple、Gatekeeper、解压复验、
   67 项文档 smoke 和 17 项 package Gate 全部通过；
 - 本机 13 个 macOS 必跑 mount 用例全部逐项开启 `--fail-on-skip`：13 passed、0 failed、
   0 skipped、227 checks；覆盖 Bash、Git、Python/Node/Go/Rust、并发、锁、元数据、重挂载、
   性能和 1,000 文件；
-- 另一台 M1 `192.168.130.217:22` 当前连接超时，尚不能完成额外干净 Mac 分发验证；
+- 另一台没有源码、只有 Command Line Tools 的 M1 已覆盖安装 preview.22；FSKit extension
+  enabled，30 项无源码 smoke 通过，覆盖 Git、快照恢复、deep check、archive v2 校验与导入；
+- 该真机先后发现并验证修复两个真实问题：未发布 `index.lock` 的 version-0 历史污染，以及
+  快照 archive 把已删除 inode 的 ACL 当作当前 ACL；preview.20/21 因此不再作为推荐包；
 
 历史包证据继续保留：
 
@@ -447,8 +450,8 @@ macOS 完成 Apple 公证、干净机器安装和 extension 启用流程；Linux
 
 交付物和证据：
 
-- macOS：`dist/vexdb-lite/vexdb-lite-0.1.0-preview.20-macos-arm64.zip`
-  （SHA-256 `3818155cc0aae66b17b9655b9e2df6f49a84fd1ff75d07fabdaabc03bb01a2ac`）；
+- macOS：`dist/vexdb-lite/vexdb-lite-0.1.0-preview.22-macos-arm64.zip`
+  （SHA-256 `773b0c05e47908dfe2b8f890be4a16f04f10ff3c1937843e9e2aea1c3aa25d1c`）；
 - Linux x86_64：`dist/release/vexdb-lite-sqlite-files-linux-x86_64.tar.gz`
   （SHA-256 `7a736d020cb523740b6e5763d27d96dcb7a7124442b851f2f1c4d389b31e2085`）；
 - Linux AArch64：`dist/release/vexdb-lite-sqlite-files-linux-aarch64.tar.gz`
@@ -458,6 +461,8 @@ macOS 完成 Apple 公证、干净机器安装和 extension 启用流程；Linux
 - preview.17 公证报告：`docs/reports/2026-07-22_vexfs-preview17-apple-notarization.md`。
 - preview.20 公证与真实 FSKit Gate：
   `docs/reports/2026-07-23_vexfs-preview20-notarized-fskit-gate.md`。
+- preview.22 无源码 M1 真机 Gate：
+  `docs/reports/2026-07-23_vexfs-preview22-clean-mac-gate.md`。
 
 ### N5. 真实项目和规模基线
 
@@ -491,6 +496,8 @@ macOS 完成 Apple 公证、干净机器安装和 extension 启用流程；Linux
 - preview.20 的 13 个 macOS 必跑 Gate 为 13 passed、0 failed、0 skipped、227 checks；8 MiB
   顺序写 46.863 MiB/s、随机写 1,041.044 ops/s，1,000 文件创建 175.253 files/s，同轮比
   APFS 慢 72.012 倍；
+- preview.22 在另一台无源码 M1 上完成 30 项安装后 smoke；Git workspace、快照恢复、索引、
+  deep check 和 archive v2 导出/校验/导入均通过；
 - 尚需完成 100,000 文件完整复测、真实 Coding Agent 和写入优化。
 
 证据位置：

@@ -16,6 +16,7 @@ WORKSPACE=clean-install
 CHECKS=0
 EXPECTED_VERSION="${VEXDB_LITE_EXPECTED_VERSION:-}"
 PAYLOAD="vexdb package smoke"
+MOUNTED=0
 
 fs() {
     "$VEXDB" fs --db "$DB" --workspace "$WORKSPACE" "$@"
@@ -38,7 +39,9 @@ check_file() {
 }
 
 cleanup() {
-    fs unmount --force "$MOUNT_POINT" >/dev/null 2>&1 || true
+    if [ "$MOUNTED" = 1 ]; then
+        fs unmount --force "$MOUNT_POINT" >/dev/null 2>&1 || true
+    fi
     if [ "${VEXDB_LITE_KEEP_SMOKE:-0}" = 1 ]; then
         echo "保留测试目录：$ROOT" >&2
     else
@@ -64,6 +67,7 @@ printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
 CHECKS=$((CHECKS + 3))
 
 fs mount "$MOUNT_POINT"
+MOUNTED=1
 mkdir -p "$MOUNT_POINT/project/src"
 printf '%s\n' "$PAYLOAD" > "$MOUNT_POINT/project/src/message.txt"
 check_equal "$PAYLOAD" "$(cat "$MOUNT_POINT/project/src/message.txt")" "cat 内容错误"
@@ -111,6 +115,7 @@ fs grep "$PAYLOAD" /project | grep -q '/project/src/message.txt'
 CHECKS=$((CHECKS + 1))
 
 fs unmount "$MOUNT_POINT"
+MOUNTED=0
 set +e
 MOUNT_STATUS="$(fs --json mount status "$MOUNT_POINT")"
 MOUNT_STATUS_CODE=$?

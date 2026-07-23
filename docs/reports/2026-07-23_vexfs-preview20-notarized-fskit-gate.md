@@ -1,5 +1,9 @@
 # VexFS preview.20 公证与真实 FSKit Gate 报告
 
+> 后续状态：preview.20 在第二台 M1 的无源码完整测试中发现 Git `index.lock`
+> 历史引用 version 0 的真实问题，已由 preview.22 修复并取代。preview.20 不再作为推荐交付包；
+> 最新证据见 `docs/reports/2026-07-23_vexfs-preview22-clean-mac-gate.md`。
+
 - 日期：2026-07-23
 - 分支：`feature/agent_files`
 - 源码 commit：`4f53577884`
