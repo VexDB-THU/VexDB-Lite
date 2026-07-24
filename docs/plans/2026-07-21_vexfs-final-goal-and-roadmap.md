@@ -37,9 +37,9 @@
 
 1. **已完成**：冻结 NFS adapter 与 Workspace Engine 的窄接口，不复制数据库逻辑；
 2. **已完成**：实现 localhost-only NFS gateway、mount/unmount/status/doctor；
-3. **部分完成**：Bash、Git、hardlink、xattr、fsync 已进入真机 eval；OpenCode、npm/cargo、
-   文件锁和 sleep/wake 尚待补齐；gateway 单次 `SIGKILL` 后的强制卸载、状态清理和重挂载已覆盖；
-4. **已完成首轮**：1,000 小文件为 181.689 files/s，同轮 APFS 为 14304.029 files/s；
+3. **部分完成**：Bash、Git、hardlink、xattr、fsync、单机跨进程 `flock`/`fcntl`、轻量 npm/Cargo 和单次真实 OpenCode 已进入真机 eval；
+   跨机器锁、长任务和 sleep/wake 尚待补齐；gateway 单次 `SIGKILL` 后的强制卸载、状态清理和重挂载已覆盖；
+4. **已完成首轮**：1,000 小文件为 205.643 files/s，同轮 APFS 为 16940.431 files/s；
 5. **待完成**：生成不含 FSKit 授权前置的签名公证包，在干净 Mac 验证安装和系统提示；
 6. **代码已完成，发行待 Gate**：默认 backend 已改为 NFS，FSKit 只在显式选择时使用。
 
@@ -58,22 +58,22 @@ VexFS FSKit extension。
 - NFS gateway 已连接平台无关 `vexfs_mount_*` C ABI；SQLite 已完成，PG 复用同一 HostStore；
 - 公开版 `nfsserve` 缺少 LINK/COMMIT，仓库内固定 fork 已补协议 handler，真实 hardlink 的
   inode、link count、共享内容、重挂载和快照恢复均通过；
-- 41 项真实 NFS eval、30 项 package smoke 通过。
+- 45 项完整 NFS eval、13 项真实 OpenCode eval、30 项 package smoke 通过。
 
 同时确认两个性能和实现边界：
 
 1. NFSv3 没有 macOS named attributes。macOS 26.3.1 为新文件写入
    `com.apple.provenance` 时会尝试写 `._文件名`。当前 gateway 已将 raw AppleDouble 数据吸收为
    目标 inode xattr，用户树和数据库 dentry 都为 0 个 `._*`。
-2. 当前真实 SQLite adapter 创建 1,000 个 2-byte 文件为 5.503902 秒、181.689 files/s；同轮
-   APFS 为 0.069910 秒、14304.029 files/s，约慢 78.7 倍。它与此前 FSKit 约 175 files/s
+2. 当前真实 SQLite adapter 创建 1,000 个 2-byte 文件为 4.862788 秒、205.643 files/s；同轮
+   APFS 为 0.059030 秒、16940.431 files/s，约慢 82.4 倍。它与此前 FSKit 约 175 files/s
    同级，0.1 可用但不是性能达标终点。
 
 因此最近任务增加两个硬 Gate：
 
 - AppleDouble 隔离已进入 eval；后续每次 NFS 发布必须保留该断言；
 - 0.2 实现批量提交、写回合并和有界 metadata cache，再做同机 1,000/10,000 文件对照；
-- 0.1 发布前仍需完成干净 Mac 安装、公证、重复 crash/sleep-wake、文件锁与长期运行 Gate。
+- 0.1 发布前仍需完成干净 Mac 安装、公证、重复 crash/sleep-wake、跨机器锁边界与长期运行 Gate。
 
 ## 1. 这份文档解决什么问题
 
@@ -170,7 +170,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | Linux | libfuse3 真实挂载已通过 root 和 uid 1000 各 9 组；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；异常撤销后底层目录保持 0500，显式卸载恢复 0700；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
 | 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、当前源码下的 macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项，以及双机 extension 崩溃、网络中断和数据库停机 25 项 | 当前审计源码对应的公证包尚未生成，需要重跑双机安装 Gate；局域网直连 FSKit 还需要 macOS 本地网络授权；PG 文本索引尚未实现 |
-| 性能规模 | SQLite 直连已完成 10 万文件；默认 NFS 1,000 小文件为 5.503902 秒、181.689 files/s，同轮 APFS 0.069910 秒、14304.029 files/s；此前 FSKit 为约 175 files/s | NFS 小文件仍比 APFS 慢约 78.7 倍；0.2 需批量提交、写回合并、metadata cache，并重跑 1 万/10 万和真实 Coding Agent |
+| 性能规模 | SQLite 直连已完成 10 万文件；默认 NFS 1,000 小文件为 4.862788 秒、205.643 files/s，同轮 APFS 0.059030 秒、16940.431 files/s；此前 FSKit 为约 175 files/s | NFS 小文件仍比 APFS 慢约 82.4 倍；0.2 需批量提交、写回合并、metadata cache，并重跑 1 万/10 万和真实 Coding Agent |
 
 “合同中已保存”不等于“所有平台已经完整执行”。例如 owner/group 和便携 ACL 已经可以保存、读取和恢复，但身份认证、权限判断和各系统的原生 ACL 映射仍属于后续阶段。
 

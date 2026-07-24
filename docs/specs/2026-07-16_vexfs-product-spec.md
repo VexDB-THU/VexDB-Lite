@@ -35,10 +35,13 @@ Linux FUSE 和 Windows WinFsp 必须共用同一 Workspace Engine、mount runtim
 
 2026-07-24 已完成连接 SQLite mount runtime 的 localhost NFSv3 adapter，并设为 macOS CLI
 默认 driver。gateway 只监听 loopback，由 `mount/unmount/status/doctor` 管理独立 PID、端口、
-日志和受保护状态目录。真实 macOS 26.3.1 arm64 eval 共 41 项，覆盖 Bash、hardlink、symlink、
-mode、fsync、xattr、原子替换、open-then-unlink、Git、gateway `SIGKILL` 恢复、卸载/重挂载和完整 workspace 快照恢复；
+日志和受保护状态目录。真实 macOS 26.3.1 arm64 eval 共 45 项，覆盖 Bash、hardlink、symlink、
+mode、fsync、xattr、原子替换、open-then-unlink、单机跨进程 `flock`/`fcntl`、轻量 npm/Cargo、Git、gateway `SIGKILL` 恢复、卸载/重挂载和完整 workspace 快照恢复；
 package smoke 30 项也通过。公开版 `nfsserve` 缺少 NFSv3 LINK/COMMIT，当前仓库固定维护一个
 小型 fork，LINK 调用数据库 hardlink 合同，COMMIT 调用强同步并返回同一 server verifier。
+另有独立的真实 OpenCode Gate：OpenCode 1.18.3 使用 `openai/gpt-5.4-mini` 在默认 NFS
+挂载项目中修复代码并运行测试，13 项检查在 28.349 秒内通过；卸载和重挂载后的数据库内容、
+Git diff 与单测结果保持一致。
 
 默认挂载使用 bounded soft NFS：固定 10 秒重传间隔、最多 4 次，并设 60 秒 dead timeout。
 它让 gateway 崩溃时的文件调用最终返回错误而不是永久卡死，同时覆盖 runtime 最长 30 秒的
@@ -46,8 +49,8 @@ package smoke 30 项也通过。公开版 `nfsserve` 缺少 NFSv3 LINK/COMMIT，
 
 macOS 写入的 AppleDouble 由 gateway 吸收为目标 inode 的
 `io.vexdb.macos.appledouble` xattr，不进入用户目录、dentry、grep 或快照树。1000 个 2-byte
-小文件创建为 5.503902 秒、181.689 files/s；同轮 APFS 为 0.069910 秒、14304.029 files/s，
-约慢 78.7 倍。这个吞吐与此前 FSKit 约 175 files/s 同级，满足“不比现有默认入口明显退化”的
+小文件创建为 4.862788 秒、205.643 files/s；同轮 APFS 为 0.059030 秒、16940.431 files/s，
+约慢 82.4 倍。这个吞吐与此前 FSKit 约 175 files/s 同级，满足“不比现有默认入口明显退化”的
 0.1 入口条件，但远未接近原生盘，列为 0.2 批量提交、写回合并和 metadata cache 优化项。
 
 后文中的 FSKit 完成状态仍是历史事实；凡是把 FSKit 写成“默认、MVP 主入口或当前发布前置”的

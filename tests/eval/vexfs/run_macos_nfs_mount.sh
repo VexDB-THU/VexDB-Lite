@@ -98,6 +98,68 @@ equal nfs-ok "$($MOUNT_POINT/project/run.sh)" "可执行权限"
 equal yes "$(/usr/bin/xattr -p user.vexdb.nfs-eval "$MOUNT_POINT/project/src/data.txt")" \
     "扩展属性"
 
+/usr/bin/python3 - "$MOUNT_POINT/project/process.lock" <<'PY'
+import fcntl
+import multiprocessing
+import os
+import sys
+
+path = sys.argv[1]
+open(path, "wb").write(b"lock\n")
+multiprocessing.set_start_method("fork")
+
+
+def acquire(handle, kind, nonblocking=False):
+    flag = fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0)
+    if kind == "flock":
+        fcntl.flock(handle, flag)
+    else:
+        fcntl.lockf(handle, flag, 1, 0, os.SEEK_SET)
+
+
+def hold(kind, ready, release):
+    with open(path, "r+b", buffering=0) as handle:
+        acquire(handle, kind)
+        ready.set()
+        release.wait(5)
+
+
+for kind in ("flock", "fcntl"):
+    ready = multiprocessing.Event()
+    release = multiprocessing.Event()
+    process = multiprocessing.Process(target=hold, args=(kind, ready, release))
+    process.start()
+    assert ready.wait(5), f"{kind} holder did not acquire lock"
+    blocked = False
+    with open(path, "r+b", buffering=0) as handle:
+        try:
+            acquire(handle, kind, nonblocking=True)
+        except BlockingIOError:
+            blocked = True
+    release.set()
+    process.join(5)
+    assert process.exitcode == 0, f"{kind} holder failed: {process.exitcode}"
+    assert blocked, f"{kind} allowed two exclusive holders"
+PY
+CHECKS=$((CHECKS + 2))
+
+mkdir -p "$MOUNT_POINT/project/node"
+printf '%s\n' \
+    '{"name":"vexfs-nfs-eval","version":"1.0.0","private":true,"scripts":{"test":"node index.js"}}' \
+    > "$MOUNT_POINT/project/node/package.json"
+printf '%s\n' 'console.log("npm-ok")' > "$MOUNT_POINT/project/node/index.js"
+HOME="$TEST_HOME" npm --prefix "$MOUNT_POINT/project/node" install \
+    --package-lock-only --ignore-scripts --offline --no-audit --no-fund >/dev/null
+equal npm-ok "$(HOME="$TEST_HOME" npm --prefix "$MOUNT_POINT/project/node" test --silent)" \
+    "npm 项目"
+
+cargo init --quiet --bin --vcs none "$MOUNT_POINT/project/rust"
+printf '%s\n' 'fn main() { println!("cargo-ok"); }' \
+    > "$MOUNT_POINT/project/rust/src/main.rs"
+equal cargo-ok "$(cargo run --quiet --offline \
+    --manifest-path "$MOUNT_POINT/project/rust/Cargo.toml")" "Cargo 项目"
+printf '%s\n' '/rust/target/' > "$MOUNT_POINT/project/.gitignore"
+
 printf 'old\n' > "$MOUNT_POINT/project/atomic.txt"
 printf 'new\n' > "$MOUNT_POINT/project/atomic.next"
 mv -f "$MOUNT_POINT/project/atomic.next" "$MOUNT_POINT/project/atomic.txt"
