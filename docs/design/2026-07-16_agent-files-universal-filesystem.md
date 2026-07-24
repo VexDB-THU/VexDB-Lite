@@ -2,7 +2,7 @@
 
 - 日期：2026-07-16
 - 分支：`feature/agent_files`
-- 文档版本：1.6
+- 文档版本：1.7
 - 状态：macOS FSKit 与 Linux libfuse3 已复用同一 runtime；PostgreSQL `0.4.0-alpha.1`
   已完成数据库合同、format v2、role/ACL/审计、libpq HostStore、macOS/Linux 真实 mount、
   跨机器 OpenCode 和逻辑/物理备份；第二台 Mac 的局域网直连只差一次系统授权确认
@@ -14,6 +14,13 @@
 
 > 2026-07-24 默认入口变更：macOS 0.1 使用系统 NFS client + 本机用户态 gateway；FSKit
 > 保留为后续可选原生 adapter。已有 FSKit 章节记录已完成实现和历史证据，不再表示默认发布路径。
+
+同日真机传输原型已确认 macOS 26.3.1 arm64 可以由当前用户挂载只监听 localhost 的
+NFSv3 服务，无需 FSKit extension；基础 Bash、mode、symlink 和 Git commit 均通过。原型同时
+确认 NFS adapter 不能直接照搬开源 demo：macOS `com.apple.provenance` 会产生 `._*`
+AppleDouble sidecar，优化镜像原型也只有约 75 个用户小文件/秒。正式 adapter 必须在
+Workspace Engine 边界内吸收 AppleDouble/xattr，并用批量写回和 metadata cache 达到性能 Gate。
+这两个问题属于 mount adapter，不允许修改数据库文件、版本、权限或备份的权威合同。
 
 VexFS 是由 PostgreSQL、DuckDB 或 SQLite 加载和管理的数据库扩展。三个宿主共享逻辑合同，但首个闭环固定为 macOS + SQLite，不要求第一版同时完成其他数据库和操作系统。
 

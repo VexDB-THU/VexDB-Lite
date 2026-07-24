@@ -4,7 +4,7 @@
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
 - 日期：2026-07-24
 - 分支：`feature/agent_files`
-- 文档版本：2.9
+- 文档版本：3.0
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
 - 当前阶段：Phase 2 PostgreSQL 功能与验收已完成；最后一次数据审计已让所有变更记录
   认证用户、workspace、commit、对象和前后版本，并保留 workspace 删除证据。PG 16–19、
@@ -40,6 +40,39 @@
 4. 跑 1,000 小文件与 APFS/现有 FSKit 的同机对照，确认 NFS 是否改善吞吐；
 5. 生成不含 FSKit 授权前置的签名公证包，在干净 Mac 验证安装和系统提示；
 6. 通过正确性和安装 Gate 后，才把 NFS 设为代码中的默认 backend。
+
+### 0.1 2026-07-24 本机 NFS 原型验证
+
+已在 macOS 26.3.1 arm64 真机完成第一轮传输层验证。测试使用只监听
+`127.0.0.1:11111` 的用户态 NFSv3 服务和系统 `/sbin/mount_nfs`，没有启用或调用
+VexFS FSKit extension。
+
+已确认：
+
+- 当前用户可以直接挂载到 `/tmp` 目录，mount 表显示 `mounted by Four`；
+- `ls`、`cat`、`grep`、创建、`mkdir`、`cp`、`mv`、`rm`、`chmod` 和 symlink 通过；
+- 挂载目录中完成了 `git init`、`git add` 和一次 commit；
+- `mount_nfs` 支持固定 `port`/`mountport`，因此 gateway 不需要占用系统 portmapper；
+- 功能原型证明“NFS 默认、FSKit 可选”可行，但尚未连接 VexFS SQLite/PG HostStore，不能写成
+  VexDB NFS adapter 已完成。
+
+同时发现两个发布阻塞项：
+
+1. NFSv3 没有 macOS named attributes。macOS 26.3.1 为新文件写入
+   `com.apple.provenance` 时，会额外创建 `._文件名` AppleDouble 文件。200 个用户文件实际产生
+   200 个 sidecar；必须决定由 gateway 内部吸收、隐藏并映射为 VexFS xattr，不能让它们污染
+   workspace 历史、配额、grep 和快照。
+2. 优化构建、关闭 debug 日志并使用 AgentFS 同类挂载参数后，200 个 1 字节文件耗时
+   2.66 秒，约 75 个用户文件/秒；同轮 `/tmp` APFS 为 0.03 秒。这个镜像原型不是数据库
+   adapter，不能代表最终吞吐，但已经证明不能只靠更换 mount 协议自动解决小文件性能。
+
+因此最近任务增加两个硬 Gate：
+
+- NFS eval 必须断言用户视图、数据库路径、历史、快照和配额中都没有可见 `._*` 垃圾对象，
+  同时保留需要的 macOS xattr；
+- 先实现批量提交、写回合并和有界 metadata cache，再做同机 1,000/10,000 文件对照。
+  NFS 默认发布至少不能明显低于当前 FSKit 基线；若达不到，继续作为实验 backend，不能仅因
+  免授权就替换默认入口。
 
 ## 1. 这份文档解决什么问题
 

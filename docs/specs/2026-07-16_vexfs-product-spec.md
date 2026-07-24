@@ -5,7 +5,7 @@
 - 所属项目：VexDB-Lite
 - 日期：2026-07-16
 - 分支：`feature/agent_files`
-- 文档版本：1.8
+- 文档版本：1.9
 - 状态：SQLite `0.9.0`、macOS FSKit、Linux libfuse3 和 arm64 真机交付已实现；
 PostgreSQL `0.4.0-alpha.1` 的数据库合同、format v2、ACL、审计、libpq HostStore、
   macOS/Linux 真实 mount、双 Mac 串行 Agent 工作区和备份恢复已实现
@@ -32,6 +32,13 @@ Linux FUSE 和 Windows WinFsp 必须共用同一 Workspace Engine、mount runtim
   Developer ID 签名与公证，避免 Gatekeeper 阻止 CLI/gateway；
 - NFS 协议版本、mount 权限提示、锁、xattr、缓存一致性、sleep/wake 和 gateway crash 必须
   通过真机 Gate 后，才能宣传“安装后无缝 Bash”。
+
+2026-07-24 已完成不连接数据库的 localhost NFSv3 传输原型。macOS 26.3.1 arm64 当前用户可
+直接 mount/unmount，普通 Bash 文件操作、mode、symlink 和 `git init/add/commit` 已通过；
+这只证明系统入口可行，不表示 VexDB NFS adapter 已实现。原型还发现 macOS
+`com.apple.provenance` 会在 NFSv3 上落成每文件一个 `._*` AppleDouble sidecar；优化后的镜像
+原型创建 200 个用户文件耗时 2.66 秒，同轮 APFS 为 0.03 秒。因此 AppleDouble 内部映射和
+小文件写回合并是默认 NFS 发布 Gate，不能把“免 FSKit 授权”当作唯一选型标准。
 
 后文中的 FSKit 完成状态仍是历史事实；凡是把 FSKit 写成“默认、MVP 主入口或当前发布前置”的
 旧表述，均由本节替代。
@@ -231,7 +238,9 @@ VexFS 的目标是把普通文件管理放进数据库事务、权限、版本�
 VexFS 由三部分组成：
 
 1. **数据库扩展**：权威状态、SQL 合同、事务、权限、版本、快照、审计和备份兼容。
-2. **mount gateway**：通过数据库公开合同把 workspace 显示为真实操作系统目录；macOS 使用 FSKit App Extension，Linux 使用 libfuse3，Windows 后续使用 WinFsp。
+2. **mount gateway**：通过数据库公开合同把 workspace 显示为真实操作系统目录；macOS
+   默认使用 localhost NFS gateway，FSKit 是后续可选 adapter；Linux 使用 libfuse3，Windows
+   后续使用 WinFsp。
 3. **配套 CLI**：安装、连接、mount/unmount、直接文件命令、worktree、shell、exec、导入导出和运维入口。
 
 数据库扩展是权威核心。没有 mount gateway 或 CLI 时，全部数据能力仍可通过 SQL 使用；mount gateway 崩溃或卸载不能损坏数据库中已经提交的文件。
@@ -248,16 +257,19 @@ VexFS 由三部分组成：
 
 ### 4.1 MVP Gate 目标
 
-- 只支持 macOS 26.0+、Apple Silicon、SQLite、单 gateway、单 mount 和单数据库 principal；
-- 采用 FSKit `FSUnaryFileSystem` 和 `FSVolume`，把一个 workspace 挂载为真实目录；
+- 首个默认发行只支持经真机矩阵确认的 macOS 版本和 CPU、SQLite、单 gateway、单 mount 和
+  单数据库 principal；
+- 采用系统 NFS client + 只监听 loopback 的当前用户 gateway，把一个 workspace 挂载为真实目录；
 - 支持普通文件和目录的最小调用集，以及 O_CREAT、O_EXCL、O_TRUNC 和 O_APPEND；
 - 明确采用 close-to-open 一致性，不宣传完整 POSIX 强一致；
-- MVP 不启用 FSKit kernel data cache，权限与正确性优先；
-- 允许在 adapter 内对小型只读文件做有边界的打开期缓存，但必须覆盖并通过写打开、
+- NFS attribute/data cache 使用可测试的有界 TTL、COMMIT/fsync 和主动失效规则，权限与正确性优先；
+- 允许在 gateway 内对 metadata 和小型只读文件做有边界的缓存，但必须覆盖并通过写打开、
   truncate、rename、unlink、同名重建和大文件回退测试；
-- FSKit `write`、`synchronize`、`closeItem` 和 `reclaimItem` 的成功含义及故障恢复规则可测试；
-- `synchronize` 成功后的内容在 FSKit extension 被终止和数据库 reopen 后仍完整；
-- 完成签名并公证的 macOS App、FSKit extension、SQLite 扩展和 CLI 组合包，以及版本握手、doctor 和卸载流程；
+- NFS `WRITE`、`COMMIT`、close、fsync 和 unmount 的成功含义及故障恢复规则可测试；
+- sync 成功后的内容在 gateway 被终止和数据库 reopen 后仍完整；
+- `._*` AppleDouble 不能作为普通用户文件进入路径、历史、快照、配额和 grep；需要保留的
+  macOS xattr 必须映射到统一 VexFS xattr 合同；
+- 完成签名并公证的 macOS CLI、gateway 和 SQLite 扩展组合包，以及版本握手、doctor 和卸载流程；
 - Bash、Python 和基础 Git 流程不需要 VexFS 专用命令；
 - 1,000 个文件、1 GiB 当前内容和 100 MiB 单文件通过正确性测试。
 
@@ -1687,7 +1699,10 @@ vexdb fs --workspace agent-workspace setup \
   --mount ~/VexDB/agent-workspace
 ```
 
-未传 `--db` 时使用 `~/Library/Application Support/VexDB-Lite/default.sqlite3`。`setup` 初始化 SQLite 和 workspace；传入 `--mount` 时再检查 macOS 和 FSKit、App/extension、签名和合同版本，创建私有 mount point 并请求系统挂载。用户没有启用 extension 时必须给出准确的系统设置位置，不能假装挂载成功。
+未传 `--db` 时使用 `~/Library/Application Support/VexDB-Lite/default.sqlite3`。`setup` 初始化
+SQLite 和 workspace；传入 `--mount` 时检查 gateway 签名、数据库合同、loopback 端口和系统
+NFS client，创建私有 mount point 并请求系统挂载。默认流程不检查或要求启用 FSKit extension。
+显式使用 `--backend fskit` 时，才检查 App Extension 和系统启用状态。
 
 context 配置不能保存明文密码。认证使用数据库支持的密码文件、环境变量、系统凭证或交互提示。需要登录后自动挂载时，用户显式增加 `--persist`。
 
@@ -1701,11 +1716,11 @@ python scripts/generate.py
 git status
 ```
 
-这是真实挂载目录，不是 checkout 副本。程序通过普通文件 API 读写；FSKit
-`synchronize` 映射到平台无关 sync。macOS mount 的专用 SQLite 连接使用
+这是真实挂载目录，不是 checkout 副本。程序通过普通文件 API 读写；NFS `COMMIT`、fsync、
+close 和安全 unmount 映射到平台无关 sync。macOS mount 的专用 SQLite 连接使用
 `WAL + NORMAL staging + FULL publish`：普通 write 返回时内容仍未发布，sync 成功时
 完整版本已经发布并达到 FULL。这个策略不修改其他业务 SQLite 连接，`doctor` 必须显示
-实际配置和风险。`closeItem/reclaimItem` 只负责句柄结束和可恢复兜底。另一个 handle
+实际配置和风险。NFS handle close 和 gateway 故障恢复只负责句柄结束和可恢复兜底。另一个 handle
 在重新 open 后看到已发布版本；MVP 不承诺多个 gateway 实时同步。
 
 常用生命周期命令：
@@ -1713,7 +1728,8 @@ git status
 - `vexfs mount ~/VexFS/agent-workspace`：挂载当前 workspace；
 - `vexfs mount status`：查看连接、principal、workspace 和待处理 handle；
 - `vexfs unmount ~/VexFS/agent-workspace`：安全卸载；
-- `vexfs doctor`：检查 App、FSKit extension、签名、SQLite 扩展、连接、权限和版本。
+- `vexfs doctor`：检查 gateway、系统 NFS client、loopback 端口、挂载表、签名、SQLite
+  扩展、连接、权限和版本；显式选择 FSKit 时再检查 extension。
 
 ### 27.5 Agent 使用
 
@@ -1740,7 +1756,8 @@ vexfs txn run --workspace agent-workspace -- \
 
 VexFS 承诺：
 
-- macOS 完成一次 FSKit extension 启用和 setup 后，workspace 是可以直接 `cd` 进入的真实路径；
+- macOS 完成 setup 后，一条 mount 命令启动本机 gateway 并得到可以直接 `cd` 的真实路径；
+- 默认入口不要求用户进入“文件系统扩展”页面；
 - Bash、ls、cat、rg、sed、python、git、编译器和 apply_patch 直接可用；
 - 不需要为每个系统命令开发 VexFS 版本；
 - 每个文件操作仍由数据库统一处理事务、权限、版本、配额和审计；
@@ -1748,7 +1765,7 @@ VexFS 承诺：
 
 VexFS 不承诺：
 
-- MVP 覆盖 Linux、Windows、macOS 26.0 以下版本、普通容器和不能启用 FSKit extension 环境的真实挂载；
+- 首个默认发行覆盖 Linux、Windows、普通容器或未进入 NFS 真机矩阵的 macOS 版本；
 - 把多条 Bash 命令自动变成一个数据库事务；
 - 支持设备文件、socket、FIFO、setuid 或全部 POSIX 特殊行为；
 - 通过 mount point 获得高于数据库 principal 的权限。
