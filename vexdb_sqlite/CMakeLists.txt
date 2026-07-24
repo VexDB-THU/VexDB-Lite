@@ -99,6 +99,13 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_TOOLCHAIN_FILE
     endif()
     message(STATUS "macOS arch 对齐真实硬件: ${CMAKE_OSX_ARCHITECTURES}")
 endif()
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET AND NOT CMAKE_TOOLCHAIN_FILE
+   AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # 默认 NFS 路径不依赖 FSKit。FSKit App 保持自己的 macOS 26 target，
+    # CLI、SQLite extension 和 NFS gateway 保持对更低版本 macOS 的兼容。
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "" FORCE)
+    message(STATUS "macOS NFS core deployment target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+endif()
 
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
@@ -333,6 +340,7 @@ if(VEXDB_SQLITE_DESKTOP)
             OUTPUT "${VEXFS_NFS_RUST_LIBRARY}"
             COMMAND "${CMAKE_COMMAND}" -E env
                 "CARGO_TARGET_DIR=${VEXFS_NFS_CARGO_TARGET_DIR}"
+                "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
                 "${VEXFS_CARGO}" build --release --locked
                     --target "${VEXFS_NFS_RUST_TARGET}"
                     --manifest-path "${VEXFS_NFS_GATEWAY_DIR}/Cargo.toml"
@@ -363,6 +371,11 @@ if(VEXDB_SQLITE_DESKTOP)
         endif()
         set_target_properties(vexfs_nfs_gateway PROPERTIES
             OUTPUT_NAME "vexfs-nfs-gateway" LINKER_LANGUAGE CXX)
+        if(VEXFS_BUNDLE_POSTGRESQL_RUNTIME)
+            set_target_properties(vexfs_nfs_gateway PROPERTIES
+                BUILD_WITH_INSTALL_RPATH ON
+                INSTALL_RPATH "@executable_path/../lib/runtime;@executable_path/../lib/vexdb-lite/runtime")
+        endif()
     endif()
 
     set_source_files_properties(${SQLITE_AMALG_DIR}/shell.c PROPERTIES

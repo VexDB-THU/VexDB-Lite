@@ -14,10 +14,10 @@ VexDB-Lite 在一个安装包中提供：
 
 ## 系统要求
 
-- macOS 26.0 或更高版本；
+- 默认 NFS、CLI 和 SQLite 扩展支持 macOS 13.0 或更高版本；
 - Apple Silicon 包要求 arm64 Mac；
 - 默认真实挂载使用 macOS 自带的 NFS client，不要求安装驱动或打开系统扩展开关；
-- FSKit 是可选 driver。只有显式使用 `--mount-driver fskit` 时才需要 macOS 允许
+- FSKit 是 macOS 26.0+ 的可选 driver。只有显式使用 `--mount-driver fskit` 时才需要 macOS 允许
   `VexDB Lite` 文件系统扩展。
 
 ## 安装

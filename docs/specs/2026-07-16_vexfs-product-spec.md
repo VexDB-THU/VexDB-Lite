@@ -79,9 +79,11 @@ VexFS 有两种不同的事务入口，文档和产品界面必须明确区分�
 2. mount 中的普通 Bash 操作由 gateway 建立短事务，不能自动加入应用已经打开的数据库事务，多条 Bash 命令也不会自动合成一个事务。
 
 macOS 默认挂载改为系统 NFS client + 本机用户态 gateway，不再受 FSKit V2
-`FSPathURLResource` 的 macOS 26.0 最低版本约束；新的最低 macOS 版本和 Intel/Apple Silicon
-支持范围由 NFS 发行包真机验证决定。现有 macOS 26.0+ Apple Silicon FSKit 实现作为后续可选
+`FSPathURLResource` 的 macOS 26.0 最低版本约束；默认 NFS core 已完成 macOS 13.0 deployment
+target 构建，Intel/Apple Silicon 的完整支持范围仍由发行包真机验证决定。现有 macOS 26.0+ Apple Silicon FSKit 实现作为后续可选
 原生 adapter 保留。Linux 已有 libfuse3 预览，Windows 后续使用 WinFsp。
+打包时必须同时写入 `minimum_macos=13.0` 和 `fskit_minimum_macos=26.0`，并保证
+NFS gateway 同时能在压缩包目录和 `~/.local` 安装目录找到随包的 PostgreSQL runtime。
 
 ### 0.1 最终目标和开发顺序
 
@@ -318,7 +320,7 @@ MVP Gate 不等于完整产品。它只回答三个问题：数据库能否保�
 
 ### 4.4 非目标
 
-- MVP Gate 不承诺 Linux、Windows、macOS 26.0 以下版本和所有容器都能真实挂载；
+- MVP Gate 不承诺 Linux、Windows、macOS 13.0 以下版本和所有容器都能真实挂载；
 - 不把 mount gateway 做成另一套权威文件服务器；
 - 不建立另一套网络协议；
 - 不提供必须接入的 SDK；

@@ -70,6 +70,11 @@ expect_fail() {
 
 mkdir -p "$TEST_HOME"
 
+equal "13.0" "$(sed -n 's/^minimum_macos=//p' "$STAGE/MANIFEST.txt")" \
+    "default NFS minimum macOS"
+equal "26.0" "$(sed -n 's/^fskit_minimum_macos=//p' "$STAGE/MANIFEST.txt")" \
+    "optional FSKit minimum macOS"
+
 # 交付物和使用说明。App 放在隐藏 payload，防止解压目录被 LaunchServices
 # 当成第二个可运行副本，从而让 FSKit 随机选到未安装的扩展。
 check test ! -e "$STAGE/VexDB Lite.app"
@@ -98,6 +103,11 @@ check test -f "$STAGE/lib/runtime/libpq.5.dylib"
 equal "$PACKAGE_ARCHITECTURE" \
     "$(lipo -archs "$STAGE/bin/vexfs-nfs-gateway")" \
     "NFS gateway architecture"
+GATEWAY_LOAD_COMMANDS="$(otool -l "$STAGE/bin/vexfs-nfs-gateway")"
+contains "$GATEWAY_LOAD_COMMANDS" "@executable_path/../lib/runtime" \
+    "NFS gateway package runtime path"
+contains "$GATEWAY_LOAD_COMMANDS" "@executable_path/../lib/vexdb-lite/runtime" \
+    "NFS gateway installed runtime path"
 EXTENSION_ENTITLEMENTS="$TMP_DIR/extension-entitlements.plist"
 EXTENSION_ENTITLEMENTS_LOG="$TMP_DIR/extension-entitlements.log"
 if ! codesign -d --entitlements - --xml \

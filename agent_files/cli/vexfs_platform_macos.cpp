@@ -243,10 +243,11 @@ std::string ProductVersion() {
     return buffer;
 }
 
-bool ProductVersionSupported(const std::string &version) {
+bool ProductVersionSupported(const std::string &version, const std::string &driver) {
     char *end = nullptr;
     const long major = std::strtol(version.c_str(), &end, 10);
-    return end != version.c_str() && major >= 26;
+    if (end == version.c_str()) return false;
+    return major >= (driver == "nfs" ? 13 : 26);
 }
 
 std::string MountedFileSystemAt(const std::string &path) {
@@ -945,7 +946,7 @@ VexFSPlatformState VexFSPlatformInspect(const std::string &mount_driver) {
     VexFSPlatformState state;
     state.platform = "macos";
     state.version = ProductVersion();
-    state.platform_supported = ProductVersionSupported(state.version);
+    state.platform_supported = ProductVersionSupported(state.version, driver);
     void *framework = dlopen("/System/Library/Frameworks/FSKit.framework/FSKit", RTLD_LAZY);
     const bool fskit_available = framework != nullptr;
     if (framework != nullptr) dlclose(framework);

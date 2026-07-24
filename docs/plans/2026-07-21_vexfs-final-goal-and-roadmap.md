@@ -166,7 +166,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试；PG 已执行 ACL 和继承 | SQLite 尚未执行完整 ACL 授权；特殊文件不支持 |
 | 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、原生备份、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 自动维护、history/staging/index/total quota 和 DuckDB 导入端未完成 |
 | 长期校验 | `chunked-v1` 使用不可变 manifest、64 KiB 块和逐块/整文件 SHA-256；只读 check 覆盖结构、引用、顺序、大小和流式内容校验 | 自动 repair 和跨文件通用去重不在当前范围 |
-| macOS | 默认 NFS 已连接 SQLite runtime，35 项真机 eval 和 30 项 package smoke 通过；hardlink、COMMIT/fsync、AppleDouble 隔离、Git、重挂载和快照恢复均已验证。既有 FSKit 仍保留并有 preview.22/preview.37 真机证据 | 默认 NFS 尚未从干净提交生成公证包，也未在未启用 FSKit 的干净 Mac 验证；gateway crash/sleep-wake、锁、长期 Agent、macOS 26.0–26.4 和 x86_64 待补 |
+| macOS | 默认 NFS 已连接 SQLite runtime，45 项完整真机 eval、13 项 OpenCode eval 和 30 项 package smoke 通过；hardlink、COMMIT/fsync、AppleDouble 隔离、Git、单机锁、npm/Cargo、重挂载和快照恢复均已验证；macOS 13.0 deployment target 构建通过。preview.40 ad-hoc 完整打包通过 99 项文档/安装检查、18 项干净包安装 eval、哈希和签名校验；既有 FSKit 仍保留并有 preview.22/preview.37 真机证据 | 默认 NFS 尚未从干净提交生成公证包，也未在 macOS 13–15 或未启用 FSKit 的干净 Mac 验证；重复 crash/sleep-wake、跨机器锁、长期 Agent 和 x86_64 待补 |
 | Linux | libfuse3 真实挂载已通过 root 和 uid 1000 各 9 组；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；异常撤销后底层目录保持 0500，显式卸载恢复 0700；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
 | 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、当前源码下的 macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项，以及双机 extension 崩溃、网络中断和数据库停机 25 项 | 当前审计源码对应的公证包尚未生成，需要重跑双机安装 Gate；局域网直连 FSKit 还需要 macOS 本地网络授权；PG 文本索引尚未实现 |

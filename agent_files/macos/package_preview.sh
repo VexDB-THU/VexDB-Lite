@@ -15,6 +15,8 @@ RUNTIME_ABI="$(sed -n 's/^#define VEXFS_RUNTIME_ABI_VERSION \([0-9][0-9]*\)u$/\1
 
 VERSION="${VEXDB_LITE_PREVIEW_VERSION:-${VEXFS_PREVIEW_VERSION:-0.1.0-preview.1}}"
 ARCH="${VEXDB_LITE_ARCH:-${VEXFS_ARCH:-arm64}}"
+MINIMUM_MACOS="${VEXDB_LITE_MINIMUM_MACOS:-13.0}"
+FSKIT_MINIMUM_MACOS=26.0
 SIGN_MODE="${VEXDB_LITE_SIGN_MODE:-${VEXFS_SIGN_MODE:-ad-hoc}}"
 TEAM_ID="${VEXDB_LITE_TEAM_ID:-${VEXFS_TEAM_ID:-BB5VK42K87}}"
 EXPORT_OPTIONS="${VEXDB_LITE_EXPORT_OPTIONS:-${VEXFS_EXPORT_OPTIONS:-$SCRIPT_DIR/ExportOptions-DeveloperID.plist}}"
@@ -29,6 +31,10 @@ fi
 case "$VERSION" in
     *[!A-Za-z0-9._-]*) echo "版本只能包含字母、数字、点、下划线和连字符" >&2; exit 2 ;;
 esac
+if [[ ! "$MINIMUM_MACOS" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "VEXDB_LITE_MINIMUM_MACOS 必须是 major.minor：$MINIMUM_MACOS" >&2
+    exit 2
+fi
 BUNDLE_MARKETING_VERSION="${VEXDB_LITE_BUNDLE_MARKETING_VERSION:-${VERSION%%-*}}"
 BUNDLE_BUILD_VERSION="${VEXDB_LITE_BUNDLE_BUILD_VERSION:-}"
 if [ -z "$BUNDLE_BUILD_VERSION" ]; then
@@ -277,6 +283,7 @@ echo "=== 构建 VexDB-Lite CLI 与 SQLite 扩展 ==="
 "$CMAKE_BIN" -S "$SQLITE_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_OSX_ARCHITECTURES="$ARCH" \
+    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MINIMUM_MACOS" \
     -DVEXDB_LITE_VERSION="$VERSION" \
     -DVEXFS_REQUIRE_POSTGRESQL=ON \
     -DVEXFS_BUNDLE_POSTGRESQL_RUNTIME=ON \
@@ -520,7 +527,8 @@ write_manifest() {
         echo "contract_version=0.9.0"
         echo "mount_abi_version=$RUNTIME_ABI"
         echo "platform=macOS"
-        echo "minimum_macos=26.0"
+        echo "minimum_macos=$MINIMUM_MACOS"
+        echo "fskit_minimum_macos=$FSKIT_MINIMUM_MACOS"
         echo "architecture=$ARCH"
         echo "source_branch=$GIT_BRANCH"
         echo "source_commit=$GIT_COMMIT"

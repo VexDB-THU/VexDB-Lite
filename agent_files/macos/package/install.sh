@@ -19,6 +19,20 @@ PACKAGE_APP="$ROOT/.payload/VexDB Lite.app"
 [ -f "$ROOT/MANIFEST.txt" ] || { echo "安装包缺少 MANIFEST.txt" >&2; exit 1; }
 [ -f "$ROOT/SHA256SUMS.txt" ] || { echo "安装包缺少 SHA256SUMS.txt" >&2; exit 1; }
 
+MINIMUM_MACOS="$(sed -n 's/^minimum_macos=//p' "$ROOT/MANIFEST.txt")"
+CURRENT_MACOS="$(/usr/bin/sw_vers -productVersion 2>/dev/null || true)"
+[ -n "$MINIMUM_MACOS" ] || { echo "安装包清单缺少 minimum_macos" >&2; exit 1; }
+[ -n "$CURRENT_MACOS" ] || { echo "无法读取当前 macOS 版本" >&2; exit 1; }
+if ! /usr/bin/awk -v current="$CURRENT_MACOS" -v required="$MINIMUM_MACOS" 'BEGIN {
+        split(current, c, "."); split(required, r, ".");
+        if ((c[1] + 0) > (r[1] + 0)) exit 0;
+        if ((c[1] + 0) < (r[1] + 0)) exit 1;
+        exit !((c[2] + 0) >= (r[2] + 0));
+    }'; then
+    echo "VexDB-Lite 默认 NFS 需要 macOS $MINIMUM_MACOS 或更高版本；当前为 $CURRENT_MACOS" >&2
+    exit 1
+fi
+
 (cd "$ROOT" && /usr/bin/shasum -a 256 -c SHA256SUMS.txt >/dev/null) || {
     echo "安装包文件哈希校验失败" >&2
     exit 1
