@@ -305,6 +305,66 @@ if(VEXDB_SQLITE_BUILD_TESTS OR VEXDB_SQLITE_DESKTOP)
 endif()
 
 if(VEXDB_SQLITE_DESKTOP)
+    if(APPLE)
+        find_program(VEXFS_CARGO cargo)
+        if(NOT VEXFS_CARGO)
+            message(FATAL_ERROR
+                "macOS 默认 NFS gateway 需要 Rust cargo；请安装 Rust toolchain")
+        endif()
+        set(VEXFS_NFS_GATEWAY_DIR
+            "${REPO_ROOT}/agent_files/mount/macos/nfs_gateway")
+        set(VEXFS_NFS_CARGO_TARGET_DIR
+            "${CMAKE_BINARY_DIR}/nfs-gateway-cargo")
+        if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+            set(VEXFS_NFS_RUST_TARGET "aarch64-apple-darwin")
+        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+            set(VEXFS_NFS_RUST_TARGET "x86_64-apple-darwin")
+        else()
+            message(FATAL_ERROR
+                "macOS NFS gateway 当前要求单架构构建（arm64 或 x86_64）；"
+                "通用包由发布脚本合并两个独立构建")
+        endif()
+        set(VEXFS_NFS_RUST_LIBRARY
+            "${VEXFS_NFS_CARGO_TARGET_DIR}/${VEXFS_NFS_RUST_TARGET}/release/libvexfs_nfs_gateway.a")
+        file(GLOB_RECURSE VEXFS_NFS_RUST_SOURCES CONFIGURE_DEPENDS
+            "${VEXFS_NFS_GATEWAY_DIR}/src/*.rs"
+            "${VEXFS_NFS_GATEWAY_DIR}/vendor/nfsserve/src/*.rs")
+        add_custom_command(
+            OUTPUT "${VEXFS_NFS_RUST_LIBRARY}"
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "CARGO_TARGET_DIR=${VEXFS_NFS_CARGO_TARGET_DIR}"
+                "${VEXFS_CARGO}" build --release --locked
+                    --target "${VEXFS_NFS_RUST_TARGET}"
+                    --manifest-path "${VEXFS_NFS_GATEWAY_DIR}/Cargo.toml"
+            DEPENDS
+                "${VEXFS_NFS_GATEWAY_DIR}/Cargo.toml"
+                "${VEXFS_NFS_GATEWAY_DIR}/Cargo.lock"
+                "${VEXFS_NFS_GATEWAY_DIR}/vendor/nfsserve/Cargo.toml"
+                ${VEXFS_NFS_RUST_SOURCES}
+            COMMENT "Build macOS VexFS NFS protocol adapter"
+            VERBATIM)
+        add_custom_target(vexfs_nfs_gateway_rust_build
+            DEPENDS "${VEXFS_NFS_RUST_LIBRARY}")
+        add_library(vexfs_nfs_gateway_rust STATIC IMPORTED GLOBAL)
+        set_target_properties(vexfs_nfs_gateway_rust PROPERTIES
+            IMPORTED_LOCATION "${VEXFS_NFS_RUST_LIBRARY}")
+        add_dependencies(vexfs_nfs_gateway_rust vexfs_nfs_gateway_rust_build)
+
+        add_executable(vexfs_nfs_gateway
+            ${VEXFS_NFS_GATEWAY_DIR}/vexfs_nfs_gateway_main.cpp)
+        target_include_directories(vexfs_nfs_gateway PRIVATE
+            ${VEXFS_NFS_GATEWAY_DIR}/include
+            ${REPO_ROOT}/agent_files/mount/common/include)
+        target_link_libraries(vexfs_nfs_gateway PRIVATE
+            vexfs_nfs_gateway_rust vexfs_runtime sqlite3_amalg
+            Threads::Threads ${CMAKE_DL_LIBS})
+        if(PostgreSQL_FOUND)
+            target_link_libraries(vexfs_nfs_gateway PRIVATE ${PostgreSQL_LIBRARIES})
+        endif()
+        set_target_properties(vexfs_nfs_gateway PROPERTIES
+            OUTPUT_NAME "vexfs-nfs-gateway" LINKER_LANGUAGE CXX)
+    endif()
+
     set_source_files_properties(${SQLITE_AMALG_DIR}/shell.c PROPERTIES
         COMPILE_DEFINITIONS "main=vexdb_sqlite_shell_main;SQLITE_SHELL_INIT_PROC=vexdb_shell_init")
     set(VEXDB_CLI_SOURCES
@@ -366,6 +426,9 @@ if(VEXDB_SQLITE_DESKTOP)
             COMMENT "Create vexfs compatibility entry")
     endif()
     add_custom_target(vexfs_cli DEPENDS vexdb_cli)
+    if(APPLE)
+        add_dependencies(vexfs_cli vexfs_nfs_gateway)
+    endif()
 
     if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         find_package(PkgConfig QUIET)

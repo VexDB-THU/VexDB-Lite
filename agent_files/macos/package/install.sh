@@ -13,6 +13,7 @@ PACKAGE_APP="$ROOT/.payload/VexDB Lite.app"
 [ -d "$PACKAGE_APP" ] || { echo "安装包缺少 .payload/VexDB Lite.app" >&2; exit 1; }
 [ -x "$ROOT/bin/vexdb" ] || { echo "安装包缺少 bin/vexdb" >&2; exit 1; }
 [ -x "$ROOT/bin/vexfs" ] || { echo "安装包缺少 bin/vexfs" >&2; exit 1; }
+[ -x "$ROOT/bin/vexfs-nfs-gateway" ] || { echo "安装包缺少 NFS gateway" >&2; exit 1; }
 [ -f "$ROOT/lib/vexdb_lite.dylib" ] || { echo "安装包缺少 SQLite 扩展" >&2; exit 1; }
 [ -f "$ROOT/lib/runtime/libpq.5.dylib" ] || { echo "安装包缺少 PostgreSQL runtime" >&2; exit 1; }
 [ -f "$ROOT/MANIFEST.txt" ] || { echo "安装包缺少 MANIFEST.txt" >&2; exit 1; }
@@ -107,6 +108,7 @@ verify_component "$PACKAGE_APP" --deep
 PACKAGE_EXTENSION="$PACKAGE_APP/Contents/Extensions/VexFSAppEx.appex"
 verify_component "$PACKAGE_EXTENSION"
 verify_component "$ROOT/bin/vexdb"
+verify_component "$ROOT/bin/vexfs-nfs-gateway"
 verify_component "$ROOT/lib/vexdb_lite.dylib"
 find "$ROOT/lib/runtime" \
     "$PACKAGE_APP/Contents/Extensions/VexFSAppEx.appex/Contents/Frameworks" \
@@ -149,7 +151,7 @@ verify_installed_mount() {
             rm -rf "$probe_root"
             return 0
         fi
-        echo "临时 FSKit 验证目录未能卸载，已保留以避免删除挂载内容：$probe_root" >&2
+        echo "临时 NFS 验证目录未能卸载，已保留以避免删除挂载内容：$probe_root" >&2
         return 1
     }
 
@@ -160,16 +162,14 @@ verify_installed_mount() {
         return 1
     fi
 
-    # FSKit can briefly report the newly registered path before ExtensionKit has
-    # finished replacing the old helper. A real disposable mount is the only
-    # reliable readiness check; doctor intentionally reports registry state only.
+    # 真实临时挂载是验证系统 NFS client、gateway 和数据库合同的最终检查。
     for attempt in 1 2; do
         if "$BIN_DIR/vexdb" fs --db "$probe_database" \
                 --workspace install-probe mount "$probe_mount" \
                 >/dev/null 2>"$probe_error"; then
-            if printf '%s\n' ready-from-fskit >"$probe_mount/ready.txt" 2>>"$probe_error"; then
+            if printf '%s\n' ready-from-nfs >"$probe_mount/ready.txt" 2>>"$probe_error"; then
                 actual="$(cat "$probe_mount/ready.txt" 2>>"$probe_error" || true)"
-                if [ "$actual" = ready-from-fskit ]; then
+                if [ "$actual" = ready-from-nfs ]; then
                     if "$BIN_DIR/vexdb" fs --db "$probe_database" \
                             --workspace install-probe unmount "$probe_mount" \
                             >/dev/null 2>>"$probe_error"; then
@@ -177,7 +177,7 @@ verify_installed_mount() {
                         return 0
                     fi
                     cat "$probe_error" >&2
-                    echo "临时 FSKit 验证目录未能正常卸载，已保留：$probe_root" >&2
+                    echo "临时 NFS 验证目录未能正常卸载，已保留：$probe_root" >&2
                     return 1
                 fi
             fi
@@ -296,6 +296,7 @@ STAGED_APP="$TRANSACTION_DIR/new.bundle"
 PREVIOUS_APP=""
 APP_REPLACED=false
 CLI_BACKED_UP=false
+GATEWAY_BACKED_UP=false
 LIBRARY_BACKED_UP=false
 RUNTIME_BACKED_UP=false
 INSTALL_COMMITTED=false
@@ -323,6 +324,12 @@ rollback_install() {
         else
             rm -f "$BIN_DIR/vexdb"
         fi
+        if [ "$GATEWAY_BACKED_UP" = true ]; then
+            cp -p "$TRANSACTION_DIR/previous-vexfs-nfs-gateway" \
+                "$BIN_DIR/vexfs-nfs-gateway" >/dev/null 2>&1 || true
+        else
+            rm -f "$BIN_DIR/vexfs-nfs-gateway"
+        fi
         if [ "$LIBRARY_BACKED_UP" = true ]; then
             cp -p "$TRANSACTION_DIR/previous-vexdb_lite.dylib" \
                 "$LIB_DIR/vexdb_lite.dylib" >/dev/null 2>&1 || true
@@ -347,6 +354,11 @@ trap 'rollback_install $?' EXIT
 if [ -e "$BIN_DIR/vexdb" ]; then
     cp -p "$BIN_DIR/vexdb" "$TRANSACTION_DIR/previous-vexdb"
     CLI_BACKED_UP=true
+fi
+if [ -e "$BIN_DIR/vexfs-nfs-gateway" ]; then
+    cp -p "$BIN_DIR/vexfs-nfs-gateway" \
+        "$TRANSACTION_DIR/previous-vexfs-nfs-gateway"
+    GATEWAY_BACKED_UP=true
 fi
 if [ -e "$LIB_DIR/vexdb_lite.dylib" ]; then
     cp -p "$LIB_DIR/vexdb_lite.dylib" "$TRANSACTION_DIR/previous-vexdb_lite.dylib"
@@ -387,6 +399,7 @@ if ! mv "$STAGED_APP" "$INSTALLED_APP"; then
 fi
 APP_REPLACED=true
 install -m 0755 "$ROOT/bin/vexdb" "$BIN_DIR/vexdb"
+install -m 0755 "$ROOT/bin/vexfs-nfs-gateway" "$BIN_DIR/vexfs-nfs-gateway"
 ln -sfn vexdb "$BIN_DIR/vexfs"
 install -m 0644 "$ROOT/lib/vexdb_lite.dylib" "$LIB_DIR/vexdb_lite.dylib"
 rm -rf "$LIB_DIR/runtime"
@@ -397,11 +410,18 @@ find "$ROOT/lib/runtime" -type f -name '*.dylib' -print0 \
     done
 verify_component "$INSTALLED_APP" --deep
 verify_component "$BIN_DIR/vexdb"
+verify_component "$BIN_DIR/vexfs-nfs-gateway"
 verify_component "$LIB_DIR/vexdb_lite.dylib"
 find "$LIB_DIR/runtime" -type f -name '*.dylib' -print0 \
     | while IFS= read -r -d '' library; do
         verify_component "$library"
     done
+
+if ! verify_installed_mount; then
+    echo "默认 NFS 挂载检查失败；安装没有通过真实文件读写验证。" >&2
+    exit 1
+fi
+echo "默认 NFS 真实挂载检查通过。"
 
 if [ -z "$APP_DIR_OVERRIDE" ]; then
     INSTALLED_EXTENSION="$INSTALLED_APP/Contents/Extensions/VexFSAppEx.appex"
@@ -415,13 +435,8 @@ if [ -z "$APP_DIR_OVERRIDE" ]; then
     # App has been launched once. Launch it hidden so doctor does not keep
     # reporting `extension: missing` after a valid upgrade.
     /usr/bin/open -gj "$INSTALLED_APP" >/dev/null 2>&1 || true
-    # Registration is now stable. Refresh only fskit_agent; rotating pkd here
-    # can assign another extension UUID after the agent has already cached the
-    # previous identity and leads to ExtensionKit error 2 during the first mount.
-    restart_current_user_fskit_agent
-    sleep 1
     /usr/bin/open -gj "$INSTALLED_APP" >/dev/null 2>&1 || true
-    sleep 2
+    sleep 1
 
     # enabled 只表示同 bundle ID 的扩展已经获准使用，不保证 FSKit 当前解析到
     # 新安装的 App。用签名 CLI 读取 FSKit 的真实 module URL，避免安装成功但
@@ -429,7 +444,7 @@ if [ -z "$APP_DIR_OVERRIDE" ]; then
     EXTENSION_CHECK=""
     for ATTEMPT in 1 2 3 4 5; do
         EXTENSION_CHECK="$(VEXFS_EXPECTED_EXTENSION_PATH="$INSTALLED_EXTENSION" \
-            "$BIN_DIR/vexdb" fs --json doctor 2>/dev/null || true)"
+            "$BIN_DIR/vexdb" fs --mount-driver fskit --json doctor 2>/dev/null || true)"
         case "$EXTENSION_CHECK" in
             *'"extension_path_matches":true'*) break ;;
         esac
@@ -440,11 +455,7 @@ if [ -z "$APP_DIR_OVERRIDE" ]; then
     case "$EXTENSION_CHECK" in
         *'"extension_path_matches":true'*)
             if [[ "$EXTENSION_CHECK" == *'"mount_ready":true'* ]]; then
-                if ! verify_installed_mount; then
-                    echo "FSKit 已注册，但真实临时挂载仍未就绪；请稍后重试安装或运行 vexdb fs doctor。" >&2
-                    exit 1
-                fi
-                echo "FSKit 真实挂载检查通过。"
+                echo "可选 FSKit 扩展已启用。"
             else
                 case "$EXTENSION_CHECK" in
                     *'"extension":"disabled"'*)
@@ -462,10 +473,9 @@ if [ -z "$APP_DIR_OVERRIDE" ]; then
             echo "警告：系统尚未返回 FSKit module 路径；启用扩展后请运行 vexdb fs doctor。" >&2
             ;;
         *)
-            echo "FSKit 当前没有加载新安装的扩展，安装未完成：" >&2
+            echo "警告：可选 FSKit 当前没有加载新安装的扩展；默认 NFS 不受影响。" >&2
             echo "$EXTENSION_CHECK" >&2
             echo "期望路径：$INSTALLED_EXTENSION" >&2
-            exit 1
             ;;
     esac
 fi
@@ -490,6 +500,7 @@ trap - EXIT
 echo "VexDB-Lite 已安装："
 echo "  App: $APP_DIR/VexDB Lite.app"
 echo "  CLI: $BIN_DIR/vexdb"
+echo "  NFS gateway: $BIN_DIR/vexfs-nfs-gateway"
 echo "  文件快捷命令: $BIN_DIR/vexfs"
 echo "  SQLite: $LIB_DIR/vexdb_lite.dylib"
 echo "  PostgreSQL runtime: $LIB_DIR/runtime/"

@@ -77,7 +77,7 @@ void VexFSPlatformProtectDirectory(const std::filesystem::path &path) {
 #endif
 }
 
-VexFSPlatformState VexFSPlatformInspect() {
+VexFSPlatformState VexFSPlatformInspect(const std::string &) {
     VexFSPlatformState state;
     state.platform = PlatformName();
     state.version = "unknown";
@@ -91,7 +91,7 @@ VexFSPlatformState VexFSPlatformInspect() {
 
 int VexFSPlatformMount(const std::string &, const std::string &,
                        const std::string &,
-                       const std::string &) {
+                       const std::string &, const std::string &) {
     throw std::runtime_error(std::string("VexFS ") + MountDriverName() +
                              " mount adapter is not implemented yet");
 }

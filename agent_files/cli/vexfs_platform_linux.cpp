@@ -211,7 +211,9 @@ void VexFSPlatformProtectDirectory(const std::filesystem::path &path) {
     if (chmod(path.c_str(), 0700) != 0) throw std::runtime_error(std::strerror(errno));
 }
 
-VexFSPlatformState VexFSPlatformInspect() {
+VexFSPlatformState VexFSPlatformInspect(const std::string &mount_driver) {
+    if (!mount_driver.empty() && mount_driver != "fuse" && mount_driver != "libfuse3")
+        throw std::runtime_error("Linux mount driver must be fuse");
     VexFSPlatformState state;
     state.platform = "linux";
     state.version = KernelVersion();
@@ -234,7 +236,8 @@ VexFSPlatformState VexFSPlatformInspect() {
 
 int VexFSPlatformMount(const std::string &backend, const std::string &connection,
                        const std::string &workspace,
-                       const std::string &mount_point) {
+                       const std::string &mount_point,
+                       const std::string &mount_driver) {
     const std::string mounted_type = MountedFileSystemAt(mount_point);
     if (mounted_type == "fuse.vexfs") {
         const std::string requested_database = backend == VEXFS_RUNTIME_BACKEND_SQLITE
@@ -251,7 +254,7 @@ int VexFSPlatformMount(const std::string &backend, const std::string &connection
     }
     if (!mounted_type.empty())
         throw std::runtime_error("mount point is already used by " + mounted_type);
-    const VexFSPlatformState state = VexFSPlatformInspect();
+    const VexFSPlatformState state = VexFSPlatformInspect(mount_driver);
     if (!state.mount_ready)
         throw std::runtime_error("VexFS libfuse3 mount is not ready: " + state.extension_state);
     PrepareMountPoint(mount_point);

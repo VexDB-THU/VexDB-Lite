@@ -28,6 +28,7 @@ struct Options {
     std::string dsn;
     std::string workspace = "default";
     std::string mount_point;
+    std::string mount_driver;
     bool json = false;
     std::vector<std::string> arguments;
 };
@@ -37,7 +38,7 @@ std::string g_program_name = "vexfs";
 void Usage(std::ostream &output) {
     output <<
         "Usage: " << g_program_name << " [--db PATH | --backend pg --dsn DSN] "
-        "[--workspace NAME] COMMAND [ARGS]\n"
+        "[--workspace NAME] [--mount-driver DRIVER] COMMAND [ARGS]\n"
         "\n"
         "Commands:\n"
         "  setup [--mount PATH]         Initialize and optionally mount a workspace\n"
@@ -90,6 +91,7 @@ void Usage(std::ostream &output) {
         "  rm [-r] PATH                 Remove a file or directory\n"
         "  descriptor OUTPUT            Write a portable workspace descriptor\n"
         "  mount MOUNT_POINT            Mount through the platform adapter\n"
+        "                               macOS defaults to nfs; fskit is optional\n"
         "  mount status [MOUNT_POINT]   Show active VexFS mounts\n"
         "  unmount [--force] MOUNT_POINT\n"
         "                               Unmount; --force detaches a stale mount\n"
@@ -114,6 +116,8 @@ Options ParseOptions(int argc, char **argv) {
             options.workspace = argv[++index];
         } else if (argument == "--mount" && index + 1 < argc) {
             options.mount_point = argv[++index];
+        } else if (argument == "--mount-driver" && index + 1 < argc) {
+            options.mount_driver = argv[++index];
         } else if (argument == "--json") {
             options.json = true;
         } else if (argument == "--help" || argument == "-h") {
@@ -694,7 +698,7 @@ std::vector<VexFSPlatformMountEntry> WorkspaceMounts(const Options &options) {
     const bool postgresql = options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL;
     const std::string database = postgresql ? options.dsn : NormalizedPath(options.database);
     std::vector<VexFSPlatformMountEntry> matches;
-    for (const auto &mount : VexFSPlatformInspect().mounts) {
+    for (const auto &mount : VexFSPlatformInspect(options.mount_driver).mounts) {
         if (mount.backend != options.backend) continue;
         const bool same_connection = postgresql
             ? mount.database == database
@@ -710,7 +714,7 @@ std::vector<VexFSPlatformMountEntry> WorkspaceMounts(const Options &options) {
 int PrintMountStatus(const Options &options, const std::string &requested_path) {
     const std::string requested = requested_path.empty() ? "" : NormalizedPath(requested_path);
     std::vector<VexFSPlatformMountEntry> mounts;
-    for (const auto &mount : VexFSPlatformInspect().mounts) {
+    for (const auto &mount : VexFSPlatformInspect(options.mount_driver).mounts) {
         if (requested.empty() || NormalizedPath(mount.target) == requested) mounts.push_back(mount);
     }
     if (options.json) {
@@ -740,7 +744,7 @@ int MountWorkspace(const Options &options, const std::string &mount_point) {
         options.backend,
         options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
             ? options.dsn : options.database,
-        options.workspace, mount_point);
+        options.workspace, mount_point, options.mount_driver);
 }
 
 int UnmountWorkspace(const std::string &mount_point, bool force) {
@@ -785,7 +789,7 @@ int64_t RestoreSnapshotAfterUnmount(Session &session, const std::string &name,
 }
 
 int RunDoctor(const Options &options) {
-    const VexFSPlatformState platform = VexFSPlatformInspect();
+    const VexFSPlatformState platform = VexFSPlatformInspect(options.mount_driver);
     std::string database_details;
     std::string database_error;
     try {
@@ -815,7 +819,7 @@ int RunDoctor(const Options &options) {
                       << "\",\"macos_supported\":"
                       << (platform.platform_supported ? "true" : "false")
                       << ",\"fskit\":"
-                      << (platform.mount_driver_available ? "true" : "false");
+                      << (platform.extension_state == "enabled" ? "true" : "false");
         }
         std::cout << ",\"backend\":\"" << JsonEscape(options.backend)
                   << "\",\"database\":";
@@ -830,7 +834,9 @@ int RunDoctor(const Options &options) {
                   << (platform.platform_supported ? " (supported)" : " (unsupported)") << '\n'
                   << "mount driver: " << platform.mount_driver << ' '
                   << (platform.mount_driver_available ? "(available)" : "(unavailable)") << '\n'
-                  << "mount state: " << platform.extension_state << '\n'
+                  << (platform.platform == "macos" && platform.mount_driver == "NFSv3"
+                      ? "optional FSKit: " : "mount state: ")
+                  << platform.extension_state << '\n'
                   << (platform.extension_path.empty() ? std::string() :
                       "extension path: " + platform.extension_path + "\n")
                   << (platform.extension_path_matches ? std::string() :

@@ -63,7 +63,7 @@ mkdir -p "$MOUNT_POINT"
 fs setup >/dev/null
 DOCTOR="$(fs --json doctor)"
 printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["mount_ready"] is True; assert value["extension"] == "enabled"; assert value["database"]["schema_version"] == "0.9.0"'
+    'import json,sys; value=json.load(sys.stdin); assert value["mount_ready"] is True; assert value["mount_driver"] == "NFSv3"; assert value["database"]["schema_version"] == "0.9.0"'
 CHECKS=$((CHECKS + 3))
 
 fs mount "$MOUNT_POINT"

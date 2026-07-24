@@ -6,7 +6,7 @@
 ## 运行
 
 ```bash
-# 默认 full：构建后覆盖功能、恢复、并发、备份、性能和 FSKit 编译
+# 默认 full：构建后覆盖功能、恢复、并发、备份、性能和平台 adapter 编译
 bash build_sqlite.sh eval
 
 # 日常快速回归
@@ -39,11 +39,17 @@ VEXDB_LITE_PACKAGE_STAGE=/absolute/path/to/stage \
 tests/eval/vexfs/python.sh tests/eval/vexfs/run.py --mode full --filter mount \
   --mount-cli /absolute/path/to/vexfs --fail-on-skip
 
+# macOS 默认 NFS：真实 Bash、hardlink/symlink、fsync、xattr、Git、
+# 1000 个小文件、卸载/重挂载、完整快照恢复；文件数硬限制为 1..10000
+VEXDB_NFS_FILE_COUNT=1000 \
+  bash tests/eval/vexfs/run_macos_nfs_mount.sh \
+  /absolute/path/to/vexdb
+
 # Linux AArch64/x86_64：在真实 /dev/fuse 上分别以 root 和 uid 1000
 # 运行与 macOS 完全相同的 mount 合同（需要 Docker Desktop 或 Docker Engine）
 bash tests/eval/vexfs/run_linux_mount.sh
 
-# 用同一个 SQLite 文件完成 macOS FSKit → Linux FUSE → macOS FSKit 往返
+# 用同一个 SQLite 文件完成 macOS adapter → Linux FUSE → macOS adapter 往返
 bash tests/eval/vexfs/run_cross_platform_portability.sh
 
 # 显式调用真实 OpenCode 模型，在挂载项目中自主改代码并跑测试
@@ -280,15 +286,17 @@ quick/full/stress 的峰值 RSS 保护线分别为 1 GiB、1.5 GiB、2 GiB；SQL
 只留下一个超时字符串；成功时这些大文件自动清理。搜索等待时间由
 `VEXFS_EVAL_NATIVE_SEARCH_TIMEOUT_SECONDS` 控制。
 
-`mount.real-bash` 是环境 Gate。macOS、FSKit 和已启用的 VexFS 系统扩展都满足时，
-它会真实挂载并运行 `mkdir`、`cat`、`grep`、`cp`、`mv`、`find`、`rm` 等命令；
-条件不满足时报告会明确写 `SKIP` 和原因，不会把未执行伪装成通过。
+`mount.real-bash` 是 macOS 默认 NFS 环境 Gate。它只使用系统自带 NFS client 和本机
+loopback gateway，不要求用户启用 FSKit；会真实运行 `mkdir`、`cat`、`grep`、`cp`、
+`mv`、`find`、`rm` 等命令。`run_macos_nfs_mount.sh` 是更完整的发版前 Gate，还覆盖
+hardlink、fsync、Git、AppleDouble 隔离、重挂载和快照恢复。条件不满足时必须失败或明确
+报告 `SKIP`，不能用 C ABI smoke 冒充真实挂载通过。
 
 `mount.real-linux-bash-git` 是 Linux 环境 Gate。构建中存在 `vexfs-fuse`，且
 `/dev/fuse`、`fusermount3` 和 Git 可用时，它会以真实挂载目录验证完整 Git
 workspace，并在卸载和重挂载后再次运行 `git status`。
 
 `mount.cross-platform-conformance` 是平台一致性 Gate。Linux 可通过
-`run_linux_mount.sh` 自动准备 libfuse3 环境并验证 root/普通用户；macOS 必须先在
-“系统设置 → 通用 → 登录项与扩展 → 文件系统扩展”中启用 VexDB Lite，再运行该
-用例。缺少真实挂载条件时结果是 `SKIP`，不会用 C ABI smoke 冒充平台通过。
+`run_linux_mount.sh` 自动准备 libfuse3 环境并验证 root/普通用户；macOS 默认使用 NFS，
+无需系统扩展授权。只有显式传 `--mount-driver fskit` 时才要求在系统设置中启用 VexDB Lite。
+缺少真实挂载条件时结果是 `SKIP`，不会用 C ABI smoke 冒充平台通过。

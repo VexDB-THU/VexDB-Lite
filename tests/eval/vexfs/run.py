@@ -2415,7 +2415,7 @@ def cli_command_surface(ctx: Context) -> dict[str, Any]:
         doctor_json = json.loads(doctor.stdout)
         expected_platform = {"Darwin": "macos", "Linux": "linux",
                              "Windows": "windows"}.get(platform.system(), "unsupported")
-        expected_driver = {"Darwin": "FSKit", "Linux": "libfuse3",
+        expected_driver = {"Darwin": "NFSv3", "Linux": "libfuse3",
                            "Windows": "WinFsp"}.get(platform.system(), "none")
         ctx.equal(doctor_json["platform"], expected_platform, "doctor platform")
         ctx.equal(doctor_json["mount_driver"], expected_driver, "doctor mount driver")
@@ -3337,7 +3337,7 @@ def fskit_unsigned_build(ctx: Context) -> dict[str, Any]:
 
 
 def mount_cli(ctx: Context) -> Path:
-    """FSKit 只向受信任调用方公开扩展；发行 Gate 必须显式绑定被测 CLI。"""
+    """发行 Gate 必须显式绑定本次构建的 mount CLI。"""
     if ctx.mount_cli_override is not None:
         return ctx.mount_cli_override
     installed = Path.home() / ".local/bin/vexfs"
@@ -3394,7 +3394,7 @@ def prepare_real_mount_adapter(ctx: Context, base: Path,
     """为当前系统准备真实 mount；测试主体不包含平台分支。"""
     system = platform.system()
     if system == "Darwin":
-        name = "fskit"
+        name = "nfs"
         cli = mount_cli(ctx)
     elif system == "Linux":
         name = "libfuse3"
@@ -3427,22 +3427,10 @@ def prepare_real_mount_adapter(ctx: Context, base: Path,
     except json.JSONDecodeError as error:
         raise EvalFailure(
             f"{name} doctor 没有返回 JSON: {doctor.stdout.decode(errors='replace')}") from error
-    if system == "Darwin" and details.get("extension") != "enabled":
-        raise EvalSkip(
-            f"FSKit extension={details.get('extension', 'unknown')}，需安装并在系统设置中启用")
     if system == "Darwin":
-        module_path = details.get("extension_path", "")
-        installed_extensions = {
-            str(path.resolve())
-            for path in (
-                Path.home() / "Applications/VexDB Lite.app/Contents/Extensions/VexFSAppEx.appex",
-                Path("/Applications/VexDB Lite.app/Contents/Extensions/VexFSAppEx.appex"),
-            )
-            if path.exists()
-        }
-        ctx.check(bool(module_path), "doctor 必须返回 FSKit 真实 module URL")
-        ctx.check(str(Path(module_path).resolve()) in installed_extensions,
-                  "FSKit module URL 必须指向正式安装 App，不能指向 archive/DerivedData")
+        ctx.equal(details.get("mount_driver"), "NFSv3", "macOS 默认 mount driver")
+        if not details.get("mount_ready"):
+            raise EvalSkip("macOS NFS gateway 或系统 mount_nfs 不可用")
     if system == "Linux" and not details.get("mount_ready"):
         raise EvalSkip(f"libfuse3 adapter={details.get('extension', 'unknown')}")
     mount_point.mkdir()
@@ -4473,10 +4461,10 @@ def mount_helper_crash_recovery(ctx: Context) -> dict[str, Any]:
                             str(adapter.mount_point)], check=False, timeout=60)
 
 
-@case("mount.real-bash", "mount", "真实 FSKit mount 后用 bash 常用文件命令操作")
+@case("mount.real-bash", "mount", "真实 macOS NFS mount 后用 bash 常用文件命令操作")
 def real_mount_bash(ctx: Context) -> dict[str, Any]:
     if platform.system() != "Darwin":
-        raise EvalSkip("真实 FSKit mount 只在 macOS 执行")
+        raise EvalSkip("真实 macOS NFS mount 只在 macOS 执行")
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-eval-") as directory:
         base = Path(directory)
         adapter = prepare_real_mount_adapter(ctx, base, "eval")
@@ -4493,23 +4481,9 @@ def real_mount_bash(ctx: Context) -> dict[str, Any]:
             ctx.equal(len(mounts), 1, "挂载状态数量")
             ctx.equal(mounts[0]["target"], expected_target, "挂载状态目标")
             source = mounts[0]["source"]
-            source_path = (Path(unquote(urlparse(source).path))
-                           if source.startswith("file:") else Path(source))
-            descriptor = json.loads(
-                (source_path / ".vexfs-volume.json").read_text())
-            expected_connection = (adapter.database.name
-                                   if adapter.backend == "sqlite"
-                                   else adapter.connection_identity)
-            ctx.equal(descriptor, {"version": 3, "backend": adapter.backend,
-                                   "connection": expected_connection,
-                                   "workspace": "eval"}, "FSKit 目录资源描述文件")
-            if adapter.backend == "sqlite":
-                descriptor_connection = Path(descriptor["connection"])
-                ctx.check(not descriptor_connection.is_absolute(),
-                          "FSKit SQLite 描述文件不得保存绝对路径")
-                ctx.equal(os.path.realpath(source_path / descriptor_connection),
-                          os.path.realpath(adapter.database),
-                          "FSKit SQLite 描述文件相对路径解析")
+            ctx.equal(source, "127.0.0.1:/", "NFS gateway 只从 loopback export 挂载")
+            ctx.equal(mounts[0]["type"], "nfs", "macOS 默认真实挂载类型")
+            descriptor = {"driver": "nfs", "source": source}
             shell = r'''
 set -e
 mkdir -p "$1/project/sub"
@@ -4518,6 +4492,8 @@ grep agent "$1/project/input.txt" > "$1/project/sub/result.txt"
 cp "$1/project/input.txt" "$1/project/copy.txt"
 mv "$1/project/copy.txt" "$1/project/moved.txt"
 cmp "$1/project/input.txt" "$1/project/moved.txt"
+ln "$1/project/input.txt" "$1/project/input-hard.txt"
+ln -s input.txt "$1/project/input-link.txt"
 /bin/ls -la "$1/project"
 find "$1/project" -type f | sort
 rm "$1/project/moved.txt"
@@ -4529,10 +4505,24 @@ test "$(/bin/cat "$1/project/sub/result.txt")" = agent
                       "bash find 输出")
             ctx.equal((mount_point / "project/sub/result.txt").read_text(), "agent\n",
                       "挂载路径结果")
-            reverse = run_process(prefix + ["cat", "/project/sub/result.txt"])
-            ctx.equal(reverse.stdout, b"agent\n", "数据库 CLI 反向读取挂载写入")
+            source_file = mount_point / "project/input.txt"
+            hardlink = mount_point / "project/input-hard.txt"
+            symlink = mount_point / "project/input-link.txt"
+            ctx.equal(source_file.stat().st_ino, hardlink.stat().st_ino,
+                      "NFS hardlink inode")
+            ctx.equal(source_file.stat().st_nlink, 2, "NFS hardlink 数量")
+            ctx.equal(os.readlink(symlink), "input.txt", "NFS symlink target")
+            with source_file.open("ab", buffering=0) as stream:
+                stream.write(b"fsync\n")
+                os.fsync(stream.fileno())
+            ctx.check(hardlink.read_bytes().endswith(b"fsync\n"),
+                      "NFS fsync 后 hardlink 共享内容")
+            sidecar_names = [path.name for path in mount_point.rglob("._*")]
+            ctx.equal(sidecar_names, [], "AppleDouble sidecar 不得出现在 workspace")
         finally:
             mount_adapter_unmount(ctx, adapter, "Bash")
+        reverse = run_process(prefix + ["cat", "/project/sub/result.txt"])
+        ctx.equal(reverse.stdout, b"agent\n", "数据库 CLI 反向读取挂载写入")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
         ctx.equal(after["mount_count"], 0, "卸载后挂载数")
         ctx.equal(after["database"]["pending_handles"], 0, "卸载后未发布句柄")
@@ -4542,8 +4532,8 @@ test "$(/bin/cat "$1/project/sub/result.txt")" = agent
                 "doctor_before": details, "doctor_after": after,
                 "mounts": mounts,
                 "descriptor": descriptor,
-                "commands": ["mkdir", "printf", "grep", "cp", "mv", "cmp", "ls",
-                             "find", "rm", "cat", "vexfs cat"]}
+                "commands": ["mkdir", "printf", "grep", "cp", "mv", "cmp", "hardlink",
+                             "symlink", "fsync", "ls", "find", "rm", "cat", "vexfs cat"]}
 
 
 @case("mount.real-linux-bash-git", "mount",

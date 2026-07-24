@@ -92,8 +92,12 @@ equal "$PACKAGE_ARCHITECTURE" \
     "FSKit extension architecture"
 check test -x "$STAGE/bin/vexdb"
 check test -L "$STAGE/bin/vexfs"
+check test -x "$STAGE/bin/vexfs-nfs-gateway"
 check test -f "$STAGE/lib/vexdb_lite.dylib"
 check test -f "$STAGE/lib/runtime/libpq.5.dylib"
+equal "$PACKAGE_ARCHITECTURE" \
+    "$(lipo -archs "$STAGE/bin/vexfs-nfs-gateway")" \
+    "NFS gateway architecture"
 EXTENSION_ENTITLEMENTS="$TMP_DIR/extension-entitlements.plist"
 EXTENSION_ENTITLEMENTS_LOG="$TMP_DIR/extension-entitlements.log"
 if ! codesign -d --entitlements - --xml \
@@ -128,14 +132,17 @@ if [ "$PACKAGE_SIGNATURE" = developer-id ]; then
         "$EXTENSION_APPLICATION" "FSKit application identifier"
 fi
 check test -f "$STAGE/使用说明.md"
+check test -f "$STAGE/THIRD_PARTY.md"
+check test -f "$STAGE/licenses/nfsserve-LICENSE"
+check grep -q 'nfsserve 0.11.0' "$STAGE/THIRD_PARTY.md"
+check grep -q 'BSD 3-Clause License' "$STAGE/licenses/nfsserve-LICENSE"
 check grep -q 'Developer ID' "$STAGE/使用说明.md"
-check grep -q '按类别' "$STAGE/使用说明.md"
-check grep -q '文件系统扩展' "$STAGE/使用说明.md"
+check grep -q '默认使用系统自带的 NFS client' "$STAGE/使用说明.md"
+check grep -q '127.0.0.1:/' "$STAGE/使用说明.md"
 check grep -q '底层目录设为' "$STAGE/使用说明.md"
 check grep -q '不会被 VexDB Lite 自动重放' "$STAGE/使用说明.md"
 check grep -q 'verify_installed_mount' "$STAGE/install.sh"
-check grep -q '正在使用的 FSKit 文件系统' "$STAGE/install.sh"
-check grep -q 'pkill -KILL -u.*fskit_agent' "$STAGE/install.sh"
+check grep -q '默认 NFS 真实挂载检查通过' "$STAGE/install.sh"
 expect_fail grep -q 'killall -u.*pkd' "$STAGE/install.sh"
 expect_fail grep -q 'lsregister.*-kill' "$STAGE/install.sh"
 check grep -Eq '不会.*清空 LaunchServices 注册库' "$STAGE/使用说明.md"
@@ -194,10 +201,12 @@ VEXDB_LITE_ALLOW_DIRTY_INSTALL="$ALLOW_DIRTY" \
 
 VEXDB="$BIN_DIR/vexdb"
 VEXFS="$BIN_DIR/vexfs"
+NFS_GATEWAY="$BIN_DIR/vexfs-nfs-gateway"
 DYLIB="$LIB_DIR/vexdb_lite.dylib"
 check test -d "$APP_DIR/VexDB Lite.app"
 check test -x "$VEXDB"
 check test -L "$VEXFS"
+check test -x "$NFS_GATEWAY"
 check test -f "$DYLIB"
 contains "$("$VEXDB" --version)" "$EXPECTED_PRODUCT_VERSION" "version"
 contains "$(env HOME="$TEST_HOME" PATH="$BIN_DIR:/usr/bin:/bin:/usr/sbin:/sbin" vexdb --version)" \
@@ -304,26 +313,10 @@ equal "first" "$(HOME="$TEST_HOME" "$VEXDB" fs cat /docs/plan.md)" \
 expect_fail env HOME="$TEST_HOME" "$VEXDB" fs stat /after-snapshot/new.txt
 HOME="$TEST_HOME" "$VEXDB" fs snapshot diff before-agent >/dev/null
 
-# doctor 必须如实报告当前机器的 FSKit 状态。临时 HOME 只隔离数据库，
-# 不会隔离系统已经注册的扩展，因此测试机可能是 missing、registered、disabled
-# 或 enabled。
-set +e
-DOCTOR_JSON="$(HOME="$TEST_HOME" "$VEXDB" fs doctor --json 2>/dev/null)"
-DOCTOR_RC=$?
-set -e
-DOCTOR_STATE="$(printf '%s\n' "$DOCTOR_JSON" | sed -n 's/.*"extension":"\([^"]*\)".*/\1/p')"
-case "$DOCTOR_STATE" in
-    enabled)
-        equal "0" "$DOCTOR_RC" "doctor enabled extension exit code"
-        ;;
-    missing|registered|disabled|service-unavailable)
-        equal "1" "$DOCTOR_RC" "doctor unavailable extension exit code"
-        ;;
-    *)
-        fail "unexpected doctor extension state: ${DOCTOR_STATE:-empty}"
-        ;;
-esac
-contains "$DOCTOR_JSON" "\"extension\":\"$DOCTOR_STATE\"" "doctor extension state"
+# 默认 doctor 只要求系统 NFS client 和同包 gateway；FSKit 状态只作为可选信息。
+DOCTOR_JSON="$(HOME="$TEST_HOME" "$VEXDB" fs --json doctor)"
+contains "$DOCTOR_JSON" '"mount_driver":"NFSv3"' "default NFS driver"
+contains "$DOCTOR_JSON" '"mount_ready":true' "default NFS readiness"
 contains "$DOCTOR_JSON" '"schema_ready":true' "doctor database state"
 
 # 数据库备份、拒绝覆盖和备份验证。
@@ -371,6 +364,7 @@ VEXDB_LITE_LIB_DIR="$LIB_DIR" \
 check test ! -e "$APP_DIR/VexDB Lite.app"
 check test ! -e "$VEXDB"
 check test ! -e "$VEXFS"
+check test ! -e "$NFS_GATEWAY"
 check test ! -e "$DYLIB"
 check test -f "$DEFAULT_DB"
 check test -f "$BACKUP_DB"

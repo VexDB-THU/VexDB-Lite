@@ -381,6 +381,9 @@ __pycache__/
 *.egg-info/
 *.whl
 
+# Rust build artifacts
+agent_files/mount/macos/nfs_gateway/target/
+
 # DuckDB runtime / built extensions
 *.duckdb
 *.duckdb.wal

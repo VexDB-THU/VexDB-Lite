@@ -5,8 +5,8 @@
 - 所属项目：VexDB-Lite
 - 日期：2026-07-16
 - 分支：`feature/agent_files`
-- 文档版本：1.9
-- 状态：SQLite `0.9.0`、macOS FSKit、Linux libfuse3 和 arm64 真机交付已实现；
+- 文档版本：2.0
+- 状态：SQLite `0.9.0`、macOS 默认 NFS、可选 FSKit、Linux libfuse3 和 arm64 真机交付已实现；
 PostgreSQL `0.4.0-alpha.1` 的数据库合同、format v2、ACL、审计、libpq HostStore、
   macOS/Linux 真实 mount、双 Mac 串行 Agent 工作区和备份恢复已实现
 - 适用范围：VexFS 完整产品定义；开发顺序以 `docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md` 为准
@@ -33,12 +33,22 @@ Linux FUSE 和 Windows WinFsp 必须共用同一 Workspace Engine、mount runtim
 - NFS 协议版本、mount 权限提示、锁、xattr、缓存一致性、sleep/wake 和 gateway crash 必须
   通过真机 Gate 后，才能宣传“安装后无缝 Bash”。
 
-2026-07-24 已完成不连接数据库的 localhost NFSv3 传输原型。macOS 26.3.1 arm64 当前用户可
-直接 mount/unmount，普通 Bash 文件操作、mode、symlink 和 `git init/add/commit` 已通过；
-这只证明系统入口可行，不表示 VexDB NFS adapter 已实现。原型还发现 macOS
-`com.apple.provenance` 会在 NFSv3 上落成每文件一个 `._*` AppleDouble sidecar；优化后的镜像
-原型创建 200 个用户文件耗时 2.66 秒，同轮 APFS 为 0.03 秒。因此 AppleDouble 内部映射和
-小文件写回合并是默认 NFS 发布 Gate，不能把“免 FSKit 授权”当作唯一选型标准。
+2026-07-24 已完成连接 SQLite mount runtime 的 localhost NFSv3 adapter，并设为 macOS CLI
+默认 driver。gateway 只监听 loopback，由 `mount/unmount/status/doctor` 管理独立 PID、端口、
+日志和受保护状态目录。真实 macOS 26.3.1 arm64 eval 共 41 项，覆盖 Bash、hardlink、symlink、
+mode、fsync、xattr、原子替换、open-then-unlink、Git、gateway `SIGKILL` 恢复、卸载/重挂载和完整 workspace 快照恢复；
+package smoke 30 项也通过。公开版 `nfsserve` 缺少 NFSv3 LINK/COMMIT，当前仓库固定维护一个
+小型 fork，LINK 调用数据库 hardlink 合同，COMMIT 调用强同步并返回同一 server verifier。
+
+默认挂载使用 bounded soft NFS：固定 10 秒重传间隔、最多 4 次，并设 60 秒 dead timeout。
+它让 gateway 崩溃时的文件调用最终返回错误而不是永久卡死，同时覆盖 runtime 最长 30 秒的
+数据库 busy timeout。应用必须把返回的 I/O 错误当成失败，不能假定写入成功。
+
+macOS 写入的 AppleDouble 由 gateway 吸收为目标 inode 的
+`io.vexdb.macos.appledouble` xattr，不进入用户目录、dentry、grep 或快照树。1000 个 2-byte
+小文件创建为 5.503902 秒、181.689 files/s；同轮 APFS 为 0.069910 秒、14304.029 files/s，
+约慢 78.7 倍。这个吞吐与此前 FSKit 约 175 files/s 同级，满足“不比现有默认入口明显退化”的
+0.1 入口条件，但远未接近原生盘，列为 0.2 批量提交、写回合并和 metadata cache 优化项。
 
 后文中的 FSKit 完成状态仍是历史事实；凡是把 FSKit 写成“默认、MVP 主入口或当前发布前置”的
 旧表述，均由本节替代。
@@ -449,7 +459,11 @@ git diff
 vexfs mount status
 ```
 
-用户不需要给 `ls/cat/rg/sed/python` 添加 `vexfs` 前缀。文件在平台 adapter 成功 publish/sync 后提交为新版本；macOS MVP 由 FSKit `synchronize` 和可报告结果的 close 路径触发。需要把多个文件和业务 SQL 一起原子提交时，必须使用显式 changeset/事务入口，不能假设多条 Bash 命令天然属于同一个数据库事务。
+用户不需要给 `ls/cat/rg/sed/python` 添加 `vexfs` 前缀。文件在平台 adapter 成功
+publish/sync 后提交为新版本；macOS 默认 NFS 的 WRITE 返回 FILE_SYNC，显式 COMMIT/fsync、
+gateway 同步和安全卸载都映射到数据库强同步。可选 FSKit 继续使用 `synchronize` 和可报告
+结果的 close 路径。需要把多个文件和业务 SQL 一起原子提交时，必须使用显式
+changeset/事务入口，不能假设多条 Bash 命令天然属于同一个数据库事务。
 
 ## 8. 系统边界和所有权
 
@@ -778,7 +792,7 @@ VexFS 使用四层数据保护：
 | FR-MNT-016 | P0 | 路径规范化、`.`、`..` 和越界规则必须与 SQL 合同一致；当前符号链接明确采用 POSIX target 原样保存合同，未来的 workspace 内限制策略必须作为独立可选合同。 |
 | FR-MNT-017 | P0 | 不支持设备文件、socket、FIFO 和 setuid/setgid 文件；创建时返回明确错误。 |
 | FR-MNT-018 | P1 | MVP Gate 不承诺 advisory flock；Phase 0 必须记录 macOS NFS 的 `flock/fcntl` 实际行为。若默认 mount 使用 `nolocks`，doctor 和能力矩阵必须明确报告，不能声称适合在挂载内运行依赖文件锁的数据库。 |
-| FR-MNT-019 | P1 | 支持 hardlink，并在支持前对 link 调用返回稳定的不支持错误。 |
+| FR-MNT-019 | P1 | 支持 hardlink。SQLite、Linux FUSE、macOS FSKit 和默认 NFS 已接入同一合同；NFSv3 LINK 由仓库内固定 fork 实现并进入真实 eval。 |
 | FR-MNT-020 | P1 | 已支持扩展属性，并把值持久化到 SQLite；未知或不存在的 xattr 返回稳定错误。 |
 
 #### 10.13.3 写入、版本与事务
@@ -1435,6 +1449,9 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 | AC-MVP-010 | gateway 与扩展合同版本不兼容时拒绝可写挂载；卸载 gateway 后，SQL 仍可读写全部已提交文件。 |
 
 当前验收已经额外覆盖 `chmod` 的 `0000..0777` mode、可执行脚本、symlink、readlink、xattr、hardlink、owner/group 元数据和便携 ACL；Linux 已覆盖 chown 和 hardlink 的 mount 映射。仍不验收多 gateway、完整 ACL 授权、跨 gateway flock、共享可写 mmap、10 万文件和 DuckDB mount。
+
+2026-07-24 默认 NFS 已通过 35 项真机回归和 30 项 package smoke，包含 hardlink 与 fsync；
+正式 0.1 仍需补干净 Mac 安装、公证包、gateway crash/sleep-wake、锁行为和长期负载 Gate。
 
 ### 20.2 P0 产品验收
 

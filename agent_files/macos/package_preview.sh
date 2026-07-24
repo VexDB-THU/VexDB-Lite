@@ -281,7 +281,7 @@ echo "=== 构建 VexDB-Lite CLI 与 SQLite 扩展 ==="
     -DVEXFS_REQUIRE_POSTGRESQL=ON \
     -DVEXFS_BUNDLE_POSTGRESQL_RUNTIME=ON \
     -DVEXDB_SQLITE_BUILD_TESTS=OFF
-"$CMAKE_BIN" --build "$BUILD_DIR" --target vexdb_cli vexdb_lite_loadable -j "$BUILD_JOBS"
+"$CMAKE_BIN" --build "$BUILD_DIR" --target vexfs_cli vexdb_lite_loadable -j "$BUILD_JOBS"
 PG_CLIENT_LIBRARY="$(sed -n 's/^VEXFS_POSTGRESQL_CLIENT_LIBRARY:FILEPATH=//p' \
     "$BUILD_DIR/CMakeCache.txt")"
 [ -f "$PG_CLIENT_LIBRARY" ] || {
@@ -333,6 +333,7 @@ else
 fi
 [ -d "$APP_SOURCE" ] || { echo "没有找到 $APP_NAME" >&2; exit 1; }
 [ -x "$BUILD_DIR/vexdb" ] || { echo "没有找到 vexdb CLI" >&2; exit 1; }
+[ -x "$BUILD_DIR/vexfs-nfs-gateway" ] || { echo "没有找到 VexFS NFS gateway" >&2; exit 1; }
 [ -f "$BUILD_DIR/vexdb_lite.dylib" ] || { echo "没有找到 vexdb_lite.dylib" >&2; exit 1; }
 for bundle in \
     "$APP_SOURCE" \
@@ -352,7 +353,7 @@ for bundle in \
 done
 
 rm -rf "$STAGE"
-mkdir -p "$STAGE/bin" "$STAGE/lib/runtime" "$STAGE/.payload"
+mkdir -p "$STAGE/bin" "$STAGE/lib/runtime" "$STAGE/licenses" "$STAGE/.payload"
 ditto "$APP_SOURCE" "$PAYLOAD_APP"
 if [ "$SIGN_MODE" = developer-id ]; then
     # 先复制交付 App，再撤销并删除 Xcode 的临时同 ID App。这样 LaunchServices
@@ -362,6 +363,7 @@ if [ "$SIGN_MODE" = developer-id ]; then
     rm -rf "$ARCHIVE_PATH" "$EXPORT_DIR" "$DERIVED_DATA"
 fi
 install -m 0755 "$BUILD_DIR/vexdb" "$STAGE/bin/vexdb"
+install -m 0755 "$BUILD_DIR/vexfs-nfs-gateway" "$STAGE/bin/vexfs-nfs-gateway"
 ln -s vexdb "$STAGE/bin/vexfs"
 install -m 0644 "$BUILD_DIR/vexdb_lite.dylib" "$STAGE/lib/vexdb_lite.dylib"
 install -m 0755 "$PACKAGE_DIR/install.sh" "$STAGE/install.sh"
@@ -371,6 +373,10 @@ install -m 0644 "$PACKAGE_DIR/README.md" "$STAGE/README.md"
 install -m 0644 "$PACKAGE_DIR/使用说明.md" "$STAGE/使用说明.md"
 install -m 0644 "$PACKAGE_DIR/使用说明.md" "$GUIDE"
 install -m 0644 "$ROOT/LICENSE" "$STAGE/LICENSE"
+install -m 0644 "$ROOT/agent_files/mount/macos/nfs_gateway/THIRD_PARTY.md" \
+    "$STAGE/THIRD_PARTY.md"
+install -m 0644 "$ROOT/agent_files/mount/macos/nfs_gateway/vendor/nfsserve/LICENSE" \
+    "$STAGE/licenses/nfsserve-LICENSE"
 
 EXTENSION="$PAYLOAD_APP/Contents/Extensions/VexFSAppEx.appex"
 EXTENSION_EXECUTABLE="$EXTENSION/Contents/MacOS/VexFSAppEx"
@@ -398,6 +404,8 @@ fi
 bash "$SCRIPT_DIR/bundle_pg_runtime.sh" \
     "$STAGE/bin/vexdb" "$STAGE/lib/runtime" "$ARCH" "$PG_RUNTIME_SEARCH_DIR"
 bash "$SCRIPT_DIR/bundle_pg_runtime.sh" \
+    "$STAGE/bin/vexfs-nfs-gateway" "$STAGE/lib/runtime" "$ARCH" "$PG_RUNTIME_SEARCH_DIR"
+bash "$SCRIPT_DIR/bundle_pg_runtime.sh" \
     "$EXTENSION_EXECUTABLE" "$EXTENSION_FRAMEWORKS" "$ARCH" "$PG_RUNTIME_SEARCH_DIR"
 
 SIGNATURE=ad-hoc
@@ -418,6 +426,7 @@ if [ "$SIGN_MODE" = developer-id ]; then
             codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$library"
         done
     codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$STAGE/bin/vexdb"
+    codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$STAGE/bin/vexfs-nfs-gateway"
     codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$STAGE/lib/vexdb_lite.dylib"
     codesign --force --options runtime --timestamp --generate-entitlement-der \
         --sign "$SIGNING_IDENTITY" \
@@ -438,6 +447,7 @@ if [ "$SIGN_MODE" = developer-id ]; then
     verify_team_identifier "$PAYLOAD_APP"
     verify_team_identifier "$EXTENSION"
     verify_team_identifier "$STAGE/bin/vexdb"
+    verify_team_identifier "$STAGE/bin/vexfs-nfs-gateway"
     verify_team_identifier "$STAGE/lib/vexdb_lite.dylib"
     find "$STAGE/lib/runtime" "$EXTENSION_FRAMEWORKS" -type f -name '*.dylib' -print0 \
         | while IFS= read -r -d '' library; do verify_team_identifier "$library"; done
@@ -478,6 +488,7 @@ else
             codesign --force --sign - --timestamp=none "$library"
         done
     codesign --force --sign - --timestamp=none "$STAGE/bin/vexdb"
+    codesign --force --sign - --timestamp=none "$STAGE/bin/vexfs-nfs-gateway"
     codesign --force --sign - --timestamp=none "$STAGE/lib/vexdb_lite.dylib"
     codesign --force --sign - --timestamp=none --generate-entitlement-der \
         --entitlements "$EXTENSION_SIGN_ENTITLEMENTS" "$EXTENSION"
@@ -486,6 +497,7 @@ else
 fi
 codesign --verify --deep --strict --verbose=2 "$PAYLOAD_APP"
 codesign --verify --strict --verbose=2 "$STAGE/bin/vexdb"
+codesign --verify --strict --verbose=2 "$STAGE/bin/vexfs-nfs-gateway"
 codesign --verify --strict --verbose=2 "$STAGE/lib/vexdb_lite.dylib"
 find "$STAGE/lib/runtime" "$EXTENSION_FRAMEWORKS" -type f -name '*.dylib' -print0 \
     | while IFS= read -r -d '' library; do
@@ -531,7 +543,10 @@ write_hashes() {
             uninstall.sh \
             README.md \
             LICENSE \
+            THIRD_PARTY.md \
+            licenses/nfsserve-LICENSE \
             bin/vexdb \
+            bin/vexfs-nfs-gateway \
             lib/vexdb_lite.dylib \
             使用说明.md \
             "$PAYLOAD_RELATIVE/Contents/MacOS/VexDB Lite" \
@@ -575,13 +590,17 @@ verify_zip() (
     ditto -x -k "$ZIP" "$verify_dir"
     [ -d "$verify_app" ] || { echo "压缩包缺少 $PAYLOAD_RELATIVE" >&2; return 1; }
     [ -x "$verify_root/bin/vexdb" ] || { echo "压缩包缺少 bin/vexdb" >&2; return 1; }
+    [ -x "$verify_root/bin/vexfs-nfs-gateway" ] || { echo "压缩包缺少 NFS gateway" >&2; return 1; }
     [ -L "$verify_root/bin/vexfs" ] || { echo "压缩包中的 bin/vexfs 不是兼容链接" >&2; return 1; }
     [ -f "$verify_root/lib/vexdb_lite.dylib" ] || { echo "压缩包缺少 SQLite 扩展" >&2; return 1; }
     [ -f "$verify_root/lib/runtime/libpq.5.dylib" ] || { echo "压缩包缺少 PostgreSQL runtime" >&2; return 1; }
     [ -f "$verify_root/使用说明.md" ] || { echo "压缩包缺少使用说明" >&2; return 1; }
+    [ -f "$verify_root/THIRD_PARTY.md" ] || { echo "压缩包缺少第三方软件说明" >&2; return 1; }
+    [ -f "$verify_root/licenses/nfsserve-LICENSE" ] || { echo "压缩包缺少 nfsserve 许可证" >&2; return 1; }
 
     codesign --verify --deep --strict --verbose=2 "$verify_app"
     codesign --verify --strict --verbose=2 "$verify_root/bin/vexdb"
+    codesign --verify --strict --verbose=2 "$verify_root/bin/vexfs-nfs-gateway"
     codesign --verify --strict --verbose=2 "$verify_root/lib/vexdb_lite.dylib"
     find "$verify_root/lib/runtime" \
         "$verify_app/Contents/Extensions/VexFSAppEx.appex/Contents/Frameworks" \

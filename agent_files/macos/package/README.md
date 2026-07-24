@@ -5,9 +5,10 @@
 
 VexDB-Lite 在一个安装包中提供：
 
-- `.payload/VexDB Lite.app`：安装程序使用的隐藏 App payload，包含 VexFS FSKit 文件系统扩展；
+- `.payload/VexDB Lite.app`：可选的 VexFS FSKit 文件系统扩展宿主；
 - `bin/vexdb`：内置 SQLite、向量检索和文件 SQL 能力的统一命令；
 - `bin/vexfs`：`vexdb fs` 的兼容快捷入口；
+- `bin/vexfs-nfs-gateway`：macOS 默认真实挂载使用的本机 NFS gateway；
 - `lib/vexdb_lite.dylib`：供现有 SQLite 程序加载的扩展；
 - 安装和卸载脚本。
 
@@ -15,7 +16,9 @@ VexDB-Lite 在一个安装包中提供：
 
 - macOS 26.0 或更高版本；
 - Apple Silicon 包要求 arm64 Mac；
-- 只有真实挂载需要 macOS 允许 `VexDB Lite` 文件系统扩展；系统显示的是宿主 App 名，内部文件系统名才是 VexFS。
+- 默认真实挂载使用 macOS 自带的 NFS client，不要求安装驱动或打开系统扩展开关；
+- FSKit 是可选 driver。只有显式使用 `--mount-driver fskit` 时才需要 macOS 允许
+  `VexDB Lite` 文件系统扩展。
 
 ## 安装
 
@@ -36,16 +39,14 @@ VexDB-Lite 在一个安装包中提供：
 - SQLite 扩展：`~/.local/lib/vexdb-lite/vexdb_lite.dylib`
 - 默认数据库：`~/Library/Application Support/VexDB-Lite/default.sqlite3`
 
-安装程序会在后台启动一次 VexDB Lite App，让 macOS 立即发现新安装或刚替换的 FSKit 模块。
-它不会替用户打开扩展开关；首次安装仍需在系统设置中允许。
-App payload 放在隐藏目录中，避免解压目录和安装目录同时被 macOS 注册为两个同名
-FSKit 模块。扩展已经获准时，安装程序还会执行一次临时真实挂载；挂载失败不会假报安装成功。
+安装程序会用默认 NFS driver 执行一次临时真实挂载；只有 gateway 启动、写入、读回和
+卸载都成功才报告完成。App payload 放在隐藏目录中，避免解压目录和安装目录同时被
+macOS 注册为两个同名 FSKit 模块。FSKit 未授权不影响默认 NFS。
 升级时，旧 App、CLI、SQLite 扩展和 PostgreSQL runtime 只放在隐藏事务目录中；任何一步失败
 都会恢复旧版本，成功后立即删除临时备份，不会在 Applications 中留下可被系统再次识别的
 `.app.disabled` 副本。如果 macOS 要求新签名版本重新授权，安装程序会明确提示，不会静默跳过。
-安装或升级前请先卸载正在使用的 VexFS、exFAT 等 FSKit 卷。安装程序会拒绝在这些卷
-仍挂载时替换扩展，然后只重启当前用户的 `fskit_agent` 来刷新模块；它不会重启 `pkd`、
-清空 LaunchServices 注册库或影响其他用户。
+安装或升级前请先卸载正在使用的 VexFS。安装程序不会重启 `pkd`、清空 LaunchServices
+注册库或修改其他 App 的扩展状态。
 
 如果 `~/.local/bin` 不在 PATH：
 
@@ -92,8 +93,8 @@ vexdb fs archive verify workspace.vexfs
 已挂载 workspace 会在恢复时自动安全卸载并挂回原目录；正常卸载失败时不会开始恢复。
 `--force-unmount` 只用于用户明确接受中断打开文件的场景。
 
-FSKit 异常退出后，底层 mountpoint 会保持不可写，避免 Bash 把文件误写进普通本机目录。
-此时先运行 `vexdb fs unmount --force MOUNTPOINT` 清理，再重新挂载。PostgreSQL 网络中断时，
+NFS gateway 异常退出后，底层 mountpoint 会保持不可写，避免 Bash 把文件误写进普通本机
+目录。此时先运行 `vexdb fs unmount --force MOUNTPOINT` 清理，再重新挂载。PostgreSQL 网络中断时，
 失败的写命令不会被隐式重放；连接恢复后先读取或 quick check，再重新发出写命令。
 
 旧命令继续可用：
@@ -104,19 +105,22 @@ vexfs ls /
 
 ## 真实 Bash 挂载
 
-1. 打开 `~/Applications/VexDB Lite.app`；
-2. 进入“系统设置 → 通用 → 登录项与扩展”，滚动到扩展区域；
-3. 切换到“按类别”视图；
-4. 在“文件系统扩展”这一行点右侧 ⓘ，找到 `VexDB Lite` 并打开它的开关；
-5. 如果看到的是 `VexDB Lite / FSKit Modules` 只读详情，说明仍在“按 App”视图，返回上一层切换视图；
-6. 运行：
-
 ```bash
 vexdb fs doctor
 vexdb fs mount ~/VexDB
 cd ~/VexDB
 ls
 cat hello.txt
+```
+
+gateway 只监听 `127.0.0.1`，mount status 的来源应是 `127.0.0.1:/`。状态文件和日志位于
+`~/Library/Application Support/VexDB-Lite/nfs-gateways/`，正常卸载会清理对应目录。
+
+要单独测试可选 FSKit：
+
+```bash
+vexdb fs --mount-driver fskit doctor
+vexdb fs --mount-driver fskit mount ~/VexDB-FSKit
 ```
 
 ## 签名状态
@@ -130,8 +134,8 @@ cat hello.txt
 默认拒绝安装任何脏源码 Developer ID 包。只有真机开发验证时才可显式运行
 `VEXDB_LITE_ALLOW_DIRTY_INSTALL=1 ./install.sh`；正式发布和普通安装禁止使用这个开关。
 
-FSKit 首次使用需要 macOS 允许该文件系统扩展。安装程序不能静默启用；
-请在“按类别”视图的“文件系统扩展”中完成这一步。
+FSKit 首次使用需要 macOS 允许该文件系统扩展，安装程序不能静默启用；这只影响显式
+选择 FSKit 的用户，不影响默认 NFS 挂载。
 
 ## 卸载
 

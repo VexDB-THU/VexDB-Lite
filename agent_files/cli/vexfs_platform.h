@@ -32,8 +32,9 @@ struct VexFSPlatformState {
 // Database operations use vexfs_runtime_admin.h; platform adapters stay independent.
 std::string VexFSPlatformDefaultDatabasePath();
 void VexFSPlatformProtectDirectory(const std::filesystem::path &path);
-VexFSPlatformState VexFSPlatformInspect();
+VexFSPlatformState VexFSPlatformInspect(const std::string &mount_driver = {});
 int VexFSPlatformMount(const std::string &backend, const std::string &connection,
                        const std::string &workspace,
-                       const std::string &mount_point);
+                       const std::string &mount_point,
+                       const std::string &mount_driver = {});
 int VexFSPlatformUnmount(const std::string &mount_point, bool force);
