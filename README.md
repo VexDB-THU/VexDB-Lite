@@ -1,6 +1,6 @@
 # VexDB
 
-**English** | **[中文](README.zh.md)**
+**[English](README.md)** | **[中文](README.zh.md)** | **[日本語](README.ja.md)**
 
 `VexDB` currently contains two vector-index integrations that share the same core graph algorithm and distance stack:
 

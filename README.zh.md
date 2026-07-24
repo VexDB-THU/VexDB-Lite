@@ -1,6 +1,6 @@
 # VexDB
 
-**[English](README.md)** | **中文**
+**[English](README.md)** | **[中文](README.zh.md)** | **[日本語](README.ja.md)**
 
 `VexDB` 当前包含两条共享算法内核的向量索引实现：
 
