@@ -66,7 +66,8 @@ int main() {
             return Fail("platform state");
         }
         try {
-            VexFSPlatformMount("workspace.sqlite3", "default", "/tmp/vexfs-mount");
+            VexFSPlatformMount("sqlite", "workspace.sqlite3", "default",
+                               "/tmp/vexfs-mount");
             return Fail("unsupported mount succeeded");
         } catch (const std::runtime_error &error) {
             if (std::string(error.what()).find(expected_driver) == std::string::npos)

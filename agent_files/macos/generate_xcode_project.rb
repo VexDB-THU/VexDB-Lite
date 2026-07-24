@@ -41,7 +41,7 @@ fskit = project.frameworks_group.new_file('System/Library/Frameworks/FSKit.frame
 fskit.source_tree = 'SDKROOT'
 extension.frameworks_build_phase.add_file_reference(fskit)
 
-build_core = extension.new_shell_script_build_phase('Build VexFS SQLite Core')
+build_core = extension.new_shell_script_build_phase('Build VexFS Runtime Core')
 build_core.always_out_of_date = '1'
 build_core.shell_script = <<~'SH'
   set -e
@@ -49,12 +49,23 @@ build_core.shell_script = <<~'SH'
   [ -x "$CMAKE_BIN" ] || CMAKE_BIN=/opt/homebrew/bin/cmake
   [ -x "$CMAKE_BIN" ] || CMAKE_BIN=/usr/local/bin/cmake
   [ -x "$CMAKE_BIN" ] || { echo "cmake is required" >&2; exit 1; }
-  BUILD_DIR="$SRCROOT/../../vexdb_sqlite/build-fskit"
+  # Run-script phases are not per-architecture, so CURRENT_ARCH is often
+  # "undefined_arch". The packaging flow intentionally builds one architecture
+  # at a time and passes ARCHS explicitly.
+  BUILD_ARCH="${ARCHS:-}"
+  case "$BUILD_ARCH" in
+    arm64|x86_64) ;;
+    *) echo "unsupported FSKit build architecture: $BUILD_ARCH" >&2; exit 2 ;;
+  esac
+  BUILD_DIR="$SRCROOT/../../vexdb_sqlite/build-fskit-$BUILD_ARCH"
   BUILD_JOBS="${VEXDB_LITE_BUILD_JOBS:-4}"
   case "$BUILD_JOBS" in *[!0-9]*|0) echo "VEXDB_LITE_BUILD_JOBS must be a positive integer" >&2; exit 2;; esac
   [ "$BUILD_JOBS" -le 4 ] || BUILD_JOBS=4
   "$CMAKE_BIN" -S "$SRCROOT/../../vexdb_sqlite" -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE="$CONFIGURATION" -DVEXDB_SQLITE_BUILD_TESTS=OFF
+    -DCMAKE_BUILD_TYPE="$CONFIGURATION" \
+    -DCMAKE_OSX_ARCHITECTURES="$BUILD_ARCH" \
+    -DVEXFS_REQUIRE_POSTGRESQL=ON \
+    -DVEXDB_SQLITE_BUILD_TESTS=OFF
   "$CMAKE_BIN" --build "$BUILD_DIR" --target vexfs_runtime -j "$BUILD_JOBS"
 SH
 extension.build_phases.move(build_core, 0)
@@ -107,12 +118,14 @@ extension.build_configurations.each do |configuration|
     'INFOPLIST_FILE' => 'VexFSAppEx/Info.plist',
     'INFOPLIST_KEY_CFBundleDisplayName' => 'VexFS file system',
     'LD_RUNPATH_SEARCH_PATHS' => '$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks',
+    'LIBRARY_SEARCH_PATHS' => '$(inherited) "$(SRCROOT)/../../vexdb_sqlite/build-fskit-$(ARCHS)/pg-client/lib"',
     'MARKETING_VERSION' => '0.1.0',
     'OTHER_LDFLAGS' => [
       '$(inherited)',
-      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexfs_runtime.a"',
-      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit/libvexdb_lite_static.a"',
+      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit-$(ARCHS)/libvexfs_runtime.a"',
+      '"$(SRCROOT)/../../vexdb_sqlite/build-fskit-$(ARCHS)/libvexdb_lite_static.a"',
       '-lsqlite3',
+      '-lpq',
       '-lc++'
     ],
     'PRODUCT_BUNDLE_IDENTIFIER' => 'io.vexdb.vexfs.extension',

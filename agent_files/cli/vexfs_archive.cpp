@@ -5,6 +5,10 @@
 
 #include "sqlite3.h"
 
+#if defined(VEXFS_HAVE_LIBPQ)
+#include <libpq-fe.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -71,6 +75,14 @@ class Statement {
     void Int64(int index, sqlite3_int64 value) {
         Check("bind integer", sqlite3_bind_int64(statement_, index, value));
     }
+    void Blob(int index, const void *value, size_t size) {
+        if (size > static_cast<size_t>(std::numeric_limits<int>::max())) {
+            throw Error("archive record BLOB is too large");
+        }
+        Check("bind blob", sqlite3_bind_blob(
+            statement_, index, size == 0 ? "" : value, static_cast<int>(size),
+            SQLITE_TRANSIENT));
+    }
     void Null(int index) { Check("bind NULL", sqlite3_bind_null(statement_, index)); }
     bool Row() {
         const int rc = sqlite3_step(statement_);
@@ -91,6 +103,12 @@ class Statement {
         const int size = sqlite3_column_bytes(statement_, column);
         return value == nullptr ? std::string() :
             std::string(reinterpret_cast<const char *>(value), size);
+    }
+    const void *Blob(int column) const { return sqlite3_column_blob(statement_, column); }
+    int Bytes(int column) const { return sqlite3_column_bytes(statement_, column); }
+    void Reset() {
+        Check("reset", sqlite3_reset(statement_));
+        Check("clear bindings", sqlite3_clear_bindings(statement_));
     }
 
   private:
@@ -443,6 +461,348 @@ ORDER BY package_chunk.id
     }
 }
 
+#if defined(VEXFS_HAVE_LIBPQ)
+
+struct PgConnectionCloser {
+    void operator()(PGconn *connection) const {
+        if (connection != nullptr) PQfinish(connection);
+    }
+};
+using PgConnection = std::unique_ptr<PGconn, PgConnectionCloser>;
+
+struct PgResultCloser {
+    void operator()(PGresult *result) const {
+        if (result != nullptr) PQclear(result);
+    }
+};
+using PgResult = std::unique_ptr<PGresult, PgResultCloser>;
+
+PgConnection OpenPostgres(const std::string &dsn) {
+    PGconn *raw = PQconnectdb(dsn.c_str());
+    PgConnection connection(raw);
+    if (raw == nullptr || PQstatus(raw) != CONNECTION_OK) {
+        throw Error("cannot connect to PostgreSQL: " +
+                    std::string(raw == nullptr ? "out of memory" : PQerrorMessage(raw)));
+    }
+    return connection;
+}
+
+void PgCommand(PGconn *connection, const char *sql) {
+    PgResult result(PQexec(connection, sql));
+    if (!result || PQresultStatus(result.get()) != PGRES_COMMAND_OK) {
+        throw Error("PostgreSQL command failed: " + std::string(PQerrorMessage(connection)));
+    }
+}
+
+std::string PgScalar(PGconn *connection, const char *sql, int parameter_count,
+                     const char *const *values, const int *lengths = nullptr,
+                     const int *formats = nullptr) {
+    PgResult result(PQexecParams(
+        connection, sql, parameter_count, nullptr, values, lengths, formats, 0));
+    if (!result || PQresultStatus(result.get()) != PGRES_TUPLES_OK ||
+        PQntuples(result.get()) != 1 || PQnfields(result.get()) != 1 ||
+        PQgetisnull(result.get(), 0, 0)) {
+        throw Error("PostgreSQL query failed: " + std::string(PQerrorMessage(connection)));
+    }
+    return std::string(PQgetvalue(result.get(), 0, 0),
+                       static_cast<size_t>(PQgetlength(result.get(), 0, 0)));
+}
+
+struct PgArchiveExportResult {
+    sqlite3_int64 source_commit = 0;
+    std::string checksum;
+};
+
+PgArchiveExportResult ExportPostgresRecords(
+    const std::string &dsn, const std::string &workspace,
+    const std::string &snapshot, const std::string &output) {
+    if (dsn.empty()) throw Error("PostgreSQL export needs a connection DSN");
+    if (workspace.empty()) throw Error("PostgreSQL export needs a workspace name");
+    if (output.empty()) throw Error("export output path is empty");
+    if (std::filesystem::exists(output)) {
+        throw Error("export output already exists: " + output);
+    }
+
+    bool owns_output = false;
+    try {
+        {
+            Database created = Open(output, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                            SQLITE_OPEN_EXCLUSIVE);
+            Exec(created.get(), "PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;");
+        }
+        owns_output = true;
+        std::filesystem::permissions(
+            output, std::filesystem::perms::owner_read |
+                    std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace);
+
+        Database package = Open(":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                             SQLITE_OPEN_URI);
+        RegisterHash(package.get());
+        Attach(package.get(), output, "package");
+        Exec(package.get(), "BEGIN IMMEDIATE");
+        CreateArchiveSchema(package.get());
+        Exec(package.get(), R"SQL(
+CREATE TEMP TABLE incoming(
+ record_type TEXT NOT NULL,record_key TEXT NOT NULL,record_json TEXT NOT NULL,
+ PRIMARY KEY(record_type,record_key));
+)SQL");
+        Statement incoming(package.get(),
+            "INSERT INTO incoming(record_type,record_key,record_json) VALUES(?1,?2,?3)");
+        Statement chunk(package.get(), R"SQL(
+INSERT INTO package.chunks(
+ record_key,source_manifest,chunk_no,content,size,checksum,record_checksum)
+VALUES(?1,json_extract(?2,'$.source_manifest'),json_extract(?2,'$.chunk_no'),?3,
+       json_extract(?2,'$.size'),json_extract(?2,'$.checksum'),'')
+)SQL");
+
+        PgConnection connection = OpenPostgres(dsn);
+        PgCommand(connection.get(), "BEGIN ISOLATION LEVEL REPEATABLE READ");
+        PgCommand(connection.get(), "SET LOCAL client_min_messages=warning");
+        const char *values[2] = {workspace.c_str(), snapshot.empty() ? nullptr : snapshot.c_str()};
+        if (PQsendQueryParams(connection.get(),
+                "SELECT record_type,record_key,record_json::text,content "
+                "FROM public.vexfs_archive_export_records($1,$2)",
+                2, nullptr, values, nullptr, nullptr, 0) != 1) {
+            throw Error("cannot start PostgreSQL archive stream: " +
+                        std::string(PQerrorMessage(connection.get())));
+        }
+        if (PQsetSingleRowMode(connection.get()) != 1) {
+            throw Error("cannot enable PostgreSQL single-row archive streaming");
+        }
+        bool completed = false;
+        while (PGresult *raw = PQgetResult(connection.get())) {
+            PgResult row(raw);
+            const ExecStatusType status = PQresultStatus(raw);
+            if (status == PGRES_TUPLES_OK) {
+                completed = true;
+                continue;
+            }
+            if (status != PGRES_SINGLE_TUPLE || PQntuples(raw) != 1 || PQnfields(raw) != 4) {
+                throw Error("PostgreSQL archive stream failed: " +
+                            std::string(PQresultErrorMessage(raw)));
+            }
+            const std::string type(PQgetvalue(raw, 0, 0),
+                                   static_cast<size_t>(PQgetlength(raw, 0, 0)));
+            const std::string key(PQgetvalue(raw, 0, 1),
+                                  static_cast<size_t>(PQgetlength(raw, 0, 1)));
+            const std::string json(PQgetvalue(raw, 0, 2),
+                                   static_cast<size_t>(PQgetlength(raw, 0, 2)));
+            if (type == "chunks") {
+                if (PQgetisnull(raw, 0, 3)) throw Error("PostgreSQL chunk content is NULL");
+                size_t decoded_size = 0;
+                unsigned char *decoded = PQunescapeBytea(
+                    reinterpret_cast<const unsigned char *>(PQgetvalue(raw, 0, 3)),
+                    &decoded_size);
+                if (decoded == nullptr) throw Error("cannot decode PostgreSQL chunk content");
+                try {
+                    chunk.Text(1, key);
+                    chunk.Text(2, json);
+                    chunk.Blob(3, decoded, decoded_size);
+                    chunk.Done();
+                    chunk.Reset();
+                } catch (...) {
+                    PQfreemem(decoded);
+                    throw;
+                }
+                PQfreemem(decoded);
+            } else {
+                incoming.Text(1, type);
+                incoming.Text(2, key);
+                incoming.Text(3, json);
+                incoming.Done();
+                incoming.Reset();
+            }
+        }
+        if (!completed) {
+            throw Error("PostgreSQL archive stream ended without completion");
+        }
+        PgCommand(connection.get(), "COMMIT");
+
+        Exec(package.get(), R"SQL(
+INSERT INTO package.manifest(
+ format_version,source_engine,source_workspace,source_commit,source_snapshot,
+ root_source_inode,history_floor_source_commit,retention_keep_versions,
+ retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes,
+ created_at,package_checksum,complete)
+SELECT json_extract(record_json,'$.format_version'),
+       json_extract(record_json,'$.source_engine'),
+       json_extract(record_json,'$.source_workspace'),
+       json_extract(record_json,'$.source_commit'),
+       json_extract(record_json,'$.source_snapshot'),
+       json_extract(record_json,'$.root_source_inode'),
+       json_extract(record_json,'$.history_floor_source_commit'),
+       json_extract(record_json,'$.retention_keep_versions'),
+       json_extract(record_json,'$.retention_keep_days'),
+       json_extract(record_json,'$.quota_max_bytes'),
+       json_extract(record_json,'$.quota_max_files'),
+       json_extract(record_json,'$.quota_max_file_bytes'),
+       json_extract(record_json,'$.created_at'),NULL,0
+FROM incoming WHERE record_type='manifest';
+
+INSERT INTO package.commits(
+ record_key,source_id,parent_source_id,message,created_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_id'),
+       json_extract(record_json,'$.parent_source_id'),json_extract(record_json,'$.message'),
+       json_extract(record_json,'$.created_at'),''
+FROM incoming WHERE record_type='commits';
+
+INSERT INTO package.inodes(
+ record_key,source_id,kind,mode,owner_principal,uid,gid,size,current_version,
+ created_at,accessed_at,updated_at,changed_at,deleted_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_id'),json_extract(record_json,'$.kind'),
+       json_extract(record_json,'$.mode'),json_extract(record_json,'$.owner_principal'),
+       json_extract(record_json,'$.uid'),json_extract(record_json,'$.gid'),
+       json_extract(record_json,'$.size'),json_extract(record_json,'$.current_version'),
+       json_extract(record_json,'$.created_at'),json_extract(record_json,'$.accessed_at'),
+       json_extract(record_json,'$.updated_at'),json_extract(record_json,'$.changed_at'),
+       json_extract(record_json,'$.deleted_at'),''
+FROM incoming WHERE record_type='inodes';
+
+INSERT INTO package.dentries(
+ record_key,parent_source_inode,name,inode_source_id,record_checksum)
+SELECT record_key,json_extract(record_json,'$.parent_source_inode'),
+       json_extract(record_json,'$.name'),json_extract(record_json,'$.inode_source_id'),''
+FROM incoming WHERE record_type='dentries';
+
+INSERT INTO package.file_versions(
+ record_key,source_inode,version_no,source_commit,source_manifest,size,checksum,
+ source_version_no,created_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),
+       json_extract(record_json,'$.version_no'),json_extract(record_json,'$.source_commit'),
+       json_extract(record_json,'$.source_manifest'),json_extract(record_json,'$.size'),
+       json_extract(record_json,'$.checksum'),json_extract(record_json,'$.source_version_no'),
+       json_extract(record_json,'$.created_at'),''
+FROM incoming WHERE record_type='file_versions';
+
+INSERT INTO package.manifests(
+ record_key,source_id,file_size,chunk_size,chunk_count,checksum,created_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_id'),
+       json_extract(record_json,'$.file_size'),json_extract(record_json,'$.chunk_size'),
+       json_extract(record_json,'$.chunk_count'),json_extract(record_json,'$.checksum'),
+       json_extract(record_json,'$.created_at'),''
+FROM incoming WHERE record_type='manifests';
+
+INSERT INTO package.inode_states(
+ record_key,source_inode,source_commit,kind,mode,owner_principal,uid,gid,size,
+ current_version,created_at,accessed_at,updated_at,changed_at,deleted_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),
+       json_extract(record_json,'$.source_commit'),json_extract(record_json,'$.kind'),
+       json_extract(record_json,'$.mode'),json_extract(record_json,'$.owner_principal'),
+       json_extract(record_json,'$.uid'),json_extract(record_json,'$.gid'),
+       json_extract(record_json,'$.size'),json_extract(record_json,'$.current_version'),
+       json_extract(record_json,'$.created_at'),json_extract(record_json,'$.accessed_at'),
+       json_extract(record_json,'$.updated_at'),json_extract(record_json,'$.changed_at'),
+       json_extract(record_json,'$.deleted_at'),''
+FROM incoming WHERE record_type='inode_states';
+
+INSERT INTO package.dentry_states(
+ record_key,parent_source_inode,name,source_commit,inode_source_id,deleted,record_checksum)
+SELECT record_key,json_extract(record_json,'$.parent_source_inode'),
+       json_extract(record_json,'$.name'),json_extract(record_json,'$.source_commit'),
+       json_extract(record_json,'$.inode_source_id'),json_extract(record_json,'$.deleted'),''
+FROM incoming WHERE record_type='dentry_states';
+
+INSERT INTO package.xattr_states(
+ record_key,source_inode,name,source_commit,value,deleted,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),json_extract(record_json,'$.name'),
+       json_extract(record_json,'$.source_commit'),
+       unhex(json_extract(record_json,'$.value_hex')),
+       json_extract(record_json,'$.deleted'),''
+FROM incoming WHERE record_type='xattr_states';
+
+INSERT INTO package.acl_states(
+ record_key,source_inode,principal_id,effect,source_commit,permissions,
+ inherit_flags,deleted,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),
+       json_extract(record_json,'$.principal_id'),json_extract(record_json,'$.effect'),
+       json_extract(record_json,'$.source_commit'),json_extract(record_json,'$.permissions'),
+       json_extract(record_json,'$.inherit_flags'),json_extract(record_json,'$.deleted'),''
+FROM incoming WHERE record_type='acl_states';
+
+INSERT INTO package.snapshots(record_key,name,source_commit,created_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.name'),
+       json_extract(record_json,'$.source_commit'),json_extract(record_json,'$.created_at'),''
+FROM incoming WHERE record_type='snapshots';
+
+INSERT INTO package.xattrs(record_key,source_inode,name,value,updated_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),json_extract(record_json,'$.name'),
+       unhex(json_extract(record_json,'$.value_hex')),
+       json_extract(record_json,'$.updated_at'),''
+FROM incoming WHERE record_type='xattrs';
+
+INSERT INTO package.acl_entries(
+ record_key,source_inode,principal_id,effect,permissions,inherit_flags,
+ created_at,updated_at,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_inode'),
+       json_extract(record_json,'$.principal_id'),json_extract(record_json,'$.effect'),
+       json_extract(record_json,'$.permissions'),json_extract(record_json,'$.inherit_flags'),
+       json_extract(record_json,'$.created_at'),json_extract(record_json,'$.updated_at'),''
+FROM incoming WHERE record_type='acl_entries';
+
+INSERT INTO package.principals(record_key,source_principal,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_principal'),''
+FROM incoming WHERE record_type='principals';
+
+UPDATE package.commits SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,created_at) AS BLOB));
+UPDATE package.inodes SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_id,kind,mode,owner_principal,uid,gid,size,
+  current_version,created_at,accessed_at,updated_at,changed_at,deleted_at) AS BLOB));
+UPDATE package.dentries SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(parent_source_inode,name,inode_source_id) AS BLOB));
+UPDATE package.file_versions SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,version_no,source_commit,source_manifest,
+  size,checksum,source_version_no,created_at) AS BLOB));
+UPDATE package.manifests SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_id,file_size,chunk_size,chunk_count,checksum,
+  created_at) AS BLOB));
+UPDATE package.chunks SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_manifest,chunk_no,size,checksum) AS BLOB));
+UPDATE package.inode_states SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,source_commit,kind,mode,owner_principal,
+  uid,gid,size,current_version,created_at,accessed_at,updated_at,changed_at,deleted_at) AS BLOB));
+UPDATE package.dentry_states SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(parent_source_inode,name,source_commit,inode_source_id,
+  deleted) AS BLOB));
+UPDATE package.xattr_states SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,name,source_commit,hex(value),deleted) AS BLOB));
+UPDATE package.acl_states SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,principal_id,effect,source_commit,
+  permissions,inherit_flags,deleted) AS BLOB));
+UPDATE package.snapshots SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(name,source_commit,created_at) AS BLOB));
+UPDATE package.xattrs SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,name,hex(value),updated_at) AS BLOB));
+UPDATE package.acl_entries SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_inode,principal_id,effect,permissions,
+  inherit_flags,created_at,updated_at) AS BLOB));
+UPDATE package.principals SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_principal) AS BLOB));
+)SQL");
+        Exec(package.get(), "UPDATE package.manifest SET complete=1");
+        const std::string checksum = ComputePackageChecksum(package.get());
+        {
+            Statement finish(package.get(),
+                "UPDATE package.manifest SET package_checksum=?1");
+            finish.Text(1, checksum);
+            finish.Done();
+        }
+        const sqlite3_int64 source_commit = ScalarInt64(
+            package.get(), "SELECT source_commit FROM package.manifest");
+        Exec(package.get(), "COMMIT");
+        return {source_commit, checksum};
+    } catch (...) {
+        if (owns_output) {
+            std::error_code ignored;
+            std::filesystem::remove(output, ignored);
+        }
+        throw;
+    }
+}
+
+#endif  // VEXFS_HAVE_LIBPQ
+
 }  // namespace
 
 std::string ExportArchive(const std::string &database, const std::string &workspace,
@@ -762,6 +1122,26 @@ WHERE principal<>'';
     }
 }
 
+std::string ExportPostgresArchive(const std::string &dsn, const std::string &workspace,
+                                  const std::string &snapshot, const std::string &output) {
+#if defined(VEXFS_HAVE_LIBPQ)
+    const PgArchiveExportResult result =
+        ExportPostgresRecords(dsn, workspace, snapshot, output);
+    const auto bytes = std::filesystem::file_size(output);
+    return "{\"format_version\":" + std::to_string(kArchiveFormatVersion) +
+        ",\"workspace\":\"" + JsonEscape(workspace) +
+        "\",\"source_commit\":" + std::to_string(result.source_commit) +
+        ",\"package_checksum\":\"" + result.checksum +
+        "\",\"bytes\":" + std::to_string(bytes) + "}";
+#else
+    (void)dsn;
+    (void)workspace;
+    (void)snapshot;
+    (void)output;
+    throw Error("this vexdb build does not include PostgreSQL client support");
+#endif
+}
+
 namespace {
 
 struct ArchiveInfo {
@@ -1052,6 +1432,151 @@ WHERE source_manifest=?1 ORDER BY chunk_no
     return info;
 }
 
+#if defined(VEXFS_HAVE_LIBPQ)
+
+std::string ImportPostgresRecords(sqlite3 *db, const std::string &dsn,
+                                  const std::string &workspace) {
+    Statement manifest(db, R"SQL(
+SELECT json_object(
+ 'format_version',format_version,'source_engine',source_engine,
+ 'source_workspace',source_workspace,'source_commit',source_commit,
+ 'source_snapshot',source_snapshot,'root_source_inode',root_source_inode,
+ 'history_floor_source_commit',history_floor_source_commit,
+ 'retention_keep_versions',retention_keep_versions,
+ 'retention_keep_days',retention_keep_days,'quota_max_bytes',quota_max_bytes,
+ 'quota_max_files',quota_max_files,'quota_max_file_bytes',quota_max_file_bytes,
+ 'created_at',created_at)
+FROM package.manifest
+)SQL");
+    if (!manifest.Row()) throw Error("archive manifest is missing");
+    const std::string manifest_json = manifest.Text(0);
+
+    PgConnection connection = OpenPostgres(dsn);
+    PgCommand(connection.get(), "BEGIN");
+    try {
+        PgCommand(connection.get(), "SET LOCAL client_min_messages=warning");
+        const char *begin_values[2] = {workspace.c_str(), manifest_json.c_str()};
+        const std::string job = PgScalar(
+            connection.get(),
+            "SELECT public.vexfs_archive_import_begin($1,$2::jsonb)::text",
+            2, begin_values);
+
+        struct RecordQuery {
+            const char *type;
+            const char *sql;
+            bool has_content;
+        };
+        static constexpr RecordQuery queries[] = {
+            {"commits", R"SQL(
+SELECT record_key,json_object(
+ 'source_id',source_id,'parent_source_id',parent_source_id,
+ 'message',message,'created_at',created_at),NULL
+FROM package.commits ORDER BY record_key)SQL", false},
+            {"inodes", R"SQL(
+SELECT record_key,json_object(
+ 'source_id',source_id,'kind',kind,'mode',mode,'owner_principal',owner_principal,
+ 'uid',uid,'gid',gid,'size',size,'current_version',current_version,
+ 'created_at',created_at,'accessed_at',accessed_at,'updated_at',updated_at,
+ 'changed_at',changed_at,'deleted_at',deleted_at),NULL
+FROM package.inodes ORDER BY record_key)SQL", false},
+            {"dentries", R"SQL(
+SELECT record_key,json_object(
+ 'parent_source_inode',parent_source_inode,'name',name,
+ 'inode_source_id',inode_source_id),NULL
+FROM package.dentries ORDER BY record_key)SQL", false},
+            {"file_versions", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'version_no',version_no,'source_commit',source_commit,
+ 'source_manifest',source_manifest,'size',size,'checksum',checksum,
+ 'source_version_no',source_version_no,'created_at',created_at),NULL
+FROM package.file_versions ORDER BY record_key)SQL", false},
+            {"manifests", R"SQL(
+SELECT record_key,json_object(
+ 'source_id',source_id,'file_size',file_size,'chunk_size',chunk_size,
+ 'chunk_count',chunk_count,'checksum',checksum,'created_at',created_at),NULL
+FROM package.manifests ORDER BY record_key)SQL", false},
+            {"chunks", R"SQL(
+SELECT record_key,json_object(
+ 'source_manifest',source_manifest,'chunk_no',chunk_no,'size',size,
+ 'checksum',checksum),content
+FROM package.chunks ORDER BY record_key)SQL", true},
+            {"inode_states", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'source_commit',source_commit,'kind',kind,'mode',mode,
+ 'owner_principal',owner_principal,'uid',uid,'gid',gid,'size',size,
+ 'current_version',current_version,'created_at',created_at,'accessed_at',accessed_at,
+ 'updated_at',updated_at,'changed_at',changed_at,'deleted_at',deleted_at),NULL
+FROM package.inode_states ORDER BY record_key)SQL", false},
+            {"dentry_states", R"SQL(
+SELECT record_key,json_object(
+ 'parent_source_inode',parent_source_inode,'name',name,'source_commit',source_commit,
+ 'inode_source_id',inode_source_id,'deleted',deleted),NULL
+FROM package.dentry_states ORDER BY record_key)SQL", false},
+            {"xattr_states", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'name',name,'source_commit',source_commit,
+ 'value_hex',lower(hex(value)),'deleted',deleted),NULL
+FROM package.xattr_states ORDER BY record_key)SQL", false},
+            {"acl_states", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'principal_id',principal_id,'effect',effect,
+ 'source_commit',source_commit,'permissions',permissions,
+ 'inherit_flags',inherit_flags,'deleted',deleted),NULL
+FROM package.acl_states ORDER BY record_key)SQL", false},
+            {"snapshots", R"SQL(
+SELECT record_key,json_object(
+ 'name',name,'source_commit',source_commit,'created_at',created_at),NULL
+FROM package.snapshots ORDER BY record_key)SQL", false},
+            {"xattrs", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'name',name,'value_hex',lower(hex(value)),
+ 'updated_at',updated_at),NULL
+FROM package.xattrs ORDER BY record_key)SQL", false},
+            {"acl_entries", R"SQL(
+SELECT record_key,json_object(
+ 'source_inode',source_inode,'principal_id',principal_id,'effect',effect,
+ 'permissions',permissions,'inherit_flags',inherit_flags,
+ 'created_at',created_at,'updated_at',updated_at),NULL
+FROM package.acl_entries ORDER BY record_key)SQL", false},
+            {"principals", R"SQL(
+SELECT record_key,json_object('source_principal',source_principal),NULL
+FROM package.principals ORDER BY record_key)SQL", false}
+        };
+
+        for (const RecordQuery &query : queries) {
+            Statement records(db, query.sql);
+            while (records.Row()) {
+                const std::string key = records.Text(0);
+                const std::string json = records.Text(1);
+                const int content_bytes = query.has_content ? records.Bytes(2) : 0;
+                const void *content = query.has_content ? records.Blob(2) : nullptr;
+                const char *values[5] = {
+                    job.c_str(), query.type, key.c_str(), json.c_str(),
+                    query.has_content ? static_cast<const char *>(content) : nullptr};
+                const int lengths[5] = {0, 0, 0, 0, content_bytes};
+                const int formats[5] = {0, 0, 0, 0, query.has_content ? 1 : 0};
+                (void)PgScalar(
+                    connection.get(),
+                    "SELECT public.vexfs_archive_import_record("
+                    "$1::bigint,$2,$3,$4::jsonb,$5)::text",
+                    5, values, lengths, formats);
+            }
+        }
+        const char *finish_values[1] = {job.c_str()};
+        const std::string result = PgScalar(
+            connection.get(),
+            "SELECT public.vexfs_archive_import_finish($1::bigint)::text",
+            1, finish_values);
+        PgCommand(connection.get(), "COMMIT");
+        return result;
+    } catch (...) {
+        try { PgCommand(connection.get(), "ROLLBACK"); } catch (...) {}
+        throw;
+    }
+}
+
+#endif  // VEXFS_HAVE_LIBPQ
+
 }  // namespace
 
 std::string VerifyArchive(const std::string &input) {
@@ -1070,6 +1595,35 @@ std::string VerifyArchive(const std::string &input) {
         std::to_string(info.versions) + ",\"content_bytes\":" +
         std::to_string(info.content_bytes) + ",\"package_checksum\":\"" +
         info.checksum + "\"}";
+}
+
+std::string ImportPostgresArchive(const std::string &dsn, const std::string &workspace,
+                                  const std::string &input) {
+#if defined(VEXFS_HAVE_LIBPQ)
+    if (dsn.empty()) throw Error("PostgreSQL import needs a connection DSN");
+    if (workspace.empty() || workspace.size() > 128) {
+        throw Error("workspace name must be 1..128 bytes");
+    }
+    if (!std::filesystem::is_regular_file(input)) {
+        throw Error("archive file not found: " + input);
+    }
+    Database db = Open(":memory:", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_URI);
+    RegisterHash(db.get());
+    AttachReadOnly(db.get(), input, "package");
+    Exec(db.get(), "PRAGMA query_only=ON");
+    const ArchiveInfo info = VerifyAttachedArchive(db.get());
+    std::string result = ImportPostgresRecords(db.get(), dsn, workspace);
+    if (!result.empty() && result.back() == '}') {
+        result.pop_back();
+        result += ",\"package_checksum\":\"" + info.checksum + "\"}";
+    }
+    return result;
+#else
+    (void)dsn;
+    (void)workspace;
+    (void)input;
+    throw Error("this vexdb build does not include PostgreSQL client support");
+#endif
 }
 
 std::string ImportArchive(const std::string &database, const std::string &workspace,

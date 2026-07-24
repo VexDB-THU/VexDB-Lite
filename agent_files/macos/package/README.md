@@ -5,7 +5,7 @@
 
 VexDB-Lite 在一个安装包中提供：
 
-- `VexDB Lite.app`：包含 VexFS FSKit 文件系统扩展；
+- `.payload/VexDB Lite.app`：安装程序使用的隐藏 App payload，包含 VexFS FSKit 文件系统扩展；
 - `bin/vexdb`：内置 SQLite、向量检索和文件 SQL 能力的统一命令；
 - `bin/vexfs`：`vexdb fs` 的兼容快捷入口；
 - `lib/vexdb_lite.dylib`：供现有 SQLite 程序加载的扩展；
@@ -38,6 +38,14 @@ VexDB-Lite 在一个安装包中提供：
 
 安装程序会在后台启动一次 VexDB Lite App，让 macOS 立即发现新安装或刚替换的 FSKit 模块。
 它不会替用户打开扩展开关；首次安装仍需在系统设置中允许。
+App payload 放在隐藏目录中，避免解压目录和安装目录同时被 macOS 注册为两个同名
+FSKit 模块。扩展已经获准时，安装程序还会执行一次临时真实挂载；挂载失败不会假报安装成功。
+升级时，旧 App、CLI、SQLite 扩展和 PostgreSQL runtime 只放在隐藏事务目录中；任何一步失败
+都会恢复旧版本，成功后立即删除临时备份，不会在 Applications 中留下可被系统再次识别的
+`.app.disabled` 副本。如果 macOS 要求新签名版本重新授权，安装程序会明确提示，不会静默跳过。
+安装或升级前请先卸载正在使用的 VexFS、exFAT 等 FSKit 卷。安装程序会拒绝在这些卷
+仍挂载时替换扩展，然后只重启当前用户的 `fskit_agent` 来刷新模块；它不会重启 `pkd`、
+清空 LaunchServices 注册库或影响其他用户。
 
 如果 `~/.local/bin` 不在 PATH：
 
@@ -83,6 +91,10 @@ vexdb fs archive verify workspace.vexfs
 
 已挂载 workspace 会在恢复时自动安全卸载并挂回原目录；正常卸载失败时不会开始恢复。
 `--force-unmount` 只用于用户明确接受中断打开文件的场景。
+
+FSKit 异常退出后，底层 mountpoint 会保持不可写，避免 Bash 把文件误写进普通本机目录。
+此时先运行 `vexdb fs unmount --force MOUNTPOINT` 清理，再重新挂载。PostgreSQL 网络中断时，
+失败的写命令不会被隐式重放；连接恢复后先读取或 quick check，再重新发出写命令。
 
 旧命令继续可用：
 

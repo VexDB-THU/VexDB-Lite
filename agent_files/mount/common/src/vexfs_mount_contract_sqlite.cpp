@@ -4,6 +4,10 @@
 #include "agent_files/vexfs_sqlite.h"
 #include "vexdb_sqlite.h"
 
+#if defined(VEXFS_HAVE_LIBPQ)
+#include <libpq-fe.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -14,6 +18,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #if defined(_WIN32)
 #include <process.h>
@@ -27,6 +32,10 @@
 
 struct vexfs_mount_session {
     sqlite3 *db = nullptr;
+#if defined(VEXFS_HAVE_LIBPQ)
+    PGconn *pg = nullptr;
+#endif
+    bool postgresql = false;
     std::string workspace;
     std::string principal;
     std::string session_id;
@@ -34,7 +43,9 @@ struct vexfs_mount_session {
     bool session_started = false;
     bool no_create = false;
     bool synchronous_full = true;
+    uint32_t operation_timeout_ms = 0;
     std::chrono::steady_clock::time_point next_heartbeat{};
+    std::chrono::steady_clock::time_point next_visibility_poll{};
     uint64_t contract_calls = 0;
     uint64_t ordinary_mutation_calls = 0;
     uint64_t full_boundary_calls = 0;
@@ -52,62 +63,327 @@ struct vexfs_mount_session {
 namespace {
 
 constexpr int kUnsupportedBackend = -1001;
+constexpr int kPgDatabaseError = -1100;
+constexpr int kPgInvalidArgument = -1101;
+constexpr int kPgNotFound = -1102;
+constexpr int kPgConflict = -1103;
+constexpr int kPgReadOnly = -1104;
+constexpr int kPgBusy = -1105;
+constexpr int kPgPermission = -1106;
+constexpr int kPgNoSpace = -1107;
+constexpr int kPgCorruption = -1108;
+constexpr int kPgNotEmpty = -1109;
+
+#if defined(VEXFS_HAVE_LIBPQ)
+void EnsurePostgreSQLConnection(vexfs_mount_session *session);
+#endif
 
 class CallError : public std::runtime_error {
   public:
-    CallError(int code, const std::string &message) : std::runtime_error(message), code(code) {}
+    CallError(int code, const std::string &message,
+              const std::string &backend = VEXFS_RUNTIME_BACKEND_SQLITE)
+        : std::runtime_error(message), code(code), backend(backend) {}
     int code;
+    std::string backend;
 };
 
 class Call {
   public:
-    Call(sqlite3 *db, const char *sql) : db_(db) {
-        const int rc = sqlite3_prepare_v2(db, sql, -1, &statement_, nullptr);
-        if (rc != SQLITE_OK) Throw(rc);
+    Call(sqlite3 *db, const char *sql) : db_(db) { PrepareSQLite(sql); }
+    Call(vexfs_mount_session *session, const char *sql) {
+        if (session == nullptr) throw CallError(SQLITE_MISUSE, "mount session is NULL");
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (session->postgresql) {
+            EnsurePostgreSQLConnection(session);
+            pg_ = session->pg;
+            if (pg_ == nullptr || PQstatus(pg_) != CONNECTION_OK) {
+                throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            PreparePostgreSQL(sql);
+            return;
+        }
+#endif
+        db_ = session->db;
+        PrepareSQLite(sql);
     }
     ~Call() {
         if (statement_ != nullptr) sqlite3_finalize(statement_);
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_result_ != nullptr) PQclear(pg_result_);
+#endif
     }
     Call(const Call &) = delete;
     Call &operator=(const Call &) = delete;
 
     void Text(int index, const char *value) {
         if (value == nullptr) throw CallError(SQLITE_MISUSE, "required text is NULL");
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            PgBind(index, std::string(value), 0, 0, false);
+            return;
+        }
+#endif
         Check(sqlite3_bind_text(statement_, index, value, -1, SQLITE_TRANSIENT));
     }
     void Int64(int index, int64_t value) {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            PgBind(index, std::to_string(value), 0, 0, false);
+            return;
+        }
+#endif
         Check(sqlite3_bind_int64(statement_, index, value));
     }
-    void Int(int index, int value) { Check(sqlite3_bind_int(statement_, index, value)); }
-    void Null(int index) { Check(sqlite3_bind_null(statement_, index)); }
+    void Int(int index, int value) { Int64(index, value); }
+    void Null(int index) {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            PgBind(index, std::string(), 0, 0, true);
+            return;
+        }
+#endif
+        Check(sqlite3_bind_null(statement_, index));
+    }
     void Blob(int index, const void *data, uint64_t size) {
         if (size > static_cast<uint64_t>(std::numeric_limits<sqlite3_uint64>::max())) {
             throw CallError(SQLITE_TOOBIG, "buffer is too large");
         }
         if (data == nullptr && size != 0) throw CallError(SQLITE_MISUSE, "buffer is NULL");
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            if (size > static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+                throw CallError(kPgInvalidArgument,
+                                "PostgreSQL parameter is too large",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            PgBind(index,
+                   std::string(static_cast<const char *>(size == 0 ? "" : data),
+                               static_cast<size_t>(size)),
+                   17, 1, false);
+            return;
+        }
+#endif
         Check(sqlite3_bind_blob64(statement_, index, size == 0 ? "" : data, size, SQLITE_TRANSIENT));
     }
     void Row() {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            ExecutePostgreSQL();
+            if (PQntuples(pg_result_) < 1) {
+                throw CallError(kPgNotFound, "PostgreSQL query returned no row",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            return;
+        }
+#endif
         const int rc = sqlite3_step(statement_);
         if (rc != SQLITE_ROW) Throw(rc);
     }
     bool MaybeRow() {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            ExecutePostgreSQL();
+            return PQntuples(pg_result_) > 0;
+        }
+#endif
         const int rc = sqlite3_step(statement_);
         if (rc == SQLITE_ROW) return true;
         if (rc == SQLITE_DONE) return false;
         Throw(rc);
         return false;
     }
-    int64_t ResultInt64() const { return sqlite3_column_int64(statement_, 0); }
+    int64_t ResultInt64() const {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            const std::string value = ResultText();
+            char *end = nullptr;
+            const long long result = std::strtoll(value.c_str(), &end, 10);
+            if (end == nullptr || *end != '\0') {
+                throw CallError(kPgDatabaseError,
+                                "PostgreSQL result is not an integer",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            return static_cast<int64_t>(result);
+        }
+#endif
+        return sqlite3_column_int64(statement_, 0);
+    }
     std::string ResultText() const {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            if (pg_result_ == nullptr || PQntuples(pg_result_) < 1 ||
+                PQnfields(pg_result_) < 1 || PQgetisnull(pg_result_, 0, 0)) {
+                return std::string();
+            }
+            return std::string(PQgetvalue(pg_result_, 0, 0),
+                               static_cast<size_t>(PQgetlength(pg_result_, 0, 0)));
+        }
+#endif
         const unsigned char *value = sqlite3_column_text(statement_, 0);
         return value == nullptr ? std::string() :
             std::string(reinterpret_cast<const char *>(value));
     }
-    const void *ResultBlob() const { return sqlite3_column_blob(statement_, 0); }
-    int ResultBytes() const { return sqlite3_column_bytes(statement_, 0); }
+    const void *ResultBlob() const {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            PreparePostgreSQLResultBytes();
+            return pg_result_bytes_.data();
+        }
+#endif
+        return sqlite3_column_blob(statement_, 0);
+    }
+    int ResultBytes() const {
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (pg_ != nullptr) {
+            PreparePostgreSQLResultBytes();
+            if (pg_result_bytes_.size() > static_cast<size_t>(std::numeric_limits<int>::max())) {
+                throw CallError(kPgInvalidArgument, "PostgreSQL result is too large",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            return static_cast<int>(pg_result_bytes_.size());
+        }
+#endif
+        return sqlite3_column_bytes(statement_, 0);
+    }
 
   private:
+    void PrepareSQLite(const char *sql) {
+        if (db_ == nullptr) throw CallError(SQLITE_MISUSE, "SQLite connection is NULL");
+        const int rc = sqlite3_prepare_v2(db_, sql, -1, &statement_, nullptr);
+        if (rc != SQLITE_OK) Throw(rc);
+    }
+#if defined(VEXFS_HAVE_LIBPQ)
+    struct PgParameter {
+        std::string value;
+        Oid type = 0;
+        int format = 0;
+        bool is_null = true;
+    };
+
+    void PreparePostgreSQL(const char *sql) {
+        pg_sql_.clear();
+        const std::string source(sql == nullptr ? "" : sql);
+        for (size_t index = 0; index < source.size();) {
+            if (source[index] == '?' && index + 1 < source.size() &&
+                source[index + 1] >= '0' && source[index + 1] <= '9') {
+                pg_sql_.push_back('$');
+                ++index;
+                while (index < source.size() && source[index] >= '0' && source[index] <= '9') {
+                    pg_sql_.push_back(source[index++]);
+                }
+            } else {
+                pg_sql_.push_back(source[index++]);
+            }
+        }
+    }
+
+    void PgBind(int index, std::string value, Oid type, int format, bool is_null) {
+        if (index <= 0 || index > 1024) {
+            throw CallError(kPgInvalidArgument, "PostgreSQL parameter index is invalid",
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        if (pg_parameters_.size() < static_cast<size_t>(index)) {
+            pg_parameters_.resize(static_cast<size_t>(index));
+        }
+        pg_parameters_[static_cast<size_t>(index - 1)] = {
+            std::move(value), type, format, is_null};
+    }
+
+    static int PostgreSQLCode(const char *state) {
+        if (state == nullptr) return kPgDatabaseError;
+        const std::string value(state);
+        if (value == "P0002") return kPgNotFound;
+        if (value == "40001" || value == "23505") return kPgConflict;
+        if (value == "42501") return kPgPermission;
+        if (value == "25006") return kPgReadOnly;
+        if (value == "53100") return kPgNoSpace;
+        if (value == "55006" || value == "55P03") return kPgBusy;
+        if (value == "XX001") return kPgCorruption;
+        if (value == "2BP01") return kPgNotEmpty;
+        if (value.rfind("22", 0) == 0 || value == "42809") return kPgInvalidArgument;
+        return kPgDatabaseError;
+    }
+
+    void ExecutePostgreSQL() {
+        if (pg_result_ != nullptr) return;
+        std::vector<Oid> types(pg_parameters_.size());
+        std::vector<const char *> values(pg_parameters_.size());
+        std::vector<int> lengths(pg_parameters_.size());
+        std::vector<int> formats(pg_parameters_.size());
+        for (size_t index = 0; index < pg_parameters_.size(); ++index) {
+            const PgParameter &parameter = pg_parameters_[index];
+            types[index] = parameter.type;
+            values[index] = parameter.is_null ? nullptr : parameter.value.data();
+            lengths[index] = static_cast<int>(parameter.value.size());
+            formats[index] = parameter.format;
+        }
+        pg_result_ = PQexecParams(
+            pg_, pg_sql_.c_str(), static_cast<int>(pg_parameters_.size()),
+            types.empty() ? nullptr : types.data(),
+            values.empty() ? nullptr : values.data(),
+            lengths.empty() ? nullptr : lengths.data(),
+            formats.empty() ? nullptr : formats.data(), 0);
+        if (pg_result_ == nullptr) {
+            throw CallError(kPgDatabaseError, PQerrorMessage(pg_),
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        const ExecStatusType status = PQresultStatus(pg_result_);
+        if (status != PGRES_TUPLES_OK) {
+            const char *state = PQresultErrorField(pg_result_, PG_DIAG_SQLSTATE);
+            std::string message = PQresultErrorMessage(pg_result_);
+            if (state != nullptr && *state != '\0') {
+                message = std::string("SQLSTATE ") + state + ": " + message;
+            }
+            throw CallError(PostgreSQLCode(state), message,
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+    }
+
+    void PreparePostgreSQLResultBytes() const {
+        if (pg_result_bytes_ready_) return;
+        pg_result_bytes_ready_ = true;
+        pg_result_bytes_.clear();
+        if (pg_result_ == nullptr || PQntuples(pg_result_) < 1 ||
+            PQnfields(pg_result_) < 1 || PQgetisnull(pg_result_, 0, 0)) return;
+        if (PQftype(pg_result_, 0) == 17) {
+            size_t size = 0;
+            unsigned char *value = PQunescapeBytea(
+                reinterpret_cast<const unsigned char *>(PQgetvalue(pg_result_, 0, 0)),
+                &size);
+            if (value == nullptr) {
+                throw CallError(kPgDatabaseError, "cannot decode PostgreSQL bytea result",
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            pg_result_bytes_.assign(reinterpret_cast<const char *>(value), size);
+            PQfreemem(value);
+            return;
+        }
+        pg_result_bytes_.assign(PQgetvalue(pg_result_, 0, 0),
+                                static_cast<size_t>(PQgetlength(pg_result_, 0, 0)));
+        if (PQftype(pg_result_, 0) == 114 || PQftype(pg_result_, 0) == 3802) {
+            std::string compact;
+            compact.reserve(pg_result_bytes_.size());
+            bool quoted = false;
+            bool escaped = false;
+            for (const char value : pg_result_bytes_) {
+                if (quoted) {
+                    compact.push_back(value);
+                    if (escaped) escaped = false;
+                    else if (value == '\\') escaped = true;
+                    else if (value == '"') quoted = false;
+                } else if (value == '"') {
+                    quoted = true;
+                    compact.push_back(value);
+                } else if (value != ' ' && value != '\t' && value != '\r' && value != '\n') {
+                    compact.push_back(value);
+                }
+            }
+            pg_result_bytes_ = std::move(compact);
+        }
+    }
+#endif
+
     void Check(int rc) {
         if (rc != SQLITE_OK) Throw(rc);
     }
@@ -117,19 +393,95 @@ class Call {
 
     sqlite3 *db_ = nullptr;
     sqlite3_stmt *statement_ = nullptr;
+#if defined(VEXFS_HAVE_LIBPQ)
+    PGconn *pg_ = nullptr;
+    PGresult *pg_result_ = nullptr;
+    std::string pg_sql_;
+    std::vector<PgParameter> pg_parameters_;
+    mutable bool pg_result_bytes_ready_ = false;
+    mutable std::string pg_result_bytes_;
+#endif
 };
 
-void ClearError(vexfs_mount_error *error) {
+#if defined(VEXFS_HAVE_LIBPQ)
+void RequirePostgreSQLCommand(PGconn *connection, PGresult *result,
+                              const char *operation) {
+    if (result != nullptr && PQresultStatus(result) == PGRES_COMMAND_OK) {
+        PQclear(result);
+        return;
+    }
+    const std::string message = result == nullptr
+        ? PQerrorMessage(connection) : PQresultErrorMessage(result);
+    if (result != nullptr) PQclear(result);
+    throw CallError(kPgDatabaseError,
+                    std::string(operation) + ": " + message,
+                    VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+}
+
+void EnsurePostgreSQLConnection(vexfs_mount_session *session) {
+    if (session == nullptr || !session->postgresql || session->pg == nullptr) {
+        throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    if (PQstatus(session->pg) == CONNECTION_OK) return;
+
+    // Only reconnect before a new operation.  A command interrupted in flight
+    // has an unknown commit state, so this layer never replays it implicitly.
+    PQreset(session->pg);
+    if (PQstatus(session->pg) != CONNECTION_OK) {
+        throw CallError(kPgDatabaseError, PQerrorMessage(session->pg),
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    if (session->operation_timeout_ms != 0) {
+        const std::string command = "SET statement_timeout TO " +
+            std::to_string(session->operation_timeout_ms);
+        RequirePostgreSQLCommand(session->pg, PQexec(session->pg, command.c_str()),
+                                 "restore statement timeout");
+    }
+    RequirePostgreSQLCommand(session->pg, PQexec(session->pg, "LISTEN vexfs_change"),
+                             "restore change notifications");
+    if (session->session_started) {
+        const char *values[] = {session->workspace.c_str(), session->session_id.c_str()};
+        PGresult *start = PQexecParams(
+            session->pg, "SELECT vexfs_mount_session_start($1,$2)", 2,
+            nullptr, values, nullptr, nullptr, 0);
+        if (start == nullptr || PQresultStatus(start) != PGRES_TUPLES_OK) {
+            const std::string message = start == nullptr
+                ? PQerrorMessage(session->pg) : PQresultErrorMessage(start);
+            if (start != nullptr) PQclear(start);
+            throw CallError(kPgDatabaseError,
+                            "restore mount session: " + message,
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        PQclear(start);
+        session->next_heartbeat =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    }
+}
+#endif
+
+void ClearError(vexfs_mount_error *error,
+                const char *backend = VEXFS_RUNTIME_BACKEND_SQLITE) {
     if (error == nullptr) return;
     error->status = VEXFS_MOUNT_OK;
     error->native_code = SQLITE_OK;
     std::snprintf(error->backend, sizeof(error->backend), "%s",
-                  VEXFS_RUNTIME_BACKEND_SQLITE);
+                  backend);
     error->message[0] = '\0';
 }
 
 vexfs_mount_status MapStatus(int sqlite_code, const std::string &) {
     if (sqlite_code == kUnsupportedBackend) return VEXFS_MOUNT_UNSUPPORTED;
+    if (sqlite_code == kPgInvalidArgument) return VEXFS_MOUNT_INVALID_ARGUMENT;
+    if (sqlite_code == kPgNotFound) return VEXFS_MOUNT_NOT_FOUND;
+    if (sqlite_code == kPgConflict) return VEXFS_MOUNT_CONFLICT;
+    if (sqlite_code == kPgReadOnly) return VEXFS_MOUNT_READ_ONLY;
+    if (sqlite_code == kPgBusy) return VEXFS_MOUNT_BUSY;
+    if (sqlite_code == kPgPermission) return VEXFS_MOUNT_PERMISSION_DENIED;
+    if (sqlite_code == kPgNoSpace) return VEXFS_MOUNT_NO_SPACE;
+    if (sqlite_code == kPgCorruption) return VEXFS_MOUNT_CORRUPTION;
+    if (sqlite_code == kPgNotEmpty) return VEXFS_MOUNT_NOT_EMPTY;
+    if (sqlite_code == kPgDatabaseError) return VEXFS_MOUNT_DATABASE_ERROR;
     if (sqlite_code == VEXFS_SQLITE_CONSTRAINT_NOT_EMPTY) return VEXFS_MOUNT_NOT_EMPTY;
     const int primary = sqlite_code & 0xff;
     if (primary == SQLITE_BUSY || primary == SQLITE_LOCKED) return VEXFS_MOUNT_BUSY;
@@ -145,13 +497,14 @@ vexfs_mount_status MapStatus(int sqlite_code, const std::string &) {
 }
 
 vexfs_mount_status SetError(vexfs_mount_error *error, int sqlite_code,
-                            const std::string &message) {
+                            const std::string &message,
+                            const std::string &backend = VEXFS_RUNTIME_BACKEND_SQLITE) {
     const vexfs_mount_status status = MapStatus(sqlite_code, message);
     if (error != nullptr) {
         error->status = status;
         error->native_code = sqlite_code;
         std::snprintf(error->backend, sizeof(error->backend), "%s",
-                      VEXFS_RUNTIME_BACKEND_SQLITE);
+                      backend.c_str());
         std::snprintf(error->message, sizeof(error->message), "%s", message.c_str());
     }
     return status;
@@ -164,7 +517,7 @@ vexfs_mount_status Guard(vexfs_mount_error *error, Function function) {
         function();
         return VEXFS_MOUNT_OK;
     } catch (const CallError &exception) {
-        return SetError(error, exception.code, exception.what());
+        return SetError(error, exception.code, exception.what(), exception.backend);
     } catch (const std::bad_alloc &) {
         return SetError(error, SQLITE_NOMEM, "out of memory");
     } catch (const std::exception &exception) {
@@ -177,22 +530,35 @@ vexfs_mount_status Guard(vexfs_mount_error *error, Function function) {
 template <typename Function>
 vexfs_mount_status Guard(vexfs_mount_session *session, vexfs_mount_error *error,
                          Function function) {
-    return Guard(error, [&] {
+    if (error != nullptr && session != nullptr && session->postgresql) {
+        ClearError(error, VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    const vexfs_mount_status status = Guard(error, [&] {
         if (session == nullptr) throw CallError(SQLITE_MISUSE, "mount session is NULL");
         std::lock_guard<std::recursive_mutex> lock(session->mutex);
         ++session->contract_calls;
         function();
     });
+    if (status == VEXFS_MOUNT_OK && error != nullptr && session != nullptr &&
+        session->postgresql) {
+        ClearError(error, VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    return status;
 }
 
 void RequireSession(vexfs_mount_session *session) {
-    if (session == nullptr || session->db == nullptr) {
+    if (session == nullptr ||
+        (session->db == nullptr
+#if defined(VEXFS_HAVE_LIBPQ)
+         && session->pg == nullptr
+#endif
+        )) {
         throw CallError(SQLITE_MISUSE, "mount session is NULL");
     }
-    if (session->exclusive_gateway && session->session_started) {
+    if (session->session_started) {
         const auto now = std::chrono::steady_clock::now();
         if (now < session->next_heartbeat) return;
-        Call heartbeat(session->db, "SELECT vexfs_mount_session_heartbeat(?1,?2)");
+        Call heartbeat(session, "SELECT vexfs_mount_session_heartbeat(?1,?2)");
         heartbeat.Text(1, session->workspace.c_str());
         heartbeat.Text(2, session->session_id.c_str());
         heartbeat.Row();
@@ -384,7 +750,7 @@ void Exec(sqlite3 *db, const char *sql) {
 void UseOrdinaryDurability(vexfs_mount_session *session) {
     ++session->ordinary_mutation_calls;
     ++session->mutation_epoch;
-    if (!session->synchronous_full) return;
+    if (session->postgresql || !session->synchronous_full) return;
     Exec(session->db, "PRAGMA synchronous=NORMAL");
     session->synchronous_full = false;
     ++session->synchronous_mode_switches;
@@ -392,7 +758,7 @@ void UseOrdinaryDurability(vexfs_mount_session *session) {
 
 void UseFullDurability(vexfs_mount_session *session) {
     ++session->full_boundary_calls;
-    if (session->synchronous_full) return;
+    if (session->postgresql || session->synchronous_full) return;
     // fsync/synchronize/snapshot 前切回 FULL。随后必须执行真实写事务；仅修改
     // PRAGMA 不会形成持久化屏障。
     Exec(session->db, "PRAGMA synchronous=FULL");
@@ -401,7 +767,11 @@ void UseFullDurability(vexfs_mount_session *session) {
 }
 
 void DurabilityBarrier(vexfs_mount_session *session) {
-    Call barrier(session->db,
+    if (session->postgresql) {
+        ++session->durability_barriers;
+        return;
+    }
+    Call barrier(session,
         "INSERT INTO _vexfs_meta(key,value) VALUES('durability_epoch','1') "
         "ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) "
         "RETURNING value");
@@ -415,7 +785,8 @@ const char *EffectiveRequestId(vexfs_mount_session *session, const char *request
     // FSKit/libfuse generate a fresh UUID for every callback, so persisting
     // stage/publish/sync UUIDs cannot deduplicate an OS retry.  These operations
     // are generation-idempotent.  Keep open/close/append requests persisted.
-    if (session->exclusive_gateway && safe_without_persistent_replay) return "";
+    if (!session->postgresql && session->exclusive_gateway &&
+        safe_without_persistent_replay) return "";
     return request_id;
 }
 
@@ -445,29 +816,130 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
     if (output != nullptr) *output = nullptr;
     return Guard(error, [&] {
         if (config == nullptr || output == nullptr || config->backend == nullptr ||
-            config->connection == nullptr || config->workspace == nullptr ||
-            config->principal == nullptr) {
+            config->connection == nullptr || config->workspace == nullptr) {
             throw CallError(SQLITE_MISUSE,
-                "config, output, backend, connection, workspace and principal are required");
+                "config, output, backend, connection and workspace are required");
         }
         if (config->abi_version != VEXFS_RUNTIME_ABI_VERSION) {
             throw CallError(SQLITE_MISUSE, "unsupported runtime ABI version");
         }
-        if (std::strcmp(config->backend, VEXFS_RUNTIME_BACKEND_SQLITE) != 0) {
+        const bool sqlite_backend =
+            std::strcmp(config->backend, VEXFS_RUNTIME_BACKEND_SQLITE) == 0;
+        const bool postgresql_backend =
+            std::strcmp(config->backend, VEXFS_RUNTIME_BACKEND_POSTGRESQL) == 0;
+        if (!sqlite_backend && !postgresql_backend) {
             throw CallError(kUnsupportedBackend,
-                            "this adapter only supports the sqlite backend");
+                            "runtime backend must be sqlite or postgresql");
         }
-        if (std::strcmp(config->principal, "local") != 0) {
+        if (sqlite_backend &&
+            (config->principal == nullptr || std::strcmp(config->principal, "local") != 0)) {
             throw CallError(SQLITE_AUTH,
                 "sqlite backend is single-user and only accepts the local principal");
         }
         vexfs_mount_session *session = new vexfs_mount_session();
         session->workspace = config->workspace;
-        session->principal = config->principal;
+        session->principal = config->principal == nullptr ? "" : config->principal;
         session->session_id = RandomSessionId();
         session->exclusive_gateway = (config->flags & VEXFS_RUNTIME_EXCLUSIVE_GATEWAY) != 0;
         const bool no_create = (config->flags & VEXFS_RUNTIME_OPEN_NO_CREATE) != 0;
         session->no_create = no_create;
+        session->operation_timeout_ms = config->operation_timeout_ms;
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (postgresql_backend) {
+            session->postgresql = true;
+            session->pg = PQconnectdb(config->connection);
+            if (session->pg == nullptr || PQstatus(session->pg) != CONNECTION_OK) {
+                const std::string message = session->pg == nullptr
+                    ? "cannot allocate PostgreSQL connection"
+                    : PQerrorMessage(session->pg);
+                if (session->pg != nullptr) PQfinish(session->pg);
+                delete session;
+                throw CallError(kPgDatabaseError, message,
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            try {
+                if (config->operation_timeout_ms != 0) {
+                    const std::string command = "SET statement_timeout TO " +
+                        std::to_string(config->operation_timeout_ms);
+                    PGresult *result = PQexec(session->pg, command.c_str());
+                    if (result == nullptr || PQresultStatus(result) != PGRES_COMMAND_OK) {
+                        const std::string message = result == nullptr
+                            ? PQerrorMessage(session->pg) : PQresultErrorMessage(result);
+                        if (result != nullptr) PQclear(result);
+                        throw CallError(kPgDatabaseError, message,
+                                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+                    }
+                    PQclear(result);
+                }
+                Call version(session, "SELECT vexfs_pg_adapter_version()");
+                version.Row();
+                Call actor(session, "SELECT session_user");
+                actor.Row();
+                session->principal = actor.ResultText();
+                bool workspace_exists = true;
+                try {
+                    Call workspace(session, "SELECT vexfs_workspace_stat(?1)");
+                    workspace.Text(1, config->workspace);
+                    workspace.Row();
+                } catch (const CallError &exception) {
+                    if (exception.code != kPgNotFound || no_create) throw;
+                    workspace_exists = false;
+                }
+                if (!workspace_exists) {
+                    Call create(session, "SELECT vexfs_workspace_create(?1)");
+                    create.Text(1, config->workspace);
+                    create.Row();
+                }
+                {
+                    PGresult *listen = PQexec(session->pg, "LISTEN vexfs_change");
+                    if (listen == nullptr || PQresultStatus(listen) != PGRES_COMMAND_OK) {
+                        const std::string message = listen == nullptr
+                            ? PQerrorMessage(session->pg) : PQresultErrorMessage(listen);
+                        if (listen != nullptr) PQclear(listen);
+                        throw CallError(kPgDatabaseError, message,
+                                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+                    }
+                    PQclear(listen);
+                }
+                if (!no_create) {
+                    Call start(session, "SELECT vexfs_mount_session_start(?1,?2)");
+                    start.Text(1, config->workspace);
+                    start.Text(2, session->session_id.c_str());
+                    start.Row();
+                    session->session_started = true;
+                    Call recover(session,
+                        "SELECT vexfs_mount_synchronize(?1,?2,?3)");
+                    recover.Text(1, config->workspace);
+                    recover.Text(2, ("mount-recover:" + session->session_id).c_str());
+                    recover.Text(3, session->session_id.c_str());
+                    recover.Row();
+                    session->next_heartbeat =
+                        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                }
+            } catch (...) {
+                if (session->session_started) {
+                    try {
+                        Call end(session, "SELECT vexfs_mount_session_end(?1,?2)");
+                        end.Text(1, session->workspace.c_str());
+                        end.Text(2, session->session_id.c_str());
+                        end.Row();
+                    } catch (...) {
+                    }
+                }
+                PQfinish(session->pg);
+                delete session;
+                throw;
+            }
+            *output = session;
+            return;
+        }
+#else
+        if (postgresql_backend) {
+            delete session;
+            throw CallError(kUnsupportedBackend,
+                            "postgresql backend was built without libpq");
+        }
+#endif
         PreparePrivateDatabase(config->connection, no_create);
         int sqlite_open_flags =
             (no_create ? SQLITE_OPEN_READWRITE : SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) |
@@ -493,12 +965,20 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                 Exec(session->db, "PRAGMA foreign_keys=ON;");
             } else {
                 Exec(session->db,
-                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;");
+                    "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;"
+                    // Move automatic checkpoints out of the hottest small-file loop.
+                    // This is a target threshold, not a hard WAL-size limit when readers
+                    // prevent a checkpoint.
+                    "PRAGMA wal_autocheckpoint=8192;"
+                    // One gateway owns one long-lived connection. Keep its suggested page
+                    // cache near 32 MiB so history lookups do not fall back to a tiny
+                    // default cache as the workspace grows.
+                    "PRAGMA cache_size=-32768;");
                 ProtectSidecar(std::string(config->connection) + "-wal");
                 ProtectSidecar(std::string(config->connection) + "-shm");
-                Call init(session->db, "SELECT vexfs_init()");
+                Call init(session, "SELECT vexfs_init()");
                 init.Row();
-                Call workspace(session->db, "SELECT vexfs_workspace_create(?1)");
+                Call workspace(session, "SELECT vexfs_workspace_create(?1)");
                 workspace.Text(1, config->workspace);
                 workspace.Row();
                 ProtectSidecar(std::string(config->connection) + "-wal");
@@ -506,7 +986,7 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                 if (session->exclusive_gateway) {
                     CheckExistingLocalSession(session->db, config->workspace,
                                               session->session_id);
-                    Call start(session->db, "SELECT vexfs_mount_session_start(?1,?2)");
+                    Call start(session, "SELECT vexfs_mount_session_start(?1,?2)");
                     start.Text(1, config->workspace);
                     start.Text(2, session->session_id.c_str());
                     start.Row();
@@ -514,7 +994,7 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                     // A previous gateway may have died after staging writes but before
                     // close. SessionStart claims those retained handles for this new
                     // session; publish them before exposing the remounted workspace.
-                    Call recover(session->db,
+                    Call recover(session,
                         "SELECT vexfs_mount_synchronize(?1,?2,?3)");
                     recover.Text(1, config->workspace);
                     recover.Text(2, "");
@@ -532,7 +1012,7 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
         } catch (...) {
             if (session->session_started) {
                 try {
-                    Call end(session->db, "SELECT vexfs_mount_session_end(?1,?2)");
+                    Call end(session, "SELECT vexfs_mount_session_end(?1,?2)");
                     end.Text(1, session->workspace.c_str());
                     end.Text(2, session->session_id.c_str());
                     end.Row();
@@ -549,12 +1029,16 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
 
 extern "C" void vexfs_mount_session_close(vexfs_mount_session *session) {
     if (session == nullptr) return;
-    if (session->db != nullptr) {
+    if (session->db != nullptr
+#if defined(VEXFS_HAVE_LIBPQ)
+        || session->pg != nullptr
+#endif
+    ) {
         std::lock_guard<std::recursive_mutex> lock(session->mutex);
         try {
             if (!session->no_create) {
                 UseFullDurability(session);
-                Call synchronize(session->db, session->session_started
+                Call synchronize(session, session->session_started
                     ? "SELECT vexfs_mount_synchronize(?1,'',?2)"
                     : "SELECT vexfs_mount_synchronize(?1,'')");
                 synchronize.Text(1, session->workspace.c_str());
@@ -564,7 +1048,7 @@ extern "C" void vexfs_mount_session_close(vexfs_mount_session *session) {
                 synchronize.Row();
                 DurabilityBarrier(session);
                 if (session->session_started) {
-                    Call end(session->db, "SELECT vexfs_mount_session_end(?1,?2)");
+                    Call end(session, "SELECT vexfs_mount_session_end(?1,?2)");
                     end.Text(1, session->workspace.c_str());
                     end.Text(2, session->session_id.c_str());
                     end.Row();
@@ -574,7 +1058,10 @@ extern "C" void vexfs_mount_session_close(vexfs_mount_session *session) {
         } catch (...) {
             // close 不能抛异常；未发布内容仍留在数据库中，后续可诊断和回收。
         }
-        sqlite3_close(session->db);
+        if (session->db != nullptr) sqlite3_close(session->db);
+#if defined(VEXFS_HAVE_LIBPQ)
+        if (session->pg != nullptr) PQfinish(session->pg);
+#endif
     }
     delete session;
 }
@@ -584,27 +1071,34 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
                                                          vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
+        if (session->postgresql) {
+            Call diagnostics(session, "SELECT vexfs_diagnostics(?1)");
+            diagnostics.Text(1, session->workspace.c_str());
+            diagnostics.Row();
+            CopyResult(diagnostics, json);
+            return;
+        }
         // doctor 以只读方式打开数据库，不初始化也不改写 schema。
-        Call contract(session->db,
+        Call contract(session,
             "SELECT value FROM _vexfs_meta WHERE key='contract_version'");
         contract.Row();
-        Call journal(session->db, "PRAGMA journal_mode");
+        Call journal(session, "PRAGMA journal_mode");
         journal.Row();
-        Call synchronous(session->db, "PRAGMA synchronous");
+        Call synchronous(session, "PRAGMA synchronous");
         synchronous.Row();
-        Call foreign_keys(session->db, "PRAGMA foreign_keys");
+        Call foreign_keys(session, "PRAGMA foreign_keys");
         foreign_keys.Row();
-        Call workspace_exists(session->db,
+        Call workspace_exists(session,
             "SELECT count(*) FROM _vexfs_workspaces WHERE name=?1");
         workspace_exists.Text(1, session->workspace.c_str());
         workspace_exists.Row();
-        Call pending(session->db,
+        Call pending(session,
             "SELECT count(*) FROM _vexfs_handles WHERE workspace_id="
             "(SELECT id FROM _vexfs_workspaces WHERE name=?1) "
             "AND state IN ('open','retained') AND dirty_generation>published_generation");
         pending.Text(1, session->workspace.c_str());
         pending.Row();
-        Call retained(session->db,
+        Call retained(session,
             "SELECT count(*) FROM _vexfs_handles WHERE workspace_id="
             "(SELECT id FROM _vexfs_workspaces WHERE name=?1) AND state='retained'");
         retained.Text(1, session->workspace.c_str());
@@ -612,7 +1106,7 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
         const bool split_staging = sqlite3_table_column_metadata(
             session->db, "main", "_vexfs_staging", "logical_size",
             nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK;
-        Call staging(session->db, split_staging
+        Call staging(session, split_staging
             ? "SELECT COALESCE(sum(s.logical_size),0) FROM _vexfs_staging s "
               "JOIN _vexfs_handles h ON h.id=s.handle_id WHERE h.workspace_id="
               "(SELECT id FROM _vexfs_workspaces WHERE name=?1)"
@@ -660,7 +1154,7 @@ extern "C" vexfs_mount_status vexfs_mount_mkdir(vexfs_mount_session *session,
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_mkdir(?1,?2)");
+        Call call(session, "SELECT vexfs_mkdir(?1,?2)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Row();
     });
 }
@@ -675,7 +1169,7 @@ extern "C" vexfs_mount_status vexfs_mount_create(vexfs_mount_session *session,
         if (path == nullptr || kind == nullptr || mode > 0777) {
             throw CallError(SQLITE_MISUSE, "path, kind and mode 0..0777 are required");
         }
-        Call call(session->db, "SELECT vexfs_create(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_create(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Text(3, kind);
@@ -693,7 +1187,7 @@ extern "C" vexfs_mount_status vexfs_mount_set_mode(vexfs_mount_session *session,
         if (inode <= 0 || mode > 0777) {
             throw CallError(SQLITE_MISUSE, "positive inode and mode 0..0777 are required");
         }
-        Call call(session->db, "SELECT vexfs_set_mode(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_set_mode(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Int(3, static_cast<int>(mode));
@@ -715,7 +1209,7 @@ extern "C" vexfs_mount_status vexfs_mount_set_times(vexfs_mount_session *session
             throw CallError(SQLITE_MISUSE,
                             "positive inode, non-negative times and a valid mask are required");
         }
-        Call call(session->db, "SELECT vexfs_set_times(?1,?2,?3,?4,?5)");
+        Call call(session, "SELECT vexfs_set_times(?1,?2,?3,?4,?5)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Int64(3, accessed_at_ms);
@@ -737,7 +1231,7 @@ extern "C" vexfs_mount_status vexfs_mount_symlink(vexfs_mount_session *session,
             throw CallError(SQLITE_MISUSE,
                             "path and symlink target of 1..4096 bytes are required");
         }
-        Call call(session->db, "SELECT vexfs_symlink(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_symlink(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Blob(3, target, target_size);
@@ -754,7 +1248,7 @@ extern "C" vexfs_mount_status vexfs_mount_readlink(vexfs_mount_session *session,
         if (inode <= 0 || target == nullptr) {
             throw CallError(SQLITE_MISUSE, "positive inode and target output are required");
         }
-        Call call(session->db, "SELECT vexfs_readlink(?1,?2)");
+        Call call(session, "SELECT vexfs_readlink(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Row();
@@ -772,7 +1266,7 @@ extern "C" vexfs_mount_status vexfs_mount_link(vexfs_mount_session *session,
         if (source == nullptr || destination == nullptr) {
             throw CallError(SQLITE_MISUSE, "source and destination are required");
         }
-        Call call(session->db, "SELECT vexfs_link(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_link(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, source);
         call.Text(3, destination);
@@ -792,7 +1286,7 @@ extern "C" vexfs_mount_status vexfs_mount_chown(vexfs_mount_session *session,
             throw CallError(SQLITE_MISUSE,
                             "positive inode and uid/gid in -1..4294967295 are required");
         }
-        Call call(session->db, "SELECT vexfs_chown(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_chown(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Int64(3, uid);
@@ -809,7 +1303,7 @@ extern "C" vexfs_mount_status vexfs_mount_write_file(vexfs_mount_session *sessio
         RequireSession(session);
         UseOrdinaryDurability(session);
         if (version == nullptr) throw CallError(SQLITE_MISUSE, "version output is NULL");
-        Call call(session->db, "SELECT vexfs_write(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_write(?1,?2,?3)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Blob(3, data, size);
         call.Row(); *version = call.ResultInt64();
     });
@@ -826,7 +1320,7 @@ extern "C" vexfs_mount_status vexfs_mount_append_file(vexfs_mount_session *sessi
             throw CallError(SQLITE_MISUSE,
                             "positive inode, content and version output are required");
         }
-        Call call(session->db, "SELECT vexfs_append(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_append(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Blob(3, data, size);
@@ -841,7 +1335,7 @@ extern "C" vexfs_mount_status vexfs_mount_read_file(vexfs_mount_session *session
                                                       vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
-        Call call(session->db, "SELECT vexfs_read(?1,?2)");
+        Call call(session, "SELECT vexfs_read(?1,?2)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Row();
         CopyResult(call, content);
     });
@@ -860,7 +1354,7 @@ extern "C" vexfs_mount_status vexfs_mount_grep(vexfs_mount_session *session,
             throw CallError(SQLITE_RANGE,
                             "grep needs path, a non-empty pattern, valid flags and limit 1..10240");
         }
-        Call call(session->db, "SELECT vexfs_grep(?1,?2,?3,?4,?5)");
+        Call call(session, "SELECT vexfs_grep(?1,?2,?3,?4,?5)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Text(3, pattern);
@@ -880,7 +1374,7 @@ extern "C" vexfs_mount_status vexfs_mount_check(vexfs_mount_session *session,
         if ((flags & ~VEXFS_MOUNT_CHECK_QUICK) != 0) {
             throw CallError(SQLITE_RANGE, "check flags are invalid");
         }
-        Call call(session->db, "SELECT vexfs_check(?1,?2)");
+        Call call(session, "SELECT vexfs_check(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int(2, (flags & VEXFS_MOUNT_CHECK_QUICK) == 0 ? 1 : 0);
         call.Row();
@@ -897,8 +1391,15 @@ extern "C" vexfs_mount_status vexfs_mount_grep_index(vexfs_mount_session *sessio
         if (action == nullptr || action[0] == '\0') {
             throw CallError(SQLITE_MISUSE, "index action is required");
         }
-        Call call(session->db, "SELECT vexfs_grep_index(?1)");
-        call.Text(1, action);
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_grep_index(?1,?2)"
+            : "SELECT vexfs_grep_index(?1)");
+        if (session->postgresql) {
+            call.Text(1, session->workspace.c_str());
+            call.Text(2, action);
+        } else {
+            call.Text(1, action);
+        }
         call.Row();
         CopyResult(call, json);
     });
@@ -910,7 +1411,9 @@ extern "C" vexfs_mount_status vexfs_mount_history(vexfs_mount_session *session,
                                                      vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
-        Call call(session->db, "SELECT vexfs_history(?1,?2)");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_history_json(?1,?2,100,0)"
+            : "SELECT vexfs_history(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Row();
@@ -926,7 +1429,9 @@ extern "C" vexfs_mount_status vexfs_mount_history_page(
         if (limit == 0 || limit > 1000 || before_version < 0) {
             throw CallError(SQLITE_RANGE, "history limit must be 1..1000 and before must be non-negative");
         }
-        Call call(session->db, "SELECT vexfs_history(?1,?2,?3,?4)");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_history_json(?1,?2,?3,?4)"
+            : "SELECT vexfs_history(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Int64(3, static_cast<int64_t>(limit));
@@ -943,7 +1448,7 @@ extern "C" vexfs_mount_status vexfs_mount_read_version(vexfs_mount_session *sess
     return Guard(session, error, [&] {
         RequireSession(session);
         if (version <= 0) throw CallError(SQLITE_MISUSE, "version must be a positive integer");
-        Call call(session->db, "SELECT vexfs_read_version(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_read_version(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Int64(3, version);
@@ -960,7 +1465,7 @@ extern "C" vexfs_mount_status vexfs_mount_compare_versions(
         if (from_version <= 0 || to_version <= 0) {
             throw CallError(SQLITE_RANGE, "versions must be positive integers");
         }
-        Call call(session->db, "SELECT vexfs_compare_versions(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_compare_versions(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Int64(3, from_version);
@@ -980,7 +1485,7 @@ extern "C" vexfs_mount_status vexfs_mount_restore_version(
             throw CallError(SQLITE_MISUSE,
                             "target version, expected version and new version output are required");
         }
-        Call call(session->db, "SELECT vexfs_restore_version(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_restore_version(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Int64(3, target_version);
@@ -995,7 +1500,7 @@ extern "C" vexfs_mount_status vexfs_mount_stat(vexfs_mount_session *session,
                                                  vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
-        Call call(session->db, "SELECT vexfs_stat(?1,?2)");
+        Call call(session, "SELECT vexfs_stat(?1,?2)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Row(); CopyResult(call, json);
     });
 }
@@ -1006,7 +1511,7 @@ extern "C" vexfs_mount_status vexfs_mount_path_for_inode(vexfs_mount_session *se
                                                             vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
-        Call call(session->db, "SELECT vexfs_path(?1,?2)");
+        Call call(session, "SELECT vexfs_path(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Row();
@@ -1019,7 +1524,9 @@ extern "C" vexfs_mount_status vexfs_mount_list(vexfs_mount_session *session,
                                                  vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
-        Call call(session->db, "SELECT vexfs_list(?1,?2)");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_list_json(?1,?2)"
+            : "SELECT vexfs_list(?1,?2)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Row(); CopyResult(call, json);
     });
 }
@@ -1032,10 +1539,11 @@ extern "C" vexfs_mount_status vexfs_mount_list_versioned(
         if (path == nullptr || json == nullptr) {
             throw CallError(SQLITE_MISUSE, "path and output are required");
         }
-        Call call(session->db,
-            "SELECT json_object('version',"
-            "json_extract(vexfs_stat(?1,?2),'$.version'),"
-            "'entries',json(vexfs_list(?1,?2)))");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_list_versioned_json(?1,?2)"
+            : "SELECT json_object('version',"
+              "json_extract(vexfs_stat(?1,?2),'$.version'),"
+              "'entries',json(vexfs_list(?1,?2)))");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Row();
@@ -1049,7 +1557,7 @@ extern "C" vexfs_mount_status vexfs_mount_move(vexfs_mount_session *session,
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_move(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_move(?1,?2,?3)");
         call.Text(1, session->workspace.c_str()); call.Text(2, source); call.Text(3, destination); call.Row();
     });
 }
@@ -1061,7 +1569,7 @@ extern "C" vexfs_mount_status vexfs_mount_rename(vexfs_mount_session *session,
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_rename(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_rename(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, source);
         call.Text(3, destination);
@@ -1076,7 +1584,7 @@ extern "C" vexfs_mount_status vexfs_mount_remove(vexfs_mount_session *session,
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_remove(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_remove(?1,?2,?3)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Int(3, recursive); call.Row();
     });
 }
@@ -1090,7 +1598,7 @@ extern "C" vexfs_mount_status vexfs_mount_xattr_get(vexfs_mount_session *session
         if (inode <= 0 || name == nullptr || value == nullptr) {
             throw CallError(SQLITE_MISUSE, "inode, xattr name and output are required");
         }
-        Call call(session->db, "SELECT vexfs_xattr_get(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_xattr_get(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Text(3, name);
@@ -1108,7 +1616,7 @@ extern "C" vexfs_mount_status vexfs_mount_xattr_list(vexfs_mount_session *sessio
         if (inode <= 0 || json == nullptr) {
             throw CallError(SQLITE_MISUSE, "inode and output are required");
         }
-        Call call(session->db, "SELECT vexfs_xattr_list(?1,?2)");
+        Call call(session, "SELECT vexfs_xattr_list(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Row();
@@ -1128,7 +1636,7 @@ extern "C" vexfs_mount_status vexfs_mount_xattr_set(vexfs_mount_session *session
             (policy != 3 && value == nullptr && size != 0)) {
             throw CallError(SQLITE_MISUSE, "invalid inode, xattr name, value or policy");
         }
-        Call call(session->db, "SELECT vexfs_xattr_set(?1,?2,?3,?4,?5)");
+        Call call(session, "SELECT vexfs_xattr_set(?1,?2,?3,?4,?5)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Text(3, name);
@@ -1146,7 +1654,7 @@ extern "C" vexfs_mount_status vexfs_mount_acl_get(vexfs_mount_session *session,
         if (inode <= 0 || json == nullptr) {
             throw CallError(SQLITE_MISUSE, "inode and output are required");
         }
-        Call call(session->db, "SELECT vexfs_acl_get(?1,?2)");
+        Call call(session, "SELECT vexfs_acl_get(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
         call.Row();
@@ -1163,10 +1671,16 @@ extern "C" vexfs_mount_status vexfs_mount_acl_set(vexfs_mount_session *session,
         if (inode <= 0 || json == nullptr || size == 0) {
             throw CallError(SQLITE_MISUSE, "inode and non-empty ACL JSON are required");
         }
-        Call call(session->db, "SELECT vexfs_acl_set(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_acl_set(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, inode);
-        call.Blob(3, json, size);
+        if (session->postgresql) {
+            const std::string acl(static_cast<const char *>(json),
+                                  static_cast<size_t>(size));
+            call.Text(3, acl.c_str());
+        } else {
+            call.Blob(3, json, size);
+        }
         call.Row();
     });
 }
@@ -1177,8 +1691,9 @@ extern "C" vexfs_mount_status vexfs_mount_workspace_head(vexfs_mount_session *se
     return Guard(session, error, [&] {
         RequireSession(session);
         if (head_commit == nullptr) throw CallError(SQLITE_MISUSE, "head output is NULL");
-        Call call(session->db,
-            "SELECT COALESCE(head_commit,0) FROM _vexfs_workspaces WHERE name=?1");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_workspace_head(?1)"
+            : "SELECT COALESCE(head_commit,0) FROM _vexfs_workspaces WHERE name=?1");
         call.Text(1, session->workspace.c_str());
         call.Row();
         *head_commit = call.ResultInt64();
@@ -1193,7 +1708,47 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
         if (visibility == nullptr) {
             throw CallError(SQLITE_MISUSE, "visibility output is NULL");
         }
-        Call data_version(session->db, "PRAGMA data_version");
+        if (session->postgresql) {
+#if defined(VEXFS_HAVE_LIBPQ)
+            if (PQconsumeInput(session->pg) == 0) {
+                throw CallError(kPgDatabaseError, PQerrorMessage(session->pg),
+                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+            }
+            bool notification = false;
+            while (PGnotify *notice = PQnotifies(session->pg)) {
+                notification = true;
+                PQfreemem(notice);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            const bool local_mutation = session->visibility_initialized &&
+                session->mutation_epoch != session->observed_mutation_epoch;
+            const bool periodic_poll = now >= session->next_visibility_poll;
+            int external_workspace_commit = 0;
+            if (!session->visibility_initialized || notification || local_mutation || periodic_poll) {
+                Call head(session, "SELECT vexfs_workspace_head(?1)");
+                head.Text(1, session->workspace.c_str());
+                head.Row();
+                Call generation(session, "SELECT vexfs_cache_generation(?1)");
+                generation.Text(1, session->workspace.c_str());
+                generation.Row();
+                const int64_t current_head = head.ResultInt64();
+                const uint64_t current_generation = static_cast<uint64_t>(
+                    std::max<int64_t>(0, generation.ResultInt64()));
+                external_workspace_commit = session->visibility_initialized && notification &&
+                    current_head != session->observed_workspace_head ? 1 : 0;
+                session->observed_workspace_head = current_head;
+                session->cache_generation = current_generation;
+                session->observed_mutation_epoch = session->mutation_epoch;
+                session->visibility_initialized = true;
+                session->next_visibility_poll = now + std::chrono::seconds(1);
+            }
+            visibility->workspace_head = session->observed_workspace_head;
+            visibility->cache_generation = session->cache_generation;
+            visibility->external_commit = external_workspace_commit;
+            return;
+#endif
+        }
+        Call data_version(session, "PRAGMA data_version");
         data_version.Row();
         const int64_t current_data_version = data_version.ResultInt64();
         const bool external_database_commit = session->visibility_initialized &&
@@ -1202,7 +1757,7 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
             session->mutation_epoch != session->observed_mutation_epoch;
         int external_workspace_commit = 0;
         if (!session->visibility_initialized || external_database_commit || local_mutation) {
-            Call head(session->db,
+            Call head(session,
                 "SELECT COALESCE(head_commit,0) FROM _vexfs_workspaces WHERE name=?1");
             head.Text(1, session->workspace.c_str());
             head.Row();
@@ -1243,13 +1798,13 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_create(vexfs_mount_session *s
         // snapshot barrier rejects any dirty handle owned by another session.
         // This prevents a successful snapshot from silently missing writes.
         if (!committed_only) {
-            Call synchronize(session->db,
+            Call synchronize(session,
                 "SELECT vexfs_mount_synchronize(?1,'',?2)");
             synchronize.Text(1, session->workspace.c_str());
             synchronize.Text(2, session->session_id.c_str());
             synchronize.Row();
         }
-        Call call(session->db, committed_only
+        Call call(session, committed_only
             ? "SELECT vexfs_snapshot_create(?1,?2,NULL,'committed-only')"
             : "SELECT vexfs_snapshot_create(?1,?2)");
         call.Text(1, session->workspace.c_str());
@@ -1265,7 +1820,9 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_list(vexfs_mount_session *ses
     return Guard(session, error, [&] {
         RequireSession(session);
         if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
-        Call call(session->db, "SELECT vexfs_snapshot_list(?1)");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_snapshot_list_json(?1)"
+            : "SELECT vexfs_snapshot_list(?1)");
         call.Text(1, session->workspace.c_str());
         call.Row();
         CopyResult(call, json);
@@ -1281,7 +1838,7 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_show(vexfs_mount_session *ses
         if (name == nullptr || json == nullptr) {
             throw CallError(SQLITE_MISUSE, "snapshot name and output are required");
         }
-        Call call(session->db, "SELECT vexfs_snapshot_show(?1,?2)");
+        Call call(session, "SELECT vexfs_snapshot_show(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
         call.Row();
@@ -1298,7 +1855,7 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_diff(vexfs_mount_session *ses
         if (from == nullptr || to == nullptr || json == nullptr) {
             throw CallError(SQLITE_MISUSE, "from, to and output are required");
         }
-        Call call(session->db, "SELECT vexfs_snapshot_diff(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_snapshot_diff(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, from);
         call.Text(3, to);
@@ -1314,7 +1871,7 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_drop(vexfs_mount_session *ses
         RequireSession(session);
         UseFullDurability(session);
         if (name == nullptr) throw CallError(SQLITE_MISUSE, "snapshot name is required");
-        Call call(session->db, "SELECT vexfs_snapshot_drop(?1,?2)");
+        Call call(session, "SELECT vexfs_snapshot_drop(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
         call.Row();
@@ -1333,7 +1890,7 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *
             throw CallError(SQLITE_MISUSE,
                             "snapshot name, positive expected head and commit output are required");
         }
-        Call call(session->db, "SELECT vexfs_snapshot_restore(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_snapshot_restore(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
         call.Int64(3, expected_head);
@@ -1348,7 +1905,7 @@ extern "C" vexfs_mount_status vexfs_mount_quota_get(
     return Guard(session, error, [&] {
         RequireSession(session);
         if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
-        Call call(session->db, "SELECT vexfs_quota_get(?1)");
+        Call call(session, "SELECT vexfs_quota_get(?1)");
         call.Text(1, session->workspace.c_str());
         call.Row();
         CopyResult(call, json);
@@ -1366,7 +1923,7 @@ extern "C" vexfs_mount_status vexfs_mount_quota_set(
             throw CallError(SQLITE_RANGE,
                             "quota values must be -1 (unlimited) or non-negative");
         }
-        Call call(session->db, "SELECT vexfs_quota_set(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_quota_set(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         if (max_bytes < 0) call.Null(2); else call.Int64(2, max_bytes);
         if (max_files < 0) call.Null(3); else call.Int64(3, max_files);
@@ -1382,7 +1939,7 @@ extern "C" vexfs_mount_status vexfs_mount_retention_get(
     return Guard(session, error, [&] {
         RequireSession(session);
         if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
-        Call call(session->db, "SELECT vexfs_retention_get(?1)");
+        Call call(session, "SELECT vexfs_retention_get(?1)");
         call.Text(1, session->workspace.c_str());
         call.Row();
         CopyResult(call, json);
@@ -1397,7 +1954,7 @@ extern "C" vexfs_mount_status vexfs_mount_retention_set(
         RequireSession(session);
         UseFullDurability(session);
         if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
-        Call call(session->db, "SELECT vexfs_retention_set(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_retention_set(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, keep_versions);
         call.Int64(3, keep_days);
@@ -1415,7 +1972,7 @@ extern "C" vexfs_mount_status vexfs_mount_gc(
         if (batch == 0 || batch > 10000 || json == nullptr) {
             throw CallError(SQLITE_RANGE, "batch must be between 1 and 10000");
         }
-        Call call(session->db, "SELECT vexfs_gc(?1,?2)");
+        Call call(session, "SELECT vexfs_gc(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int64(2, batch);
         call.Row();
@@ -1432,7 +1989,7 @@ extern "C" vexfs_mount_status vexfs_mount_gc_pause(
         if ((paused != 0 && paused != 1) || json == nullptr) {
             throw CallError(SQLITE_RANGE, "paused must be 0 or 1");
         }
-        Call call(session->db, "SELECT vexfs_gc_pause(?1,?2)");
+        Call call(session, "SELECT vexfs_gc_pause(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Int(2, paused);
         call.Row();
@@ -1448,7 +2005,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_open(vexfs_mount_session *sessi
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_open(?1,?2,?3,?4,?5)");
+        Call call(session, "SELECT vexfs_handle_open(?1,?2,?3,?4,?5)");
         call.Text(1, session->workspace.c_str()); call.Text(2, path); call.Text(3, flags);
         call.Text(4, EffectiveRequestId(session, request_id, true));
         call.Text(5, session->session_id.c_str());
@@ -1466,7 +2023,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_create(
             throw CallError(SQLITE_MISUSE,
                             "path, mode 0..0777, request_id and handle output are required");
         }
-        Call call(session->db, "SELECT vexfs_handle_create(?1,?2,?3,?4,?5)");
+        Call call(session, "SELECT vexfs_handle_create(?1,?2,?3,?4,?5)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, path);
         call.Int(3, static_cast<int>(mode));
@@ -1487,7 +2044,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_truncate(
             throw CallError(SQLITE_MISUSE, "size is too large or generation output is NULL");
         }
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_truncate(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_truncate(?1,?2,?3)");
         call.Text(1, handle);
         call.Int64(2, static_cast<int64_t>(size));
         call.Text(3, EffectiveRequestId(session, request_id, true));
@@ -1505,7 +2062,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_stage_write(
             throw CallError(SQLITE_MISUSE, "offset is too large or generation output is NULL");
         }
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_stage_write(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_handle_stage_write(?1,?2,?3,?4)");
         call.Text(1, handle);
         call.Int64(2, static_cast<int64_t>(offset));
         call.Blob(3, data, size);
@@ -1526,7 +2083,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_append(
                             "handle, content, request_id and version output are required");
         }
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_append(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_append(?1,?2,?3)");
         call.Text(1, handle);
         call.Blob(2, data, size);
         call.Text(3, request_id);
@@ -1546,7 +2103,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_read(vexfs_mount_session *sessi
             length > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
             throw CallError(SQLITE_MISUSE, "read range is too large");
         }
-        Call call(session->db, "SELECT vexfs_handle_read(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_read(?1,?2,?3)");
         call.Text(1, handle); call.Int64(2, static_cast<int64_t>(offset));
         call.Int64(3, static_cast<int64_t>(length)); call.Row(); CopyResult(call, content);
     });
@@ -1564,7 +2121,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_publish(
         if (std::strcmp(durability, "full") == 0) UseFullDurability(session);
         else UseOrdinaryDurability(session);
         if (version == nullptr) throw CallError(SQLITE_MISUSE, "version output is NULL");
-        Call call(session->db, "SELECT vexfs_handle_publish(?1,?2,?3,?4)");
+        Call call(session, "SELECT vexfs_handle_publish(?1,?2,?3,?4)");
         call.Text(1, handle); call.Int64(2, generation); call.Text(3, durability);
         call.Text(4, EffectiveRequestId(session, request_id, true));
         call.Row(); *version = call.ResultInt64();
@@ -1582,7 +2139,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_publish_close(
         }
         if (std::strcmp(durability, "full") == 0) UseFullDurability(session);
         else UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_publish_close(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_publish_close(?1,?2,?3)");
         call.Text(1, handle);
         call.Int64(2, generation);
         call.Text(3, durability);
@@ -1597,7 +2154,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_close(
     return Guard(session, error, [&] {
         RequireSession(session);
         UseOrdinaryDurability(session);
-        Call call(session->db, "SELECT vexfs_handle_close(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_close(?1,?2,?3)");
         call.Text(1, handle); call.Int(2, retain_unpublished);
         call.Text(3, EffectiveRequestId(session, request_id, true));
         call.Row(); CopyResult(call, state);
@@ -1612,7 +2169,7 @@ extern "C" vexfs_mount_status vexfs_mount_synchronize(vexfs_mount_session *sessi
         RequireSession(session);
         UseFullDurability(session);
         if (published == nullptr) throw CallError(SQLITE_MISUSE, "published output is NULL");
-        Call call(session->db, "SELECT vexfs_mount_synchronize(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_mount_synchronize(?1,?2,?3)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, EffectiveRequestId(session, request_id, true));
         call.Text(3, session->session_id.c_str()); call.Row();
@@ -1630,7 +2187,7 @@ extern "C" vexfs_mount_status vexfs_mount_reclaim(vexfs_mount_session *session,
         RequireSession(session);
         UseOrdinaryDurability(session);
         if (reclaimed == nullptr) throw CallError(SQLITE_MISUSE, "reclaimed output is NULL");
-        Call call(session->db, "SELECT vexfs_item_reclaim(?1,?2)");
+        Call call(session, "SELECT vexfs_item_reclaim(?1,?2)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, EffectiveRequestId(session, request_id, true));
         call.Row();

@@ -15,7 +15,7 @@
 
 namespace {
 
-constexpr const char *kRegistryVersion = "VEXFS_MOUNT_REGISTRY_V1";
+constexpr const char *kRegistryVersion = "VEXFS_MOUNT_REGISTRY_V2";
 
 std::string PercentDecode(std::string value) {
     const auto hex = [](char character) -> int {
@@ -86,7 +86,13 @@ bool ReadRecord(const std::filesystem::path &path, VexFSPlatformMountEntry *entr
     if (!std::getline(input, version) || version != kRegistryVersion) return false;
     return static_cast<bool>(input >> std::quoted(entry->source)
         >> std::quoted(entry->target) >> std::quoted(entry->type)
-        >> std::quoted(entry->database) >> std::quoted(entry->workspace));
+        >> std::quoted(entry->backend) >> std::quoted(entry->database)
+        >> std::quoted(entry->workspace));
+}
+
+std::string NormalizeConnection(const std::string &backend,
+                                const std::string &connection) {
+    return backend == "sqlite" ? NormalizePath(connection) : connection;
 }
 
 }  // namespace
@@ -104,7 +110,8 @@ std::vector<VexFSPlatformMountEntry> VexFSPlatformAttachMountRegistry(
         for (auto &live : mounts) {
             if (NormalizePath(live.target) != NormalizePath(saved.target) ||
                 NormalizeSource(live.source) != NormalizeSource(saved.source)) continue;
-            live.database = NormalizePath(saved.database);
+            live.backend = saved.backend;
+            live.database = NormalizeConnection(saved.backend, saved.database);
             live.workspace = saved.workspace;
             break;
         }
@@ -114,7 +121,8 @@ std::vector<VexFSPlatformMountEntry> VexFSPlatformAttachMountRegistry(
 
 void VexFSPlatformRememberMount(const std::filesystem::path &registry_directory,
                                 const VexFSPlatformMountEntry &mount) {
-    if (mount.target.empty() || mount.source.empty() || mount.database.empty() ||
+    if (mount.target.empty() || mount.source.empty() || mount.backend.empty() ||
+        mount.database.empty() ||
         mount.workspace.empty()) {
         throw std::runtime_error("incomplete VexFS mount identity");
     }
@@ -131,7 +139,8 @@ void VexFSPlatformRememberMount(const std::filesystem::path &registry_directory,
                << std::quoted(mount.source) << '\n'
                << std::quoted(NormalizePath(mount.target)) << '\n'
                << std::quoted(mount.type) << '\n'
-               << std::quoted(NormalizePath(mount.database)) << '\n'
+               << std::quoted(mount.backend) << '\n'
+               << std::quoted(NormalizeConnection(mount.backend, mount.database)) << '\n'
                << std::quoted(mount.workspace) << '\n';
         if (!output) throw std::runtime_error("cannot finish VexFS mount registry");
     }

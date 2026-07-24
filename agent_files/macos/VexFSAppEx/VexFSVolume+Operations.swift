@@ -198,7 +198,14 @@ extension VexFSVolume: FSVolume.Operations {
         }
         if nameString == "." { return replyHandler(directory, name, nil) }
         do {
-            let path = try childPath(parent: directory, name: nameString)
+            let generation = try currentCacheGeneration()
+            let path = try childPath(parent: directory, name: nameString,
+                                     generation: generation)
+            if let (record, parentID) = cachedLookupRecord(path: path,
+                                                           generation: generation) {
+                return replyHandler(cachedItem(path: path, record: record,
+                                               parentID: parentID), name, nil)
+            }
             let record = try backend.stat(path: path)
             replyHandler(cachedItem(path: path, record: record, parentID: directory.itemID), name, nil)
         } catch { replyHandler(nil, nil, error) }
@@ -246,12 +253,12 @@ extension VexFSVolume: FSVolume.Operations {
             let record = try backend.stat(path: path)
             let item = cachedItem(path: path, record: record, parentID: directory.itemID)
             if let createdHandle {
-                // The atomic create leaves an empty generation staged.  Reuse
-                // that handle for the first write and publish one version on
-                // close/synchronize, instead of an empty version plus content.
+                // createFileHandle has already published the empty file so the
+                // directory entry is visible. Reuse its handle for later writes;
+                // the next stage operation supplies the next dirty generation.
                 item.handle = createdHandle
                 item.handleWritable = true
-                item.dirtyGeneration = 1
+                item.dirtyGeneration = nil
             }
             recordDirectoryMutation(directory)
             replyHandler(item, name, nil)

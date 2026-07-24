@@ -1,8 +1,10 @@
 import Foundation
+import OSLog
 
 struct VexFSDescriptor: Codable {
     let version: Int
-    let database_file: String
+    let backend: String
+    let connection: String
     let workspace: String
 }
 
@@ -83,11 +85,13 @@ struct VexFSDirectoryListing: Codable {
 
 final class VexFSBackend {
     private var session: OpaquePointer?
-    private let databasePath: String
+    private let backend: String
+    private let connection: String
     private let workspace: String
 
-    init(databasePath: String, workspace: String) throws {
-        self.databasePath = databasePath
+    init(backend: String, connection: String, workspace: String) throws {
+        self.backend = backend
+        self.connection = connection
         self.workspace = workspace
         try reopen()
     }
@@ -100,14 +104,15 @@ final class VexFSBackend {
         config.flags = UInt32(VEXFS_RUNTIME_EXCLUSIVE_GATEWAY)
         var opened: OpaquePointer?
         var error = vexfs_mount_error()
-        let status = "sqlite".withCString { backendPointer in
-            databasePath.withCString { databasePointer in
+        let principal = backend == "sqlite" ? "local" : ""
+        let status = backend.withCString { backendPointer in
+            connection.withCString { connectionPointer in
                 workspace.withCString { workspacePointer in
-                    "local".withCString { principalPointer in
+                    principal.withCString { principalPointer in
                         config.backend = backendPointer
-                        config.connection = databasePointer
+                        config.connection = connectionPointer
                         config.workspace = workspacePointer
-                        config.principal = principalPointer
+                        config.principal = backend == "sqlite" ? principalPointer : nil
                         return vexfs_mount_session_open(&config, &opened, &error)
                     }
                 }
@@ -371,6 +376,16 @@ final class VexFSBackend {
         guard let value = String(data: Self.take(&output), encoding: .utf8) else {
             throw POSIXError(.EIO)
         }
+        do {
+            // handle_create prepares an empty private generation.  POSIX create
+            // must make the directory entry visible before FSKit asks for the
+            // returned item's attributes, so publish generation 1 now and keep
+            // the same handle open for a later write.
+            _ = try publish(handle: value, generation: 1)
+        } catch {
+            try? closeHandle(value, retain: true)
+            throw error
+        }
         return value
     }
 
@@ -501,6 +516,15 @@ final class VexFSBackend {
     private static func check(_ status: vexfs_mount_status,
                               error: inout vexfs_mount_error) throws {
         guard status != VEXFS_MOUNT_OK else { return }
+        let detail = withUnsafePointer(to: &error.message) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: 512) {
+                String(cString: $0)
+            }
+        }
+        if !detail.isEmpty {
+            Logger.vexfs.error(
+                "runtime rejected operation: \(detail, privacy: .public)")
+        }
         let code: POSIXError.Code
         switch status {
         case VEXFS_MOUNT_NOT_FOUND: code = .ENOENT

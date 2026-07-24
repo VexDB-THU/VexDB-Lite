@@ -1,7 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
-VEXDB="${1:?usage: vexdb_unified_smoke.sh /path/to/vexdb}"
+VEXDB_INPUT="${1:?usage: vexdb_unified_smoke.sh /path/to/vexdb}"
+VEXDB="$(cd "$(dirname "$VEXDB_INPUT")" && pwd)/$(basename "$VEXDB_INPUT")"
 TMP_DIR="$(mktemp -d -t vexdb-unified-smoke)"
 DB="$TMP_DIR/agent.sqlite3"
 COPY="$TMP_DIR/agent-copy.sqlite3"
@@ -16,7 +17,10 @@ cleanup() {
 trap cleanup EXIT
 
 "$VEXDB" --version | grep -q 'vexdb-lite'
-cp "$VEXDB" "$VEXFS_EXE"
+# Keep the executable next to its package-relative runtime libraries. The real
+# installation also exposes vexfs as a symlink to vexdb; copying only the Mach-O
+# binary would deliberately break @executable_path dependency resolution.
+ln -s "$VEXDB" "$VEXFS_EXE"
 "$VEXFS_EXE" --help | grep -q 'Commands:'
 
 RESULT="$("$VEXDB" "$DB" \

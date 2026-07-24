@@ -93,8 +93,12 @@ class Statement {
     }
 
     void BindBlob(int index, const std::vector<unsigned char> &value) {
-        const void *data = value.empty() ? static_cast<const void *>("") : value.data();
-        Check(sqlite3_bind_blob64(stmt_, index, data, value.size(), SQLITE_STATIC),
+        BindBlobView(index, value.empty() ? nullptr : value.data(), value.size());
+    }
+
+    void BindBlobView(int index, const void *data, size_t size) {
+        const void *bound = size == 0 ? static_cast<const void *>("") : data;
+        Check(sqlite3_bind_blob64(stmt_, index, bound, size, SQLITE_STATIC),
               "bind blob");
     }
 
@@ -133,6 +137,21 @@ class Statement {
         const int bytes = sqlite3_column_bytes(stmt_, column);
         if (data == nullptr || bytes == 0) return {};
         return std::vector<unsigned char>(data, data + bytes);
+    }
+
+    const unsigned char *BlobData(int column) const {
+        return static_cast<const unsigned char *>(sqlite3_column_blob(stmt_, column));
+    }
+
+    int BlobBytes(int column) const { return sqlite3_column_bytes(stmt_, column); }
+
+    bool BlobEquals(int column, const void *data, size_t size) const {
+        const int bytes = BlobBytes(column);
+        if (bytes < 0 || static_cast<size_t>(bytes) != size) return false;
+        if (size == 0) return true;
+        const unsigned char *stored = BlobData(column);
+        return stored != nullptr && data != nullptr &&
+               std::memcmp(stored, data, size) == 0;
     }
 
   private:
@@ -1032,18 +1051,19 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
     sqlite3_int64 offset = 0;
     sqlite3_int64 expected_chunk = 0;
     while (chunks.Row()) {
-        const std::vector<unsigned char> chunk = chunks.Blob(1);
         const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
             kContentChunkBytes, storage.size - offset);
+        const int chunk_bytes = chunks.BlobBytes(1);
+        const unsigned char *chunk = chunks.BlobData(1);
         if (chunks.Int64(0) != expected_chunk || expected_size <= 0 ||
             chunks.Int64(2) != expected_size ||
-            static_cast<sqlite3_int64>(chunk.size()) != expected_size ||
+            chunk_bytes != expected_size || chunk == nullptr ||
             chunks.Text(3).size() != 64 ||
-            vexfs::Sha256Hex(chunk.data(), chunk.size()) != chunks.Text(3)) {
+            vexfs::Sha256Hex(chunk, static_cast<size_t>(chunk_bytes)) != chunks.Text(3)) {
             throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
         }
-        std::copy(chunk.begin(), chunk.end(), content.begin() + offset);
-        file_hash.Update(chunk.data(), chunk.size());
+        std::memcpy(content.data() + offset, chunk, static_cast<size_t>(chunk_bytes));
+        file_hash.Update(chunk, static_cast<size_t>(chunk_bytes));
         offset += expected_size;
         ++expected_chunk;
     }
@@ -1445,10 +1465,11 @@ sqlite3_int64 StoreManifest(sqlite3 *db, sqlite3_int64 workspace_id,
                             sqlite3_int64 inode_id,
                             sqlite3_int64 previous_manifest,
                             const std::vector<unsigned char> &content,
-                            const std::string &checksum) {
+                            std::string *checksum_out) {
     const sqlite3_int64 size = static_cast<sqlite3_int64>(content.size());
     const sqlite3_int64 chunk_count =
         (size + kContentChunkBytes - 1) / kContentChunkBytes;
+    const std::string pending_checksum(64, '0');
     Statement manifest(db, R"SQL(
 INSERT INTO _vexfs_manifests(workspace_id,file_size,chunk_size,chunk_count,checksum)
 VALUES(?1,?2,?3,?4,?5)
@@ -1457,7 +1478,7 @@ VALUES(?1,?2,?3,?4,?5)
     manifest.BindInt64(2, size);
     manifest.BindInt64(3, kContentChunkBytes);
     manifest.BindInt64(4, chunk_count);
-    manifest.BindText(5, checksum);
+    manifest.BindText(5, pending_checksum);
     manifest.Done();
     const sqlite3_int64 manifest_id = sqlite3_last_insert_rowid(db);
 
@@ -1476,20 +1497,21 @@ INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
 VALUES(?1,?2,?3)
 )SQL");
     std::unordered_map<std::string, sqlite3_int64> new_chunks;
+    vexfs::Sha256 file_hash;
     for (sqlite3_int64 chunk_no = 0, offset = 0; offset < size;
          ++chunk_no, offset += kContentChunkBytes) {
         const size_t bytes = static_cast<size_t>(std::min<sqlite3_int64>(
             kContentChunkBytes, size - offset));
-        std::vector<unsigned char> data(
-            content.begin() + offset, content.begin() + offset + bytes);
-        const std::string chunk_checksum = vexfs::Sha256Hex(data.data(), data.size());
+        const unsigned char *data = content.data() + offset;
+        file_hash.Update(data, bytes);
+        const std::string chunk_checksum = vexfs::Sha256Hex(data, bytes);
         sqlite3_int64 chunk_id = 0;
         if (previous_manifest > 0) {
             previous.BindInt64(1, previous_manifest);
             previous.BindInt64(2, chunk_no);
             previous.BindInt64(3, inode_id);
             if (previous.Row() && previous.Int64(2) == static_cast<sqlite3_int64>(bytes) &&
-                previous.Text(3) == chunk_checksum && previous.Blob(1) == data) {
+                previous.Text(3) == chunk_checksum && previous.BlobEquals(1, data, bytes)) {
                 chunk_id = previous.Int64(0);
             }
             previous.Reset();
@@ -1502,7 +1524,7 @@ VALUES(?1,?2,?3)
         if (chunk_id == 0) {
             chunk.BindInt64(1, workspace_id);
             chunk.BindInt64(2, inode_id);
-            chunk.BindBlob(3, data);
+            chunk.BindBlobView(3, data, bytes);
             chunk.BindInt64(4, static_cast<sqlite3_int64>(bytes));
             chunk.BindText(5, chunk_checksum);
             chunk.Done();
@@ -1516,6 +1538,13 @@ VALUES(?1,?2,?3)
         entry.Done();
         entry.Reset();
     }
+    const std::string checksum = vexfs::Hex(file_hash.Finish());
+    Statement finalize(db,
+        "UPDATE _vexfs_manifests SET checksum=?1 WHERE id=?2");
+    finalize.BindText(1, checksum);
+    finalize.BindInt64(2, manifest_id);
+    finalize.Done();
+    *checksum_out = checksum;
     return manifest_id;
 }
 
@@ -1544,9 +1573,9 @@ sqlite3_int64 StoreVersion(sqlite3 *db, const Workspace &workspace, const Node &
     }
 
     const sqlite3_int64 commit = CreateCommit(db, workspace, message);
-    const std::string checksum = vexfs::Sha256Hex(content.data(), content.size());
+    std::string checksum;
     const sqlite3_int64 manifest_id = StoreManifest(
-        db, workspace.id, node.id, previous_manifest, content, checksum);
+        db, workspace.id, node.id, previous_manifest, content, &checksum);
     Statement insert(db,
         "INSERT INTO _vexfs_file_versions"
         "(inode_id,version_no,commit_id,manifest_id,size,checksum) "
@@ -2091,19 +2120,9 @@ sqlite3_int64 StoreManifestFromStaging(sqlite3 *db, sqlite3_int64 workspace_id,
         throw SqlError("staging capacity does not match BLOB", SQLITE_CORRUPT);
     }
     std::vector<unsigned char> buffer(static_cast<size_t>(kContentChunkBytes));
-    std::vector<std::string> chunk_checksums;
-    vexfs::Sha256 file_hash;
-    for (sqlite3_int64 offset = 0; offset < staging.logical_size;
-         offset += kContentChunkBytes) {
-        const int bytes = static_cast<int>(std::min<sqlite3_int64>(
-            kContentChunkBytes, staging.logical_size - offset));
-        rc = sqlite3_blob_read(blob.get(), buffer.data(), bytes, static_cast<int>(offset));
-        if (rc != SQLITE_OK) throw SqlError("cannot read staging BLOB", rc);
-        file_hash.Update(buffer.data(), static_cast<size_t>(bytes));
-        chunk_checksums.push_back(vexfs::Sha256Hex(buffer.data(), static_cast<size_t>(bytes)));
-    }
-    const std::string checksum = vexfs::Hex(file_hash.Finish());
-    const sqlite3_int64 chunk_count = static_cast<sqlite3_int64>(chunk_checksums.size());
+    const sqlite3_int64 chunk_count =
+        (staging.logical_size + kContentChunkBytes - 1) / kContentChunkBytes;
+    const std::string pending_checksum(64, '0');
     Statement manifest(db, R"SQL(
 INSERT INTO _vexfs_manifests(workspace_id,file_size,chunk_size,chunk_count,checksum)
 VALUES(?1,?2,?3,?4,?5)
@@ -2112,7 +2131,7 @@ VALUES(?1,?2,?3,?4,?5)
     manifest.BindInt64(2, staging.logical_size);
     manifest.BindInt64(3, kContentChunkBytes);
     manifest.BindInt64(4, chunk_count);
-    manifest.BindText(5, checksum);
+    manifest.BindText(5, pending_checksum);
     manifest.Done();
     const sqlite3_int64 manifest_id = sqlite3_last_insert_rowid(db);
     Statement previous(db, R"SQL(
@@ -2130,22 +2149,24 @@ INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
 VALUES(?1,?2,?3)
 )SQL");
     std::unordered_map<std::string, sqlite3_int64> new_chunks;
+    vexfs::Sha256 file_hash;
     for (sqlite3_int64 chunk_no = 0, offset = 0; chunk_no < chunk_count;
          ++chunk_no, offset += kContentChunkBytes) {
         const int bytes = static_cast<int>(std::min<sqlite3_int64>(
             kContentChunkBytes, staging.logical_size - offset));
         rc = sqlite3_blob_read(blob.get(), buffer.data(), bytes, static_cast<int>(offset));
-        if (rc != SQLITE_OK) throw SqlError("cannot reread staging BLOB", rc);
-        std::vector<unsigned char> content(buffer.begin(), buffer.begin() + bytes);
-        const std::string &chunk_checksum =
-            chunk_checksums[static_cast<size_t>(chunk_no)];
+        if (rc != SQLITE_OK) throw SqlError("cannot read staging BLOB", rc);
+        file_hash.Update(buffer.data(), static_cast<size_t>(bytes));
+        const std::string chunk_checksum =
+            vexfs::Sha256Hex(buffer.data(), static_cast<size_t>(bytes));
         sqlite3_int64 chunk_id = 0;
         if (previous_manifest > 0) {
             previous.BindInt64(1, previous_manifest);
             previous.BindInt64(2, chunk_no);
             previous.BindInt64(3, inode_id);
             if (previous.Row() && previous.Int64(2) == bytes &&
-                previous.Text(3) == chunk_checksum && previous.Blob(1) == content) {
+                previous.Text(3) == chunk_checksum &&
+                previous.BlobEquals(1, buffer.data(), static_cast<size_t>(bytes))) {
                 chunk_id = previous.Int64(0);
             }
             previous.Reset();
@@ -2158,7 +2179,7 @@ VALUES(?1,?2,?3)
         if (chunk_id == 0) {
             chunk.BindInt64(1, workspace_id);
             chunk.BindInt64(2, inode_id);
-            chunk.BindBlob(3, content);
+            chunk.BindBlobView(3, buffer.data(), static_cast<size_t>(bytes));
             chunk.BindInt64(4, bytes);
             chunk.BindText(5, chunk_checksum);
             chunk.Done();
@@ -2172,6 +2193,12 @@ VALUES(?1,?2,?3)
         entry.Done();
         entry.Reset();
     }
+    const std::string checksum = vexfs::Hex(file_hash.Finish());
+    Statement finalize(db,
+        "UPDATE _vexfs_manifests SET checksum=?1 WHERE id=?2");
+    finalize.BindText(1, checksum);
+    finalize.BindInt64(2, manifest_id);
+    finalize.Done();
     *checksum_out = checksum;
     return manifest_id;
 }
@@ -2269,7 +2296,9 @@ sqlite3_int64 StoreVersionFromStaging(sqlite3 *db, const Workspace &workspace,
                                       const Node &node, const Handle &handle,
                                       sqlite3_int64 generation,
                                       const std::string &message) {
-    Savepoint savepoint(db, "vexfs_store_staged_version");
+    // PublishHandleInTransaction always owns the surrounding savepoint. Keeping
+    // another savepoint here added two SQL statements to every small-file close
+    // without adding another rollback boundary.
     AcquireWriteLock(db);
     const StagingInfo staging = FindStaging(db, handle);
     if (staging.generation != generation) {
@@ -2309,11 +2338,11 @@ VALUES(?1,?2,?3,?4,?5,?6)
     insert.BindText(6, checksum);
     insert.Done();
     UpdateGrepIndexFromVersion(db, workspace.id, node.id, version);
-    savepoint.Release();
     return version;
 }
 
-sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation) {
+sqlite3_int64 PublishHandleInTransaction(sqlite3 *db, Handle handle,
+                                         sqlite3_int64 generation) {
     if (handle.state == "closed") throw SqlError("handle is closed", SQLITE_NOTFOUND);
     if (generation <= handle.published_generation) {
         return NodeById(db, handle.inode_id, true).version;
@@ -2327,7 +2356,6 @@ sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation
         throw SqlError("write conflict: file changed after handle_open", SQLITE_CONSTRAINT);
     }
     Workspace workspace = WorkspaceById(db, handle.workspace_id);
-    Savepoint savepoint(db, "vexfs_publish_handle");
     const sqlite3_int64 version = StoreVersionFromStaging(
         db, workspace, node, handle, generation, "handle publish");
 
@@ -2338,6 +2366,13 @@ sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation
     update.BindInt64(2, generation);
     update.BindText(3, handle.id);
     update.Done();
+    return version;
+}
+
+sqlite3_int64 PublishHandle(sqlite3 *db, Handle handle, sqlite3_int64 generation) {
+    Savepoint savepoint(db, "vexfs_publish_handle");
+    const sqlite3_int64 version = PublishHandleInTransaction(
+        db, std::move(handle), generation);
     savepoint.Release();
     return version;
 }
@@ -5856,7 +5891,8 @@ void HandleAppendFunction(sqlite3_context *context, int, sqlite3_value **values)
         CreateStagingFromVersion(db, handle, node);
         const sqlite3_int64 generation = StageWrite(db, handle, node.size, suffix);
         handle.dirty_generation = generation;
-        const sqlite3_int64 version = PublishHandle(db, handle, generation);
+        const sqlite3_int64 version = PublishHandleInTransaction(
+            db, std::move(handle), generation);
         StoreRequestInteger(db, request_id, "handle_append", fingerprint, version);
         savepoint.Release();
         sqlite3_result_int64(context, version);
@@ -5945,7 +5981,8 @@ void HandlePublishCloseFunction(sqlite3_context *context, int, sqlite3_value **v
             throw SqlError("durability must be none, data, or full", SQLITE_MISMATCH);
         }
         Savepoint savepoint(db, "vexfs_handle_publish_close");
-        const sqlite3_int64 version = PublishHandle(db, FindHandle(db, handle_id), generation);
+        const sqlite3_int64 version = PublishHandleInTransaction(
+            db, FindHandle(db, handle_id), generation);
         Statement update(db,
             "UPDATE _vexfs_handles SET state='closed',lease_until=NULL,"
             "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?1");

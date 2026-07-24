@@ -19,8 +19,33 @@ ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 PG_VEXDB_SRC="${PG_VEXDB_SRC:-$ROOT_DIR}"
 SPEC_DIR="${ROOT_DIR}/build/spec/pg"
 RESULTS_DIR="${SPEC_DIR}/results"
-IMAGE="vexdb_pg19:latest"
-CONTAINER="vexdb_pg19-test"
+IMAGE="${VEXDB_PG_IMAGE:-vexdb_pg19:latest}"
+CONTAINER="${VEXDB_PG_CONTAINER:-vexdb_pg19-test}"
+DATABASE="${VEXDB_PG_DATABASE:-test}"
+PYTHON_BIN="${VEXDB_LITE_PYTHON:-}"
+
+if [[ -n "$PYTHON_BIN" ]]; then
+    [[ -x "$PYTHON_BIN" ]] || { echo "VEXDB_LITE_PYTHON 不可执行：$PYTHON_BIN" >&2; exit 2; }
+    "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' || {
+        echo "VEXDB_LITE_PYTHON 需要 Python 3.8 或更高版本：$PYTHON_BIN" >&2
+        exit 2
+    }
+else
+    for candidate in \
+        "$(command -v python3 2>/dev/null || true)" \
+        /opt/homebrew/bin/python3 \
+        /opt/anaconda3/bin/python3 \
+        /usr/bin/python3; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if "$candidate" -c \
+                'import sys; raise SystemExit(sys.version_info < (3, 8))' \
+                >/dev/null 2>&1; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
+    [[ -n "$PYTHON_BIN" ]] || { echo "PG spec 需要 Python 3.8 或更高版本" >&2; exit 2; }
+fi
 
 YEL=$'\033[1;33m'; GRN=$'\033[0;32m'; RED=$'\033[0;31m'; NC=$'\033[0m'
 info() { printf '%s[pg]%s %s\n' "$YEL" "$NC" "$*"; }
@@ -83,8 +108,8 @@ cmd_up() {
     fi
     info "等待 PG ready..."
     for _ in $(seq 1 30); do
-        if docker exec "$CONTAINER" psql -d test -c 'SELECT 1' >/dev/null 2>&1; then
-            ok "PG ready on localhost:5433 db=test (容器内 5432)"
+        if docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -c 'SELECT 1' >/dev/null 2>&1; then
+            ok "PG ready on localhost:5433 db=$DATABASE (容器内 5432)"
             return 0
         fi
         sleep 1
@@ -99,7 +124,7 @@ cmd_down() {
 }
 
 cmd_shell() {
-    docker exec -it "$CONTAINER" psql -d test
+    docker exec -it "$CONTAINER" psql -U postgres -d "$DATABASE"
 }
 
 cmd_logs() {
@@ -130,7 +155,7 @@ cmd_test() {
         # -X: 不读 .psqlrc; -q: quiet (不输出 CREATE TABLE 等); -t: 不带 header/footer
         # -A: unaligned; -F '|': 字段分隔符; --no-psqlrc; ON_ERROR_STOP 失败立即停
         # 每个 spec 跑前: 删除 public schema 下所有用户表 (保留 extension)
-        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off > /dev/null 2>&1 <<'EOF'
+        docker exec -i "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t -A -F '|' -P pager=off > /dev/null 2>&1 <<'EOF'
 DO $$
 DECLARE r record;
 BEGIN
@@ -139,7 +164,7 @@ BEGIN
   END LOOP;
 END $$;
 EOF
-        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off \
+        docker exec -i "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t -A -F '|' -P pager=off \
             > "$actual" 2>&1 < "$sql_file" || true
         # 过滤 psql 命令完成消息 + 服务端日志级别消息 + 报错位置标记 (^ / LINE).
         # 单条 ERE 替代之前 23 个 -e 模式.
@@ -154,7 +179,7 @@ EOF
         awk 'NF || prev_nf { print } { prev_nf = NF }' "$actual" > "${actual}.tmp" && mv "${actual}.tmp" "$actual"
 
         if [[ -f "$expected" ]]; then
-            if python3 "${ROOT_DIR}/tests/spec/_lib/docker/compare.py" "$expected" "$actual" 2>"$diff_file"; then
+            if "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/docker/compare.py" "$expected" "$actual" 2>"$diff_file"; then
                 pass=$((pass+1))
                 rm -f "$diff_file"
                 printf '  %s%s%s %s\n' "$GRN" "PASS" "$NC" "$name"

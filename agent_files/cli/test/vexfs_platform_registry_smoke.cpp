@@ -28,13 +28,14 @@ int main() {
 
     try {
         VexFSPlatformRememberMount(registry,
-            {source.string(), target.string(), "vexfs", database.string(), "agent"});
+            {source.string(), target.string(), "vexfs", "sqlite", database.string(), "agent"});
         std::string encoded_source = source.string();
         const size_t space = encoded_source.find(' ');
         if (space != std::string::npos) encoded_source.replace(space, 1, "%20");
         auto attached = VexFSPlatformAttachMountRegistry(
             {{"file://" + encoded_source + "/", target.string(), "vexfs"}}, registry);
         if (attached.size() != 1 ||
+            attached[0].backend != "sqlite" ||
             attached[0].database != std::filesystem::weakly_canonical(database).string() ||
             attached[0].workspace != "agent") {
             const std::string details = attached.empty() ? "empty" :
@@ -54,6 +55,16 @@ int main() {
         if (!attached[0].database.empty()) {
             std::filesystem::remove_all(root);
             return Fail("forgotten mount identity");
+        }
+        const std::string dsn = "postgresql://postgres@127.0.0.1:5432/test";
+        VexFSPlatformRememberMount(registry,
+            {source.string(), target.string(), "vexfs", "postgresql", dsn, "remote"});
+        attached = VexFSPlatformAttachMountRegistry(
+            {{source.string(), target.string(), "vexfs"}}, registry);
+        if (attached[0].backend != "postgresql" || attached[0].database != dsn ||
+            attached[0].workspace != "remote") {
+            std::filesystem::remove_all(root);
+            return Fail("PostgreSQL connection identity must not be normalized as a path");
         }
     } catch (const std::exception &error) {
         std::filesystem::remove_all(root);

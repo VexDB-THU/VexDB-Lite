@@ -5,13 +5,38 @@
 - 所属项目：VexDB-Lite
 - 日期：2026-07-16
 - 分支：`feature/agent_files`
-- 文档版本：1.3
-- 状态：SQLite 合同、macOS FSKit 垂直闭环和 Linux libfuse3 双架构预览包已实现；当前继续本地开发者预览收口
+- 文档版本：1.8
+- 状态：SQLite `0.9.0`、macOS FSKit、Linux libfuse3 和 arm64 真机交付已实现；
+PostgreSQL `0.4.0-alpha.1` 的数据库合同、format v2、ACL、审计、libpq HostStore、
+  macOS/Linux 真实 mount、双 Mac 串行 Agent 工作区和备份恢复已实现
 - 适用范围：VexFS 完整产品定义；开发顺序以 `docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md` 为准
 
 ## 0. 阅读结论
 
-VexFS 是由 PostgreSQL、DuckDB 或 SQLite 加载和管理的数据库文件管理扩展。三个数据库共享文件合同，但不要求同时完成。macOS + SQLite 的首个闭环已经跑通，Linux + SQLite 的 libfuse3 真实挂载预览也已经跑通；当前先把这两个本地平台收口成可安装的开发者预览，再进入 PostgreSQL 远程共享工作区。Windows 使用 WinFsp 接入同一 mount runtime；DuckDB 后续先提供 SQL、CLI 和 worktree。
+### 0.0 2026-07-24 macOS 默认挂载决策
+
+macOS 0.1 默认使用系统内置 NFS 客户端连接本机 VexFS NFS gateway。FSKit 已完成的实现和
+真机证据继续保留，但降为后续原生增强，不再是首次安装、默认挂载或 0.1 发布 Gate。
+
+这个决定只改变 macOS mount adapter，不改变数据库权威核心：NFS gateway、后续 FSKit、
+Linux FUSE 和 Windows WinFsp 必须共用同一 Workspace Engine、mount runtime、数据库合同和
+一致性 eval，不能形成两套文件、版本、权限或备份逻辑。
+
+默认 NFS 路径的产品要求是：
+
+- 用户不需要在“文件系统扩展”中寻找和启用 VexFS；
+- `vexdb fs mount` 自动启动当前用户的本机 gateway，并调用系统 NFS 客户端挂载；
+- NFS 服务只绑定 loopback，不作为局域网或公网文件服务器；
+- mount/unmount/status/doctor 管理 gateway 生命周期和 stale mount；
+- FSKit 的签名、entitlement、启用和公证不再阻塞 NFS 版 0.1，但普通 macOS 发行物仍需
+  Developer ID 签名与公证，避免 Gatekeeper 阻止 CLI/gateway；
+- NFS 协议版本、mount 权限提示、锁、xattr、缓存一致性、sleep/wake 和 gateway crash 必须
+  通过真机 Gate 后，才能宣传“安装后无缝 Bash”。
+
+后文中的 FSKit 完成状态仍是历史事实；凡是把 FSKit 写成“默认、MVP 主入口或当前发布前置”的
+旧表述，均由本节替代。
+
+VexFS 是由 PostgreSQL、DuckDB 或 SQLite 加载和管理的数据库文件管理扩展。三个数据库共享文件合同，但不要求同时完成。macOS + SQLite 和 Linux + SQLite 的真实挂载预览已经跑通；PostgreSQL `0.4.0-alpha.1` 已完成数据库内合同、format v2、真实 role、ACL、审计、跨 gateway 锁与缓存失效、libpq HostStore、macOS FSKit、Linux FUSE、数据库重启以及逻辑和物理备份恢复。两台真实 Mac 已通过回环隧道串行挂载同一 PG workspace，各运行一次真实 OpenCode，完成创建、继承修改、双快照和整工作区一键恢复；局域网直连 FSKit 只需要用户完成一次 macOS“本地网络”授权。Windows 使用 WinFsp 接入同一 mount runtime；DuckDB 后续先提供 SQL、CLI 和 worktree。
 
 它在数据库中提供文件、目录、路径、版本、快照、权限、审计、配额、完整性检查和逻辑导入导出。文件修改可以和普通业务 SQL 在同一个事务中提交或回滚。
 
@@ -33,7 +58,10 @@ VexFS 有两种不同的事务入口，文档和产品界面必须明确区分�
 1. SQL 调用可以参加调用者当前数据库事务，实现“文件 + 业务表”原子提交；
 2. mount 中的普通 Bash 操作由 gateway 建立短事务，不能自动加入应用已经打开的数据库事务，多条 Bash 命令也不会自动合成一个事务。
 
-macOS 可挂载技术闭环支持 macOS 26.0+、Apple Silicon 和 FSKit。FSKit 基础接口从 macOS 15.4 提供，但本产品用来传递数据库目录资源的 `FSPathURLResource` 从 macOS 26.0 才提供。Linux 已有 libfuse3 预览，x86_64 和 AArch64 都已有 manylinux 安装包和对应架构真机安装证据，真实挂载已覆盖 root 与普通用户；Windows、较旧 macOS 和不能启用文件系统扩展的环境仍先使用数据库函数与 CLI。
+macOS 默认挂载改为系统 NFS client + 本机用户态 gateway，不再受 FSKit V2
+`FSPathURLResource` 的 macOS 26.0 最低版本约束；新的最低 macOS 版本和 Intel/Apple Silicon
+支持范围由 NFS 发行包真机验证决定。现有 macOS 26.0+ Apple Silicon FSKit 实现作为后续可选
+原生 adapter 保留。Linux 已有 libfuse3 预览，Windows 后续使用 WinFsp。
 
 ### 0.1 最终目标和开发顺序
 
@@ -79,7 +107,7 @@ VexFS 的不变最终目标、阶段边界、完成条件和当前下一步统�
 
 SQLite MVP 没有数据库用户认证。该阶段的 principal 只能来自受签名 App/extension、当前 macOS 用户、security-scoped 数据库目录和数据库文件权限共同建立的本地身份边界；不能把 PostgreSQL 角色语义直接套到 SQLite。
 
-### 1.2 当前实现状态（2026-07-23）
+### 1.2 当前实现状态（2026-07-24）
 
 SQLite 合同为 `0.9.0`，runtime ABI 为 1。除单文件版本外，当前实现已经提供完整 workspace 时间点恢复：
 
@@ -105,9 +133,19 @@ SQLite 合同为 `0.9.0`，runtime ABI 为 1。除单文件版本外，当前实
   `O_APPEND`、最小 `flock`/`fcntl`、打开文件 rename/unlink、强制卸载和 helper 崩溃恢复已验证；
 - 同一 SQLite 数据库已完成 macOS → Linux → macOS 往返，内容、Unicode、mode、链接、
   xattr、便携 ACL、数字 UID/GID、历史和跨系统快照恢复均通过；
-- macOS `preview.17` 已完成 Developer ID 签名、Apple 公证、staple、本机安装和真实 FSKit
-  回归；尚缺另一台没有源码和 Xcode 构建记录的干净 Mac 验证。Linux x86_64/AArch64
-  `preview.9` 包已完成原生无 root 安装、扩展加载、自检、文件读写和卸载回归。
+- macOS `preview.22` 已完成 Developer ID 签名、Apple 公证、staple、本机安装和真实 FSKit
+  回归，另一台没有源码和完整 Xcode 的 M1 Mac 也已完成安装、挂载、Git、OpenCode 和恢复
+  验证。`preview.36` 又修复了重签后 DER entitlement 与原子升级事务；本机已经允许
+  `preview.37` 的 FSKit module，`doctor` 连续确认 `extension=enabled` 和 `mount_ready=true`；
+  用户再次唤醒系统后，本机 PostgreSQL FSKit 13/13 场景、247 项检查已全部通过，凭据生命周期
+  9 项、macOS↔Linux 跨 gateway 47 项、两台 Mac 文件/快照往返 50 项、双机故障恢复 25 项，
+  以及双 Mac 串行真实 OpenCode 的 7 + 9 + 21 条检查也通过。后者覆盖第一台创建、第二台继承
+  同一 Git workspace、第一台回看、两个完整快照和一键恢复。PG 当前 grep 仍是数据库扫描，
+  不宣称索引加速。该包仍没有 Apple 公证票据，不能作为正式分发
+  结论；安装器已经修复旧 extension UUID 刷新问题，必须从干净提交构建、公证并 staple
+  `preview.38` 后再做最终发行复测。Linux
+  x86_64/AArch64 `preview.9`
+  包已完成原生无 root 安装、扩展加载、自检、文件读写和卸载回归。
 - Python、Node.js、Go、Rust 和 Git 已在 FSKit 挂载盘中运行并通过重挂载复测；SQLite
   直连已通过 10 万文件，FSKit 已通过 1 万文件；10 万文件已完成创建/遍历/抽样读取，
   但普通 `rg` 在 3,600 秒内未完成；900 秒混合重开稳定性完成 594,000
@@ -144,9 +182,17 @@ SQLite 合同为 `0.9.0`，runtime ABI 为 1。除单文件版本外，当前实
   `importing` 状态完成映射和深度检查，再在同一事务中原子发布；
 - export、`archive verify` 和 import 都逐个处理不超过 64 KiB 的 chunk，校验和导入
   使用同一个事务快照。HEAD 导出遇到未发布句柄时拒绝，指定快照
-  导出不受后续写入影响。当前只实现 SQLite 读写该逻辑格式；PG/DuckDB 消费端尚未实现。
+  导出不受后续写入影响。当前 SQLite 和 PostgreSQL 已能读写该逻辑格式；DuckDB 消费端尚未实现。
 
-当前已经是完整 workspace 时间点恢复，但还不是完整 POSIX 文件系统。SQLite 文件版本 SHA-256、只读 check、live quota、retention、显式 GC、逻辑导入导出和 `chunked-v1` 内容模型已实现；principal 权限执行、ACL 授权、审计、history/staging/index/total quota 和跨文件通用去重仍未实现。四类时间戳和本地最小文件锁已经验证，但跨 gateway 锁、setuid/setgid/sticky bit 和特殊文件没有形成跨平台承诺。hardlink、owner/group 和便携 ACL 当前只能称为“数据库合同已实现并在部分平台接入”，不能称为完整身份权限系统。GC 回收的是数据库可复用页，不会自动执行 `VACUUM` 缩小 SQLite 文件。snapshot 解决误改和任务检查点，SQLite Backup 才是独立备份，两者不能混为一谈。
+当前已经是完整 workspace 时间点恢复，但还不是完整 POSIX 文件系统。SQLite 文件版本
+SHA-256、只读 check、live quota、retention、显式 GC、逻辑导入导出和 `chunked-v1` 内容模型
+已实现；PostgreSQL 还完成了真实 role、路径 ACL 授权与继承、审计、跨 gateway 锁和权限/内容
+失效。SQLite 仍只保存便携 ACL，不执行完整路径授权。产品整体尚未实现
+history/staging/index/total quota、跨文件通用去重、setuid/setgid/sticky bit 和特殊文件。
+hardlink、owner/group 和便携 ACL 已进入公共合同和 macOS/Linux mount 测试，但不能把这些
+能力扩大描述为所有平台的原生 ACL 完全等价。GC 回收的是数据库可复用页，不会自动执行
+`VACUUM` 缩小 SQLite 文件。snapshot 解决误改和任务检查点，SQLite Backup 或 PostgreSQL
+原生备份才解决数据库灾难恢复，两者不能混为一谈。
 
 当前符号链接采用 POSIX 行为：target 是原样字符串，可以指向挂载目录外部。它解决兼容性，但不提供路径隔离；需要隔离时仍由 Agent sandbox 负责。未来可以增加可选的 `internal` 策略，但当前版本没有实现该策略。
 
@@ -584,6 +630,14 @@ VexFS 禁止：
 | FR-AU-006 | P1 | 支持可选审计 hash 链，用于发现记录被改写。 |
 | FR-AU-007 | P1 | 工作区可以开启读取审计，默认关闭以控制数据量。 |
 
+PostgreSQL `0.4.0-alpha.1` 当前对 workspace、目录、文件、link、owner、mode、时间戳、
+xattr、ACL、单文件恢复、workspace 恢复和 format v2 导入等变更写审计。每行保存由数据库
+认证的 `session_user` 与 role OID、workspace 名称和 ID、commit、操作、路径、inode、
+`before_version` 与 `after_version`；不保存文件正文、xattr 值、密码或连接串。删除 workspace
+前先写审计，外键使用 `ON DELETE SET NULL`，因此删除后仍保留 workspace 名称和最后操作，
+不会产生无法识别的孤立记录。普通 role 不能读取审计，`vexfs_check` 会报告对象或前后版本
+不完整的审计行。
+
 ### 10.8 配额、保留和垃圾回收
 
 | ID | 优先级 | 需求 |
@@ -689,29 +743,29 @@ VexFS 使用四层数据保护：
 
 | ID | 优先级 | 需求 |
 |---|---|---|
-| FR-MNT-001 | P0 | macOS 发行物必须包含受系统信任的 VexFS App、FSKit App Extension、SQLite 扩展和 CLI；Phase 1 必须验证 Developer ID 公证或 Mac App Store/TestFlight 中至少一条真实分发路径。 |
+| FR-MNT-001 | P0 | macOS 发行物必须包含受系统信任的 VexDB CLI、SQLite 扩展和本机 NFS gateway；必须验证 Developer ID 签名、公证、安装、挂载和卸载。FSKit App Extension 是后续可选产物。 |
 | FR-MNT-002 | P0 | `vexfs mount <目录>` 必须使用当前 context 和 workspace 完成挂载。 |
-| FR-MNT-003 | P0 | 必须提供 `mount`、`unmount`、`mount list`、`mount status` 和 `doctor`，并显示 FSKit extension 的安装、启用和版本状态。 |
+| FR-MNT-003 | P0 | 必须提供 `mount`、`unmount`、`mount list`、`mount status` 和 `doctor`，并显示 NFS gateway、系统 NFS client、挂载表、端口、进程和版本状态；安装了 FSKit 时再显示可选 adapter 状态。 |
 | FR-MNT-004 | P0 | mount point 必须是当前操作系统用户控制的空目录，默认权限为 0700。 |
 | FR-MNT-005 | P0 | 本地 mount 默认只服务当前操作系统用户，不向其他本地用户共享；Linux `allow_other` 默认关闭。 |
-| FR-MNT-006 | P0 | FSKit extension 由 macOS 管理生命周期；CLI 不能自行启动长期 root 进程，数据库扩展初始化和 SQL callback 也不能启动文件系统 loop。FSKit extension 可以在自身进程中打开 SQLite 连接。 |
+| FR-MNT-006 | P0 | 默认 NFS gateway 以当前用户身份运行，只绑定 loopback，由 CLI 管理生命周期；不能建立长期 root 服务。数据库扩展初始化和 SQL callback 不能启动文件系统 loop 或 NFS 服务。 |
 | FR-MNT-007 | P1 | 登录后自动挂载必须显式开启，并使用 macOS 允许的用户级生命周期机制。 |
 | FR-MNT-008 | P0 | mount gateway 停止后，数据库扩展、SQL 和已提交文件必须继续正常工作。 |
-| FR-MNT-009 | P0 | FSKit 不可用、extension 未启用、签名不可信或系统版本过低时，doctor 必须给出明确原因、系统设置入口及 CLI/worktree 回退方法。 |
+| FR-MNT-009 | P0 | 系统 NFS client 不可用、mount 被系统拒绝、gateway 启动失败、签名不可信或出现 stale mount 时，doctor 必须给出明确原因和清理方法；不能把 FSKit 未启用当作默认挂载失败。 |
 
 #### 10.13.2 文件与目录操作
 
 | ID | 优先级 | 需求 |
 |---|---|---|
-| FR-MNT-010 | P0 | FSKit adapter 支持 lookupItem、getAttributes、enumerateDirectory、openItem、closeItem、read、write 和 createItem，并映射到平台无关核心合同。 |
-| FR-MNT-011 | P0 | FSKit adapter 支持 removeItem、renameItem、setAttributes、synchronize、reclaimItem 和 statfs 等 MVP 所需操作。 |
+| FR-MNT-010 | P0 | macOS NFS adapter 支持 lookup/getattr/readdir/open/close/read/write/create，并映射到平台无关核心合同；后续 FSKit adapter 复用同一合同。 |
+| FR-MNT-011 | P0 | macOS NFS adapter 支持 remove/rename/setattr/fsync/commit/statfs 等 MVP 所需操作；协议能力不足时返回稳定错误，不能假装成功。 |
 | FR-MNT-012 | P0 | 支持 lseek、statfs 和 utimens；chmod、symlink、readlink、hardlink 和 chown 必须按能力矩阵接入。当前 Linux 尚需补齐 utimens 的正式验收。 |
 | FR-MNT-013 | P0 | 正确处理 O_CREAT、O_EXCL、O_TRUNC、O_APPEND、只读和读写打开模式。 |
 | FR-MNT-014 | P0 | 同一目录内及跨目录 rename 必须原子生效，不能短暂出现两个名称都不存在。 |
 | FR-MNT-015 | P0 | open 后 unlink 必须允许已打开句柄继续使用；最后一个句柄关闭后再回收无引用版本。 |
 | FR-MNT-016 | P0 | 路径规范化、`.`、`..` 和越界规则必须与 SQL 合同一致；当前符号链接明确采用 POSIX target 原样保存合同，未来的 workspace 内限制策略必须作为独立可选合同。 |
 | FR-MNT-017 | P0 | 不支持设备文件、socket、FIFO 和 setuid/setgid 文件；创建时返回明确错误。 |
-| FR-MNT-018 | P1 | MVP Gate 不承诺 advisory flock；Phase 0 记录 macOS/FSKit 实际锁行为，跨 gateway 锁在 PostgreSQL 阶段映射为数据库租约或锁。 |
+| FR-MNT-018 | P1 | MVP Gate 不承诺 advisory flock；Phase 0 必须记录 macOS NFS 的 `flock/fcntl` 实际行为。若默认 mount 使用 `nolocks`，doctor 和能力矩阵必须明确报告，不能声称适合在挂载内运行依赖文件锁的数据库。 |
 | FR-MNT-019 | P1 | 支持 hardlink，并在支持前对 link 调用返回稳定的不支持错误。 |
 | FR-MNT-020 | P1 | 已支持扩展属性，并把值持久化到 SQLite；未知或不存在的 xattr 返回稳定错误。 |
 
@@ -719,9 +773,9 @@ VexFS 使用四层数据保护：
 
 | ID | 优先级 | 需求 |
 |---|---|---|
-| FR-MNT-021 | P0 | 普通文件写入先进入带 request id 的未发布 staging；平台无关 `publish/sync` 以幂等短事务发布完整新版本。macOS adapter 主要由 `synchronize` 和 `closeItem` 触发。 |
+| FR-MNT-021 | P0 | 普通文件写入先进入带 request id 的未发布 staging；平台无关 `publish/sync` 以幂等短事务发布完整新版本。macOS NFS adapter 主要由 COMMIT/fsync、close 和安全卸载触发；具体映射必须由真实 syscall/protocol trace 冻结。 |
 | FR-MNT-022 | P0 | 不能在文件 open 到 close 的整个期间持有长期数据库事务。 |
-| FR-MNT-023 | P0 | `write` 成功表示对应数据库 staging 已保存，但不表示新版本已发布。macOS SQLite mount 的未发布 staging 使用 WAL + NORMAL；`synchronize/publish/close` 前必须切回 FULL。电源故障可以丢失最近的未发布 staging，但不能产生半个已发布文件；`synchronize` 成功后完整版本必须达到 FULL。普通 SQL 连接仍使用调用者自己的 durability 配置。 |
+| FR-MNT-023 | P0 | `write` 成功的含义必须由 NFS reply、数据库 staging 和 COMMIT/fsync 边界共同定义，不能在数据只存在 gateway 易失内存时伪造已安全保存。SQLite mount 的未发布 staging 使用 WAL + NORMAL；强 publish/sync 前切回 FULL。普通 SQL 连接仍使用调用者自己的 durability 配置。 |
 | FR-MNT-024 | P0 | create、mkdir、unlink、rename 和 truncate 等单个文件系统操作各自在数据库事务内原子执行；chmod/chown 在进入支持范围后遵守同一规则。 |
 | FR-MNT-025 | P0 | 多条 Bash 命令和多个 file handle 默认不是一个数据库事务，文档和错误信息不能暗示它们天然原子。 |
 | FR-MNT-026 | P0 | 多文件或“文件 + 业务 SQL”原子提交必须使用公开 changeset/数据库事务合同。 |
@@ -744,7 +798,7 @@ VexFS 使用四层数据保护：
 
 | ID | 优先级 | 需求 |
 |---|---|---|
-| FR-MNT-036 | P0 | 正确性优先：MVP Gate 不启用 FSKit `DataCacheHandler` 的 kernel data cache；如 SDK 要求协商缓存，选择 no-cache 模式。后续启用缓存前必须具备版本校验和权限失效方案。 |
+| FR-MNT-036 | P0 | 正确性优先：NFS attribute/data cache 的 TTL、close-to-open、COMMIT/fsync 和主动失效行为必须可测；默认参数不能让刚写、rename、restore 或权限变化后的内容静默保持旧值。FSKit DataCacheHandler 留到后续版本。 |
 | FR-MNT-037 | P0 | 数据库连接中断时，未确认提交的操作必须返回 I/O 错误，不能报告成功。 |
 | FR-MNT-038 | P0 | gateway 崩溃后，数据库中只能存在完整旧版本、完整新版本或可识别的未发布暂存对象。 |
 | FR-MNT-039 | P0 | 重新挂载后必须清理或恢复过期暂存对象，不能把半写文件发布给用户。 |
@@ -752,7 +806,7 @@ VexFS 使用四层数据保护：
 | FR-MNT-041 | P0 | mount gateway 不能成为数据库备份的一部分；数据库原生备份必须独立包含全部已提交状态。 |
 | FR-MNT-042 | P1 | 多个 gateway 同时访问时支持主动失效通知；在此能力完成前，不承诺跨 gateway 实时可见，只保证 close-to-open、冲突检测和不静默覆盖。 |
 | FR-MNT-043 | P0 | 同一 handle 必须读到自己的 staged writes；其他已打开 handle 继续读取其打开时版本；成功 publish/synchronize 后的新 open 读取新版本。 |
-| FR-MNT-044 | P0 | closeItem/reclaimItem 时如果仍有 dirty staging，可以执行可恢复的兜底发布，但失败不能删除 staging、伪造成功或产生半版本。 |
+| FR-MNT-044 | P0 | NFS close/COMMIT/fsync 或 gateway 回收 handle 时如果仍有 dirty staging，可以执行可恢复的兜底发布，但失败不能删除 staging、伪造成功或产生半版本。 |
 
 ### 10.14 多数据库适配
 
@@ -1057,6 +1111,15 @@ worktree 清单不保存凭证，也不能被数据库扩展信任为权限依�
 - 权限和 ACL 需要验证恢复结果；
 - VexFS 不调用或调度 pg_dump、base backup 或复制。
 
+当前 PostgreSQL `0.4.0-alpha.1` 已实现文件版本、workspace commit、snapshot、
+expected-head/version、chunk/manifest、SHA-256、quick/deep check、quota、retention、
+分批 GC、ACL、完整变更审计、format v2 和 libpq 远程 mount。`pg_dump/pg_restore` 与
+`pg_basebackup` 已通过恢复测试，恢复后文件、历史、快照、设置、权限、审计和业务表保持一致。
+16 MiB 有界性能 Gate 已验证克隆可启动、`pg_verifybackup`、format v2 导入导出、CLI
+峰值 RSS、容器 `memory.max=1 GiB`，且运行前后 `oom_kill=0`。当前审计实现下，逻辑
+dump/restore 为 173.913/175.824 MiB/s，format v2 导出/导入为 72.727/106.667 MiB/s；
+这些是 2026-07-24 本机有界样本，不是所有机器的固定承诺。
+
 ### 15.3 SQLite
 
 - 使用 SQLite Online Backup API 或安全数据库备份方式；
@@ -1103,8 +1166,9 @@ workspace 历史。canonical 内容保持 manifest + 64 KiB chunk，恢复别名
 导入目标 workspace 必须不存在。导入先创建同一事务内不可见的 `importing` workspace，映射
 commit/inode/manifest ID，重建 chunk 引用、当前树和历史，运行深度 `vexfs_check`，成功后才切换成 `active` 并提交。
 任何格式、结构、记录、内容、整包 hash 或深度检查失败都会回滚，目标名称不会留下半成品。
-SQLite 到 SQLite 采用 principal 原值映射；未来 PG/DuckDB 导入必须在 format v2 principal
-表之上增加显式目标身份映射，不能自动扩大权限。
+SQLite 到 SQLite 采用 principal 原值映射；PostgreSQL 导入把目标 owner 绑定到真实数据库
+role，并保留可移植 ACL 信息，不能自动扩大权限。DuckDB 后续也必须在 format v2 principal
+表之上实现明确的目标身份映射。
 
 ## 16. 三端能力矩阵
 
@@ -1117,10 +1181,10 @@ SQLite 到 SQLite 采用 principal 原值映射；未来 PG/DuckDB 导入必须�
 | 冲突方式 | 锁、MVCC、约束 | busy、单 writer | 乐观冲突 |
 | WAL/恢复 | PostgreSQL 管理 | SQLite 管理 | DuckDB 管理 |
 | 原生备份 | PG 工具 | Online Backup API | DB copy/export/安全文件流程 |
-| 路径 ACL | 完整 | 应用内 | 应用内 |
-| P0 合同 | Phase 2 实现 | Phase 1 收口 | Phase 4 实现 |
-| 可写 macOS mount | Phase 2 | 已有 SQLite 预览 | Phase 4 后按单写者条件决定 |
-| 可写 Linux mount | Phase 2 | 已有 libfuse3 预览 | Phase 4 后按单写者条件决定 |
+| 路径 ACL | 已实现 | 应用内 | 应用内 |
+| P0 合同 | 已实现 | Phase 1 收口 | Phase 4 实现 |
+| 可写 macOS mount | 已实现 | 已有 SQLite 预览 | Phase 4 后按单写者条件决定 |
+| 可写 Linux mount | 已实现 | 已有 libfuse3 预览 | Phase 4 后按单写者条件决定 |
 | 可写 Windows mount | Phase 3 | Phase 3 | Phase 4 后按单写者条件决定 |
 
 版本约束：
@@ -1347,14 +1411,14 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 
 | ID | 验收场景 |
 |---|---|
-| AC-MVP-001 | 在干净的 macOS 26.0+ Apple Silicon 环境安装并启用 VexFS FSKit extension 后，`vexfs doctor` 通过，一条 `vexfs mount` 命令得到可 `cd` 的真实目录。 |
+| AC-MVP-001 | 在干净 Mac 安装默认 NFS 发行物后，不启用文件系统扩展，`vexdb fs doctor` 通过，一条 `vexdb fs mount` 命令得到可 `cd` 的真实目录。最低系统和 CPU 范围由发行真机矩阵确定。 |
 | AC-MVP-002 | `ls/cat/cp/mv/rm/mkdir/find/grep/sed`、Python 读写和基础 Git `init/add/commit/checkout` 直接运行。 |
-| AC-MVP-003 | FSKit lookup/get attributes/enumerate/open/close/create/read/write/remove/rename/set attributes/synchronize/reclaim 和 statfs 通过核心合同测试。 |
+| AC-MVP-003 | macOS NFS mount 的 lookup/getattr/readdir/open/close/create/read/write/remove/rename/setattr/fsync/COMMIT 和 statfs 通过核心合同与真实 Bash 测试。 |
 | AC-MVP-004 | 同一 handle 读到自己的未发布写入；其他 handle 看到打开时版本；成功 publish/synchronize 后的新 open 看到新版本。 |
 | AC-MVP-005 | `synchronize` 重复调用不产生重复 commit；close/reclaim 失败不能丢弃 dirty staging 或伪造提交成功。 |
-| AC-MVP-006 | `synchronize` 成功后终止 FSKit extension、重启 SQLite 并重新挂载，内容和 checksum 保持正确。 |
+| AC-MVP-006 | 强 sync 成功后终止 NFS gateway、重启 SQLite 并重新挂载，内容和 checksum 保持正确；未 sync 窗口的行为有明确测试证据。 |
 | AC-MVP-007 | SQLite busy、连接中断、空间不足、版本冲突和 stale handle 返回冻结后的稳定 errno。 |
-| AC-MVP-008 | MVP 不启用 FSKit kernel data cache，mount point 为当前用户私有，其他本地用户不能访问。 |
+| AC-MVP-008 | NFS gateway 只监听 loopback，mount point 为当前用户私有；其他本地用户和局域网主机不能访问 export。 |
 | AC-MVP-009 | 1,000 个文件、1 GiB 当前内容、100 MiB 单文件完成写入、重挂载、读取和校验，没有半文件或丢失目录项。 |
 | AC-MVP-010 | gateway 与扩展合同版本不兼容时拒绝可写挂载；卸载 gateway 后，SQL 仍可读写全部已提交文件。 |
 
@@ -1377,8 +1441,8 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 | AC-P0-011 | 缺失 chunk 时 check 报告损坏，read 不返回伪造内容。 |
 | AC-P0-012 | 10 万文件和 10 GiB 数据集通过正确性与初始性能目标。 |
 | AC-P0-013 | 完成一次 context 和 workspace 配置后，用户可以用一条 vexfs mount 命令得到真实目录并直接 cd 进入。 |
-| AC-P0-014 | FSKit extension 被终止、数据库重启或连接中断后，已成功 synchronize 的文件仍完整，未成功发布不被伪装成成功。 |
-| AC-P0-015 | vexfs doctor 能准确报告 App/extension 未安装、FSKit extension 未启用、系统版本过低、签名或版本不兼容、未初始化、连接失败和权限不足。 |
+| AC-P0-014 | NFS gateway 被终止、数据库重启或连接中断后，已成功强 sync 的文件仍完整，未成功发布不被伪装成成功。 |
+| AC-P0-015 | `vexdb fs doctor` 能准确报告 gateway 不存在或版本不兼容、NFS client 不可用、mount 权限被拒、stale mount、端口冲突、未初始化、连接失败和权限不足。 |
 | AC-P0-016 | mount point 默认仅当前操作系统用户可访问，数据库 ACL 变化会影响后续文件操作。 |
 | AC-P0-017 | 两个 mount 同时修改同一版本时至少一个得到冲突，不能静默覆盖。 |
 | AC-P0-018 | 不安装或不运行 gateway 时，SQL 和 CLI 数据能力仍然可用。 |
@@ -1427,6 +1491,9 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 - 多连接并发和 deadlock；
 - WAL/restart；
 - pg_dump/pg_restore 和物理备份恢复；
+- 两个真实 mount gateway 同时在线时，分别注入 helper 崩溃、网络中断和数据库停机；
+- helper 异常撤销后底层 mountpoint 必须不可写，不能让普通用户产生未进入数据库的本地文件；
+- 网络恢复不得隐式重放提交状态未知的写请求，必须先用幂等读操作确认连接与状态；
 - extension 安装和升级。
 
 #### DuckDB
@@ -1449,7 +1516,7 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 |---|---|---|
 | Phase 0 | 统一合同、macOS + SQLite 垂直闭环、Linux 真实挂载验证 | 已完成 |
 | Phase 1 | SQLite 本地开发者预览：macOS + Linux 可安装、可恢复、可跑真实项目 | 进行中 |
-| Phase 2 | PostgreSQL 共享工作区：跨电脑、多用户、数据库权限和并发 | 未开始 |
+| Phase 2 | PostgreSQL 共享工作区：跨电脑、多用户、数据库权限和并发 | 代码与自动测试完成；当前源码 Developer ID 包已验证并安装，待重新授权后补跑真挂载 Gate |
 | Phase 3 | Windows WinFsp 和 macOS/Linux/Windows 跨系统预览 | 未开始 |
 | Phase 4 | DuckDB 本地分析工作区 Beta | 未开始 |
 | Phase 5 | VexDB-Lite Files v1 稳定版 | 未开始 |
@@ -1512,9 +1579,10 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 - “安装后无缝 Bash”是第一产品目标；
 - 产品 P0 与首个 MVP Gate 分开管理，P0 能力不要求全部进入 SQLite 首个闭环；
 - mount gateway 是第一等入口，但不是权威核心；
-- macOS FSKit mount 是 MVP 和 P0 主入口；
-- 可挂载 MVP 支持 macOS 26.0+ Apple Silicon，使用 FSUnaryFileSystem、FSVolume 稳定接口和 FSKit V2 的 FSPathURLResource；
-- MVP Gate 不启用 FSKit kernel data cache，先保证权限与正确性；
+- macOS 默认 mount 是系统 NFS client + 本机用户态 NFS gateway；
+- FSKit 作为后续原生增强保留，不是 0.1 首次安装和发布前置；
+- NFS gateway 只绑定 loopback，不作为远程共享协议；跨电脑共享仍由每台机器的本地 mount gateway 连接 PostgreSQL；
+- 默认 NFS 的协议版本、锁、xattr、缓存、sleep/wake、mount 权限和 crash 恢复必须先通过真机 Gate；
 - mount 采用 close-to-open 一致性，不承诺完整跨 gateway POSIX 强一致；
 - 平台无关 publish/sync 是可报告的幂等发布边界；macOS 由 synchronize 映射，close/reclaim 只做可恢复兜底；
 - 一个 mount 绑定一个数据库 principal，mount point 默认当前用户私有；
@@ -1524,7 +1592,7 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 - 常用命令直接映射 SQL；
 - 任意普通终端程序优先通过挂载目录运行；
 - worktree 是不能挂载时的回退，不是权威存储或备份；
-- mount gateway 不建立新网络协议，不提供 SDK，不管理数据库；
+- macOS NFS 只作为 loopback mount adapter，不开放远程文件服务、不提供 SDK、不管理数据库；
 - 通过 SQL 调用的文件修改参加调用者当前数据库事务；mount 操作使用 gateway 短事务；
 - 权限来自数据库可证明身份；
 - 使用文件版本、快照、数据库原生备份和逻辑导出四层保护；
@@ -1568,18 +1636,29 @@ chmod/chown 等已明确不支持的权限修改返回 `EPERM`；跨 workspace r
 
 ### 27.1 用户需要安装什么
 
-macOS 用户安装一个签名并公证的 VexDB-Lite 发行包，包内包含四个产物：
+macOS 用户安装一个签名并公证的 VexDB-Lite 发行包，默认包含三个产物：
 
-1. `VexDB Lite.app`；
-2. App 内的 FSKit File System Extension，它承担首个 mount gateway；
-3. SQLite VexFS 数据库扩展；
-4. `vexdb` CLI，以及指向 `vexdb fs` 的 `vexfs` 兼容入口。
+1. SQLite VexFS 数据库扩展；
+2. 当前用户运行的本机 NFS gateway；
+3. `vexdb` CLI，以及指向 `vexdb fs` 的 `vexfs` 兼容入口。
 
-macOS 本地预览首先支持 macOS 26.0+ Apple Silicon。Phase 1 必须证明至少一条真实分发路径：优先 Developer ID 签名与公证，如果 FSKit entitlement 或系统策略不允许，则使用 Mac App Store/TestFlight。首次打开 App 后，用户需要在“系统设置 → 通用 → 登录项与扩展 → 文件系统扩展”中启用 VexFS；这是系统安全步骤，产品不能静默绕过。App 必须显示准确引导，`vexfs doctor` 必须检测是否已经启用。
+默认安装不要求用户进入“文件系统扩展”页面。`vexdb fs mount` 负责启动 gateway、确认它只监听
+loopback、调用系统 NFS client 并验证真实读写。macOS 仍可能针对挂载操作、目标目录或下载的
+可执行文件给出普通系统授权或 Gatekeeper 提示；安装器必须把实际提示做成真机 Gate，不能把
+“不需要 FSKit 授权”写成“macOS 永远不会出现任何授权”。
 
-默认 SQLite 数据库放在 `~/Library/Application Support/VexDB-Lite/default.sqlite3`。每个 mount 把数据库所在的独立 0700 资源目录作为 security-scoped `FSPathURLResource` 交给系统；目录内的非权威 `.vexfs-volume.json` 只保存合同版本、数据库文件名和 workspace，不保存密码或绝对路径。extension 必须拒绝 `.`、`..`、子路径和任何逃逸该目录的文件名。一个数据库文件独占一个父目录，目录只放 descriptor、数据库、WAL 和 SHM。
+后续 FSKit 版本可以在发行包中增加 `VexDB Lite.app` 和 App Extension，作为显式选择的
+`--backend fskit`；它不能拥有另一套数据库 schema、版本、权限或备份逻辑。
 
-CLI 与 FSKit extension 必须在挂载前读取数据库扩展的合同版本和能力位。主版本不兼容时拒绝可写挂载；卸载时先停止新操作、执行 synchronize、报告仍未发布的 handle，再执行 unmount。安装、升级和卸载都不得删除数据库中的已提交文件。
+发行包、解压验证目录和构建目录不得长期暴露第二份同 bundle ID 的 `.app`。打包完成后必须撤销这些临时路径的 LaunchServices 登记并删除展开 stage；安装包把 App 放在隐藏 `.payload` 中。扩展已经获准时，安装器必须以临时数据库执行真实 mount、写入、读回和 unmount，不能只根据注册状态宣布成功。
+
+默认 SQLite 数据库放在 `~/Library/Application Support/VexDB-Lite/default.sqlite3`。NFS gateway
+直接以当前用户权限打开数据库，不需要 security-scoped `FSPathURLResource`。非权威 mount
+descriptor 只保存合同版本、数据库标识、workspace、gateway 实例和 mountpoint，不保存密码。
+
+CLI 与 NFS gateway 必须在挂载前读取数据库扩展的合同版本和能力位。主版本不兼容时拒绝可写
+挂载；卸载时先停止新操作、执行强 sync、报告仍未发布的 handle，再执行 unmount 并退出
+gateway。安装、升级和卸载都不得删除数据库中的已提交文件。
 
 运行时边界保持不变：数据库扩展保存全部权威状态；mount gateway 只把数据库文件展示为本地路径；CLI 管理连接和挂载。gateway 不保存最终文件，不管理数据库。
 

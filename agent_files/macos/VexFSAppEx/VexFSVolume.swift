@@ -5,11 +5,19 @@ final class VexFSVolume: FSVolume,
                          FSVolume.ReadWriteOperations,
                          FSVolume.OpenCloseOperations,
                          FSVolume.XattrOperations {
+    private struct CachedLookupRecord {
+        let record: VexFSStatRecord
+        let parentID: FSItem.Identifier
+        let generation: UInt64
+    }
+
     let backend: VexFSBackend
     let workspace: String
     let rootItem: VexFSItem
     private let cacheLock = NSLock()
     private var itemCache: [UInt64: VexFSItem] = [:]
+    private var lookupRecordCache: [String: CachedLookupRecord] = [:]
+    private let maximumLookupRecordCount = 100_000
     private let maximumReadCacheBytes: UInt64 = 1024 * 1024
     private let maximumTotalReadCacheBytes: UInt64 = 64 * 1024 * 1024
     private var readCacheBytes: UInt64 = 0
@@ -49,6 +57,7 @@ final class VexFSVolume: FSVolume,
         cacheLock.lock()
         for item in itemCache.values { item.readCache = nil }
         itemCache.removeAll(keepingCapacity: true)
+        lookupRecordCache.removeAll(keepingCapacity: true)
         itemCache[rootRecord.inode] = rootItem
         readCacheBytes = 0
         observedCacheGeneration = visibility.generation
@@ -60,6 +69,12 @@ final class VexFSVolume: FSVolume,
     func currentCacheGeneration() throws -> UInt64 {
         let visibility = try backend.refreshVisibility()
         cacheLock.lock()
+        if observedCacheGeneration != visibility.generation {
+            // 目录枚举带回的元数据只对当时的 workspace generation 有效。
+            // 其他 gateway 提交、rename 或 restore 后必须整体丢弃，不能让
+            // lookup 为了省一次 stat 而返回旧路径或旧版本。
+            lookupRecordCache.removeAll(keepingCapacity: true)
+        }
         observedCacheGeneration = visibility.generation
         let generation = observedCacheGeneration
         cacheLock.unlock()
@@ -96,15 +111,51 @@ final class VexFSVolume: FSVolume,
         return path
     }
 
+    // 调用方已经刷新过 visibility 时，generation 相同就说明本地记录里的
+    // 路径仍然有效。正常的只读遍历不需要为每个文件再跑一次 vexfs_path。
+    func currentPath(for item: VexFSItem, generation: UInt64) throws -> String {
+        cacheLock.lock()
+        let cacheGeneration = observedCacheGeneration
+        cacheLock.unlock()
+        if !item.isUnlinked && generation == cacheGeneration &&
+            item.cacheGeneration == generation {
+            return item.path
+        }
+        return try currentPath(for: item)
+    }
+
     func childPath(parent: VexFSItem, name: String) throws -> String {
         let parentPath = try currentPath(for: parent)
         return parentPath == "/" ? "/\(name)" : "\(parentPath)/\(name)"
+    }
+
+    func childPath(parent: VexFSItem, name: String, generation: UInt64) throws -> String {
+        let parentPath = try currentPath(for: parent, generation: generation)
+        return parentPath == "/" ? "/\(name)" : "\(parentPath)/\(name)"
+    }
+
+    func cachedLookupRecord(path: String,
+                            generation: UInt64) -> (VexFSStatRecord, FSItem.Identifier)? {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard let cached = lookupRecordCache[path], cached.generation == generation else {
+            return nil
+        }
+        return (cached.record, cached.parentID)
     }
 
     func cachedItem(path: String, record: VexFSStatRecord,
                     parentID: FSItem.Identifier) -> VexFSItem {
         cacheLock.lock()
         defer { cacheLock.unlock() }
+        if lookupRecordCache[path] == nil &&
+            lookupRecordCache.count >= maximumLookupRecordCount {
+            // 防止长时间遍历大量不同目录时缓存无上限增长。清空只会退回
+            // 一次权威 stat，不影响内容或正确性。
+            lookupRecordCache.removeAll(keepingCapacity: true)
+        }
+        lookupRecordCache[path] = CachedLookupRecord(
+            record: record, parentID: parentID, generation: observedCacheGeneration)
         if let item = itemCache[record.inode] {
             item.path = path
             item.record = record
@@ -233,7 +284,7 @@ final class VexFSVolume: FSVolume,
                 item.dirtyGeneration = nil
             }
             if item.handle == nil {
-                let path = try currentPath(for: item)
+                let path = try currentPath(for: item, generation: generation)
                 if !writable && item.record.size <= maximumReadCacheBytes {
                     let data = try backend.readFile(path: path)
                     if installReadCache(data, for: item) {

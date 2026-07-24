@@ -1,0 +1,189 @@
+name: pg__vexfs_handles_gateway
+tags: [vexfs, pg, handles, gateway, idempotency, locks]
+description: PostgreSQL 持久句柄、未发布隔离、多网关冲突、追加、恢复和文件锁合同
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-handles') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-handles', '/value.txt', convert_to('base', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_session_start('pg-handles', 'gateway-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_session_start('pg-handles', 'gateway-b');
+  expect:
+  - - 1
+- statement: CREATE TEMP TABLE handle_ids(name text PRIMARY KEY, handle text NOT NULL);
+- statement: INSERT INTO handle_ids VALUES ('reader', vexfs_handle_open('pg-handles', '/value.txt', 'r', 'open-reader', 'gateway-a'));
+- statement: INSERT INTO handle_ids VALUES ('a', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'open-a', 'gateway-a'));
+- statement: INSERT INTO handle_ids VALUES ('b', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'open-b', 'gateway-b'));
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='a'), 0, convert_to('first', 'UTF8'), 'stage-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='a'), 0, convert_to('first', 'UTF8'), 'stage-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='a'), 0, convert_to('other', 'UTF8'), 'stage-a');
+  expect_error: VEXFS_REQUEST_CONFLICT
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='b'), 0, convert_to('second', 'UTF8'), 'stage-b');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/value.txt'), 'UTF8'), convert_from(vexfs_handle_read((SELECT handle FROM handle_ids WHERE name='a'), 0, 16), 'UTF8');
+  expect:
+  - - base
+    - first
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='a'), 1, 'data', 'publish-a');
+  expect:
+  - - 2
+- query: SELECT convert_from(vexfs_handle_read((SELECT handle FROM handle_ids WHERE name='reader'), 0, 16), 'UTF8');
+  expect:
+  - - first
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='a'), 1, 'data', 'publish-a');
+  expect:
+  - - 2
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='a'), 1, 'full', 'publish-a');
+  expect_error: VEXFS_REQUEST_CONFLICT
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='b'), 1, 'data', 'publish-b');
+  expect_error: VEXFS_VERSION_CONFLICT
+- query: SELECT convert_from(vexfs_read('pg-handles', '/value.txt'), 'UTF8');
+  expect:
+  - - first
+- query: SELECT vexfs_handle_close((SELECT handle FROM handle_ids WHERE name='b'), true, 'close-b');
+  expect:
+  - - retained
+- statement: INSERT INTO handle_ids VALUES ('create', vexfs_handle_create('pg-handles', '/new.txt', 448, 'create-new', 'gateway-a'));
+- query: SELECT count(*) FROM vexfs_list('pg-handles', '/') WHERE name='new.txt';
+  expect:
+  - - 0
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='create'), 0, convert_to('new-data', 'UTF8'), 'stage-new');
+  expect:
+  - - 2
+- query: SELECT count(*) FROM vexfs_list('pg-handles', '/') WHERE name='new.txt';
+  expect:
+  - - 0
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='create'), 2, 'full', 'publish-new');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/new.txt'), 'UTF8'), (vexfs_stat('pg-handles', '/new.txt')->>'mode')::integer;
+  expect:
+  - - new-data
+    - 448
+- statement: INSERT INTO handle_ids VALUES ('recover', vexfs_handle_open('pg-handles', '/new.txt', 'rw', 'open-recover', 'gateway-a'));
+- query: SELECT vexfs_handle_truncate((SELECT handle FROM handle_ids WHERE name='recover'), 3, 'truncate-recover');
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_session_end('pg-handles', 'gateway-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_session_start('pg-handles', 'gateway-a');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_handle_read((SELECT handle FROM handle_ids WHERE name='recover'), 0, 8), 'UTF8');
+  expect:
+  - - new
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='recover'), 1, 'data', 'publish-recover');
+  expect:
+  - - 2
+- statement: INSERT INTO handle_ids VALUES ('append-a', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'append-open-a', 'gateway-a'));
+- statement: INSERT INTO handle_ids VALUES ('append-b', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'append-open-b', 'gateway-b'));
+- query: SELECT vexfs_handle_append((SELECT handle FROM handle_ids WHERE name='append-a'), convert_to('-a', 'UTF8'), 'append-a');
+  expect:
+  - - 3
+- query: SELECT vexfs_handle_append((SELECT handle FROM handle_ids WHERE name='append-b'), convert_to('-b', 'UTF8'), 'append-b');
+  expect:
+  - - 4
+- query: SELECT convert_from(vexfs_read('pg-handles', '/value.txt'), 'UTF8');
+  expect:
+  - - first-a-b
+- statement: INSERT INTO handle_ids VALUES ('sync', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'sync-open', 'gateway-a'));
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='sync'), 0, convert_to('sync!', 'UTF8'), 'sync-stage');
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_synchronize('pg-handles', 'sync-all', 'gateway-a');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/value.txt'), 'UTF8');
+  expect:
+  - - sync!-a-b
+- query: SELECT vexfs_lock_acquire('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-a', 'shared', 'lock-a-shared');
+  expect:
+  - - 1
+- query: SELECT vexfs_lock_acquire('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-b', 'shared', 'lock-b-shared');
+  expect:
+  - - 1
+- query: SELECT vexfs_lock_acquire('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-a', 'exclusive', 'lock-a-exclusive-fail');
+  expect_error: VEXFS_LOCK_CONFLICT
+- query: SELECT vexfs_lock_release('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-b', 'unlock-b');
+  expect:
+  - - 1
+- query: SELECT vexfs_lock_acquire('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-a', 'exclusive', 'lock-a-exclusive');
+  expect:
+  - - 1
+- query: SELECT vexfs_lock_acquire('pg-handles', (vexfs_stat('pg-handles', '/value.txt')->>'inode')::bigint, 'gateway-b', 'shared', 'lock-b-shared-fail');
+  expect_error: VEXFS_LOCK_CONFLICT
+- query: SELECT (vexfs_visibility('pg-handles')->>'workspace_head')::bigint > 1, (vexfs_visibility('pg-handles')->>'cache_generation')::bigint > 1;
+  expect:
+  - - true
+    - true
+- query: SELECT vexfs_write('pg-handles', '/open-unlink.txt', convert_to('abcdef', 'UTF8'));
+  expect:
+  - - 1
+- statement: INSERT INTO handle_ids VALUES ('unlink-reader', vexfs_handle_open('pg-handles', '/open-unlink.txt', 'r', 'unlink-open-reader', 'gateway-a'));
+- statement: INSERT INTO handle_ids VALUES ('unlink-writer', vexfs_handle_open('pg-handles', '/open-unlink.txt', 'rw', 'unlink-open-writer', 'gateway-a'));
+- query: SELECT vexfs_remove('pg-handles', '/open-unlink.txt', false);
+  expect:
+  - - 1
+- query: SELECT vexfs_stat('pg-handles', '/open-unlink.txt');
+  expect_error: VEXFS_PATH_NOT_FOUND
+- query: SELECT inode.live, NOT EXISTS (SELECT 1 FROM _vexfs.dentries AS link WHERE link.workspace_id=inode.workspace_id AND link.inode_id=inode.inode_id) FROM _vexfs.inodes AS inode JOIN _vexfs.handles AS handle ON handle.inode_id=inode.inode_id WHERE handle.handle_id=(SELECT handle FROM handle_ids WHERE name='unlink-writer');
+  expect:
+  - - true
+    - true
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='unlink-writer'), 0, convert_to('OLD', 'UTF8'), 'unlink-stage');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_publish((SELECT handle FROM handle_ids WHERE name='unlink-writer'), 1, 'full', 'unlink-publish');
+  expect:
+  - - 2
+- query: SELECT convert_from(vexfs_handle_read((SELECT handle FROM handle_ids WHERE name='unlink-reader'), 0, 16), 'UTF8');
+  expect:
+  - - OLDdef
+- query: SELECT vexfs_write('pg-handles', '/open-unlink.txt', convert_to('NEW', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/open-unlink.txt'), 'UTF8'), (vexfs_stat('pg-handles', '/open-unlink.txt')->>'inode')::bigint <> (SELECT inode_id FROM _vexfs.handles WHERE handle_id=(SELECT handle FROM handle_ids WHERE name='unlink-writer'));
+  expect:
+  - - NEW
+    - true
+- query: SELECT vexfs_handle_close((SELECT handle FROM handle_ids WHERE name='unlink-writer'), false, 'unlink-close-writer');
+  expect:
+  - - closed
+- query: SELECT inode.live FROM _vexfs.inodes AS inode JOIN _vexfs.handles AS handle ON handle.inode_id=inode.inode_id WHERE handle.handle_id=(SELECT handle FROM handle_ids WHERE name='unlink-reader');
+  expect:
+  - - true
+- query: SELECT vexfs_handle_close((SELECT handle FROM handle_ids WHERE name='unlink-reader'), false, 'unlink-close-reader');
+  expect:
+  - - closed
+- query: SELECT inode.live FROM _vexfs.inodes AS inode JOIN _vexfs.handles AS handle ON handle.inode_id=inode.inode_id WHERE handle.handle_id=(SELECT handle FROM handle_ids WHERE name='unlink-reader');
+  expect:
+  - - false
+- query: SELECT convert_from(vexfs_read('pg-handles', '/open-unlink.txt'), 'UTF8');
+  expect:
+  - - NEW
+- query: SELECT vexfs_mount_session_heartbeat('pg-handles', 'gateway-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_close((SELECT handle FROM handle_ids WHERE name='a'), false, 'close-a');
+  expect:
+  - - closed
+- query: SELECT vexfs_handle_close((SELECT handle FROM handle_ids WHERE name='reader'), false, 'close-reader');
+  expect:
+  - - closed
+- query: SELECT vexfs_item_reclaim('pg-handles', 'reclaim') > 0;
+  expect:
+  - - true
+- query: SELECT (vexfs_check('pg-handles', 1)->>'ok')::boolean;
+  expect:
+  - - true

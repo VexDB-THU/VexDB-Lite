@@ -68,8 +68,8 @@ bool Execute(const char *path, const char *sql) {
 }
 
 int RunBenchmark(int file_count) {
-    if (file_count <= 0 || file_count > 1000) {
-        std::fprintf(stderr, "benchmark file count must be 1..1000\n");
+    if (file_count <= 0 || file_count > 100000) {
+        std::fprintf(stderr, "benchmark file count must be 1..100000\n");
         return 2;
     }
     char path[] = "/tmp/vexfs-contract-benchmark-XXXXXX";
@@ -97,6 +97,11 @@ int RunBenchmark(int file_count) {
     const int64_t versions_before = Scalar(path, "SELECT count(*) FROM _vexfs_file_versions");
     const int64_t requests_before = Scalar(path, "SELECT count(*) FROM _vexfs_requests");
     const char payload[] = "vexfs benchmark payload\n";
+    double create_call_seconds = 0.0;
+    double stat_call_seconds = 0.0;
+    double xattr_call_seconds = 0.0;
+    double stage_call_seconds = 0.0;
+    double publish_call_seconds = 0.0;
     const auto started = std::chrono::steady_clock::now();
     for (int index = 0; index < file_count; ++index) {
         char file_path[64];
@@ -104,31 +109,46 @@ int RunBenchmark(int file_count) {
         std::snprintf(file_path, sizeof(file_path), "/files/f%06d.txt", index);
         std::snprintf(request, sizeof(request), "create-%06d", index);
         vexfs_mount_bytes handle{};
+        auto call_started = std::chrono::steady_clock::now();
         if (vexfs_mount_handle_create(session, file_path, 0644, request,
                                       &handle, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark create", error);
+        create_call_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - call_started).count();
         const std::string handle_id(static_cast<const char *>(handle.data),
                                     static_cast<size_t>(handle.size));
         vexfs_mount_free(handle.data);
         vexfs_mount_bytes item_stat{};
+        call_started = std::chrono::steady_clock::now();
         if (vexfs_mount_stat(session, file_path, &item_stat, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark stat", error);
+        stat_call_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - call_started).count();
         const int64_t inode = JsonInteger(item_stat, "inode");
         vexfs_mount_free(item_stat.data);
+        call_started = std::chrono::steady_clock::now();
         if (vexfs_mount_xattr_set(session, inode, "com.apple.provenance", "p", 1,
                                   VEXFS_MOUNT_XATTR_ALWAYS_SET, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark xattr", error);
+        xattr_call_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - call_started).count();
         int64_t generation = 0;
         std::snprintf(request, sizeof(request), "write-%06d", index);
+        call_started = std::chrono::steady_clock::now();
         if (vexfs_mount_handle_stage_write(
                 session, handle_id.c_str(), 0, payload, sizeof(payload) - 1,
                 request, &generation, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark stage", error);
+        stage_call_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - call_started).count();
         int64_t version = 0;
+        call_started = std::chrono::steady_clock::now();
         if (vexfs_mount_handle_publish_close(session, handle_id.c_str(), generation,
                                              "data", &version, &error) !=
                 VEXFS_MOUNT_OK || version != 1)
             return Fail("benchmark publish close", error);
+        publish_call_seconds += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - call_started).count();
     }
     const double create_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
@@ -159,6 +179,9 @@ int RunBenchmark(int file_count) {
         "\"sync_seconds\":%.6f,\"commit_rows\":%lld,\"version_rows\":%lld,"
         "\"request_rows\":%lld,\"commits_per_file\":%.3f,"
         "\"versions_per_file\":%.3f,\"requests_per_file\":%.3f,"
+        "\"create_call_seconds\":%.6f,\"stat_call_seconds\":%.6f,"
+        "\"xattr_call_seconds\":%.6f,\"stage_call_seconds\":%.6f,"
+        "\"publish_call_seconds\":%.6f,"
         "\"ordinary_mutation_calls\":%lld,\"full_boundary_calls\":%lld,"
         "\"durability_barriers\":%lld,\"database_bytes\":%lld}\n",
         file_count, create_seconds, file_count / std::max(create_seconds, 1e-9),
@@ -166,6 +189,8 @@ int RunBenchmark(int file_count) {
         static_cast<long long>(requests), static_cast<double>(commits) / file_count,
         static_cast<double>(versions) / file_count,
         static_cast<double>(requests) / file_count,
+        create_call_seconds, stat_call_seconds, xattr_call_seconds,
+        stage_call_seconds, publish_call_seconds,
         static_cast<long long>(ordinary_calls), static_cast<long long>(full_calls),
         static_cast<long long>(barriers), static_cast<long long>(database_bytes));
     unlink(path);

@@ -24,6 +24,65 @@ endif()
 
 find_package(Threads REQUIRED)
 
+# Desktop CLI/mount runtime can connect to the PostgreSQL VexFS adapter through
+# normal libpq.  Embedded/mobile SQLite builds stay independent of libpq.
+option(VEXFS_ENABLE_POSTGRESQL "Build PostgreSQL VexFS client support when libpq is available" ON)
+option(VEXFS_REQUIRE_POSTGRESQL "Fail configuration when PostgreSQL client support is unavailable" OFF)
+option(VEXFS_BUNDLE_POSTGRESQL_RUNTIME "Use package-relative libpq runpaths" OFF)
+if(VEXFS_ENABLE_POSTGRESQL AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
+    find_package(PostgreSQL QUIET)
+    if(NOT PostgreSQL_FOUND)
+        find_program(VEXFS_PG_CONFIG pg_config
+            HINTS /opt/homebrew/opt/libpq/bin /usr/local/opt/libpq/bin /opt/anaconda3/bin)
+        if(VEXFS_PG_CONFIG)
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --includedir
+                OUTPUT_VARIABLE _VEXFS_PG_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --libdir
+                OUTPUT_VARIABLE _VEXFS_PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+        endif()
+        find_path(VEXFS_LIBPQ_INCLUDE_DIR libpq-fe.h
+            HINTS "${_VEXFS_PG_INCLUDEDIR}" /opt/homebrew/opt/libpq/include
+                  /usr/local/opt/libpq/include /opt/anaconda3/include)
+        find_library(VEXFS_LIBPQ_LIBRARY NAMES pq libpq
+            HINTS "${_VEXFS_PG_LIBDIR}" /opt/homebrew/opt/libpq/lib
+                  /usr/local/opt/libpq/lib /opt/anaconda3/lib)
+        if(VEXFS_LIBPQ_INCLUDE_DIR AND VEXFS_LIBPQ_LIBRARY)
+            set(PostgreSQL_FOUND TRUE)
+            set(PostgreSQL_INCLUDE_DIRS "${VEXFS_LIBPQ_INCLUDE_DIR}")
+            set(PostgreSQL_LIBRARIES "${VEXFS_LIBPQ_LIBRARY}")
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --version
+                OUTPUT_VARIABLE PostgreSQL_VERSION_STRING OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+    endif()
+    if(PostgreSQL_FOUND)
+        message(STATUS "PostgreSQL VexFS client: ${PostgreSQL_VERSION_STRING}")
+        set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "")
+        foreach(_VEXFS_POSTGRESQL_LIBRARY IN LISTS PostgreSQL_LIBRARIES)
+            if(EXISTS "${_VEXFS_POSTGRESQL_LIBRARY}")
+                set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "${_VEXFS_POSTGRESQL_LIBRARY}")
+                break()
+            endif()
+        endforeach()
+        if(NOT _VEXFS_POSTGRESQL_CLIENT_LIBRARY AND
+           DEFINED VEXFS_LIBPQ_LIBRARY AND EXISTS "${VEXFS_LIBPQ_LIBRARY}")
+            set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "${VEXFS_LIBPQ_LIBRARY}")
+        endif()
+        set(VEXFS_POSTGRESQL_CLIENT_LIBRARY "${_VEXFS_POSTGRESQL_CLIENT_LIBRARY}"
+            CACHE FILEPATH "Resolved libpq runtime used by VexFS" FORCE)
+        if(APPLE AND VEXFS_POSTGRESQL_CLIENT_LIBRARY)
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/pg-client/lib")
+            configure_file("${VEXFS_POSTGRESQL_CLIENT_LIBRARY}"
+                "${CMAKE_BINARY_DIR}/pg-client/lib/libpq.dylib" COPYONLY)
+        endif()
+    else()
+        message(STATUS "PostgreSQL VexFS client disabled: libpq development files not found")
+    endif()
+endif()
+if(VEXFS_REQUIRE_POSTGRESQL AND NOT PostgreSQL_FOUND)
+    message(FATAL_ERROR "PostgreSQL VexFS client support requires libpq development files")
+endif()
+
 # macOS：默认对齐真实硬件架构。两个坑：① anaconda clang 默认 target 是 x86_64；
 # ② 在 Rosetta(x86_64) 进程里 `uname -m` 会谎报 x86_64。都会编出与系统 arm64
 # sqlite3 不匹配的库。用 sysctl hw.optional.arm64 探真实硬件（不被 Rosetta 欺骗）。
@@ -226,6 +285,11 @@ target_include_directories(vexfs_runtime PUBLIC
     ${SQLITE_AMALG_DIR})
 target_compile_definitions(vexfs_runtime PRIVATE VEXDB_SQLITE_CORE=1)
 target_link_libraries(vexfs_runtime PUBLIC vexdb_lite_static)
+if(PostgreSQL_FOUND)
+    target_compile_definitions(vexfs_runtime PRIVATE VEXFS_HAVE_LIBPQ=1)
+    target_include_directories(vexfs_runtime PRIVATE ${PostgreSQL_INCLUDE_DIRS})
+    target_link_libraries(vexfs_runtime PUBLIC ${PostgreSQL_LIBRARIES})
+endif()
 set_target_properties(vexfs_runtime PROPERTIES OUTPUT_NAME "vexfs_runtime")
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
@@ -277,7 +341,17 @@ if(VEXDB_SQLITE_DESKTOP)
     target_compile_definitions(vexdb_cli PRIVATE VEXFS_EMBEDDED_MAIN=1 VEXDB_SQLITE_CORE=1)
     target_link_libraries(vexdb_cli PRIVATE vexfs_runtime sqlite3_amalg
         ${VEXDB_CLI_PLATFORM_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+    if(PostgreSQL_FOUND)
+        target_compile_definitions(vexdb_cli PRIVATE VEXFS_HAVE_LIBPQ=1)
+        target_include_directories(vexdb_cli PRIVATE ${PostgreSQL_INCLUDE_DIRS})
+        target_link_libraries(vexdb_cli PRIVATE ${PostgreSQL_LIBRARIES})
+    endif()
     set_target_properties(vexdb_cli PROPERTIES OUTPUT_NAME "vexdb" LINKER_LANGUAGE CXX)
+    if(APPLE AND VEXFS_BUNDLE_POSTGRESQL_RUNTIME)
+        set_target_properties(vexdb_cli PROPERTIES
+            BUILD_WITH_INSTALL_RPATH ON
+            INSTALL_RPATH "@executable_path/../lib/runtime;@executable_path/../lib/vexdb-lite/runtime")
+    endif()
     if(WIN32)
         add_custom_command(TARGET vexdb_cli POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -337,6 +411,16 @@ if(VEXDB_SQLITE_BUILD_TESTS)
         ${REPO_ROOT}/agent_files/mount/common/include ${SQLITE_AMALG_DIR})
     target_link_libraries(vexfs_runtime_smoke PRIVATE
         vexfs_runtime sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    if(PostgreSQL_FOUND)
+        add_executable(vexfs_pg_runtime_smoke
+            ${REPO_ROOT}/agent_files/mount/common/test/vexfs_pg_runtime_smoke.cpp)
+        target_include_directories(vexfs_pg_runtime_smoke PRIVATE
+            ${REPO_ROOT}/agent_files/mount/common/include ${PostgreSQL_INCLUDE_DIRS})
+        target_link_libraries(vexfs_pg_runtime_smoke PRIVATE
+            vexfs_runtime sqlite3_amalg ${PostgreSQL_LIBRARIES}
+            Threads::Threads ${CMAKE_DL_LIBS})
+    endif()
 
     add_executable(vexfs_platform_registry_smoke
         ${REPO_ROOT}/agent_files/cli/test/vexfs_platform_registry_smoke.cpp

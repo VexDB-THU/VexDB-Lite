@@ -1,0 +1,130 @@
+name: pg__vexfs_quota_gc
+tags: [vexfs, pg, quota, retention, gc]
+description: PostgreSQL VexFS live quota、快照恢复配额、保留策略、别名保护和分批 GC
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-quota') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-quota', '/quota.txt', convert_to('abc', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('pg-quota', 'large');
+  expect:
+  - - 2
+- query: SELECT vexfs_write('pg-quota', '/quota.txt', convert_to('x', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT (vexfs_quota_set('pg-quota', 1, 1, 2)->>'live_bytes')::bigint, (vexfs_quota_get('pg-quota')->>'over_quota')::boolean;
+  expect:
+  - - 1
+    - false
+- query: SELECT vexfs_snapshot_restore('pg-quota', 'large', 3);
+  expect_error: VEXFS_QUOTA_FILE_SIZE
+- query: SELECT vexfs_write('pg-quota', '/second.txt', convert_to('y', 'UTF8'));
+  expect_error: VEXFS_QUOTA_BYTES
+- query: SELECT vexfs_write('pg-quota', '/quota.txt', convert_to('xyz', 'UTF8'));
+  expect_error: VEXFS_QUOTA_FILE_SIZE
+- query: SELECT convert_from(vexfs_read('pg-quota', '/quota.txt'), 'UTF8'), (vexfs_workspace_stat('pg-quota')->>'head_commit')::bigint, (vexfs_quota_get('pg-quota')->>'live_files')::bigint, (SELECT count(*) FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-quota'));
+  expect:
+  - - x
+    - 3
+    - 1
+    - 2
+- query: SELECT (vexfs_quota_set('pg-quota', 0, 1, 0)->>'over_quota')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-quota', '/quota.txt', ''::bytea);
+  expect:
+  - - 3
+- query: SELECT (vexfs_quota_get('pg-quota')->>'live_bytes')::bigint, (vexfs_quota_get('pg-quota')->>'over_quota')::boolean;
+  expect:
+  - - 0
+    - false
+- query: SELECT vexfs_remove('pg-quota', '/quota.txt');
+  expect:
+  - - 1
+- query: SELECT (vexfs_quota_get('pg-quota')->>'live_files')::bigint, (vexfs_quota_get('pg-quota')->>'live_bytes')::bigint;
+  expect:
+  - - 0
+    - 0
+- query: SELECT vexfs_quota_set('pg-quota', -1, NULL, NULL);
+  expect_error: VEXFS_INVALID_QUOTA
+- query: SELECT vexfs_workspace_drop('pg-quota');
+  expect:
+  - - 1
+
+- query: SELECT vexfs_workspace_create('pg-gc') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-gc', '/history.txt', convert_to('one', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-gc', '/history.txt', convert_to('two', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('pg-gc', 'keep-two');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('pg-gc', '/history.txt', convert_to('three', 'UTF8'));
+  expect:
+  - - 3
+- query: SELECT vexfs_write('pg-gc', '/history.txt', convert_to('four', 'UTF8'));
+  expect:
+  - - 4
+- query: SELECT (vexfs_retention_set('pg-gc', 1, 0)->>'reclaimable_versions')::bigint;
+  expect:
+  - - 2
+- query: SELECT (vexfs_gc_pause('pg-gc', 1)->>'gc_paused')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_gc('pg-gc', 1);
+  expect_error: VEXFS_GC_PAUSED
+- query: SELECT (vexfs_gc_pause('pg-gc', 0)->>'gc_paused')::boolean;
+  expect:
+  - - false
+- query: SELECT (result->>'deleted_versions')::bigint, (result->>'remaining_reclaimable_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 1) AS result) AS gc;
+  expect:
+  - - 1
+    - 1
+- query: SELECT (result->>'deleted_versions')::bigint, (result->>'remaining_reclaimable_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 1) AS result) AS gc;
+  expect:
+  - - 1
+    - 0
+- query: SELECT convert_from(vexfs_read_version('pg-gc', '/history.txt', 2), 'UTF8'), convert_from(vexfs_read('pg-gc', '/history.txt'), 'UTF8');
+  expect:
+  - - two
+    - four
+- query: SELECT vexfs_read_version('pg-gc', '/history.txt', 1);
+  expect_error: VEXFS_VERSION_NOT_FOUND
+- query: SELECT vexfs_restore_version('pg-gc', '/history.txt', 2, 4);
+  expect:
+  - - 5
+- query: SELECT vexfs_snapshot_drop('pg-gc', 'keep-two');
+  expect:
+  - - 1
+- query: SELECT (vexfs_retention_set('pg-gc', 1, 0)->>'reclaimable_versions')::bigint;
+  expect:
+  - - 1
+- query: SELECT (result->>'remaining_reclaimable_versions')::bigint, (result->>'remaining_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 10000) AS result) AS gc;
+  expect:
+  - - 0
+    - 2
+- query: SELECT (vexfs_retention_get('pg-gc')->>'stored_versions')::bigint, (vexfs_retention_get('pg-gc')->>'stored_version_bytes')::bigint;
+  expect:
+  - - 2
+    - 3
+- query: SELECT source_version_no, manifest_id IS NULL FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-gc') AND version_no=5;
+  expect:
+  - - 2
+    - true
+- query: SELECT convert_from(vexfs_read('pg-gc', '/history.txt'), 'UTF8'), (vexfs_check('pg-gc', 1)->>'ok')::boolean, (vexfs_check('pg-gc', 1)->>'issue_count')::integer;
+  expect:
+  - - two
+    - true
+    - 0
+- query: SELECT vexfs_gc('pg-gc', 0);
+  expect_error: VEXFS_INVALID_GC_BATCH
+- query: SELECT vexfs_workspace_drop('pg-gc');
+  expect:
+  - - 1

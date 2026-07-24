@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+PYTHON="$ROOT/tests/eval/vexfs/python.sh"
 IMAGE="${VEXFS_LINUX_EVAL_IMAGE:-vexdb-lite-vexfs-linux-eval:debian}"
 HOST_BUILD_DIR="${VEXFS_MACOS_BUILD_DIR:-$ROOT/vexdb_sqlite/build}"
 MOUNT_CLI="${VEXFS_EVAL_MOUNT_CLI:?set VEXFS_EVAL_MOUNT_CLI to the signed CLI from the current build}"
@@ -14,7 +15,7 @@ mkdir -p "$OUTPUT_ROOT/mac-create" "$OUTPUT_ROOT/linux-roundtrip" "$OUTPUT_ROOT/
 
 require_pass() {
     local report="$1"
-    python3 -c \
+    "$PYTHON" -c \
         'import json,sys; from pathlib import Path; latest=Path(sys.argv[1]); pointer=json.load(open(latest)); reports=sorted(latest.parent.glob("*/report.json"), key=lambda path: path.stat().st_mtime); assert reports, latest; value=json.load(open(reports[-1])); summary=value["summary"]; assert pointer["status"] == "PASS" and summary["failed"] == 0 and summary["passed"] == 1 and summary["skipped"] == 0, summary' \
         "$report"
 }
@@ -22,7 +23,7 @@ require_pass() {
 echo "=== macOS FSKit 创建共享工作区 ==="
 VEXFS_PORTABILITY_PHASE=mac-create \
 VEXFS_PORTABILITY_DB="$DATABASE" \
-python3 "$ROOT/tests/eval/vexfs/run.py" \
+"$PYTHON" "$ROOT/tests/eval/vexfs/run.py" \
     --root "$ROOT" \
     --build-dir "$HOST_BUILD_DIR" \
     --output-dir "$OUTPUT_ROOT/mac-create" \
@@ -53,7 +54,7 @@ require_pass "$OUTPUT_ROOT/linux-roundtrip/latest.json"
 echo "=== macOS FSKit 回读并恢复 Linux 快照 ==="
 VEXFS_PORTABILITY_PHASE=mac-verify \
 VEXFS_PORTABILITY_DB="$DATABASE" \
-python3 "$ROOT/tests/eval/vexfs/run.py" \
+"$PYTHON" "$ROOT/tests/eval/vexfs/run.py" \
     --root "$ROOT" \
     --build-dir "$HOST_BUILD_DIR" \
     --output-dir "$OUTPUT_ROOT/mac-verify" \

@@ -8,9 +8,19 @@ TEST_HOME="$TMP_DIR/home"
 APP_DIR="$TEST_HOME/Applications"
 BIN_DIR="$TEST_HOME/.local/bin"
 LIB_DIR="$TEST_HOME/.local/lib/vexdb-lite"
+PAYLOAD_APP="$STAGE/.payload/VexDB Lite.app"
 CHECKS=0
 PACKAGE_VERSION="$(sed -n 's/^preview_version=//p' "$STAGE/MANIFEST.txt")"
 [ -n "$PACKAGE_VERSION" ] || { echo "DOCUMENTATION SMOKE: FAIL: manifest has no preview_version" >&2; exit 1; }
+BUNDLE_MARKETING_VERSION="$(sed -n 's/^bundle_marketing_version=//p' "$STAGE/MANIFEST.txt")"
+[ -n "$BUNDLE_MARKETING_VERSION" ] || { echo "DOCUMENTATION SMOKE: FAIL: manifest has no bundle marketing version" >&2; exit 1; }
+BUNDLE_BUILD_VERSION="$(sed -n 's/^bundle_build_version=//p' "$STAGE/MANIFEST.txt")"
+[ -n "$BUNDLE_BUILD_VERSION" ] || { echo "DOCUMENTATION SMOKE: FAIL: manifest has no bundle build version" >&2; exit 1; }
+PACKAGE_ARCHITECTURE="$(sed -n 's/^architecture=//p' "$STAGE/MANIFEST.txt")"
+case "$PACKAGE_ARCHITECTURE" in
+    arm64|x86_64) ;;
+    *) echo "DOCUMENTATION SMOKE: FAIL: invalid manifest architecture: $PACKAGE_ARCHITECTURE" >&2; exit 1 ;;
+esac
 MANIFEST_RUNTIME_ABI="$(sed -n 's/^mount_abi_version=//p' "$STAGE/MANIFEST.txt")"
 [ -n "$MANIFEST_RUNTIME_ABI" ] || { echo "DOCUMENTATION SMOKE: FAIL: manifest has no runtime ABI" >&2; exit 1; }
 PACKAGE_SIGNATURE="$(sed -n 's/^signature=//p' "$STAGE/MANIFEST.txt")"
@@ -60,15 +70,75 @@ expect_fail() {
 
 mkdir -p "$TEST_HOME"
 
-# 交付物和使用说明。
-check test -d "$STAGE/VexDB Lite.app"
+# 交付物和使用说明。App 放在隐藏 payload，防止解压目录被 LaunchServices
+# 当成第二个可运行副本，从而让 FSKit 随机选到未安装的扩展。
+check test ! -e "$STAGE/VexDB Lite.app"
+check test -d "$PAYLOAD_APP"
+for bundle in \
+    "$PAYLOAD_APP" \
+    "$PAYLOAD_APP/Contents/Extensions/VexFSAppEx.appex"; do
+    equal "$BUNDLE_MARKETING_VERSION" \
+        "$(plutil -extract CFBundleShortVersionString raw -o - "$bundle/Contents/Info.plist")" \
+        "bundle marketing version"
+    equal "$BUNDLE_BUILD_VERSION" \
+        "$(plutil -extract CFBundleVersion raw -o - "$bundle/Contents/Info.plist")" \
+        "bundle build version"
+done
+equal "$PACKAGE_ARCHITECTURE" \
+    "$(lipo -archs "$PAYLOAD_APP/Contents/MacOS/VexDB Lite")" \
+    "app architecture"
+equal "$PACKAGE_ARCHITECTURE" \
+    "$(lipo -archs "$PAYLOAD_APP/Contents/Extensions/VexFSAppEx.appex/Contents/MacOS/VexFSAppEx")" \
+    "FSKit extension architecture"
 check test -x "$STAGE/bin/vexdb"
 check test -L "$STAGE/bin/vexfs"
 check test -f "$STAGE/lib/vexdb_lite.dylib"
+check test -f "$STAGE/lib/runtime/libpq.5.dylib"
+EXTENSION_ENTITLEMENTS="$TMP_DIR/extension-entitlements.plist"
+EXTENSION_ENTITLEMENTS_LOG="$TMP_DIR/extension-entitlements.log"
+if ! codesign -d --entitlements - --xml \
+        "$PAYLOAD_APP/Contents/Extensions/VexFSAppEx.appex" \
+        >"$EXTENSION_ENTITLEMENTS" 2>"$EXTENSION_ENTITLEMENTS_LOG"; then
+    cat "$EXTENSION_ENTITLEMENTS_LOG" >&2
+    echo "DOCUMENTATION SMOKE: FAIL: cannot read FSKit entitlements" >&2
+    exit 1
+fi
+if grep -q 'invalid entitlements blob' "$EXTENSION_ENTITLEMENTS_LOG" ||
+        ! plutil -lint "$EXTENSION_ENTITLEMENTS" >/dev/null 2>&1; then
+    cat "$EXTENSION_ENTITLEMENTS_LOG" >&2
+    echo "DOCUMENTATION SMOKE: FAIL: invalid FSKit DER entitlements" >&2
+    exit 1
+fi
+CHECKS=$((CHECKS + 1))
+FSKIT_ENTITLEMENT="$(/usr/libexec/PlistBuddy \
+    -c 'Print :com.apple.developer.fskit.fsmodule' \
+    "$EXTENSION_ENTITLEMENTS" 2>/dev/null || true)"
+equal "true" "$FSKIT_ENTITLEMENT" "FSKit module entitlement"
+if [ "$PACKAGE_SIGNATURE" = developer-id ]; then
+    EXTENSION_TEAM="$(/usr/libexec/PlistBuddy \
+        -c 'Print :com.apple.developer.team-identifier' \
+        "$EXTENSION_ENTITLEMENTS" 2>/dev/null || true)"
+    EXTENSION_APPLICATION="$(/usr/libexec/PlistBuddy \
+        -c 'Print :com.apple.application-identifier' \
+        "$EXTENSION_ENTITLEMENTS" 2>/dev/null || true)"
+    equal "developer-id" "$PACKAGE_SIGNATURE" "Developer ID entitlement checks"
+    equal "$(sed -n 's/^signing_team=//p' "$STAGE/MANIFEST.txt")" \
+        "$EXTENSION_TEAM" "FSKit team entitlement"
+    equal "$EXTENSION_TEAM.io.vexdb.vexfs.extension" \
+        "$EXTENSION_APPLICATION" "FSKit application identifier"
+fi
 check test -f "$STAGE/使用说明.md"
 check grep -q 'Developer ID' "$STAGE/使用说明.md"
 check grep -q '按类别' "$STAGE/使用说明.md"
 check grep -q '文件系统扩展' "$STAGE/使用说明.md"
+check grep -q '底层目录设为' "$STAGE/使用说明.md"
+check grep -q '不会被 VexDB Lite 自动重放' "$STAGE/使用说明.md"
+check grep -q 'verify_installed_mount' "$STAGE/install.sh"
+check grep -q '正在使用的 FSKit 文件系统' "$STAGE/install.sh"
+check grep -q 'pkill -KILL -u.*fskit_agent' "$STAGE/install.sh"
+expect_fail grep -q 'killall -u.*pkd' "$STAGE/install.sh"
+expect_fail grep -q 'lsregister.*-kill' "$STAGE/install.sh"
+check grep -Eq '不会.*清空 LaunchServices 注册库' "$STAGE/使用说明.md"
 expect_fail grep -q '没有提供可用的授权入口' "$STAGE/使用说明.md"
 check grep -Eq '^signature=(developer-id|ad-hoc)$' "$STAGE/MANIFEST.txt"
 check grep -Eq '^notarization=(not-submitted|accepted)$' "$STAGE/MANIFEST.txt"
@@ -87,6 +157,31 @@ esac
     shasum -a 256 -c SHA256SUMS.txt >/dev/null
 ) || fail "package SHA256SUMS verification failed"
 CHECKS=$((CHECKS + 1))
+
+# 安装事务必须在 App 已替换、CLI 复制失败时恢复旧版本，并且不留下可被
+# LaunchServices 再次发现的 `.app.disabled` 副本。
+ROLLBACK_ROOT="$TMP_DIR/rollback-install"
+ROLLBACK_APP_DIR="$ROLLBACK_ROOT/Applications"
+ROLLBACK_BIN_DIR="$ROLLBACK_ROOT/read-only-bin"
+ROLLBACK_LIB_DIR="$ROLLBACK_ROOT/lib"
+mkdir -p "$ROLLBACK_APP_DIR" "$ROLLBACK_BIN_DIR" "$ROLLBACK_LIB_DIR"
+ditto "$PAYLOAD_APP" "$ROLLBACK_APP_DIR/VexDB Lite.app"
+touch "$ROLLBACK_APP_DIR/VexDB Lite.app/.rollback-marker"
+chmod 0555 "$ROLLBACK_BIN_DIR"
+expect_fail env \
+    HOME="$ROLLBACK_ROOT" \
+    VEXDB_LITE_APP_DIR="$ROLLBACK_APP_DIR" \
+    VEXDB_LITE_BIN_DIR="$ROLLBACK_BIN_DIR" \
+    VEXDB_LITE_LIB_DIR="$ROLLBACK_LIB_DIR" \
+    VEXDB_LITE_ALLOW_ADHOC_INSTALL="$ALLOW_ADHOC" \
+    VEXDB_LITE_ALLOW_DIRTY_INSTALL="$ALLOW_DIRTY" \
+    "$STAGE/install.sh"
+chmod 0755 "$ROLLBACK_BIN_DIR"
+check test -f "$ROLLBACK_APP_DIR/VexDB Lite.app/.rollback-marker"
+equal "" "$(find "$ROLLBACK_APP_DIR" -maxdepth 1 \
+    -name '*.app.disabled' -print -quit)" "no discoverable rollback App"
+equal "" "$(find "$ROLLBACK_APP_DIR" -maxdepth 1 \
+    -name '.vexdb-lite-install-*' -print -quit)" "no installation transaction residue"
 
 # 按文档执行无污染安装。所有安装位置和 HOME 都在临时目录。
 HOME="$TEST_HOME" \
@@ -210,7 +305,8 @@ expect_fail env HOME="$TEST_HOME" "$VEXDB" fs stat /after-snapshot/new.txt
 HOME="$TEST_HOME" "$VEXDB" fs snapshot diff before-agent >/dev/null
 
 # doctor 必须如实报告当前机器的 FSKit 状态。临时 HOME 只隔离数据库，
-# 不会隔离系统已经注册的扩展，因此测试机可能是 missing、registered 或 enabled。
+# 不会隔离系统已经注册的扩展，因此测试机可能是 missing、registered、disabled
+# 或 enabled。
 set +e
 DOCTOR_JSON="$(HOME="$TEST_HOME" "$VEXDB" fs doctor --json 2>/dev/null)"
 DOCTOR_RC=$?
@@ -220,7 +316,7 @@ case "$DOCTOR_STATE" in
     enabled)
         equal "0" "$DOCTOR_RC" "doctor enabled extension exit code"
         ;;
-    missing|registered)
+    missing|registered|disabled|service-unavailable)
         equal "1" "$DOCTOR_RC" "doctor unavailable extension exit code"
         ;;
     *)
@@ -251,7 +347,16 @@ if /usr/bin/sqlite3 :memory: ".help" | grep -q '^\.load'; then
 fi
 CHECKS=$((CHECKS + 1))
 LOADABLE_SQLITE="$(command -v sqlite3 || true)"
+LOADABLE_SQLITE_ARCHS=""
+LOADABLE_SQLITE_COMPATIBLE=0
+if [ -n "$LOADABLE_SQLITE" ]; then
+    LOADABLE_SQLITE_ARCHS="$(lipo -archs "$LOADABLE_SQLITE" 2>/dev/null || true)"
+fi
+case " $LOADABLE_SQLITE_ARCHS " in
+    *" $PACKAGE_ARCHITECTURE "*) LOADABLE_SQLITE_COMPATIBLE=1 ;;
+esac
 if [ -n "$LOADABLE_SQLITE" ] && [ "$LOADABLE_SQLITE" != "/usr/bin/sqlite3" ] && \
+   [ "$LOADABLE_SQLITE_COMPATIBLE" = 1 ] && \
    "$LOADABLE_SQLITE" :memory: ".help" | grep -q '^\.load'; then
     contains "$("$LOADABLE_SQLITE" "$SQL_DB" ".load $DYLIB" "SELECT vexdb_version();")" \
         "$EXPECTED_PRODUCT_VERSION" "third-party sqlite loadable extension"

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote, urlparse
 
 
 MIB = 1024 * 1024
@@ -48,6 +49,32 @@ class EvalFailureWithMetrics(EvalFailure):
 
 class EvalSkip(RuntimeError):
     pass
+
+
+class FailureArtifactDirectory:
+    """临时目录成功时清理，失败时移入当前 case 的报告目录。"""
+
+    def __init__(self, ctx: "Context", prefix: str):
+        self.ctx = ctx
+        self.path = Path(tempfile.mkdtemp(prefix=prefix))
+
+    def __enter__(self) -> str:
+        return str(self.path)
+
+    def __exit__(self, exception_type: type[BaseException] | None,
+                 _exception: BaseException | None, _traceback: Any) -> bool:
+        if exception_type is None or issubclass(exception_type, EvalSkip):
+            shutil.rmtree(self.path, ignore_errors=True)
+            return False
+        if self.ctx.current_artifacts is None:
+            return False
+        destination = self.ctx.current_artifacts / "preserved-workspace"
+        try:
+            shutil.move(str(self.path), str(destination))
+        except OSError:
+            # 保留原始临时目录比为了整理报告而覆盖真正的测试异常更重要。
+            pass
+        return False
 
 
 @dataclass(frozen=True)
@@ -323,10 +350,15 @@ def package_unified_install(ctx: Context) -> dict[str, Any]:
         raise EvalSkip("统一 macOS 安装包只在 macOS 执行")
     stage = package_stage(ctx)
     packaged_cli = stage / "bin/vexdb"
+    payload_app = stage / ".payload/VexDB Lite.app"
     ctx.check(packaged_cli.exists(), "统一包缺少 bin/vexdb")
     ctx.check((stage / "bin/vexfs").is_symlink(), "vexfs 必须是兼容链接")
-    ctx.check((stage / "VexDB Lite.app").is_dir(), "统一包缺少 VexDB Lite.app")
+    ctx.check(not (stage / "VexDB Lite.app").exists(),
+              "统一包不能暴露可被 LaunchServices 重复注册的顶层 App")
+    ctx.check(payload_app.is_dir(), "统一包缺少隐藏 App payload")
     ctx.check((stage / "lib/vexdb_lite.dylib").exists(), "统一包缺少 SQLite 扩展")
+    ctx.check((stage / "lib/runtime/libpq.5.dylib").exists(),
+              "统一包缺少 PostgreSQL runtime")
     manifest = dict(
         line.split("=", 1) for line in (stage / "MANIFEST.txt").read_text().splitlines()
         if "=" in line)
@@ -1139,6 +1171,63 @@ def idempotency(ctx: Context) -> dict[str, Any]:
         ctx.equal(db.scalar("SELECT CAST(vexfs_read('default','/file') AS TEXT)"),
                   "abcd", "幂等后内容")
         return {"request_rows": db.scalar("SELECT count(*) FROM _vexfs_requests")}
+
+
+@case("contract.publish-close-atomicity", "handles",
+      "发布并关闭必须原子提交，失败后句柄和 staging 可继续恢复")
+def publish_close_atomicity(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        db.scalar("SELECT vexfs_write('default','/publish-close','base')")
+        handle = db.scalar(
+            "SELECT vexfs_handle_open('default','/publish-close','rw','pc-open')")
+        generation = db.scalar(
+            "SELECT vexfs_handle_stage_write(?,0,'next','pc-stage')", (handle,))
+        ctx.expect_error(lambda: db.scalar(
+            "SELECT vexfs_handle_publish_close(?,?,'data')",
+            (handle, generation + 1)), "generation is stale")
+        ctx.equal(db.scalar("SELECT state FROM _vexfs_handles WHERE id=?", (handle,)),
+                  "open", "generation 失败后句柄仍可恢复")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_staging WHERE handle_id=?", (handle,)),
+            1, "generation 失败后 staging 未被清理")
+        ctx.equal(db.scalar(
+            "SELECT current_version FROM _vexfs_inodes WHERE id=("
+            "SELECT inode_id FROM _vexfs_handles WHERE id=?)", (handle,)),
+            1, "generation 失败不推进文件版本")
+        version = db.scalar(
+            "SELECT vexfs_handle_publish_close(?,?,'data')", (handle, generation))
+        ctx.equal(version, 2, "发布并关闭推进版本")
+        ctx.equal(db.scalar("SELECT state FROM _vexfs_handles WHERE id=?", (handle,)),
+                  "closed", "成功后句柄关闭")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_staging WHERE handle_id=?", (handle,)),
+            0, "成功后 staging 清理")
+        ctx.equal(db.scalar("SELECT vexfs_read('default','/publish-close')"), b"next",
+                  "发布并关闭写入内容")
+
+        first = db.scalar(
+            "SELECT vexfs_handle_open('default','/publish-close','rw','pc-first')")
+        second = db.scalar(
+            "SELECT vexfs_handle_open('default','/publish-close','rw','pc-second')")
+        first_generation = db.scalar(
+            "SELECT vexfs_handle_stage_write(?,0,'one!','pc-first-stage')", (first,))
+        second_generation = db.scalar(
+            "SELECT vexfs_handle_stage_write(?,0,'two!','pc-second-stage')", (second,))
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_publish_close(?,?,'data')",
+            (first, first_generation)), 3, "第一个并发句柄发布")
+        ctx.expect_error(lambda: db.scalar(
+            "SELECT vexfs_handle_publish_close(?,?,'data')",
+            (second, second_generation)), "write conflict")
+        ctx.equal(db.scalar("SELECT state FROM _vexfs_handles WHERE id=?", (second,)),
+                  "open", "冲突后句柄没有被误关")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_staging WHERE handle_id=?", (second,)),
+            1, "冲突后 staging 保留")
+        ctx.equal(db.scalar("SELECT vexfs_read('default','/publish-close')"), b"one!",
+                  "冲突后保留已提交内容")
+        db.scalar("SELECT vexfs_handle_close(?,0,'pc-second-close')", (second,))
+        return {"versions": 3, "rollback_paths": 2}
 
 
 @case("maintenance.request-retention", "handles",
@@ -2314,9 +2403,14 @@ def cli_command_surface(ctx: Context) -> dict[str, Any]:
         ctx.equal(index_disabled["enabled"], False, "CLI 关闭文本索引")
         run_process(prefix + ["descriptor", str(descriptor)])
         descriptor_json = json.loads(descriptor.read_text())
+        ctx.equal(descriptor_json["version"], 2, "descriptor version")
+        ctx.equal(descriptor_json["backend"], "sqlite", "descriptor backend")
         ctx.equal(descriptor_json["workspace"], "eval", "descriptor workspace")
-        ctx.equal(Path(descriptor_json["database_path"]).resolve(), database.resolve(),
+        ctx.equal(Path(descriptor_json["connection"]).resolve(), database.resolve(),
                   "descriptor database")
+        if os.name != "nt":
+            ctx.equal(descriptor.stat().st_mode & 0o777, 0o600,
+                      "descriptor 只允许当前用户读写")
         doctor = run_process(prefix + ["--json", "doctor"], check=False)
         doctor_json = json.loads(doctor.stdout)
         expected_platform = {"Darwin": "macos", "Linux": "linux",
@@ -2452,9 +2546,11 @@ def performance_mount_contract_small_files(ctx: Context) -> dict[str, Any]:
     executable = ctx.build_dir / "vexfs_runtime_smoke"
     if not executable.exists():
         raise EvalSkip(f"缺少挂载合同 benchmark: {executable}")
-    file_count = 250 if ctx.mode.name == "quick" else 1_000
+    file_count = {"quick": 250, "full": 10_000, "stress": 100_000}[
+        ctx.mode.name]
+    timeout = {"quick": 60, "full": 300, "stress": 3_600}[ctx.mode.name]
     rss_before = child_max_rss_bytes()
-    result = run_process([str(executable), "--benchmark", str(file_count)], timeout=60)
+    result = run_process([str(executable), "--benchmark", str(file_count)], timeout=timeout)
     metrics = json.loads(result.stdout)
     rss_after = child_max_rss_bytes()
     ctx.equal(metrics["files"], file_count, "挂载合同 benchmark 文件数")
@@ -2464,7 +2560,8 @@ def performance_mount_contract_small_files(ctx: Context) -> dict[str, Any]:
               "本地挂载每个文件最多保留 create/close 两条请求")
     ctx.check(metrics["durability_barriers"] >= 1, "synchronize 执行真实 FULL 屏障")
     ctx.check(rss_after < 1024 * MIB, "挂载合同 benchmark 峰值内存低于 1 GiB")
-    ctx.budget("mount_contract_create_seconds", metrics["create_seconds"], 30.0)
+    ctx.budget("mount_contract_create_seconds", metrics["create_seconds"],
+               {"quick": 30.0, "full": 300.0, "stress": 3_000.0}[ctx.mode.name])
     ctx.budget("mount_contract_sync_seconds", metrics["sync_seconds"], 5.0)
     metrics["child_max_rss_before_bytes"] = rss_before
     metrics["child_max_rss_after_bytes"] = rss_after
@@ -2584,6 +2681,98 @@ def performance_scale_tree(ctx: Context) -> dict[str, Any]:
             "max_rss_before_bytes": rss_before,
             "max_rss_after_index_bytes": rss_after_index,
             "memory_budget_bytes": memory_budget,
+            "storage": storage,
+        }
+
+
+@case("performance.mvp-dataset", "performance",
+      "MVP 的 1 千文件、1 GiB 当前内容、100 MiB 单文件、100 commits 和 10 snapshots",
+      modes=("full", "stress"))
+def performance_mvp_dataset(ctx: Context) -> dict[str, Any]:
+    file_count = 1_000
+    logical_bytes = 1024 * MIB
+    large_file_bytes = 100 * MIB
+    small_total = logical_bytes - large_file_bytes
+    small_base, small_extra = divmod(small_total, file_count - 1)
+    rss_before = self_max_rss_bytes()
+
+    with FailureArtifactDirectory(ctx, "vexfs-mvp-dataset-") as directory:
+        database_path = Path(directory) / "mvp.sqlite3"
+        db = Database(ctx, database_path)
+        db.connection.execute("PRAGMA cache_size=-32768")
+        db.scalar("SELECT vexfs_mkdir('default','/mvp')")
+
+        checksums: list[tuple[str, str]] = []
+        started = time.perf_counter()
+        large_path = "/mvp/file-0000.bin"
+        large_payload = b"L" * large_file_bytes
+        checksums.append((large_path, sha256(large_payload)))
+        db.scalar("SELECT vexfs_write('default',?,?)", (large_path, large_payload))
+        del large_payload
+
+        for index in range(1, file_count):
+            size = small_base + (1 if index <= small_extra else 0)
+            payload = (index.to_bytes(8, "little") +
+                       bytes([index % 251]) * (size - 8))
+            path = f"/mvp/file-{index:04d}.bin"
+            checksums.append((path, sha256(payload)))
+            db.scalar("SELECT vexfs_write('default',?,?)", (path, payload))
+        write_seconds = time.perf_counter() - started
+
+        for index in range(10):
+            db.scalar("SELECT vexfs_snapshot_create('default',?)", (f"mvp-{index}",))
+
+        workspace = db.connection.execute(
+            "SELECT live_files,live_bytes FROM _vexfs_workspaces "
+            "WHERE name='default'").fetchone()
+        if workspace is None:
+            raise EvalFailure("MVP workspace 不存在")
+        live_files, live_bytes = workspace
+        direct_children = len(db.json("SELECT vexfs_list('default','/mvp')"))
+        commit_count = db.scalar("SELECT count(*) FROM _vexfs_commits")
+        snapshot_count = db.scalar("SELECT count(*) FROM _vexfs_snapshots")
+        ctx.equal(db.scalar("PRAGMA integrity_check"), "ok",
+                  "MVP 写入后数据库完整")
+        db.close()
+
+        reopened = Database(ctx, database_path)
+        reopened.connection.execute("PRAGMA cache_size=-32768")
+        read_started = time.perf_counter()
+        for path, expected_checksum in checksums:
+            content = reopened.scalar("SELECT vexfs_read('default',?)", (path,))
+            ctx.equal(sha256(content), expected_checksum,
+                      f"MVP 重开后文件 checksum: {path}")
+        read_seconds = time.perf_counter() - read_started
+        ctx.equal(reopened.scalar("PRAGMA integrity_check"), "ok",
+                  "MVP 重开读取后数据库完整")
+        reopened.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        storage = db_storage(database_path)
+        reopened.close()
+
+        rss_after = self_max_rss_bytes()
+        ctx.equal(live_files, file_count, "MVP 当前文件数")
+        ctx.equal(live_bytes, logical_bytes, "MVP 当前内容总量")
+        ctx.equal(direct_children, file_count, "MVP 单目录直接子项")
+        ctx.equal(snapshot_count, 10, "MVP 快照数")
+        ctx.check(commit_count >= 100, "MVP workspace commits 不少于 100")
+        ctx.check(rss_after < 1024 * MIB, "MVP 数据集峰值内存低于 1 GiB")
+        ctx.budget("mvp_dataset_write_seconds", write_seconds, 180.0)
+        ctx.budget("mvp_dataset_read_seconds", read_seconds, 180.0)
+        return {
+            "files": live_files,
+            "logical_bytes": live_bytes,
+            "direct_children": direct_children,
+            "max_file_bytes": large_file_bytes,
+            "commits": commit_count,
+            "snapshots": snapshot_count,
+            "write_seconds": round(write_seconds, 6),
+            "write_mib_per_second": round(
+                logical_bytes / MIB / max(write_seconds, 1e-9), 3),
+            "reopen_read_seconds": round(read_seconds, 6),
+            "read_mib_per_second": round(
+                logical_bytes / MIB / max(read_seconds, 1e-9), 3),
+            "max_rss_before_bytes": rss_before,
+            "max_rss_after_bytes": rss_after,
             "storage": storage,
         }
 
@@ -3155,10 +3344,16 @@ def mount_cli(ctx: Context) -> Path:
     return installed if installed.exists() else ctx.cli
 
 
-def filesystem_cli_prefix(cli: Path, database: Path, workspace: str) -> list[str]:
+def filesystem_cli_prefix(cli: Path, database: Path, workspace: str,
+                          backend: str = "sqlite", dsn: str = "") -> list[str]:
     """同时支持独立 vexfs 名称和统一 vexdb fs 入口。"""
     name = cli.stem.lower() if cli.suffix.lower() == ".exe" else cli.name.lower()
     command = [str(cli)] if name == "vexfs" else [str(cli), "fs"]
+    if backend == "postgresql":
+        if not dsn:
+            raise EvalFailure("PostgreSQL mount eval 缺少 VEXFS_MOUNT_DSN")
+        return command + ["--backend", "pg", "--dsn", dsn,
+                          "--workspace", workspace]
     return command + ["--db", str(database), "--workspace", workspace]
 
 
@@ -3189,6 +3384,8 @@ class RealMountAdapter:
     mount_point: Path
     prefix: list[str]
     doctor_before: dict[str, Any]
+    backend: str
+    connection_identity: str
 
 
 def prepare_real_mount_adapter(ctx: Context, base: Path,
@@ -3213,9 +3410,16 @@ def prepare_real_mount_adapter(ctx: Context, base: Path,
     else:
         raise EvalSkip("共享 mount 一致性 eval 当前支持 macOS 和 Linux")
 
+    backend = os.environ.get("VEXFS_MOUNT_BACKEND", "sqlite").lower()
+    if backend in {"pg", "postgres"}:
+        backend = "postgresql"
+    if backend not in {"sqlite", "postgresql"}:
+        raise EvalFailure(f"不支持的 mount eval backend：{backend}")
+    dsn = os.environ.get("VEXFS_MOUNT_DSN", "") if backend == "postgresql" else ""
     database = database or base / "mount.sqlite3"
     mount_point = base / "mnt"
-    prefix = filesystem_cli_prefix(cli, database, workspace)
+    prefix = filesystem_cli_prefix(cli, database, workspace, backend, dsn)
+    connection_identity = dsn if backend == "postgresql" else os.path.realpath(database)
     run_process(prefix + ["setup"])
     doctor = run_process(prefix + ["--json", "doctor"], check=False)
     try:
@@ -3242,7 +3446,8 @@ def prepare_real_mount_adapter(ctx: Context, base: Path,
     if system == "Linux" and not details.get("mount_ready"):
         raise EvalSkip(f"libfuse3 adapter={details.get('extension', 'unknown')}")
     mount_point.mkdir()
-    return RealMountAdapter(name, cli, database, mount_point, prefix, details)
+    return RealMountAdapter(name, cli, database, mount_point, prefix, details,
+                            backend, connection_identity)
 
 
 def expect_mount_errno(ctx: Context, operation: Callable[[], Any], expected: int,
@@ -3527,7 +3732,7 @@ def cross_platform_mount_conformance(ctx: Context) -> dict[str, Any]:
                 adapter.prefix + ["--json", "mount", "status",
                                   str(adapter.mount_point)]).stdout)
             ctx.equal(len(status), 1, "快照恢复后挂载仍然存在")
-            ctx.equal(status[0]["database"], os.path.realpath(adapter.database),
+            ctx.equal(status[0]["database"], adapter.connection_identity,
                       "挂载身份记录数据库")
             ctx.equal(status[0]["workspace"], "conformance", "挂载身份记录 workspace")
             clean_diff = run_process(adapter.prefix + ["snapshot", "diff", "baseline"])
@@ -3561,6 +3766,98 @@ PORTABILITY_ACL = [
 ]
 PORTABILITY_XATTR = "user.vexfs.portable"
 PORTABILITY_XATTR_VALUE = b"mac-linux-mac\x00metadata"
+
+PG_CROSS_GATEWAY_WORKSPACE = "pg-cross-gateway"
+PG_CROSS_GATEWAY_XATTR = "user.vexfs.pg-cross-gateway"
+PG_CROSS_GATEWAY_XATTR_VALUE = b"shared-through-postgresql"
+
+
+@case("portability.pg-cross-gateway", "portability",
+      "macOS FSKit 与 Linux FUSE 通过同一个 PostgreSQL 工作区双向接力")
+def pg_cross_gateway_roundtrip(ctx: Context) -> dict[str, Any]:
+    phase = os.environ.get("VEXFS_PG_CROSS_GATEWAY_PHASE", "")
+    phases = {
+        "mac-create": "Darwin",
+        "linux-modify": "Linux",
+        "mac-verify": "Darwin",
+        "linux-final": "Linux",
+    }
+    if phase not in phases:
+        raise EvalSkip(
+            "需通过 run_pg_cross_gateway.sh 设置 PostgreSQL 跨网关阶段")
+    if platform.system() != phases[phase]:
+        raise EvalFailure(
+            f"阶段 {phase} 必须在 {phases[phase]} 执行，当前为 {platform.system()}")
+    if os.environ.get("VEXFS_MOUNT_BACKEND", "").lower() not in {
+            "pg", "postgres", "postgresql"}:
+        raise EvalFailure("PostgreSQL 跨网关 eval 必须使用 PG backend")
+
+    with tempfile.TemporaryDirectory(prefix=f"vexfs-pg-gateway-{phase}-") as directory:
+        adapter = prepare_real_mount_adapter(
+            ctx, Path(directory), PG_CROSS_GATEWAY_WORKSPACE)
+        mount_adapter_mount(ctx, adapter)
+        shared = adapter.mount_point / "shared"
+        try:
+            if phase == "mac-create":
+                shared.mkdir()
+                (shared / "from-mac.txt").write_text("created on macOS\n", encoding="utf-8")
+                script = shared / "run.sh"
+                script.write_text("#!/bin/sh\nprintf 'pg-gateway-ok\\n'\n", encoding="utf-8")
+                script.chmod(0o755)
+                os.link(shared / "from-mac.txt", shared / "from-mac-hard.txt")
+                (shared / "from-mac-link.txt").symlink_to("from-mac.txt")
+                system_setxattr(shared / "from-mac.txt", PG_CROSS_GATEWAY_XATTR,
+                                PG_CROSS_GATEWAY_XATTR_VALUE)
+                ctx.equal((shared / "from-mac.txt").read_text(encoding="utf-8"),
+                          "created on macOS\n", "macOS 首次写入")
+            else:
+                ctx.equal((shared / "from-mac.txt").read_text(encoding="utf-8"),
+                          "created on macOS\n", f"{phase} 读取 macOS 文件")
+                ctx.equal((shared / "from-mac-hard.txt").stat().st_ino,
+                          (shared / "from-mac.txt").stat().st_ino,
+                          f"{phase} 保留 hardlink")
+                ctx.equal(os.readlink(shared / "from-mac-link.txt"), "from-mac.txt",
+                          f"{phase} 保留 symlink")
+                ctx.equal(system_getxattr(
+                    shared / "from-mac.txt", PG_CROSS_GATEWAY_XATTR),
+                    PG_CROSS_GATEWAY_XATTR_VALUE, f"{phase} 保留 xattr")
+                ctx.equal(run_process([str(shared / "run.sh")]).stdout,
+                          b"pg-gateway-ok\n", f"{phase} 保留可执行 mode")
+
+            if phase == "linux-modify":
+                (shared / "from-linux.txt").write_text(
+                    "created on Linux\n", encoding="utf-8")
+            elif phase in {"mac-verify", "linux-final"}:
+                ctx.equal((shared / "from-linux.txt").read_text(encoding="utf-8"),
+                          "created on Linux\n", f"{phase} 读取 Linux 文件")
+            if phase == "mac-verify":
+                (shared / "from-mac-again.txt").write_text(
+                    "created after Linux\n", encoding="utf-8")
+            elif phase == "linux-final":
+                ctx.equal((shared / "from-mac-again.txt").read_text(encoding="utf-8"),
+                          "created after Linux\n", "Linux 最终读取 macOS 回写")
+        finally:
+            mount_adapter_unmount(ctx, adapter, phase)
+
+        snapshot_name = {
+            "mac-create": "mac-baseline",
+            "linux-modify": "linux-baseline",
+            "mac-verify": "mac-after-linux",
+            "linux-final": "linux-final",
+        }[phase]
+        snapshot = run_process(adapter.prefix + ["snapshot", "create", snapshot_name])
+        ctx.check(int(snapshot.stdout.strip()) > 0, f"{phase} 创建快照")
+        snapshots = run_process(adapter.prefix + ["snapshot", "list"]).stdout
+        ctx.check(snapshot_name.encode() in snapshots, f"{phase} 快照可见")
+        check = json.loads(run_process(adapter.prefix + ["--json", "check"]).stdout)
+        ctx.equal(check["ok"], True, f"{phase} 深度检查")
+        return {
+            "phase": phase,
+            "adapter": adapter.name,
+            "backend": adapter.backend,
+            "workspace": PG_CROSS_GATEWAY_WORKSPACE,
+            "snapshot": snapshot_name,
+        }
 
 
 def verify_portable_tree(ctx: Context, adapter: RealMountAdapter,
@@ -4067,11 +4364,14 @@ def mount_helper_crash_recovery(ctx: Context) -> dict[str, Any]:
             ctx.equal(ready, "staged", "子进程已写入但未关闭 fd")
             process_table = run_process(["ps", "-eo", "pid=,args="]).stdout.decode()
             helper_pids = []
+            identity_marker = (adapter.connection_identity
+                               if adapter.backend == "postgresql"
+                               else str(adapter.database))
             for line in process_table.splitlines():
                 fields = line.strip().split(maxsplit=1)
                 if len(fields) != 2:
                     continue
-                if ("vexfs-fuse" in fields[1] and str(adapter.database) in fields[1]
+                if ("vexfs-fuse" in fields[1] and identity_marker in fields[1]
                         and str(adapter.mount_point) in fields[1]):
                     helper_pids.append(int(fields[0]))
             ctx.equal(len(helper_pids), 1, "定位唯一 FUSE helper")
@@ -4079,24 +4379,87 @@ def mount_helper_crash_recovery(ctx: Context) -> dict[str, Any]:
             child.terminate()
             child.wait(timeout=10)
 
+            # Remove the dead kernel mount without going through VexFS cleanup.
+            # The covered directory must already be 0500, otherwise Bash could
+            # silently write local files after a helper crash.
+            detached = run_process(
+                ["fusermount3", "-u", "-z", str(adapter.mount_point)],
+                check=False, timeout=30)
+            ctx.equal(detached.returncode, 0, "helper 崩溃后内核挂载可分离")
+            for _ in range(50):
+                if not os.path.ismount(adapter.mount_point):
+                    break
+                time.sleep(0.1)
+            ctx.equal(os.path.ismount(adapter.mount_point), False,
+                      "helper 崩溃后内核挂载已消失")
+            ctx.equal(adapter.mount_point.stat().st_mode & 0o777, 0o500,
+                      "helper 崩溃后底层目录禁止误写")
+            blocked = adapter.mount_point / "must-not-be-local.txt"
+            if os.geteuid() != 0:
+                try:
+                    blocked.write_text("unsafe", encoding="utf-8")
+                except PermissionError:
+                    pass
+                else:
+                    raise EvalFailure("helper 崩溃后底层目录仍可写")
+                ctx.check(not blocked.exists(), "失败写不能留下本地文件")
+
             forced = run_process(
                 adapter.prefix + ["unmount", "--force", str(adapter.mount_point)],
                 check=False, timeout=60)
             ctx.equal(forced.returncode, 0, "helper 崩溃后强制卸载")
-            with sqlite3.connect(adapter.database) as connection:
-                dirty = connection.execute(
-                    "SELECT count(*) FROM _vexfs_handles "
-                    "WHERE dirty_generation>published_generation").fetchone()[0]
-                ctx.equal(dirty, 1, "helper 崩溃后 staging 仍在数据库")
-                connection.execute("UPDATE _vexfs_mount_sessions SET lease_until=0")
+            ctx.equal(adapter.mount_point.stat().st_mode & 0o777, 0o700,
+                      "显式卸载后底层目录恢复 0700")
+            if adapter.backend == "postgresql":
+                dirty_result = run_process([
+                    "psql", adapter.connection_identity, "-X", "-q", "-t", "-A",
+                    "-v", "ON_ERROR_STOP=1", "-c",
+                    "SELECT count(*) FROM _vexfs.handles AS handle "
+                    "JOIN _vexfs.workspaces AS workspace USING (workspace_id) "
+                    "WHERE workspace.name='helper-crash' "
+                    "AND handle.dirty_generation>handle.published_generation;",
+                ])
+                dirty = int(dirty_result.stdout.decode().strip())
+                ctx.equal(dirty, 1, "helper 崩溃后 staging 仍在 PostgreSQL")
+                run_process([
+                    "psql", adapter.connection_identity, "-X", "-q",
+                    "-v", "ON_ERROR_STOP=1", "-c",
+                    "UPDATE _vexfs.mount_sessions "
+                    "SET lease_until=clock_timestamp() - interval '1 second' "
+                    "WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces "
+                    "WHERE name='helper-crash'); "
+                    "UPDATE _vexfs.handles "
+                    "SET lease_until=clock_timestamp() - interval '1 second' "
+                    "WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces "
+                    "WHERE name='helper-crash') "
+                    "AND dirty_generation>published_generation;",
+                ])
+            else:
+                with sqlite3.connect(adapter.database) as connection:
+                    dirty = connection.execute(
+                        "SELECT count(*) FROM _vexfs_handles "
+                        "WHERE dirty_generation>published_generation").fetchone()[0]
+                    ctx.equal(dirty, 1, "helper 崩溃后 staging 仍在数据库")
+                    connection.execute("UPDATE _vexfs_mount_sessions SET lease_until=0")
 
             mount_adapter_mount(ctx, adapter)
             remounted = True
             ctx.equal(target.read_bytes(), b"CRASHine", "新 session 自动发布崩溃前 staging")
-            with sqlite3.connect(adapter.database) as connection:
-                dirty_after = connection.execute(
-                    "SELECT count(*) FROM _vexfs_handles "
-                    "WHERE dirty_generation>published_generation").fetchone()[0]
+            if adapter.backend == "postgresql":
+                dirty_after_result = run_process([
+                    "psql", adapter.connection_identity, "-X", "-q", "-t", "-A",
+                    "-v", "ON_ERROR_STOP=1", "-c",
+                    "SELECT count(*) FROM _vexfs.handles AS handle "
+                    "JOIN _vexfs.workspaces AS workspace USING (workspace_id) "
+                    "WHERE workspace.name='helper-crash' "
+                    "AND handle.dirty_generation>handle.published_generation;",
+                ])
+                dirty_after = int(dirty_after_result.stdout.decode().strip())
+            else:
+                with sqlite3.connect(adapter.database) as connection:
+                    dirty_after = connection.execute(
+                        "SELECT count(*) FROM _vexfs_handles "
+                        "WHERE dirty_generation>published_generation").fetchone()[0]
             ctx.equal(dirty_after, 0, "恢复后没有未发布 staging")
             return {"adapter": adapter.name, "helper_pid": helper_pids[0]}
         finally:
@@ -4105,6 +4468,9 @@ def mount_helper_crash_recovery(ctx: Context) -> dict[str, Any]:
                 child.wait(timeout=10)
             if remounted:
                 mount_adapter_unmount(ctx, adapter, "helper 崩溃恢复")
+            else:
+                run_process(adapter.prefix + ["unmount", "--force",
+                            str(adapter.mount_point)], check=False, timeout=60)
 
 
 @case("mount.real-bash", "mount", "真实 FSKit mount 后用 bash 常用文件命令操作")
@@ -4113,30 +4479,37 @@ def real_mount_bash(ctx: Context) -> dict[str, Any]:
         raise EvalSkip("真实 FSKit mount 只在 macOS 执行")
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-eval-") as directory:
         base = Path(directory)
-        database = base / "mount.sqlite3"
-        mount_point = base / "mnt"
-        cli = mount_cli(ctx)
-        prefix = filesystem_cli_prefix(cli, database, "eval")
-        run_process(prefix + ["setup"])
-        doctor = run_process(prefix + ["--json", "doctor"], check=False)
-        details = json.loads(doctor.stdout)
-        if details.get("extension") != "enabled":
-            raise EvalSkip(
-                f"FSKit extension={details.get('extension', 'unknown')}，需安装并在系统设置中启用")
-        mount_point.mkdir()
+        adapter = prepare_real_mount_adapter(ctx, base, "eval")
+        mount_point = adapter.mount_point
+        prefix = adapter.prefix
+        details = adapter.doctor_before
         expected_target = os.path.realpath(mount_point)
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
+        mount_adapter_mount(ctx, adapter)
         descriptor: dict[str, Any] = {}
         mounts: list[dict[str, Any]] = []
-        unmount = None
         try:
-            descriptor = json.loads((base / ".vexfs-volume.json").read_text())
-            ctx.equal(descriptor, {"version": 2, "database_file": "mount.sqlite3",
-                                   "workspace": "eval"}, "FSKit 目录资源描述文件")
             status = run_process(prefix + ["--json", "mount", "status", str(mount_point)])
             mounts = json.loads(status.stdout)
             ctx.equal(len(mounts), 1, "挂载状态数量")
             ctx.equal(mounts[0]["target"], expected_target, "挂载状态目标")
+            source = mounts[0]["source"]
+            source_path = (Path(unquote(urlparse(source).path))
+                           if source.startswith("file:") else Path(source))
+            descriptor = json.loads(
+                (source_path / ".vexfs-volume.json").read_text())
+            expected_connection = (adapter.database.name
+                                   if adapter.backend == "sqlite"
+                                   else adapter.connection_identity)
+            ctx.equal(descriptor, {"version": 3, "backend": adapter.backend,
+                                   "connection": expected_connection,
+                                   "workspace": "eval"}, "FSKit 目录资源描述文件")
+            if adapter.backend == "sqlite":
+                descriptor_connection = Path(descriptor["connection"])
+                ctx.check(not descriptor_connection.is_absolute(),
+                          "FSKit SQLite 描述文件不得保存绝对路径")
+                ctx.equal(os.path.realpath(source_path / descriptor_connection),
+                          os.path.realpath(adapter.database),
+                          "FSKit SQLite 描述文件相对路径解析")
             shell = r'''
 set -e
 mkdir -p "$1/project/sub"
@@ -4159,15 +4532,14 @@ test "$(/bin/cat "$1/project/sub/result.txt")" = agent
             reverse = run_process(prefix + ["cat", "/project/sub/result.txt"])
             ctx.equal(reverse.stdout, b"agent\n", "数据库 CLI 反向读取挂载写入")
         finally:
-            unmount = run_process(prefix + ["unmount", str(mount_point)],
-                                  check=False, timeout=60)
-        ctx.equal(unmount.returncode, 0, "卸载退出码")
+            mount_adapter_unmount(ctx, adapter, "Bash")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
         ctx.equal(after["mount_count"], 0, "卸载后挂载数")
         ctx.equal(after["database"]["pending_handles"], 0, "卸载后未发布句柄")
         ctx.equal(after["database"]["retained_handles"], 0, "卸载后保留句柄")
         ctx.equal(after["database"]["staging_bytes"], 0, "卸载后暂存字节")
-        return {"cli": str(cli), "doctor_before": details, "doctor_after": after,
+        return {"cli": str(adapter.cli), "backend": adapter.backend,
+                "doctor_before": details, "doctor_after": after,
                 "mounts": mounts,
                 "descriptor": descriptor,
                 "commands": ["mkdir", "printf", "grep", "cp", "mv", "cmp", "ls",
@@ -4191,15 +4563,11 @@ def real_linux_mount_bash_git(ctx: Context) -> dict[str, Any]:
 
     with tempfile.TemporaryDirectory(prefix="vexfs-linux-mount-eval-") as directory:
         base = Path(directory)
-        database = base / "mount.sqlite3"
-        mount_point = base / "mnt"
-        prefix = [str(ctx.cli), "--db", str(database), "--workspace", "linux-eval"]
-        run_process(prefix + ["setup"])
-        details = json.loads(run_process(prefix + ["--json", "doctor"], check=False).stdout)
-        if not details.get("mount_ready"):
-            raise EvalSkip(f"libfuse3 adapter={details.get('extension', 'unknown')}")
-        mount_point.mkdir()
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
+        adapter = prepare_real_mount_adapter(ctx, base, "linux-eval")
+        mount_point = adapter.mount_point
+        prefix = adapter.prefix
+        details = adapter.doctor_before
+        mount_adapter_mount(ctx, adapter)
         first_unmount = None
         try:
             shell = r'''
@@ -4257,7 +4625,8 @@ test "$(cat "$1/project/output.txt")" = agent-linux
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
         ctx.equal(after["mount_count"], 0, "Linux 卸载后无挂载")
         ctx.equal(after["database"]["pending_handles"], 0, "Linux 卸载后无未发布句柄")
-        return {"doctor_before": details, "doctor_after": after,
+        return {"backend": adapter.backend,
+                "doctor_before": details, "doctor_after": after,
                 "commands": ["mkdir", "printf", "chmod", "exec", "grep", "cp", "mv",
                              "hardlink", "symlink", "git init", "git add", "git commit",
                              "git status", "unmount", "remount"]}
@@ -4270,20 +4639,10 @@ def real_mount_posix_metadata(ctx: Context) -> dict[str, Any]:
         raise EvalSkip("真实 FSKit mount 只在 macOS 执行")
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-posix-") as directory:
         base = Path(directory)
-        database = base / "mount.sqlite3"
-        mount_point = base / "mnt"
-        cli = mount_cli(ctx)
-        prefix = filesystem_cli_prefix(cli, database, "posix")
-        run_process(prefix + ["setup"])
-        details = json.loads(run_process(
-            prefix + ["--json", "doctor"], check=False).stdout)
-        if details.get("extension") != "enabled":
-            raise EvalSkip(
-                f"FSKit extension={details.get('extension', 'unknown')}，需安装并在系统设置中启用")
-
-        mount_point.mkdir()
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
-        first_unmount = None
+        adapter = prepare_real_mount_adapter(ctx, base, "posix")
+        mount_point = adapter.mount_point
+        prefix = adapter.prefix
+        mount_adapter_mount(ctx, adapter)
         script = mount_point / "project/run.sh"
         link = mount_point / "project/run-link"
         dangling = mount_point / "project/dangling"
@@ -4311,15 +4670,12 @@ def real_mount_posix_metadata(ctx: Context) -> dict[str, Any]:
             renamed.unlink()
             ctx.check(script.exists(), "删除链接不删除目标")
         finally:
-            first_unmount = run_process(prefix + ["unmount", str(mount_point)],
-                                        check=False, timeout=60)
-        ctx.equal(first_unmount.returncode, 0, "POSIX 首次卸载退出码")
+            mount_adapter_unmount(ctx, adapter, "POSIX 首次")
 
         # FSKit 的 unload 在 umount 返回后仍可能异步收尾；等待旧 volume 释放同一
         # container identity，避免把系统生命周期竞态误判成持久化失败。
         time.sleep(2.0)
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
-        second_unmount = None
+        mount_adapter_mount(ctx, adapter)
         try:
             ctx.equal(script.stat().st_mode & 0o777, 0o755, "重挂载后 mode 持久化")
             ctx.equal(os.readlink(link), "run.sh", "重挂载后链接 target 持久化")
@@ -4329,40 +4685,19 @@ def real_mount_posix_metadata(ctx: Context) -> dict[str, Any]:
             # mount 返回后 FSKit 仍会完成少量异步激活工作；这个回归用例操作很少，
             # 需要给 activate/deactivate 留出正常交接时间。
             time.sleep(2.0)
-            second_unmount = run_process(prefix + ["unmount", str(mount_point)],
-                                         check=False, timeout=60)
-            if second_unmount.returncode != 0:
-                run_process(["/sbin/umount", "-f", str(mount_point)],
-                            check=False, timeout=60)
-        ctx.equal(second_unmount.returncode, 0, "POSIX 第二次卸载退出码")
+            mount_adapter_unmount(ctx, adapter, "POSIX 第二次")
 
-        connection = sqlite3.connect(database, isolation_level=None)
-        connection.enable_load_extension(True)
-        connection.load_extension(str(ctx.extension))
-        try:
-            row = connection.execute(
-                "SELECT i.id,i.kind,i.mode,i.size FROM _vexfs_dentries d "
-                "JOIN _vexfs_inodes i ON i.id=d.inode_id "
-                "JOIN _vexfs_workspaces w ON w.id=d.workspace_id "
-                "WHERE w.name='posix' AND d.name='run-link' AND i.deleted_at IS NULL"
-            ).fetchone()
-            ctx.check(row is not None, "SQLite 中存在符号链接 inode")
-            assert row is not None
-            ctx.equal((row[1], row[2], row[3]), ("symlink", 0o777, len("run.sh")),
-                      "SQLite 中的链接元数据")
-            target = connection.execute(
-                "SELECT vexfs_readlink('posix',?)", (row[0],)).fetchone()[0]
-            ctx.equal(target, b"run.sh", "SQLite 中保存链接 target")
-            stored_mode = connection.execute(
-                "SELECT i.mode FROM _vexfs_dentries d JOIN _vexfs_inodes i ON i.id=d.inode_id "
-                "JOIN _vexfs_workspaces w ON w.id=d.workspace_id "
-                "WHERE w.name='posix' AND d.name='run.sh' AND i.deleted_at IS NULL"
-            ).fetchone()[0]
-            ctx.equal(stored_mode, 0o755, "SQLite 中保存可执行权限")
-        finally:
-            connection.close()
-        return {"cli": str(cli), "mode": 0o755, "target": "run.sh",
-                "remounted": True, "database_verified": True}
+        link_stat = json.loads(run_process(
+            prefix + ["stat", "/project/run-link"]).stdout)
+        script_stat = json.loads(run_process(
+            prefix + ["stat", "/project/run.sh"]).stdout)
+        ctx.equal((link_stat["kind"], link_stat["mode"], link_stat["size"]),
+                  ("symlink", 0o777, len("run.sh")),
+                  "数据库 CLI 中的链接元数据")
+        ctx.equal(script_stat["mode"], 0o755, "数据库 CLI 中保存可执行权限")
+        return {"cli": str(adapter.cli), "backend": adapter.backend,
+                "mode": 0o755, "target": "run.sh", "remounted": True,
+                "database_verified": True}
 
 
 @case("mount.performance", "mount", "真实 FSKit 分块顺序写和随机覆盖性能")
@@ -4373,18 +4708,10 @@ def real_mount_performance(ctx: Context) -> dict[str, Any]:
     random_writes = {"quick": 100, "full": 1_000, "stress": 2_000}[ctx.mode.name]
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-perf-") as directory:
         base = Path(directory)
-        database = base / "mount.sqlite3"
-        mount_point = base / "mnt"
-        cli = mount_cli(ctx)
-        prefix = filesystem_cli_prefix(cli, database, "perf")
-        run_process(prefix + ["setup"])
-        details = json.loads(run_process(
-            prefix + ["--json", "doctor"], check=False).stdout)
-        if details.get("extension") != "enabled":
-            raise EvalSkip(
-                f"FSKit extension={details.get('extension', 'unknown')}，需安装并在系统设置中启用")
-        mount_point.mkdir()
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
+        adapter = prepare_real_mount_adapter(ctx, base, "perf")
+        mount_point = adapter.mount_point
+        prefix = adapter.prefix
+        mount_adapter_mount(ctx, adapter)
         fd = -1
         try:
             path = mount_point / "bench.bin"
@@ -4420,13 +4747,12 @@ def real_mount_performance(ctx: Context) -> dict[str, Any]:
         finally:
             if fd >= 0:
                 os.close(fd)
-            unmount = run_process(prefix + ["unmount", str(mount_point)],
-                                  check=False, timeout=60)
-        ctx.equal(unmount.returncode, 0, "FSKit 性能测试卸载退出码")
+            mount_adapter_unmount(ctx, adapter, "性能测试")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
         ctx.equal(after["mount_count"], 0, "FSKit 性能测试卸载后挂载数")
         return {
-            "cli": str(cli),
+            "cli": str(adapter.cli),
+            "backend": adapter.backend,
             "sequential_mib": sequential_mib,
             "sequential_seconds": round(sequential_seconds, 6),
             "sequential_mib_per_second": round(
@@ -4451,20 +4777,11 @@ def real_mount_git_workspace(ctx: Context) -> dict[str, Any]:
         raise EvalSkip("系统没有 xattr")
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-git-") as directory:
         base = Path(directory)
-        database = base / "mount.sqlite3"
-        mount_point = base / "mnt"
-        cli = mount_cli(ctx)
-        prefix = filesystem_cli_prefix(cli, database, "git-eval")
-        run_process(prefix + ["setup"])
-        details = json.loads(run_process(
-            prefix + ["--json", "doctor"], check=False).stdout)
-        if details.get("extension") != "enabled":
-            raise EvalSkip(
-                f"FSKit extension={details.get('extension', 'unknown')}，需安装并在系统设置中启用")
-        mount_point.mkdir()
-        run_process(prefix + ["mount", str(mount_point)], timeout=60)
+        adapter = prepare_real_mount_adapter(ctx, base, "git-eval")
+        mount_point = adapter.mount_point
+        prefix = adapter.prefix
+        mount_adapter_mount(ctx, adapter)
         project = mount_point / "project"
-        unmount = None
         try:
             project.mkdir()
             run_process([xattr, "-w", "com.vexfs.eval", "stored-in-sqlite", str(project)])
@@ -4537,25 +4854,27 @@ def real_mount_git_workspace(ctx: Context) -> dict[str, Any]:
             ctx.equal(run_process(prefix + ["cat", "/project/README.md"]).stdout,
                       b"main\n", "数据库 CLI 反向读取 Git 工作区")
         finally:
-            unmount = run_process(prefix + ["unmount", str(mount_point)],
-                                  check=False, timeout=60)
-        ctx.equal(unmount.returncode, 0, "Git 测试卸载退出码")
+            mount_adapter_unmount(ctx, adapter, "Git 首次")
+
+        mount_adapter_mount(ctx, adapter)
+        try:
+            persisted_xattr = run_process(
+                [xattr, "-p", "com.vexfs.eval", str(project)], timeout=120)
+            ctx.equal(persisted_xattr.stdout.strip(), b"stored-in-sqlite",
+                      "重挂载后扩展属性持久化")
+            ctx.equal(run_process([git, "status", "--porcelain"], cwd=project,
+                                  env=environment, timeout=120).stdout,
+                      b"", "重挂载后 Git 工作区状态")
+        finally:
+            mount_adapter_unmount(ctx, adapter, "Git 第二次")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
         ctx.equal(after["mount_count"], 0, "Git 测试卸载后挂载数")
         ctx.equal(after["database"]["pending_handles"], 0, "Git 测试未发布句柄")
         ctx.equal(after["database"]["retained_handles"], 0, "Git 测试保留句柄")
         ctx.equal(after["database"]["staging_bytes"], 0, "Git 测试暂存字节")
-        connection = sqlite3.connect(database)
-        try:
-            stored_xattr = connection.execute(
-                "SELECT value FROM _vexfs_xattrs WHERE name='com.vexfs.eval'"
-            ).fetchone()
-        finally:
-            connection.close()
-        ctx.equal(None if stored_xattr is None else stored_xattr[0], b"stored-in-sqlite",
-                  "扩展属性持久化到 SQLite")
         return {
-            "cli": str(cli),
+            "cli": str(adapter.cli),
+            "backend": adapter.backend,
             "git": run_process([git, "--version"]).stdout.decode().strip(),
             "filemode": True,
             "symlinks": True,
@@ -4686,15 +5005,22 @@ def real_mount_toolchain_projects(ctx: Context) -> dict[str, Any]:
             mount_adapter_unmount(ctx, adapter, "工具链首次")
             first_unmounted = True
 
-        connection = sqlite3.connect(adapter.database)
-        try:
-            ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
-                      "工具链项目数据库完整性")
-            stored_files = connection.execute(
-                "SELECT count(*) FROM _vexfs_inodes WHERE kind='file' AND deleted_at IS NULL"
-            ).fetchone()[0]
-        finally:
-            connection.close()
+        if adapter.backend == "sqlite":
+            connection = sqlite3.connect(adapter.database)
+            try:
+                ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
+                          "工具链项目数据库完整性")
+                stored_files = connection.execute(
+                    "SELECT count(*) FROM _vexfs_inodes "
+                    "WHERE kind='file' AND deleted_at IS NULL"
+                ).fetchone()[0]
+            finally:
+                connection.close()
+        else:
+            integrity = json.loads(run_process(
+                adapter.prefix + ["--json", "check"]).stdout)
+            ctx.equal(integrity["ok"], True, "工具链项目 PG workspace 完整性")
+            stored_files = int(integrity["versions"])
         ctx.check(stored_files >= 15, "工具链项目产物进入数据库")
 
         mount_adapter_mount(ctx, adapter)
@@ -4737,6 +5063,15 @@ def real_mount_opencode_project(ctx: Context) -> dict[str, Any]:
     if opencode is None or python is None or git is None:
         raise EvalSkip("真实 OpenCode 用例需要 opencode、python3 和 git")
     model = os.environ.get("VEXFS_EVAL_OPENCODE_MODEL", "openai/gpt-5.4-mini")
+    opencode_help_result = run_process([opencode, "run", "--help"])
+    opencode_help = (opencode_help_result.stdout + opencode_help_result.stderr).decode(
+        errors="replace")
+    if "--dangerously-skip-permissions" in opencode_help:
+        approval_arguments = ["--dangerously-skip-permissions"]
+    elif "--auto" in opencode_help:
+        approval_arguments = ["--auto"]
+    else:
+        raise EvalSkip("当前 OpenCode 没有可用于隔离 eval 的自动授权参数")
 
     with tempfile.TemporaryDirectory(prefix="vexfs-opencode-project-") as directory:
         base = Path(directory)
@@ -4785,7 +5120,7 @@ def real_mount_opencode_project(ctx: Context) -> dict[str, Any]:
             )
             started = time.perf_counter()
             result = run_process(
-                [opencode, "run", "--auto", "--pure", "--format", "json",
+                [opencode, "run", *approval_arguments, "--pure", "--format", "json",
                  "--model", model, "--dir", str(project), prompt],
                 cwd=project, env=environment, timeout=900)
             agent_seconds = time.perf_counter() - started
@@ -4804,12 +5139,17 @@ def real_mount_opencode_project(ctx: Context) -> dict[str, Any]:
         stored = run_process(adapter.prefix + ["cat", "/agent-project/calc.py"])
         ctx.check(b"NotImplementedError" not in stored.stdout,
                   "OpenCode 修改已经进入数据库权威内容")
-        connection = sqlite3.connect(adapter.database)
-        try:
-            ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
-                      "OpenCode 项目数据库完整性")
-        finally:
-            connection.close()
+        if adapter.backend == "sqlite":
+            connection = sqlite3.connect(adapter.database)
+            try:
+                ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
+                          "OpenCode 项目数据库完整性")
+            finally:
+                connection.close()
+        else:
+            integrity = json.loads(run_process(
+                adapter.prefix + ["--json", "check"]).stdout)
+            ctx.equal(integrity["ok"], True, "OpenCode 项目 PG workspace 完整性")
 
         mount_adapter_mount(ctx, adapter)
         try:
@@ -4834,13 +5174,25 @@ def real_mount_opencode_project(ctx: Context) -> dict[str, Any]:
 def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
     file_count = {"quick": 1_000, "full": 10_000, "stress": 100_000}[ctx.mode.name]
     directory_count = min(1_000, max(20, file_count // 100))
-    with tempfile.TemporaryDirectory(prefix="vexfs-mount-scale-") as directory:
+    default_native_search_timeout = {"quick": 60, "full": 300, "stress": 600}[
+        ctx.mode.name]
+    native_search_timeout = float(os.environ.get(
+        "VEXFS_EVAL_NATIVE_SEARCH_TIMEOUT_SECONDS",
+        str(default_native_search_timeout)))
+    if native_search_timeout <= 0:
+        raise EvalFailure("VEXFS_EVAL_NATIVE_SEARCH_TIMEOUT_SECONDS 必须大于 0")
+    with FailureArtifactDirectory(ctx, "vexfs-mount-scale-") as directory:
         base = Path(directory)
         adapter = prepare_real_mount_adapter(ctx, base, "mount-scale")
         root = adapter.mount_point / "scale"
         search = shutil.which("rg") or shutil.which("grep")
         if search is None:
             raise EvalSkip("系统没有 rg 或 grep")
+
+        def checkpoint(stage: str, **values: Any) -> None:
+            record = {"stage": stage, "at": time.time(), **values}
+            with (base / "eval-checkpoints.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
         def create_tree(target: Path) -> None:
             target.mkdir()
@@ -4857,10 +5209,12 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
             try:
                 if Path(search).name == "rg":
                     result = run_process(
-                        [search, "-l", "needle", str(target)], timeout=3_600)
+                        [search, "-l", "needle", str(target)],
+                        timeout=native_search_timeout)
                 else:
                     result = run_process(
-                        [search, "-R", "-l", "needle", str(target)], timeout=3_600)
+                        [search, "-R", "-l", "needle", str(target)],
+                        timeout=native_search_timeout)
             except subprocess.TimeoutExpired:
                 return time.perf_counter() - started, 0, True
             return time.perf_counter() - started, len(
@@ -4878,6 +5232,10 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
         ctx.equal(native_files, file_count, "原生目录对照文件数")
         expected_matches = (file_count + 999) // 1_000
         ctx.equal(native_matches, expected_matches, "原生目录对照搜索命中数")
+        checkpoint("native-complete", files=native_files,
+                   create_seconds=native_create_seconds,
+                   walk_seconds=native_walk_seconds,
+                   search_seconds=native_search_seconds)
 
         mount_adapter_mount(ctx, adapter)
         create_seconds = 0.0
@@ -4904,11 +5262,15 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
                 ctx.equal(matches, expected_matches, "真实规模目录文本搜索命中数")
         finally:
             mount_adapter_unmount(ctx, adapter, "规模首次")
+        checkpoint("mount-tree-complete", files=file_count,
+                   create_seconds=create_seconds, walk_seconds=walk_seconds,
+                   search_seconds=search_seconds,
+                   search_timed_out=search_timed_out)
 
         database_search_started = time.perf_counter()
         database_search = json.loads(run_process(
-            [str(ctx.cli), "--db", str(adapter.database), "--workspace", "mount-scale",
-             "--json", "grep", "-l", "needle", "/scale", "--max-results", "10240"],
+            adapter.prefix + ["--json", "grep", "-l", "needle", "/scale",
+                              "--max-results", "10240"],
             timeout=3_600).stdout)
         database_search_seconds = time.perf_counter() - database_search_started
         ctx.equal(database_search["match_count"], expected_matches,
@@ -4917,25 +5279,33 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
                   "数据库快路径搜索扫描完整目录树")
         index_build_started = time.perf_counter()
         index_status = json.loads(run_process(
-            [str(ctx.cli), "--db", str(adapter.database), "--workspace", "mount-scale",
-             "index", "enable"], timeout=3_600).stdout)
+            adapter.prefix + ["index", "enable"], timeout=3_600).stdout)
         index_build_seconds = time.perf_counter() - index_build_started
-        ctx.check(index_status["indexed_files"] >= file_count,
-                  "数据库 trigram 索引覆盖业务文件和 FSKit 系统文件")
+        index_available = bool(index_status.get("available", True))
+        if index_available:
+            ctx.check(index_status["indexed_files"] >= file_count,
+                      "数据库 trigram 索引覆盖业务文件和 FSKit 系统文件")
+        else:
+            ctx.equal(index_status.get("backend"), "postgresql-scan",
+                      "PG 必须如实报告无可用 substring 索引")
         indexed_search_started = time.perf_counter()
         indexed_search = json.loads(run_process(
-            [str(ctx.cli), "--db", str(adapter.database), "--workspace", "mount-scale",
-             "--json", "grep", "-l", "needle", "/scale", "--max-results", "10240"],
+            adapter.prefix + ["--json", "grep", "-l", "needle", "/scale",
+                              "--max-results", "10240"],
             timeout=3_600).stdout)
         indexed_search_seconds = time.perf_counter() - indexed_search_started
-        ctx.equal(indexed_search["index_used"], True, "真实挂载数据使用 trigram 索引")
+        ctx.equal(indexed_search["index_used"], index_available,
+                  "数据库搜索如实报告索引使用状态")
         ctx.equal(indexed_search["match_count"], expected_matches,
                   "trigram 索引搜索命中数")
+        checkpoint("database-search-complete",
+                   database_search_seconds=database_search_seconds,
+                   index_build_seconds=index_build_seconds,
+                   indexed_search_seconds=indexed_search_seconds)
         # 当前真实 FSKit helper 可能来自已安装的上一预览包。性能数据取完后关闭
         # 新索引，避免旧 helper 后续修改临时数据库时无法维护这个新合同。
-        run_process(
-            [str(ctx.cli), "--db", str(adapter.database), "--workspace", "mount-scale",
-             "index", "disable"], timeout=300)
+        if index_available:
+            run_process(adapter.prefix + ["index", "disable"], timeout=300)
 
         snapshot_started = time.perf_counter()
         run_process(adapter.prefix + ["snapshot", "create", "scale-baseline"],
@@ -4960,27 +5330,47 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
             ctx.equal(remounted_files, file_count, "真实规模目录重挂载文件数")
         finally:
             mount_adapter_unmount(ctx, adapter, "规模第二次")
+        checkpoint("snapshot-restore-complete", snapshot_seconds=snapshot_seconds,
+                   restore_seconds=restore_seconds, remounted_files=remounted_files)
 
-        connection = sqlite3.connect(adapter.database)
         storage_rows: dict[str, int] = {}
-        try:
-            ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
-                      "真实规模目录数据库完整性")
+        if adapter.backend == "sqlite":
+            connection = sqlite3.connect(adapter.database)
+            try:
+                ctx.equal(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok",
+                          "真实规模目录数据库完整性")
+                storage_rows = {
+                    label: int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+                    for label, table in (
+                        ("inode_rows", "_vexfs_inodes"),
+                        ("commit_rows", "_vexfs_commits"),
+                        ("file_version_rows", "_vexfs_file_versions"),
+                        ("request_rows", "_vexfs_requests"),
+                        ("inode_history_rows", "_vexfs_inode_states"),
+                        ("dentry_history_rows", "_vexfs_dentry_states"),
+                        ("acl_rows", "_vexfs_acl_entries"),
+                        ("xattr_rows", "_vexfs_xattrs"),
+                    )
+                }
+            finally:
+                connection.close()
+            database_bytes = adapter.database.stat().st_size
+        else:
+            integrity = json.loads(run_process(
+                adapter.prefix + ["--json", "check"], timeout=3_600).stdout)
+            ctx.equal(integrity["ok"], True, "真实规模目录 PG workspace 完整性")
+            checked = integrity["checked"]
             storage_rows = {
-                label: int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-                for label, table in (
-                    ("inode_rows", "_vexfs_inodes"),
-                    ("commit_rows", "_vexfs_commits"),
-                    ("file_version_rows", "_vexfs_file_versions"),
-                    ("request_rows", "_vexfs_requests"),
-                    ("inode_history_rows", "_vexfs_inode_states"),
-                    ("dentry_history_rows", "_vexfs_dentry_states"),
-                    ("acl_rows", "_vexfs_acl_entries"),
-                    ("xattr_rows", "_vexfs_xattrs"),
-                )
+                "inode_rows": int(checked["inodes"]),
+                "commit_rows": int(checked["commits"]),
+                "file_version_rows": int(checked["versions"]),
+                "request_rows": int(checked["requests"]),
+                "inode_history_rows": 0,
+                "dentry_history_rows": 0,
+                "acl_rows": int(checked["acl_entries"]),
+                "xattr_rows": int(checked["xattrs"]),
             }
-        finally:
-            connection.close()
+            database_bytes = int(integrity["content_bytes"])
         create_budget = {"quick": 600.0, "full": 3_600.0, "stress": 14_400.0}[
             ctx.mode.name]
         ctx.check(create_seconds >= 0, "mount_scale_create_seconds 不能为负数")
@@ -4993,7 +5383,9 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
                     f"{create_seconds:.3f} > {create_budget:.3f}")
         if search_timed_out:
             ctx.checks += 1
-            deferred_failures.append("真实规模目录文本搜索在 3600 秒内未完成")
+            deferred_failures.append(
+                "真实规模目录文本搜索在 "
+                f"{native_search_timeout:g} 秒内未完成")
         metrics = {
             "adapter": adapter.name,
             "files": file_count,
@@ -5003,6 +5395,7 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
             "walk_seconds": round(walk_seconds, 6),
             "search_seconds": round(search_seconds, 6),
             "search_timed_out": search_timed_out,
+            "native_search_timeout_seconds": native_search_timeout,
             "search_matches": matches,
             "database_search_seconds": round(database_search_seconds, 6),
             "database_search_matches": database_search["match_count"],
@@ -5023,9 +5416,9 @@ def real_mount_scale_tree(ctx: Context) -> dict[str, Any]:
                 search_seconds / max(native_search_seconds, 1e-9), 3),
             "snapshot_seconds": round(snapshot_seconds, 6),
             "restore_seconds": round(restore_seconds, 6),
-            "database_bytes": adapter.database.stat().st_size,
+            "database_bytes": database_bytes,
             "database_bytes_per_file": round(
-                adapter.database.stat().st_size / max(file_count, 1), 3),
+                database_bytes / max(file_count, 1), 3),
             **storage_rows,
             "commits_per_file": round(storage_rows["commit_rows"] / file_count, 3),
             "versions_per_file": round(storage_rows["file_version_rows"] / file_count, 3),

@@ -1,0 +1,73 @@
+name: pg__vexfs_chunk_check
+tags: [vexfs, pg, chunk, checksum, integrity]
+description: PostgreSQL VexFS 64 KiB chunk/manifest、块复用、恢复别名和 quick/deep check
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_pg_adapter_version();
+  expect:
+  - - 0.4.0-alpha.1
+- query: SELECT vexfs_workspace_create('pg-a2') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-a2', '/large.bin', convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT octet_length(vexfs_read('pg-a2', '/large.bin')), vexfs_stat('pg-a2', '/large.bin')->>'checksum';
+  expect:
+  - - 131079
+    - 57ad989627081a0270bb309d3f9272ae22f302aedc2b907dfd1e676741bc535d
+- query: SELECT m.chunk_size, m.chunk_count, count(entry.chunk_id), count(DISTINCT entry.chunk_id) FROM _vexfs.file_versions AS f JOIN _vexfs.manifests AS m ON m.manifest_id=f.manifest_id LEFT JOIN _vexfs.manifest_chunks AS entry ON entry.manifest_id=m.manifest_id WHERE f.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND f.version_no=1 GROUP BY m.chunk_size,m.chunk_count;
+  expect:
+  - - 65536
+    - 3
+    - 3
+    - 3
+- query: SELECT vexfs_write('pg-a2', '/large.bin', convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('d', 7), 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT (SELECT count(*) FROM _vexfs.manifests WHERE workspace_id=w.workspace_id), (SELECT count(*) FROM _vexfs.chunks WHERE workspace_id=w.workspace_id), (SELECT count(*) FROM _vexfs.manifest_chunks AS first_entry JOIN _vexfs.manifest_chunks AS second_entry ON second_entry.chunk_no=first_entry.chunk_no AND second_entry.chunk_id=first_entry.chunk_id WHERE first_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=w.workspace_id AND version_no=1) AND second_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=w.workspace_id AND version_no=2)) FROM _vexfs.workspaces AS w WHERE w.name='pg-a2';
+  expect:
+  - - 2
+    - 4
+    - 2
+- query: SELECT vexfs_read('pg-a2', '/large.bin') = convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('d', 7), 'UTF8');
+  expect:
+  - - true
+- query: SELECT length(checksum), current::integer FROM vexfs_history('pg-a2', '/large.bin', 1, NULL);
+  expect:
+  - - 64
+    - 1
+- query: SELECT vexfs_restore_version('pg-a2', '/large.bin', 1, 2);
+  expect:
+  - - 3
+- query: SELECT manifest_id IS NULL, source_version_no, checksum FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=3;
+  expect:
+  - - true
+    - 1
+    - 57ad989627081a0270bb309d3f9272ae22f302aedc2b907dfd1e676741bc535d
+- query: SELECT vexfs_read('pg-a2', '/large.bin') = convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8');
+  expect:
+  - - true
+- query: SELECT (vexfs_check('pg-a2', 0)->>'ok')::boolean, vexfs_check('pg-a2', 0)->>'mode', vexfs_check('pg-a2', 0)->>'content_model';
+  expect:
+  - - true
+    - quick
+    - chunked-v1
+- query: SELECT (vexfs_check('pg-a2', 1)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->'checked'->>'canonical_versions')::bigint, (vexfs_check('pg-a2', 1)->>'issue_count')::integer;
+  expect:
+  - - true
+    - 2
+    - 0
+- statement: UPDATE _vexfs.chunks SET content=set_byte(content, 0, (get_byte(content, 0)+1)%256) WHERE chunk_id=(SELECT entry.chunk_id FROM _vexfs.file_versions AS f JOIN _vexfs.manifest_chunks AS entry ON entry.manifest_id=f.manifest_id WHERE f.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND f.version_no=1 ORDER BY entry.chunk_no LIMIT 1);
+- query: SELECT (vexfs_check('pg-a2', 0)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->>'issue_count')::integer > 0;
+  expect:
+  - - true
+    - false
+    - true
+- query: SELECT vexfs_read('pg-a2', '/large.bin');
+  expect_error: VEXFS_CHECKSUM_MISMATCH
+- query: SELECT vexfs_check('pg-a2', 2);
+  expect_error: VEXFS_INVALID_CHECK_MODE
+- query: SELECT vexfs_workspace_drop('pg-a2');
+  expect:
+  - - 1

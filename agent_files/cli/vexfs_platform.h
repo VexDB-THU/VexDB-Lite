@@ -10,6 +10,7 @@ struct VexFSPlatformMountEntry {
     std::string type;
     // Filled only when the mount was created by VexDB-Lite and its live mount
     // table entry still matches the saved identity record.
+    std::string backend;
     std::string database;
     std::string workspace;
 };
@@ -32,6 +33,7 @@ struct VexFSPlatformState {
 std::string VexFSPlatformDefaultDatabasePath();
 void VexFSPlatformProtectDirectory(const std::filesystem::path &path);
 VexFSPlatformState VexFSPlatformInspect();
-int VexFSPlatformMount(const std::string &database, const std::string &workspace,
+int VexFSPlatformMount(const std::string &backend, const std::string &connection,
+                       const std::string &workspace,
                        const std::string &mount_point);
 int VexFSPlatformUnmount(const std::string &mount_point, bool force);

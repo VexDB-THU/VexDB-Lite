@@ -8,9 +8,9 @@ extension Logger {
 }
 
 enum VexFSIdentity {
-    static func uuid(databasePath: String, workspace: String) -> UUID {
-        let normalized = URL(fileURLWithPath: databasePath).standardizedFileURL.path
-        let digest = SHA256.hash(data: Data("\(normalized)\u{0}\(workspace)".utf8))
+    static func uuid(backend: String, connection: String, workspace: String) -> UUID {
+        let digest = SHA256.hash(
+            data: Data("\(backend)\u{0}\(connection)\u{0}\(workspace)".utf8))
         var bytes = Array(digest.prefix(16))
         bytes[6] = (bytes[6] & 0x0f) | 0x50
         bytes[8] = (bytes[8] & 0x3f) | 0x80
@@ -28,8 +28,13 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
     private var resource: FSPathURLResource?
     private var volume: VexFSVolume?
 
+    private struct Configuration {
+        let descriptor: VexFSDescriptor
+        let connection: String
+    }
+
     private func configuration(for resource: FSPathURLResource) throws
-        -> (descriptor: VexFSDescriptor, databaseURL: URL) {
+        -> Configuration {
         let root = resource.url.standardizedFileURL
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
@@ -39,20 +44,26 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
         let descriptorURL = root.appendingPathComponent(Self.descriptorName, isDirectory: false)
         let descriptor = try JSONDecoder().decode(
             VexFSDescriptor.self, from: Data(contentsOf: descriptorURL))
-        guard descriptor.version == 2,
-              !descriptor.database_file.isEmpty,
-              descriptor.database_file != ".",
-              descriptor.database_file != "..",
-              URL(fileURLWithPath: descriptor.database_file).lastPathComponent ==
-                descriptor.database_file else {
+        guard descriptor.version == 3,
+              descriptor.backend == "sqlite" || descriptor.backend == "postgresql",
+              !descriptor.connection.isEmpty,
+              !descriptor.workspace.isEmpty else {
             throw POSIXError(.EINVAL)
         }
-        let databaseURL = root.appendingPathComponent(
-            descriptor.database_file, isDirectory: false).standardizedFileURL
-        guard databaseURL.deletingLastPathComponent() == root else {
-            throw POSIXError(.EACCES)
+        if descriptor.backend == "sqlite" {
+            guard descriptor.connection != ".", descriptor.connection != "..",
+                  URL(fileURLWithPath: descriptor.connection).lastPathComponent ==
+                    descriptor.connection else {
+                throw POSIXError(.EINVAL)
+            }
+            let databaseURL = root.appendingPathComponent(
+                descriptor.connection, isDirectory: false).standardizedFileURL
+            guard databaseURL.deletingLastPathComponent() == root else {
+                throw POSIXError(.EACCES)
+            }
+            return Configuration(descriptor: descriptor, connection: databaseURL.path)
         }
-        return (descriptor, databaseURL)
+        return Configuration(descriptor: descriptor, connection: descriptor.connection)
     }
 
     func probeResource(resource: FSResource,
@@ -61,9 +72,11 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             return replyHandler(nil, POSIXError(.ENODEV))
         }
         do {
-            let (descriptor, databaseURL) = try configuration(for: pathResource)
+            let configuration = try configuration(for: pathResource)
+            let descriptor = configuration.descriptor
             let identifier = FSContainerIdentifier(uuid:
-                VexFSIdentity.uuid(databasePath: databaseURL.path,
+                VexFSIdentity.uuid(backend: descriptor.backend,
+                                   connection: configuration.connection,
                                    workspace: descriptor.workspace))
             replyHandler(.usable(name: "VexFS \(descriptor.workspace)", containerID: identifier), nil)
         } catch {
@@ -84,10 +97,13 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             return replyHandler(nil, POSIXError(.EACCES))
         }
         do {
-            let (descriptor, databaseURL) = try configuration(for: pathResource)
-            let backend = try VexFSBackend(databasePath: databaseURL.path,
+            let configuration = try configuration(for: pathResource)
+            let descriptor = configuration.descriptor
+            let backend = try VexFSBackend(backend: descriptor.backend,
+                                           connection: configuration.connection,
                                            workspace: descriptor.workspace)
-            let identity = VexFSIdentity.uuid(databasePath: databaseURL.path,
+            let identity = VexFSIdentity.uuid(backend: descriptor.backend,
+                                              connection: configuration.connection,
                                               workspace: descriptor.workspace)
             let loadedVolume = try VexFSVolume(backend: backend, workspace: descriptor.workspace,
                                                volumeID: identity)
@@ -96,7 +112,11 @@ final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
             self.volume = loadedVolume
             replyHandler(loadedVolume, nil)
         } catch {
-            Logger.vexfs.error("load rejected resource: \(error.localizedDescription)")
+            // This contains the runtime error text, never the connection string or
+            // passfile contents. Keep it public so headless install/eval failures
+            // can be diagnosed from unified logs without enabling private logging.
+            Logger.vexfs.error(
+                "load rejected resource: \(error.localizedDescription, privacy: .public)")
             pathResource.url.stopAccessingSecurityScopedResource()
             replyHandler(nil, error)
         }

@@ -4,6 +4,7 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +23,9 @@
 namespace {
 
 struct Options {
+    std::string backend = VEXFS_RUNTIME_BACKEND_SQLITE;
     std::string database;
+    std::string dsn;
     std::string workspace = "default";
     std::string mount_point;
     bool json = false;
@@ -33,7 +36,8 @@ std::string g_program_name = "vexfs";
 
 void Usage(std::ostream &output) {
     output <<
-        "Usage: " << g_program_name << " [--db PATH] [--workspace NAME] COMMAND [ARGS]\n"
+        "Usage: " << g_program_name << " [--db PATH | --backend pg --dsn DSN] "
+        "[--workspace NAME] COMMAND [ARGS]\n"
         "\n"
         "Commands:\n"
         "  setup [--mount PATH]         Initialize and optionally mount a workspace\n"
@@ -43,7 +47,7 @@ void Usage(std::ostream &output) {
         "  cat PATH                     Print a file\n"
         "  ls [PATH] [--json]           List a directory\n"
         "  grep [-i] [-l] [-n] [--max-results N] PATTERN [PATH]\n"
-        "                               Search current text files inside SQLite\n"
+        "                               Search current text files in the workspace\n"
         "  index status|enable|rebuild|disable\n"
         "                               Manage the optional trigram text index\n"
         "  check [--quick]              Verify workspace metadata and content\n"
@@ -89,7 +93,7 @@ void Usage(std::ostream &output) {
         "  mount status [MOUNT_POINT]   Show active VexFS mounts\n"
         "  unmount [--force] MOUNT_POINT\n"
         "                               Unmount; --force detaches a stale mount\n"
-        "  doctor [--json]              Check platform adapter and SQLite state\n";
+        "  doctor [--json]              Check platform adapter and database state\n";
 }
 
 Options ParseOptions(int argc, char **argv) {
@@ -99,6 +103,13 @@ Options ParseOptions(int argc, char **argv) {
         std::string argument = argv[index];
         if (argument == "--db" && index + 1 < argc) {
             options.database = argv[++index];
+        } else if (argument == "--backend" && index + 1 < argc) {
+            options.backend = argv[++index];
+            if (options.backend == "pg" || options.backend == "postgres") {
+                options.backend = "postgresql";
+            }
+        } else if (argument == "--dsn" && index + 1 < argc) {
+            options.dsn = argv[++index];
         } else if (argument == "--workspace" && index + 1 < argc) {
             options.workspace = argv[++index];
         } else if (argument == "--mount" && index + 1 < argc) {
@@ -111,6 +122,13 @@ Options ParseOptions(int argc, char **argv) {
         } else {
             options.arguments.push_back(std::move(argument));
         }
+    }
+    if (options.backend != VEXFS_RUNTIME_BACKEND_SQLITE &&
+        options.backend != "postgresql") {
+        throw std::runtime_error("backend must be sqlite or pg");
+    }
+    if (options.backend == "postgresql" && options.dsn.empty()) {
+        throw std::runtime_error("PostgreSQL backend needs --dsn DSN");
     }
     return options;
 }
@@ -168,18 +186,19 @@ class CliError : public std::runtime_error {
 class Session {
   public:
     explicit Session(const Options &options, bool initialize = true) {
+        const bool postgresql = options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL;
         const std::filesystem::path path(options.database);
-        if (initialize && path.has_parent_path()) {
+        if (!postgresql && initialize && path.has_parent_path()) {
             const bool existed = std::filesystem::exists(path.parent_path());
             std::filesystem::create_directories(path.parent_path());
             if (!existed) VexFSPlatformProtectDirectory(path.parent_path());
         }
         vexfs_mount_config config{};
         config.abi_version = VEXFS_RUNTIME_ABI_VERSION;
-        config.backend = VEXFS_RUNTIME_BACKEND_SQLITE;
-        config.connection = options.database.c_str();
+        config.backend = options.backend.c_str();
+        config.connection = postgresql ? options.dsn.c_str() : options.database.c_str();
         config.workspace = options.workspace.c_str();
-        config.principal = "local";
+        config.principal = postgresql ? "" : "local";
         config.operation_timeout_ms = 5000;
         config.flags = initialize ? 0 : VEXFS_RUNTIME_OPEN_NO_CREATE;
         vexfs_mount_error error{};
@@ -252,33 +271,33 @@ void PrintNames(const std::string &json) {
     }
 }
 
+int64_t JsonInteger(const std::string &json, const std::string &name);
+std::string JsonString(const std::string &json, const std::string &name);
+
 void PrintGrep(const std::string &json, bool files_only, bool show_line) {
-    const std::string path_marker = "\"path\":\"";
-    const std::string line_marker = "\"line\":";
-    const std::string text_marker = "\"text\":\"";
-    size_t position = 0;
-    while ((position = json.find(path_marker, position)) != std::string::npos) {
-        position += path_marker.size();
-        const std::string path = JsonUnescape(json, &position);
-        const size_t line_position = json.find(line_marker, position);
-        const size_t text_position = json.find(text_marker, position);
-        if (line_position == std::string::npos || text_position == std::string::npos) {
+    const std::string matches_marker = "\"matches\":[";
+    size_t position = json.find(matches_marker);
+    if (position == std::string::npos) throw std::runtime_error("invalid grep JSON");
+    position += matches_marker.size();
+    while (position < json.size() && json[position] != ']') {
+        if (json[position] == ',') ++position;
+        if (position >= json.size() || json[position] != '{') {
             throw std::runtime_error("invalid grep JSON");
         }
-        char *end = nullptr;
-        const long long line = std::strtoll(
-            json.c_str() + line_position + line_marker.size(), &end, 10);
-        if (end == json.c_str() + line_position + line_marker.size()) {
-            throw std::runtime_error("invalid grep line number");
-        }
-        position = text_position + text_marker.size();
-        const std::string text = JsonUnescape(json, &position);
+        const size_t row_start = position;
+        const size_t row_end = json.find('}', row_start);
+        if (row_end == std::string::npos) throw std::runtime_error("invalid grep JSON");
+        const std::string row = json.substr(row_start, row_end - row_start + 1);
+        const std::string path = JsonString(row, "path");
+        const long long line = JsonInteger(row, "line");
+        const std::string text = JsonString(row, "text");
         std::cout << path;
         if (!files_only) {
             if (show_line) std::cout << ':' << line;
             std::cout << ':' << text;
         }
         std::cout << '\n';
+        position = row_end + 1;
     }
 }
 
@@ -560,12 +579,41 @@ std::string JsonEscape(const std::string &value) {
 }
 
 void WriteDescriptor(const Options &options, const std::filesystem::path &path) {
+    auto has_inline_password = [](const std::string &connection) {
+        std::string compact;
+        compact.reserve(connection.size());
+        for (const unsigned char value : connection) {
+            if (value != ' ' && value != '\t' && value != '\r' && value != '\n')
+                compact.push_back(static_cast<char>(std::tolower(value)));
+        }
+        if (compact.find("password=") != std::string::npos) return true;
+        const size_t scheme = compact.find("://");
+        if (scheme == std::string::npos) return false;
+        const size_t authority = scheme + 3;
+        const size_t at = compact.find('@', authority);
+        return at != std::string::npos && compact.find(':', authority) < at;
+    };
+    if (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL &&
+        has_inline_password(options.dsn)) {
+        throw std::runtime_error(
+            "descriptor refuses an inline PostgreSQL password; use a client certificate "
+            "or a libpq service without inline secrets");
+    }
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path());
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     if (!output) throw std::runtime_error("cannot write descriptor: " + path.string());
-    output << "{\n  \"version\": 1,\n  \"database_path\": \""
-           << JsonEscape(std::filesystem::absolute(options.database).string())
+    const std::string connection = options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+        ? options.dsn : std::filesystem::absolute(options.database).string();
+    output << "{\n  \"version\": 2,\n  \"backend\": \""
+           << JsonEscape(options.backend)
+           << "\",\n  \"connection\": \"" << JsonEscape(connection)
            << "\",\n  \"workspace\": \"" << JsonEscape(options.workspace) << "\"\n}\n";
+    output.close();
+    std::error_code error;
+    std::filesystem::permissions(
+        path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+        std::filesystem::perm_options::replace, error);
+    if (error) throw std::runtime_error("cannot protect descriptor: " + error.message());
 }
 
 std::string DatabaseDiagnostics(Session &session) {
@@ -643,10 +691,15 @@ std::string NormalizedPath(const std::string &path) {
 }
 
 std::vector<VexFSPlatformMountEntry> WorkspaceMounts(const Options &options) {
-    const std::string database = NormalizedPath(options.database);
+    const bool postgresql = options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL;
+    const std::string database = postgresql ? options.dsn : NormalizedPath(options.database);
     std::vector<VexFSPlatformMountEntry> matches;
     for (const auto &mount : VexFSPlatformInspect().mounts) {
-        if (!mount.database.empty() && NormalizedPath(mount.database) == database &&
+        if (mount.backend != options.backend) continue;
+        const bool same_connection = postgresql
+            ? mount.database == database
+            : !mount.database.empty() && NormalizedPath(mount.database) == database;
+        if (same_connection &&
             mount.workspace == options.workspace) {
             matches.push_back(mount);
         }
@@ -667,6 +720,7 @@ int PrintMountStatus(const Options &options, const std::string &requested_path) 
             std::cout << "{\"source\":\"" << JsonEscape(mounts[index].source)
                       << "\",\"target\":\"" << JsonEscape(mounts[index].target)
                       << "\",\"type\":\"" << JsonEscape(mounts[index].type)
+                      << "\",\"backend\":\"" << JsonEscape(mounts[index].backend)
                       << "\",\"database\":\"" << JsonEscape(mounts[index].database)
                       << "\",\"workspace\":\"" << JsonEscape(mounts[index].workspace)
                       << "\"}";
@@ -682,7 +736,11 @@ int PrintMountStatus(const Options &options, const std::string &requested_path) 
 }
 
 int MountWorkspace(const Options &options, const std::string &mount_point) {
-    return VexFSPlatformMount(options.database, options.workspace, mount_point);
+    return VexFSPlatformMount(
+        options.backend,
+        options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+            ? options.dsn : options.database,
+        options.workspace, mount_point);
 }
 
 int UnmountWorkspace(const std::string &mount_point, bool force) {
@@ -759,10 +817,12 @@ int RunDoctor(const Options &options) {
                       << ",\"fskit\":"
                       << (platform.mount_driver_available ? "true" : "false");
         }
-        std::cout
-                  << ",\"database\":";
+        std::cout << ",\"backend\":\"" << JsonEscape(options.backend)
+                  << "\",\"database\":";
         if (database_readable) std::cout << database_details;
-        else std::cout << "{\"path\":\"" << JsonEscape(options.database)
+        else std::cout << "{\"connection\":\""
+                       << (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+                           ? "postgresql" : JsonEscape(options.database))
                        << "\",\"error\":\"" << JsonEscape(database_error) << "\"}";
         std::cout << ",\"mount_count\":" << platform.mounts.size() << "}\n";
     } else {
@@ -775,9 +835,12 @@ int RunDoctor(const Options &options) {
                       "extension path: " + platform.extension_path + "\n")
                   << (platform.extension_path_matches ? std::string() :
                       "extension path: does not match installed App\n")
-                  << "database: " << options.database << '\n'
+                  << "backend: " << options.backend << '\n'
+                  << "database: "
+                  << (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+                      ? "PostgreSQL (DSN hidden)" : options.database) << '\n'
                   << "workspace: " << options.workspace << '\n'
-                  << "SQLite schema: " << (database_ok ? "ok" :
+                  << "database schema: " << (database_ok ? "ok" :
                       (database_readable ? "version mismatch" : database_error)) << '\n'
                   << "active mounts: " << platform.mounts.size() << '\n';
         if (database_readable) std::cout << "database details: " << database_details << '\n';
@@ -826,14 +889,24 @@ int Run(const Options &options) {
         }
         const std::string output = parsed.Value("--output");
         const std::string snapshot = parsed.Value("--snapshot", false);
-        std::cout << vexfs_cli::ExportArchive(
-            options.database, options.workspace, snapshot, output) << '\n';
+        if (options.backend == "postgresql") {
+            std::cout << vexfs_cli::ExportPostgresArchive(
+                options.dsn, options.workspace, snapshot, output) << '\n';
+        } else {
+            std::cout << vexfs_cli::ExportArchive(
+                options.database, options.workspace, snapshot, output) << '\n';
+        }
         return 0;
     }
     if (command == "import") {
         if (options.arguments.size() != 2) throw std::runtime_error("import needs FILE");
-        std::cout << vexfs_cli::ImportArchive(
-            options.database, options.workspace, options.arguments[1]) << '\n';
+        if (options.backend == "postgresql") {
+            std::cout << vexfs_cli::ImportPostgresArchive(
+                options.dsn, options.workspace, options.arguments[1]) << '\n';
+        } else {
+            std::cout << vexfs_cli::ImportArchive(
+                options.database, options.workspace, options.arguments[1]) << '\n';
+        }
         return 0;
     }
     if (command == "archive") {
@@ -849,7 +922,8 @@ int Run(const Options &options) {
     vexfs_mount_error error{};
     if (command == "init" || command == "setup") {
         if (options.arguments.size() != 1) throw std::runtime_error(command + " accepts only global options");
-        std::cout << options.database << " [" << options.workspace << "]\n";
+        std::cout << (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+            ? "postgresql" : options.database) << " [" << options.workspace << "]\n";
         if (!options.mount_point.empty()) return MountWorkspace(options, options.mount_point);
     } else if (command == "mkdir") {
         if (options.arguments.size() < 2) throw std::runtime_error("mkdir needs PATH");
@@ -1109,8 +1183,6 @@ int Run(const Options &options) {
             if (parsed.Flag("--dry-run") && parsed.Flag("--force-unmount"))
                 throw std::runtime_error("--force-unmount cannot be combined with --dry-run");
             const std::string &name = parsed.positional[1];
-            int64_t head = 0;
-            Check(vexfs_mount_workspace_head(session.get(), &head, &error), error);
             if (parsed.Flag("--dry-run")) {
                 vexfs_mount_bytes json{};
                 Check(vexfs_mount_snapshot_diff(session.get(), "HEAD", name.c_str(),
@@ -1132,6 +1204,11 @@ int Run(const Options &options) {
                     }
                 }
 
+                // Unmount can publish dirty FSKit handles and legitimately advance
+                // the workspace head. Read expected-head only after the last mount
+                // is gone, otherwise our own close path causes a false conflict.
+                int64_t head = 0;
+                Check(vexfs_mount_workspace_head(session.get(), &head, &error), error);
                 int64_t commit = 0;
                 try {
                     commit = RestoreSnapshotAfterUnmount(

@@ -1,6 +1,8 @@
 #include "vexfs_platform.h"
 #include "vexfs_platform_registry.h"
+#include "vexfs_runtime_types.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -157,6 +159,41 @@ void PrepareMountPoint(const std::string &path) {
         throw std::runtime_error("mount point must be empty: " + path);
 }
 
+// A crashed FUSE helper exposes the directory below the mount again. Make that
+// directory read-only so tools cannot mistake local writes for durable VexFS
+// writes. Explicit unmount restores the ordinary private-directory mode.
+class UnderlyingMountPointGuard {
+  public:
+    explicit UnderlyingMountPointGuard(const std::string &path)
+        : descriptor_(open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)) {
+        if (descriptor_ < 0)
+            throw std::runtime_error("cannot open mount point guard: " +
+                                     std::string(std::strerror(errno)));
+    }
+    ~UnderlyingMountPointGuard() {
+        if (descriptor_ >= 0) close(descriptor_);
+    }
+    UnderlyingMountPointGuard(const UnderlyingMountPointGuard &) = delete;
+    UnderlyingMountPointGuard &operator=(const UnderlyingMountPointGuard &) = delete;
+
+    void Arm() const {
+        if (fchmod(descriptor_, 0500) != 0)
+            throw std::runtime_error("cannot protect mount point: " +
+                                     std::string(std::strerror(errno)));
+    }
+
+  private:
+    int descriptor_ = -1;
+};
+
+void DisarmMountPointGuard(const std::string &path) {
+    std::error_code error;
+    if (!std::filesystem::is_directory(path, error)) return;
+    if (chmod(path.c_str(), 0700) != 0)
+        throw std::runtime_error("cannot restore mount point permissions: " +
+                                 std::string(std::strerror(errno)));
+}
+
 std::string KernelVersion() {
     struct utsname information{};
     return uname(&information) == 0 ? information.release : "unknown";
@@ -195,15 +232,18 @@ VexFSPlatformState VexFSPlatformInspect() {
     return state;
 }
 
-int VexFSPlatformMount(const std::string &database, const std::string &workspace,
+int VexFSPlatformMount(const std::string &backend, const std::string &connection,
+                       const std::string &workspace,
                        const std::string &mount_point) {
     const std::string mounted_type = MountedFileSystemAt(mount_point);
     if (mounted_type == "fuse.vexfs") {
-        const std::string requested_database = NormalizedPath(database);
+        const std::string requested_database = backend == VEXFS_RUNTIME_BACKEND_SQLITE
+            ? NormalizedPath(connection) : connection;
         const std::string requested_target = NormalizedPath(mount_point);
         for (const auto &mount : MountedVolumes()) {
             if (NormalizedPath(mount.target) != requested_target) continue;
-            if (mount.database == requested_database && mount.workspace == workspace) return 0;
+            if (mount.backend == backend && mount.database == requested_database &&
+                mount.workspace == workspace) return 0;
             throw std::runtime_error(
                 "mount point already contains a VexFS workspace with different or unknown identity");
         }
@@ -215,30 +255,45 @@ int VexFSPlatformMount(const std::string &database, const std::string &workspace
     if (!state.mount_ready)
         throw std::runtime_error("VexFS libfuse3 mount is not ready: " + state.extension_state);
     PrepareMountPoint(mount_point);
-    const std::filesystem::path absolute_database =
-        std::filesystem::absolute(database).lexically_normal();
-    if (absolute_database.has_parent_path()) {
-        std::filesystem::create_directories(absolute_database.parent_path());
-        VexFSPlatformProtectDirectory(absolute_database.parent_path());
+    std::string mount_connection = connection;
+    if (backend == VEXFS_RUNTIME_BACKEND_SQLITE) {
+        const std::filesystem::path absolute_database =
+            std::filesystem::absolute(connection).lexically_normal();
+        if (absolute_database.has_parent_path()) {
+            std::filesystem::create_directories(absolute_database.parent_path());
+            VexFSPlatformProtectDirectory(absolute_database.parent_path());
+        }
+        mount_connection = absolute_database.string();
     }
     const std::string helper = FuseHelper();
-    const int result = RunProcess(helper,
-        {"--db", absolute_database.string(), "--workspace", workspace, mount_point});
+    std::vector<std::string> arguments = {
+        "--backend", backend,
+        backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL ? "--dsn" : "--db",
+        mount_connection,
+        "--workspace", workspace,
+        mount_point};
+    UnderlyingMountPointGuard mount_point_guard(mount_point);
+    const int result = RunProcess(helper, arguments);
     for (int attempt = 0; attempt < 50; ++attempt) {
         if (!MountedFileSystemAt(mount_point).empty()) {
             try {
+                mount_point_guard.Arm();
                 VexFSPlatformRememberMount(MountRegistryDirectory(),
-                    {"vexfs", NormalizedPath(mount_point), "fuse.vexfs",
-                     NormalizedPath(database), workspace});
+                    {"vexfs", NormalizedPath(mount_point), "fuse.vexfs", backend,
+                     backend == VEXFS_RUNTIME_BACKEND_SQLITE
+                         ? NormalizedPath(connection) : connection,
+                     workspace});
             } catch (...) {
                 const std::string fusermount = FindExecutable("fusermount3");
                 if (!fusermount.empty()) RunProcess(fusermount, {"-u", mount_point});
+                DisarmMountPointGuard(mount_point);
                 throw;
             }
             return 0;
         }
         usleep(100 * 1000);
     }
+    DisarmMountPointGuard(mount_point);
     if (result == 0)
         throw std::runtime_error("vexfs-fuse returned success but the mount is not active");
     return result;
@@ -248,6 +303,7 @@ int VexFSPlatformUnmount(const std::string &mount_point, bool force) {
     const std::string mounted_type = MountedFileSystemAt(mount_point);
     if (mounted_type.empty()) {
         VexFSPlatformForgetMount(MountRegistryDirectory(), mount_point);
+        DisarmMountPointGuard(mount_point);
         return 0;
     }
     if (mounted_type != "fuse.vexfs")
@@ -261,6 +317,7 @@ int VexFSPlatformUnmount(const std::string &mount_point, bool force) {
                                   : std::vector<std::string>{"-u", mount_point});
         if (MountedFileSystemAt(mount_point).empty()) {
             VexFSPlatformForgetMount(MountRegistryDirectory(), mount_point);
+            DisarmMountPointGuard(mount_point);
             return 0;
         }
         usleep(200 * 1000);

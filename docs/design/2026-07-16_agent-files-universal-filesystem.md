@@ -2,13 +2,18 @@
 
 - 日期：2026-07-16
 - 分支：`feature/agent_files`
-- 文档版本：1.4
-- 状态：macOS `preview.17` 已完成 Developer ID 签名、Apple 公证、staple、本机安装和真实 FSKit 回归，但它不是当前工作树的发行证明；当前统一 runtime ABI 为 1，已修复包 Gate、ABI 清单、安装校验和脏源码发行拦截，待从干净 commit 重新签名、公证并跑真机挂载；Linux libfuse3 双架构预览包已完成；1 万文件、900 秒稳定性与真实工具链已验证；干净 Mac、10 万完整 mount 复测和真实 Coding Agent 待完成
+- 文档版本：1.6
+- 状态：macOS FSKit 与 Linux libfuse3 已复用同一 runtime；PostgreSQL `0.4.0-alpha.1`
+  已完成数据库合同、format v2、role/ACL/审计、libpq HostStore、macOS/Linux 真实 mount、
+  跨机器 OpenCode 和逻辑/物理备份；第二台 Mac 的局域网直连只差一次系统授权确认
 - 产品名：暂定 `VexFS`
 - 产品规格：`docs/specs/2026-07-16_vexfs-product-spec.md`
 - 最终目标和阶段顺序：`docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md`
 
 ## 1. 最终定义
+
+> 2026-07-24 默认入口变更：macOS 0.1 使用系统 NFS client + 本机用户态 gateway；FSKit
+> 保留为后续可选原生 adapter。已有 FSKit 章节记录已完成实现和历史证据，不再表示默认发布路径。
 
 VexFS 是由 PostgreSQL、DuckDB 或 SQLite 加载和管理的数据库扩展。三个宿主共享逻辑合同，但首个闭环固定为 macOS + SQLite，不要求第一版同时完成其他数据库和操作系统。
 
@@ -26,7 +31,10 @@ VexFS 是由 PostgreSQL、DuckDB 或 SQLite 加载和管理的数据库扩展。
 - 完整性检查；
 - 工作区逻辑导入导出。
 
-VexFS 的权威核心是数据库扩展。首个产品提供 macOS FSKit App Extension，把 SQLite 中的工作区显示为真实操作系统目录。FSKit extension 是非权威 mount adapter：它通过 SQLite 连接调用公开 VexFS SQL/handle 合同，不保存最终状态，不绕过数据库事务，也不管理 SQLite 的 WAL、锁或物理文件。
+VexFS 的权威核心是数据库扩展。首个产品默认提供只监听 loopback 的 macOS NFS gateway，
+把 SQLite 中的工作区显示为真实操作系统目录。NFS gateway 是非权威 mount adapter：它调用
+公开 VexFS SQL/handle 合同，不保存最终状态，不绕过数据库事务，也不管理 SQLite 的 WAL、锁
+或物理文件。FSKit 后续通过同一个 Workspace Engine 接入，不能复制文件管理逻辑。
 
 用户通过数据库连接和 SQL 使用它：
 
@@ -63,7 +71,9 @@ vexfs --workspace agent-workspace grep -R "Result" /reports
 
 > **VexFS 给 PostgreSQL、DuckDB 和 SQLite 增加数据库原生的文件管理系统。**
 
-首个可挂载实现从 macOS 26.0+、Apple Silicon 和 SQLite 的垂直闭环开始，Linux libfuse3 预览现已接入同一合同并通过真实普通用户挂载。FSKit 基础接口从 macOS 15.4 提供，但数据库目录资源所需的 `FSPathURLResource` 属于 V2、从 macOS 26.0 提供，因此 15.4–15.x 只保留数据库与 CLI 能力，不承诺无缝挂载。当前阶段先把 macOS/Linux + SQLite 收口为本地开发者预览；PostgreSQL 用于下一阶段的跨电脑共享和权限验证，Windows 后续使用 WinFsp 接入同一 mount runtime。
+默认 NFS 路径不依赖 FSKit V2 的 `FSPathURLResource`，因此新的 macOS 最低版本和 CPU 支持范围
+由 NFS 包真机验证决定，不再先写死为 macOS 26.0+ Apple Silicon。现有 FSKit 垂直闭环继续作为
+可选 adapter 证据保留。Linux libfuse3 已接入同一合同，Windows 后续使用 WinFsp。
 
 ### 1.1 适配工作量必须按 N+M 拆分
 
@@ -73,7 +83,8 @@ vexfs --workspace agent-workspace grep -R "Result" /reports
 SQLite adapter ----+
 DuckDB adapter ----+--> VexFS 统一合同和 mount runtime
 PostgreSQL adapter-+                 |
-                                     +--> macOS FSKit
+                                     +--> macOS NFS（默认）
+                                     +--> macOS FSKit（后续可选）
                                      +--> Linux libfuse3
                                      +--> Windows WinFsp
                                      +--> 跨平台 CLI
@@ -472,17 +483,22 @@ MVP 采用 close-to-open 一致性：
 
 ### 4.4 身份与沙箱模型
 
-当前 FSKit 本地预览只服务当前 macOS 用户，并绑定一个 SQLite context、workspace 和数据库 principal：
+FSKit 本地入口只服务当前 macOS 用户；数据库 principal 由所选后端决定：
 
-- 默认 SQLite 数据库位于 `~/Library/Application Support/VexFS/`；
+- 默认 SQLite 数据库位于 `~/Library/Application Support/VexDB-Lite/`；
 - CLI 把数据库所在目录作为 security-scoped `FSPathURLResource` 交给 FSKit；
 - extension 只访问该目录内经过描述文件校验的数据库、WAL 和 SHM；
 - mount point 只允许当前用户访问；
-- SQLite principal 固定为 workspace owner，不接受 CLI 自报用户；
-- 文件和目录保存并报告数据库中的 mode 和 owner/group 元数据；便携 ACL 可以保存和恢复，但本阶段尚未实现完整路径 ACL 授权和继承；
+- SQLite principal 固定为 workspace owner，不接受 CLI 自报用户；SQLite 保存便携 ACL，但
+  当前不执行完整路径 ACL 授权和继承；
+- PostgreSQL principal 来自经过 libpq 认证的真实 role，并在 open、目录修改和 publish 时
+  重新执行路径 ACL；CLI 传入的名称或操作系统 uid 不能提升数据库权限；
+- 文件和目录保存并报告数据库中的 mode 和 owner/group 元数据；
 - App sandbox、entitlement、签名和公证配置必须进入安装回归。
 
-新版 FSKit `FSContext` 可以提供调用者 uid/gid，但 MVP 不据此实现多用户权限。PostgreSQL 阶段增加数据库 role、路径 ACL，以及每次 read/write/publish 所需的权限复查规则。操作系统身份负责保护本地入口，数据库 principal 负责决定数据库文件权限，两者不能互相替代。
+新版 FSKit `FSContext` 可以提供调用者 uid/gid，但当前不据此实现本机多用户共享。PostgreSQL
+已经增加数据库 role、路径 ACL，以及每次 read/write/publish 所需的权限复查规则。操作系统
+身份负责保护本地入口，数据库 principal 负责决定数据库文件权限，两者不能互相替代。
 
 ## 5. 三端统一 SQL 合同
 
@@ -1041,6 +1057,18 @@ vexfs backup verify workspace
 - SQL 函数默认 `SECURITY INVOKER`；
 - 内部 schema 不授予普通用户直接写权限；
 - PostgreSQL 数据库进程不启动 FSKit/FUSE/WinFsp loop 或网络线程；外部 mount adapter 使用正常 PostgreSQL 连接和 role。
+- 当前 `0.4.0-alpha.1` 已实现 chunk/manifest、版本、snapshot、ACL、审计、配额、retention、
+  GC、跨 gateway handle/lock/cache invalidation 和 libpq HostStore；
+- 变更审计由数据库在同一事务内写入，使用认证后的 `session_user` 和 role OID；记录 workspace
+  名称/ID、commit、操作、路径、inode 和前后版本。workspace 删除前先记录，删除后把 ID
+  置空但保留名称和证据。details 只保存安全元数据，不保存文件正文、xattr 值、密码或 DSN；
+- macOS FSKit 与 Linux FUSE 复用同一 runtime。macOS 的 PostgreSQL passfile 只在挂载资源存在
+  期间以 `0600` 暂存，最后卸载和 `doctor` 会清理；
+- mount 成功后，runtime 通过预先打开的目录 fd 把底层 mountpoint 设为 `0500`。FSKit/FUSE
+  异常退出时，普通用户不能把文件写进没有数据库语义的本机目录；显式卸载恢复 `0700`；
+- 网络中断时失败的 mutation 不做隐式重放，因为客户端无法确认服务端事务是否已经提交；
+  恢复后先用可重试读操作确认状态，再接受新的写请求；
+- 局域网 PostgreSQL 需要用户给 VexDB Lite 一次 macOS“本地网络”权限，程序不绕过系统授权。
 
 ### DuckDB
 
@@ -1246,7 +1274,10 @@ vexdb_lite/
 └── tests/spec/agent_files/
 ```
 
-仓库不增加远程文件协议、SDK 或独立权威服务。macOS FSKit extension 通过自己的 SQLite 连接加载数据库扩展并调用公开合同；PostgreSQL 阶段使用正常客户端连接。任何 adapter 启动前都必须与扩展交换合同版本和能力位，主版本不兼容时拒绝可写挂载。
+仓库不增加对外远程文件协议、SDK 或独立权威服务。macOS 默认 NFS 只绑定 loopback，作为
+系统 mount client 到 Workspace Engine 的本机传输层；跨电脑仍使用正常 PostgreSQL 连接。
+后续 FSKit extension 通过同一 runtime 调用公开合同。任何 adapter 启动前都必须与扩展交换
+合同版本和能力位，主版本不兼容时拒绝可写挂载。
 
 ## 16. 验收测试
 
@@ -1353,14 +1384,25 @@ vexdb_lite/
 - 完成真实项目、Coding Agent、10 万文件和长时间运行 eval；
 - 完成开发者预览所需的 retention、GC、quota、check 和 export/import 最小集合。
 
-### Phase 2：PostgreSQL 共享工作区 Alpha — 未开始
+### Phase 2：PostgreSQL 共享工作区 Alpha — 功能与验收完成
 
-- 实现 PG HostStore，不重新定义文件语义；
-- 数据库 role 映射 principal、owner、ACL、审计和配额；
-- 多 gateway 的锁、缓存失效、冲突、断线重连和数据库重启；
-- 文件与普通业务 SQL 原子提交；
-- 电脑 A 写入后，电脑 B 通过 macOS/Linux mount 继承同一 workspace、历史和快照；
-- pg_dump/pg_restore、物理备份和逻辑导出通过恢复测试。
+- 已完成数据库内路径、内容、版本、workspace commit、snapshot 和冲突保护；
+- 已完成 chunk/manifest、checksum/check、quota、retention、分批 GC 和 format v2；
+- 已完成 libpq PG HostStore，没有重新定义文件语义；
+- 已完成真实 role、principal、owner、ACL、完整变更审计和配额；普通 role 不能读取审计，
+  `vexfs_check` 会检查审计对象与前后版本字段；
+- 已完成多 gateway 锁、缓存失效、冲突、断线重连和数据库重启；
+- 已完成两台 Mac 同时挂载下的 extension 崩溃、网络中断和数据库停机 25 项故障测试；
+- 已完成 Linux root/uid 1000 helper 崩溃后的底层目录防误写、租约超时接管和 staging 发布；
+- 已验证文件与普通业务 SQL 参加同一数据库事务；
+- macOS FSKit、Linux FUSE、跨系统同一 PG、第二台 M1 Mac OpenCode 已通过；
+- pg_dump/pg_restore、pg_basebackup 和逻辑导出恢复已通过；
+- 16 MiB 有界备份性能与 RSS/OOM Gate 23 项已通过；当前审计实现下 format v2 导出/导入
+  为 72.727/106.667 MiB/s，1 GiB 容器没有 OOM；
+- 当前数据库源码的自动测试、Linux 真挂载、本机 PostgreSQL FSKit 13 组 247 项、凭据生命周期
+  9 项、macOS↔Linux 跨 gateway 47 项、两台 Mac 文件/快照往返 50 项和 extension/网络/数据库
+  故障恢复 25 项已完成；最后发行验收是从干净提交构建、公证并 staple `preview.38`，再在
+  本机和第二台 Mac 重跑安装 Gate。局域网直连仍需第二台 Mac 的“本地网络”权限。
 
 ### Phase 3：Windows 与跨系统预览 — 未开始
 
@@ -1406,7 +1448,10 @@ Linux package
 
 macOS 可挂载预览支持 macOS 26.0+ Apple Silicon。Phase 1 必须验证 Developer ID + 公证或 Mac App Store/TestFlight 至少一条真实分发路径；CI 检查 App、appex、CLI 的签名链、FSKit entitlement 和系统信任状态。首次启动必须引导用户在系统设置中启用文件系统扩展，不能尝试绕过系统授权。Linux 包必须检查 libfuse3、`fusermount3` 和 `/dev/fuse`，普通用户不能依赖 root helper 才能工作。
 
-默认 SQLite 数据库位于 `~/Library/Application Support/VexFS/vexfs.sqlite3`。每个 mount 创建不含密码的 `.vexfs-volume.json`，再把数据库父目录作为 security-scoped FSKit source resource 传给系统；extension 只能打开描述文件指定的同目录数据库。用户选择其他位置时沿用同一目录授权模型。卸载 App 不能自动删除数据库，数据删除必须是独立且明确的动作。
+默认 SQLite 数据库位于 `~/Library/Application Support/VexDB-Lite/default.sqlite3`。每个 mount
+创建不含密码的 `.vexfs-volume.json`，再把数据库父目录作为 security-scoped FSKit source
+resource 传给系统；extension 只能打开描述文件指定的同目录数据库。用户选择其他位置时沿用
+同一目录授权模型。卸载 App 不能自动删除数据库，数据删除必须是独立且明确的动作。
 
 每次 mount 的启动顺序固定为：
 
@@ -1441,4 +1486,6 @@ VexFS 的产品本体是数据库 extension：
 
 这个设计同时满足两件事：用户获得真实文件路径，数据库继续拥有全部已提交权威状态。VexDB-Lite 的差异点不是单独做一个文件服务，而是让数据库扩展提供受管文件能力，再用 mount 把它交给 Bash。
 
-实施上不按“三数据库 × 三操作系统”开发九套文件系统。当前门槛是把已经跑通的 macOS/Linux + SQLite 闭环收口为可安装、可恢复、可跑真实项目的本地开发者预览；达到路线图中的一致性、分发和规模条件后，再把主要开发重心转到 PostgreSQL 多用户共享工作区。
+实施上不按“三数据库 × 三操作系统”开发九套文件系统。SQLite 和 PostgreSQL 已经复用
+macOS/Linux 的同一 mount runtime 与一致性测试。PostgreSQL 多用户共享工作区代码完成后，
+下一步只选择 Windows WinFsp 或 DuckDB HostStore 其中一条线继续，不能重新复制文件语义。

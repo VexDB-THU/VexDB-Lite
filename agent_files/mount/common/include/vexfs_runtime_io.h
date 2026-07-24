@@ -83,6 +83,11 @@ vexfs_mount_status vexfs_mount_refresh_visibility(vexfs_mount_session *session,
                                                   vexfs_mount_visibility *visibility,
                                                   vexfs_mount_error *error);
 
+// 平台 adapter 用它实现 statfs。限制值为 null 时，后端没有设置硬上限。
+vexfs_mount_status vexfs_mount_quota_get(vexfs_mount_session *session,
+                                         vexfs_mount_bytes *json,
+                                         vexfs_mount_error *error);
+
 vexfs_mount_status vexfs_mount_handle_open(vexfs_mount_session *session, const char *path,
                                            const char *flags, const char *request_id,
                                            vexfs_mount_bytes *handle,

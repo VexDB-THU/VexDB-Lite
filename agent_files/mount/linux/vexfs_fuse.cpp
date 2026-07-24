@@ -13,6 +13,7 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <cstdio>
@@ -37,7 +38,8 @@ namespace {
 
 struct FuseState {
     vexfs_mount_session *session = nullptr;
-    std::string database;
+    std::string backend;
+    std::string connection;
     std::string request_prefix;
     std::recursive_mutex mutex;
     std::atomic<uint64_t> request_sequence{1};
@@ -133,6 +135,21 @@ int64_t JsonInteger(const std::string &json, const std::string &name) {
     size_t position = json.find(marker);
     if (position == std::string::npos) throw std::runtime_error("missing JSON integer: " + name);
     position += marker.size();
+    char *end = nullptr;
+    const long long value = std::strtoll(json.c_str() + position, &end, 10);
+    if (end == json.c_str() + position) throw std::runtime_error("invalid JSON integer: " + name);
+    return static_cast<int64_t>(value);
+}
+
+int64_t JsonOptionalInteger(const std::string &json, const std::string &name,
+                            int64_t fallback) {
+    const std::string marker = "\"" + name + "\":";
+    size_t position = json.find(marker);
+    if (position == std::string::npos) throw std::runtime_error("missing JSON integer: " + name);
+    position += marker.size();
+    while (position < json.size() && std::isspace(static_cast<unsigned char>(json[position])))
+        ++position;
+    if (json.compare(position, 4, "null") == 0) return fallback;
     char *end = nullptr;
     const long long value = std::strtoll(json.c_str() + position, &end, 10);
     if (end == json.c_str() + position) throw std::runtime_error("invalid JSON integer: " + name);
@@ -414,6 +431,8 @@ FileHandle *Handle(fuse_file_info *info) {
     return info == nullptr ? nullptr : reinterpret_cast<FileHandle *>(info->fh);
 }
 
+int Publish(FuseState *state, FileHandle *handle, const char *durability);
+
 int CreatePath(const char *path, mode_t mode, fuse_file_info *info) {
     FuseState *state = State();
     if (state == nullptr) return -EIO;
@@ -429,6 +448,27 @@ int CreatePath(const char *path, mode_t mode, fuse_file_info *info) {
     handle->append = (info->flags & O_APPEND) != 0;
     handle->generation = 1;
     handle->dirty = true;
+    // FUSE asks getattr for the new path before open(2) returns. PostgreSQL keeps
+    // handle_create as private staging until publish, so publish the POSIX-visible
+    // empty file here. Later writes still use the same handle and atomic staging.
+    const int publish_result = Publish(state, handle.get(), "data");
+    if (publish_result != 0) {
+        vexfs_mount_bytes close_state{};
+        vexfs_mount_handle_close(state->session, handle->id.c_str(), 1,
+                                 RequestId(state, "close-create-failure").c_str(),
+                                 &close_state, &error);
+        TakeBytes(&close_state);
+        return publish_result;
+    }
+    const int chown_result = ChownCreatedPath(state, path);
+    if (chown_result != 0) {
+        vexfs_mount_bytes close_state{};
+        vexfs_mount_handle_close(state->session, handle->id.c_str(), 0,
+                                 RequestId(state, "close-chown-failure").c_str(),
+                                 &close_state, &error);
+        TakeBytes(&close_state);
+        return chown_result;
+    }
     info->fh = reinterpret_cast<uint64_t>(handle.release());
     info->direct_io = 1;
     return 0;
@@ -612,10 +652,51 @@ int ReadDirectory(const char *path, void *buffer, fuse_fill_dir_t filler, off_t,
 int StatFs(const char *, struct statvfs *output) {
     FuseState *state = State();
     if (state == nullptr) return -EIO;
-    const std::filesystem::path database(state->database);
-    const std::filesystem::path directory = database.has_parent_path() ?
-        database.parent_path() : std::filesystem::current_path();
-    return statvfs(directory.c_str(), output) == 0 ? 0 : -errno;
+    if (state->backend == VEXFS_RUNTIME_BACKEND_SQLITE) {
+        const std::filesystem::path database(state->connection);
+        const std::filesystem::path directory = database.has_parent_path() ?
+            database.parent_path() : std::filesystem::current_path();
+        return statvfs(directory.c_str(), output) == 0 ? 0 : -errno;
+    }
+
+    std::lock_guard<std::recursive_mutex> guard(state->mutex);
+    vexfs_mount_bytes quota{};
+    vexfs_mount_error error{};
+    const auto status = vexfs_mount_quota_get(state->session, &quota, &error);
+    if (status != VEXFS_MOUNT_OK) return -Errno(status);
+    try {
+        const std::string json = TakeBytes(&quota);
+        constexpr uint64_t block_size = 4096;
+        constexpr uint64_t unlimited_bytes = 1ULL << 50;  // 1 PiB virtual ceiling.
+        constexpr uint64_t unlimited_files = 1ULL << 30;
+        const uint64_t live_bytes = static_cast<uint64_t>(
+            std::max<int64_t>(0, JsonInteger(json, "live_bytes")));
+        const uint64_t live_files = static_cast<uint64_t>(
+            std::max<int64_t>(0, JsonInteger(json, "live_files")));
+        const int64_t configured_bytes = JsonOptionalInteger(json, "max_bytes", -1);
+        const int64_t configured_files = JsonOptionalInteger(json, "max_files", -1);
+        const uint64_t capacity_bytes = configured_bytes < 0
+            ? std::max(unlimited_bytes, live_bytes)
+            : std::max(static_cast<uint64_t>(configured_bytes), live_bytes);
+        const uint64_t capacity_files = configured_files < 0
+            ? std::max(unlimited_files, live_files)
+            : std::max(static_cast<uint64_t>(configured_files), live_files);
+        std::memset(output, 0, sizeof(*output));
+        output->f_bsize = block_size;
+        output->f_frsize = block_size;
+        output->f_blocks = (capacity_bytes + block_size - 1) / block_size;
+        const uint64_t used_blocks = (live_bytes + block_size - 1) / block_size;
+        output->f_bfree = output->f_bavail = output->f_blocks > used_blocks
+            ? output->f_blocks - used_blocks : 0;
+        output->f_files = capacity_files;
+        output->f_ffree = output->f_favail = capacity_files > live_files
+            ? capacity_files - live_files : 0;
+        output->f_namemax = 255;
+        return 0;
+    } catch (...) {
+        TakeBytes(&quota);
+        return -EIO;
+    }
 }
 
 int PathInode(FuseState *state, const char *path, int64_t *inode) {
@@ -790,7 +871,8 @@ fuse_operations Operations() {
 }
 
 struct Options {
-    std::string database;
+    std::string backend = VEXFS_RUNTIME_BACKEND_SQLITE;
+    std::string connection;
     std::string workspace = "default";
     std::string mount_point;
     bool foreground = false;
@@ -801,7 +883,13 @@ Options ParseOptions(int argc, char **argv) {
     Options options;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index];
-        if (argument == "--db" && index + 1 < argc) options.database = argv[++index];
+        if (argument == "--backend" && index + 1 < argc) {
+            options.backend = argv[++index];
+            if (options.backend == "pg" || options.backend == "postgres")
+                options.backend = VEXFS_RUNTIME_BACKEND_POSTGRESQL;
+        }
+        else if (argument == "--db" && index + 1 < argc) options.connection = argv[++index];
+        else if (argument == "--dsn" && index + 1 < argc) options.connection = argv[++index];
         else if (argument == "--workspace" && index + 1 < argc) options.workspace = argv[++index];
         else if (argument == "--foreground" || argument == "-f") options.foreground = true;
         else if (argument == "--self-test") options.self_test = true;
@@ -810,7 +898,12 @@ Options ParseOptions(int argc, char **argv) {
         else if (options.mount_point.empty()) options.mount_point = argument;
         else throw std::runtime_error("only one mount point is allowed");
     }
-    if (options.database.empty()) throw std::runtime_error("--db DATABASE is required");
+    if (options.backend != VEXFS_RUNTIME_BACKEND_SQLITE &&
+        options.backend != VEXFS_RUNTIME_BACKEND_POSTGRESQL)
+        throw std::runtime_error("--backend must be sqlite or postgresql");
+    if (options.connection.empty())
+        throw std::runtime_error(options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL
+            ? "--dsn DSN is required" : "--db DATABASE is required");
     if (!options.self_test && options.mount_point.empty())
         throw std::runtime_error("MOUNT_POINT is required");
     return options;
@@ -856,14 +949,15 @@ int main(int argc, char **argv) {
     try {
         const Options options = ParseOptions(argc, argv);
         FuseState state;
-        state.database = options.database;
+        state.backend = options.backend;
+        state.connection = options.connection;
         state.request_prefix = NewRequestPrefix();
         vexfs_mount_config config{};
         config.abi_version = VEXFS_RUNTIME_ABI_VERSION;
-        config.backend = VEXFS_RUNTIME_BACKEND_SQLITE;
-        config.connection = options.database.c_str();
+        config.backend = options.backend.c_str();
+        config.connection = options.connection.c_str();
         config.workspace = options.workspace.c_str();
-        config.principal = "local";
+        config.principal = options.backend == VEXFS_RUNTIME_BACKEND_SQLITE ? "local" : nullptr;
         config.operation_timeout_ms = 5000;
         config.flags = options.self_test ? 0 : VEXFS_RUNTIME_EXCLUSIVE_GATEWAY;
         vexfs_mount_error error{};

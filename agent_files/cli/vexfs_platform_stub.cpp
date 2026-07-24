@@ -90,6 +90,7 @@ VexFSPlatformState VexFSPlatformInspect() {
 }
 
 int VexFSPlatformMount(const std::string &, const std::string &,
+                       const std::string &,
                        const std::string &) {
     throw std::runtime_error(std::string("VexFS ") + MountDriverName() +
                              " mount adapter is not implemented yet");

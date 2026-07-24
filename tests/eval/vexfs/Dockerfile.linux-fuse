@@ -8,6 +8,8 @@ RUN apt-get update \
         fuse3 \
         git \
         libfuse3-dev \
+        libpq-dev \
+        postgresql-client \
         pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
