@@ -155,7 +155,7 @@ int main(void) {
     free(text);
     free(handle);
 
-    // 暂存区每个 handle 只有一行；跨 64 KiB 写入按容量扩展，并补零空洞。
+    // 暂存元数据每个 handle 只有一行；稀疏写只保存碰到的 64 KiB 块，并补零空洞。
     if (!exec_ok(db, "SELECT vexfs_write('default','/notes/grow.bin',X'');"))
         return fail(db, "grow seed");
     handle = scalar_text(db,
@@ -170,7 +170,7 @@ int main(void) {
     if (scalar_int(db, sql, &ok) != 1 || !ok) return fail(db, "bounded staging rows");
     snprintf(sql, sizeof(sql),
         "SELECT capacity FROM _vexfs_staging WHERE handle_id='%s'", handle);
-    if (scalar_int(db, sql, &ok) != 131072 || !ok) return fail(db, "geometric staging capacity");
+    if (scalar_int(db, sql, &ok) != 4465 || !ok) return fail(db, "dirty chunk capacity");
     snprintf(sql, sizeof(sql),
         "SELECT hex(vexfs_handle_read('%s',69999,2))", handle);
     text = scalar_text(db, sql);

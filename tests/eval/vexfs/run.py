@@ -462,6 +462,9 @@ def schema_workspaces(ctx: Context) -> dict[str, Any]:
     with Database(ctx) as db:
         ctx.equal(db.scalar("SELECT vexfs_contract_version()"), CONTRACT_VERSION, "合同版本")
         ctx.equal(db.scalar("SELECT vexfs_init()"), 1, "重复初始化")
+        ctx.equal(db.scalar(
+            "SELECT value FROM _vexfs_meta WHERE key='staging_layout'"),
+            "overlay-v1", "staging 使用基础版本加脏块覆盖")
         default_id = db.scalar("SELECT vexfs_workspace_create('default')")
         ctx.equal(default_id, 1, "默认 workspace id")
         other_id = db.scalar("SELECT vexfs_workspace_create('other')")
@@ -1326,6 +1329,44 @@ def session_reclaim(ctx: Context) -> dict[str, Any]:
         return {"published": 2, "reclaimed": 1}
 
 
+@case("contract.active-mount-read-view", "contract",
+      "活动挂载的已接受 staging 对普通读取立即可见，普通 SDK staging 仍保持私有")
+def active_mount_read_view(ctx: Context) -> dict[str, Any]:
+    with Database(ctx) as db:
+        db.scalar("SELECT vexfs_write('default','/live-view','base')")
+
+        private = db.scalar(
+            "SELECT vexfs_handle_open('default','/live-view','rw','private-open')")
+        db.scalar("SELECT vexfs_handle_stage_write(?,0,'hidden','private-write')",
+                  (private,))
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read('default','/live-view') AS TEXT)"),
+            "base", "普通 SDK staging 不能泄漏到当前文件视图")
+        db.scalar("SELECT vexfs_handle_close(?,0,'private-close')", (private,))
+
+        db.scalar("SELECT vexfs_mount_session_start('default','live-mount')")
+        mounted = db.scalar(
+            "SELECT vexfs_handle_open('default','/live-view','rw','mount-open','live-mount')")
+        db.scalar("SELECT vexfs_handle_stage_write(?,0,'mounted','mount-write')",
+                  (mounted,))
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read('default','/live-view') AS TEXT)"),
+            "mounted", "活动挂载 staging 立即成为当前读取视图")
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read_range('default','/live-view',1,4) AS TEXT)"),
+            "ount", "活动挂载范围读取使用相同实时视图")
+        ctx.equal(db.scalar(
+            "SELECT vexfs_mount_synchronize('default','live-sync','live-mount')"),
+            1, "同步仍会把实时视图封成版本")
+        db.scalar("SELECT vexfs_mount_session_end('default','live-mount')")
+        ctx.equal(db.scalar(
+            "SELECT CAST(vexfs_read('default','/live-view') AS TEXT)"),
+            "mounted", "挂载结束后从已发布版本读取")
+        return {"private_staging_visible": False,
+                "active_mount_staging_visible": True,
+                "published_versions": 2}
+
+
 @case("contract.cross-session-snapshot-barrier", "concurrency",
       "管理会话不能静默快照另一个挂载会话尚未发布的写入")
 def cross_session_snapshot_barrier(ctx: Context) -> dict[str, Any]:
@@ -1511,7 +1552,7 @@ def integrity_structural_corruption(ctx: Context) -> dict[str, Any]:
         db.connection.execute(
             "UPDATE _vexfs_file_versions SET source_version_no=999996 "
             "WHERE source_version_no IS NOT NULL")
-        db.connection.execute("DELETE FROM _vexfs_staging_data WHERE handle_id=?", (handle,))
+        db.connection.execute("DELETE FROM _vexfs_staging_chunks WHERE handle_id=?", (handle,))
 
         report = db.json("SELECT vexfs_check('default',0)")
         codes = {issue["code"] for issue in report["issues"]}
@@ -1858,18 +1899,34 @@ def chunk_manifest_reuse(ctx: Context) -> dict[str, Any]:
 
         handle = db.scalar(
             "SELECT vexfs_handle_open('default','/chunked.bin','rw','chunk-open')")
+        staging = db.connection.execute(
+            "SELECT base_manifest_id,base_size,base_visible_size,logical_size,capacity "
+            "FROM _vexfs_staging WHERE handle_id=?", (handle,)).fetchone()
+        ctx.equal(staging, (first_manifest, len(original), len(original), len(original), 0),
+                  "打开已有文件只记录基础 manifest，不复制正文")
         patch_offset = chunk_bytes + 123
         patch = b"changed-block"
         generation = db.scalar(
             "SELECT vexfs_handle_stage_write(?,?,?,'chunk-patch')",
             (handle, patch_offset, patch))
         ctx.equal(db.scalar(
+            "SELECT capacity FROM _vexfs_staging WHERE handle_id=?", (handle,)),
+            chunk_bytes, "小范围覆盖只保存一个脏块")
+        ctx.equal(db.scalar(
             "SELECT vexfs_handle_publish(?,?,'data','chunk-publish')",
             (handle, generation)), 2, "随机覆盖发布第二版本")
-        db.scalar("SELECT vexfs_handle_close(?,0,'chunk-close')", (handle,))
         second_manifest = db.scalar(
             "SELECT manifest_id FROM _vexfs_file_versions "
             "WHERE inode_id=? AND version_no=2", (inode,))
+        ctx.equal(db.connection.execute(
+            "SELECT base_manifest_id,base_size,base_visible_size,logical_size,capacity "
+            "FROM _vexfs_staging WHERE handle_id=?", (handle,)).fetchone(),
+            (second_manifest, len(original), len(original), len(original), 0),
+            "发布后 staging 重基于新 manifest 并清空脏块")
+        ctx.equal(db.scalar(
+            "SELECT count(*) FROM _vexfs_staging_chunks WHERE handle_id=?", (handle,)),
+            0, "发布后不长期累积脏块")
+        db.scalar("SELECT vexfs_handle_close(?,0,'chunk-close')", (handle,))
         reused = db.scalar(
             "SELECT count(*) FROM _vexfs_manifest_chunks first "
             "JOIN _vexfs_manifest_chunks second "
@@ -1905,6 +1962,42 @@ def chunk_manifest_reuse(ctx: Context) -> dict[str, Any]:
         return {"logical_bytes": len(original), "chunk_bytes": chunk_bytes,
                 "reused_chunks": reused, "physical_chunks_before_gc": 5,
                 "physical_chunks_after_gc": 4}
+
+
+@case("storage.overlay-truncate-regrow", "storage",
+      "已有文件截短再扩展时不恢复旧尾部，只保存边界脏块")
+def overlay_truncate_regrow(ctx: Context) -> dict[str, Any]:
+    chunk_bytes = 64 * 1024
+    original = b"A" * chunk_bytes + b"B" * chunk_bytes
+    with Database(ctx) as db:
+        db.scalar("SELECT vexfs_write('default','/truncate.bin',?)", (original,))
+        handle = db.scalar(
+            "SELECT vexfs_handle_open('default','/truncate.bin','rw','truncate-open')")
+        generation = db.scalar(
+            "SELECT vexfs_handle_truncate(?,100,'truncate-small')", (handle,))
+        generation = db.scalar(
+            "SELECT vexfs_handle_truncate(?,?,'truncate-regrow')",
+            (handle, len(original)))
+        ctx.equal(db.scalar("SELECT vexfs_handle_read(?,0,100)", (handle,)),
+                  original[:100], "截短前缀保持不变")
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_read(?,100,?)", (handle, len(original) - 100)),
+            bytes(len(original) - 100), "重新扩展部分全部为零")
+        ctx.equal(db.scalar(
+            "SELECT capacity FROM _vexfs_staging WHERE handle_id=?", (handle,)),
+            100, "截短只物化 EOF 前仍可见的边界内容")
+        ctx.equal(db.scalar(
+            "SELECT vexfs_handle_publish(?,?,'data','truncate-publish')",
+            (handle, generation)), 2, "截短再扩展发布新版本")
+        db.scalar("SELECT vexfs_handle_close(?,0,'truncate-close')", (handle,))
+        content = db.scalar("SELECT vexfs_read('default','/truncate.bin')")
+        ctx.equal(content[:100], original[:100], "发布后前缀保持不变")
+        ctx.equal(content[100:], bytes(len(original) - 100),
+                  "发布后旧尾部不会复活")
+        ctx.check(db.json("SELECT vexfs_check('default',1)")["ok"],
+                  "截短再扩展后深度检查通过")
+        return {"logical_bytes": len(original), "dirty_bytes": 100,
+                "generation": generation, "version": 2}
 
 
 @case("recovery.initialization-failure-rollback", "recovery",
@@ -2986,14 +3079,15 @@ def performance_staged_overwrite(ctx: Context) -> dict[str, Any]:
                 (handle, offset, data, f"staged-{offset}"))
         stage_seconds = time.perf_counter() - started
         row = db.connection.execute(
-            "SELECT count(*),s.logical_size,s.capacity,length(d.content) "
-            "FROM _vexfs_staging s JOIN _vexfs_staging_data d USING(handle_id) "
+            "SELECT count(DISTINCT s.handle_id),max(s.logical_size),max(s.capacity),"
+            "count(d.chunk_no),COALESCE(sum(length(d.content)),0) "
+            "FROM _vexfs_staging s LEFT JOIN _vexfs_staging_chunks d USING(handle_id) "
             "WHERE s.handle_id=?", (handle,)).fetchone()
         ctx.equal(row[0], 1, "每个 handle 只能有一行 staging")
         ctx.equal(row[1], total, "staging logical_size")
-        ctx.equal(row[2], row[3], "capacity 与 BLOB 长度")
-        ctx.check(total <= row[2] <= MAX_FILE_BYTES, "staging capacity 边界")
-        ctx.check(row[2] < max(total * 2, 64 * 1024 + 1), "几何扩容不能超过 2x")
+        ctx.equal(row[2], row[4], "capacity 与脏块总长度")
+        ctx.equal(row[2], row[3] * 64 * 1024, "每个脏块固定为 64 KiB")
+        ctx.check(total <= row[2] < total + 64 * 1024, "顺序写物理暂存边界")
         started = time.perf_counter()
         version = db.scalar(
             "SELECT vexfs_handle_publish(?,?,'full','staged-publish')",
@@ -3016,7 +3110,8 @@ def performance_staged_overwrite(ctx: Context) -> dict[str, Any]:
         db.connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         storage_after_vacuum = db_storage(db.path)
         return {"logical_bytes": total, "capacity_bytes": row[2],
-                "staging_rows": row[0], "generation": generation, "version": version,
+                "staging_rows": row[0], "dirty_chunks": row[3],
+                "generation": generation, "version": version,
                 "stage_seconds": round(stage_seconds, 6),
                 "stage_mib_per_second": round(total / MIB / max(stage_seconds, 1e-9), 3),
                 "publish_seconds": round(publish_seconds, 6),
@@ -3054,12 +3149,15 @@ def performance_random_patches(ctx: Context) -> dict[str, Any]:
         for offset, data in list(expected.items())[-min(len(expected), 50):]:
             ctx.equal(db.scalar("SELECT vexfs_handle_read(?,?,?)",
                                 (handle, offset, patch_size)), data, "随机 patch 内容")
+        affected_chunks = {offset // (64 * 1024) for offset in expected}
         row = db.connection.execute(
             "SELECT count(*),logical_size,capacity FROM _vexfs_staging WHERE handle_id=?",
             (handle,)).fetchone()
         ctx.equal(row[0], 1, "随机写 staging 行数")
         ctx.equal(row[1], logical_size, "随机写 logical_size")
-        ctx.check(row[2] <= MAX_FILE_BYTES, "随机写 capacity")
+        ctx.equal(row[2], len(affected_chunks) * 64 * 1024,
+                  "随机写只暂存受影响的 64 KiB 块")
+        ctx.check(row[2] < logical_size, "随机写不复制整份基础文件")
         publish_started = time.perf_counter()
         ctx.equal(db.scalar(
             "SELECT vexfs_handle_publish(?,?,'data','random-publish')",
@@ -3069,7 +3167,6 @@ def performance_random_patches(ctx: Context) -> dict[str, Any]:
         patched_manifest = db.scalar(
             "SELECT manifest_id FROM _vexfs_file_versions "
             "WHERE inode_id=? AND version_no=2", (inode,))
-        affected_chunks = {offset // (64 * 1024) for offset in expected}
         total_chunks = logical_size // (64 * 1024)
         reused_chunks = db.scalar(
             "SELECT count(*) FROM _vexfs_manifest_chunks before "

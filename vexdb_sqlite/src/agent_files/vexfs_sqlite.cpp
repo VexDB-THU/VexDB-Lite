@@ -31,8 +31,6 @@ namespace {
 constexpr const char *kContractVersion = "0.9.0";
 constexpr sqlite3_int64 kMaxStagedBytes = 128LL * 1024LL * 1024LL;
 constexpr sqlite3_int64 kContentChunkBytes = 64LL * 1024LL;
-constexpr sqlite3_int64 kInitialStagingCapacity = 64LL * 1024LL;
-constexpr sqlite3_int64 kEmptyFileStagingCapacity = 4LL * 1024LL;
 constexpr sqlite3_int64 kMaxXattrBytes = 64LL * 1024LL;
 constexpr sqlite3_int64 kMaxSymlinkBytes = 4096;
 constexpr sqlite3_int64 kRequestRetentionRows = 64LL * 1024LL;
@@ -56,12 +54,6 @@ class SqlError : public std::runtime_error {
 
   private:
     int code_;
-};
-
-struct BlobCloser {
-    void operator()(sqlite3_blob *blob) const {
-        if (blob != nullptr) sqlite3_blob_close(blob);
-    }
 };
 
 class Statement {
@@ -542,6 +534,12 @@ void EnsureSchemaSlow(sqlite3 *db) {
     if (schema_exists) {
         if (version != kContractVersion)
             throw SqlError("unsupported VexFS schema version: " + version, SQLITE_MISMATCH);
+        Statement layout(db,
+            "SELECT value FROM _vexfs_meta WHERE key='staging_layout' LIMIT 1");
+        if (!layout.Row() || layout.Text(0) != "overlay-v1") {
+            throw SqlError("unsupported VexFS staging layout; create a new database",
+                           SQLITE_MISMATCH);
+        }
         DetectGrepIndex(db);
         return;
     }
@@ -716,15 +714,20 @@ CREATE INDEX IF NOT EXISTS _vexfs_handles_workspace_idx
 CREATE TABLE IF NOT EXISTS _vexfs_staging(
     handle_id TEXT PRIMARY KEY,
     generation INTEGER NOT NULL,
-    content BLOB NOT NULL,
-    logical_size INTEGER NOT NULL,
-    capacity INTEGER NOT NULL,
+    base_manifest_id INTEGER,
+    base_size INTEGER NOT NULL CHECK(base_size >= 0),
+    base_visible_size INTEGER NOT NULL CHECK(base_visible_size >= 0),
+    logical_size INTEGER NOT NULL CHECK(logical_size >= 0),
+    capacity INTEGER NOT NULL CHECK(capacity >= 0),
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
-    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+    updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
+    CHECK(base_visible_size <= base_size)
 );
-CREATE TABLE IF NOT EXISTS _vexfs_staging_data(
-    handle_id TEXT PRIMARY KEY,
-    content BLOB NOT NULL
+CREATE TABLE IF NOT EXISTS _vexfs_staging_chunks(
+    handle_id TEXT NOT NULL,
+    chunk_no INTEGER NOT NULL CHECK(chunk_no >= 0),
+    content BLOB NOT NULL CHECK(length(content) > 0 AND length(content) <= 65536),
+    PRIMARY KEY(handle_id, chunk_no)
 );
 CREATE TABLE IF NOT EXISTS _vexfs_requests(
     request_id TEXT PRIMARY KEY,
@@ -743,7 +746,7 @@ CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
 );
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.9.0');
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('content_model', 'chunked-v1');
-INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'split-v1');
+INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'overlay-v1');
 )SQL");
     CreateHistorySchema(db);
     EnsureAclHistoryTriggers(db);
@@ -1075,6 +1078,64 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
     return content;
 }
 
+std::vector<unsigned char> ReadVersionRange(sqlite3 *db, sqlite3_int64 inode_id,
+                                            sqlite3_int64 version,
+                                            sqlite3_int64 offset,
+                                            sqlite3_int64 length) {
+    const VersionStorage storage = ResolveVersionStorage(db, inode_id, version);
+    if (storage.size > kMaxStagedBytes) {
+        throw SqlError("file version is larger than 128 MiB", SQLITE_CORRUPT);
+    }
+    if (offset < 0 || length < 0 || offset > kMaxStagedBytes ||
+        length > kMaxStagedBytes) {
+        throw SqlError("read range must be within 0..128 MiB", SQLITE_RANGE);
+    }
+    if (length == 0 || offset >= storage.size) return {};
+
+    const sqlite3_int64 end = std::min<sqlite3_int64>(storage.size, offset + length);
+    const sqlite3_int64 first_chunk = offset / kContentChunkBytes;
+    const sqlite3_int64 last_chunk = (end - 1) / kContentChunkBytes;
+    std::vector<unsigned char> content;
+    content.reserve(static_cast<size_t>(end - offset));
+
+    Statement chunks(db, R"SQL(
+SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 AND entry.chunk_no BETWEEN ?2 AND ?3
+ORDER BY entry.chunk_no
+)SQL");
+    chunks.BindInt64(1, storage.manifest_id);
+    chunks.BindInt64(2, first_chunk);
+    chunks.BindInt64(3, last_chunk);
+    sqlite3_int64 expected_chunk = first_chunk;
+    while (chunks.Row()) {
+        const sqlite3_int64 chunk_no = chunks.Int64(0);
+        const sqlite3_int64 chunk_offset = chunk_no * kContentChunkBytes;
+        const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
+            kContentChunkBytes, storage.size - chunk_offset);
+        const int chunk_bytes = chunks.BlobBytes(1);
+        const unsigned char *chunk = chunks.BlobData(1);
+        if (chunk_no != expected_chunk || expected_size <= 0 ||
+            chunks.Int64(2) != expected_size || chunk_bytes != expected_size ||
+            chunk == nullptr || chunks.Text(3).size() != 64 ||
+            vexfs::Sha256Hex(chunk, static_cast<size_t>(chunk_bytes)) != chunks.Text(3)) {
+            throw SqlError("file manifest range chunk is corrupt", SQLITE_CORRUPT);
+        }
+        const sqlite3_int64 copy_start = std::max<sqlite3_int64>(offset, chunk_offset) -
+            chunk_offset;
+        const sqlite3_int64 copy_end = std::min<sqlite3_int64>(
+            end, chunk_offset + expected_size) - chunk_offset;
+        content.insert(content.end(), chunk + copy_start, chunk + copy_end);
+        ++expected_chunk;
+    }
+    if (expected_chunk != last_chunk + 1 ||
+        content.size() != static_cast<size_t>(end - offset)) {
+        throw SqlError("file manifest range is incomplete", SQLITE_CORRUPT);
+    }
+    return content;
+}
+
 bool FindChild(sqlite3 *db, sqlite3_int64 workspace_id, sqlite3_int64 parent,
                const std::string &name, Node *node) {
     Statement statement(db,
@@ -1324,8 +1385,8 @@ WHERE workspace_id=?1 AND NOT EXISTS (
     clear_acl.Done();
 }
 
-sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::string &message) {
-    Savepoint savepoint(db, "vexfs_create_commit");
+sqlite3_int64 CreateCommitInTransaction(sqlite3 *db, const Workspace &workspace,
+                                       const std::string &message) {
     Statement insert(db,
         "INSERT INTO _vexfs_commits(workspace_id, parent_commit, message) "
         "SELECT id, NULLIF(head_commit, 0), ?2 FROM _vexfs_workspaces WHERE id=?1");
@@ -1345,6 +1406,13 @@ sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace, const std::s
     update.BindInt64(1, commit);
     update.BindInt64(2, workspace.id);
     update.Done();
+    return commit;
+}
+
+sqlite3_int64 CreateCommit(sqlite3 *db, const Workspace &workspace,
+                           const std::string &message) {
+    Savepoint savepoint(db, "vexfs_create_commit");
+    const sqlite3_int64 commit = CreateCommitInTransaction(db, workspace, message);
     savepoint.Release();
     return commit;
 }
@@ -1926,121 +1994,125 @@ Handle FindHandle(sqlite3 *db, const std::string &id) {
 }
 
 struct StagingInfo {
-    sqlite3_int64 rowid = 0;
     sqlite3_int64 generation = 0;
+    sqlite3_int64 base_manifest_id = 0;
+    sqlite3_int64 base_size = 0;
+    sqlite3_int64 base_visible_size = 0;
     sqlite3_int64 logical_size = 0;
     sqlite3_int64 capacity = 0;
 };
 
 StagingInfo FindStaging(sqlite3 *db, const Handle &handle) {
     Statement statement(db,
-        "SELECT d.rowid, s.generation, s.logical_size, s.capacity "
-        "FROM _vexfs_staging s JOIN _vexfs_staging_data d ON d.handle_id=s.handle_id "
-        "WHERE s.handle_id = ?1");
+        "SELECT generation,COALESCE(base_manifest_id,0),base_size,base_visible_size,"
+        "logical_size,capacity FROM _vexfs_staging WHERE handle_id=?1");
     statement.BindText(1, handle.id);
     if (!statement.Row()) throw SqlError("staging area not found", SQLITE_NOTFOUND);
-    return {statement.Int64(0), statement.Int64(1), statement.Int64(2), statement.Int64(3)};
+    return {statement.Int64(0), statement.Int64(1), statement.Int64(2),
+            statement.Int64(3), statement.Int64(4), statement.Int64(5)};
 }
 
-void WriteBlob(sqlite3 *db, sqlite3_int64 rowid, sqlite3_int64 offset,
-               const void *data, sqlite3_int64 size) {
-    if (size == 0) return;
-    if (offset < 0 || size < 0 || offset > std::numeric_limits<int>::max() ||
-        size > std::numeric_limits<int>::max() || offset + size > std::numeric_limits<int>::max()) {
-        throw SqlError("staging BLOB range is out of range", SQLITE_RANGE);
-    }
-    sqlite3_blob *blob = nullptr;
-    int rc = sqlite3_blob_open(db, "main", "_vexfs_staging_data", "content", rowid, 1, &blob);
-    if (rc != SQLITE_OK) {
-        throw SqlError("cannot open staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
-    rc = sqlite3_blob_write(blob, data, static_cast<int>(size), static_cast<int>(offset));
-    const int close_rc = sqlite3_blob_close(blob);
-    if (rc != SQLITE_OK) {
-        throw SqlError("cannot write staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
-    if (close_rc != SQLITE_OK) {
-        throw SqlError("cannot close staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
+sqlite3_int64 DirtyChunkSize(sqlite3 *db, const std::string &handle_id,
+                             sqlite3_int64 chunk_no) {
+    Statement statement(db,
+        "SELECT length(content) FROM _vexfs_staging_chunks "
+        "WHERE handle_id=?1 AND chunk_no=?2");
+    statement.BindText(1, handle_id);
+    statement.BindInt64(2, chunk_no);
+    return statement.Row() ? statement.Int64(0) : 0;
 }
 
-void ZeroBlobRange(sqlite3 *db, sqlite3_int64 rowid, sqlite3_int64 offset,
-                   sqlite3_int64 size) {
-    static const std::array<unsigned char, 64 * 1024> zeros{};
-    if (size == 0) return;
-    if (offset < 0 || size < 0 || offset > std::numeric_limits<int>::max() ||
-        size > std::numeric_limits<int>::max() || offset + size > std::numeric_limits<int>::max()) {
-        throw SqlError("staging zero range is out of range", SQLITE_RANGE);
+void StoreDirtyChunk(sqlite3 *db, const std::string &handle_id,
+                     sqlite3_int64 chunk_no,
+                     const std::vector<unsigned char> &content) {
+    if (content.empty() || content.size() > static_cast<size_t>(kContentChunkBytes)) {
+        throw SqlError("staging chunk must be within 1..65536 bytes", SQLITE_CORRUPT);
     }
-    sqlite3_blob *blob = nullptr;
-    int rc = sqlite3_blob_open(db, "main", "_vexfs_staging_data", "content", rowid, 1, &blob);
-    if (rc != SQLITE_OK) {
-        throw SqlError("cannot open staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
-    while (size > 0) {
-        const sqlite3_int64 chunk = std::min<sqlite3_int64>(size, zeros.size());
-        rc = sqlite3_blob_write(blob, zeros.data(), static_cast<int>(chunk),
-                                static_cast<int>(offset));
-        if (rc != SQLITE_OK) break;
-        offset += chunk;
-        size -= chunk;
-    }
-    const int close_rc = sqlite3_blob_close(blob);
-    if (rc != SQLITE_OK) {
-        throw SqlError("cannot zero staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
-    if (close_rc != SQLITE_OK) {
-        throw SqlError("cannot close staging BLOB: " + std::string(sqlite3_errmsg(db)));
-    }
+    Statement statement(db, R"SQL(
+INSERT INTO _vexfs_staging_chunks(handle_id,chunk_no,content)
+VALUES(?1,?2,?3)
+ON CONFLICT(handle_id,chunk_no) DO UPDATE SET content=excluded.content
+)SQL");
+    statement.BindText(1, handle_id);
+    statement.BindInt64(2, chunk_no);
+    statement.BindBlob(3, content);
+    statement.Done();
 }
 
-StagingInfo EnsureStagingCapacity(sqlite3 *db, const Handle &handle, StagingInfo staging,
-                                  sqlite3_int64 required) {
-    if (required <= staging.capacity) return staging;
-    if (required > kMaxStagedBytes)
-        throw SqlError("staged file is larger than 128 MiB", SQLITE_TOOBIG);
-    sqlite3_int64 capacity = staging.capacity == 0
-        ? kEmptyFileStagingCapacity
-        : std::max(staging.capacity, kInitialStagingCapacity);
-    while (capacity < required) capacity = std::min(kMaxStagedBytes, capacity * 2);
-    Statement grow(db,
-        "UPDATE _vexfs_staging_data SET content=CAST(content||zeroblob(?1) AS BLOB) "
-        "WHERE handle_id=?2");
-    grow.BindInt64(1, capacity - staging.capacity);
-    grow.BindText(2, handle.id);
-    grow.Done();
-    Statement update(db,
-        "UPDATE _vexfs_staging SET capacity=?1, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE handle_id=?2");
-    update.BindInt64(1, capacity);
-    update.BindText(2, handle.id);
-    update.Done();
-    staging.capacity = capacity;
-    return staging;
+std::vector<unsigned char> ReadEffectiveChunk(sqlite3 *db, const Handle &handle,
+                                              const StagingInfo &staging,
+                                              sqlite3_int64 chunk_no,
+                                              sqlite3_int64 *dirty_bytes_out = nullptr) {
+    if (chunk_no < 0) throw SqlError("staging chunk number is out of range", SQLITE_RANGE);
+    std::vector<unsigned char> content(static_cast<size_t>(kContentChunkBytes), 0);
+    Statement dirty(db,
+        "SELECT content FROM _vexfs_staging_chunks WHERE handle_id=?1 AND chunk_no=?2");
+    dirty.BindText(1, handle.id);
+    dirty.BindInt64(2, chunk_no);
+    if (dirty.Row()) {
+        const int dirty_bytes = dirty.BlobBytes(0);
+        if (dirty_bytes <= 0 || dirty_bytes > kContentChunkBytes ||
+            dirty.BlobData(0) == nullptr) {
+            throw SqlError("staging chunk is corrupt", SQLITE_CORRUPT);
+        }
+        std::memcpy(content.data(), dirty.BlobData(0), static_cast<size_t>(dirty_bytes));
+        if (dirty_bytes_out != nullptr) *dirty_bytes_out = dirty_bytes;
+        return content;
+    }
+    if (dirty_bytes_out != nullptr) *dirty_bytes_out = 0;
+
+    const sqlite3_int64 chunk_offset = chunk_no * kContentChunkBytes;
+    if (chunk_offset >= staging.base_visible_size) return content;
+    if (staging.base_manifest_id <= 0 || staging.base_size <= chunk_offset ||
+        staging.base_visible_size > staging.base_size) {
+        throw SqlError("staging base reference is corrupt", SQLITE_CORRUPT);
+    }
+    Statement base(db, R"SQL(
+SELECT chunk.content,chunk.size,chunk.checksum
+FROM _vexfs_manifest_chunks entry
+JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
+WHERE entry.manifest_id=?1 AND entry.chunk_no=?2
+)SQL");
+    base.BindInt64(1, staging.base_manifest_id);
+    base.BindInt64(2, chunk_no);
+    if (!base.Row()) throw SqlError("staging base chunk is missing", SQLITE_CORRUPT);
+    const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
+        kContentChunkBytes, staging.base_size - chunk_offset);
+    if (expected_size <= 0 || base.Int64(1) != expected_size ||
+        base.BlobBytes(0) != expected_size || base.BlobData(0) == nullptr ||
+        base.Text(2).size() != 64 ||
+        vexfs::Sha256Hex(base.BlobData(0), static_cast<size_t>(expected_size)) != base.Text(2)) {
+        throw SqlError("staging base chunk is corrupt", SQLITE_CORRUPT);
+    }
+    const sqlite3_int64 visible = std::min<sqlite3_int64>(
+        expected_size, staging.base_visible_size - chunk_offset);
+    std::memcpy(content.data(), base.BlobData(0), static_cast<size_t>(visible));
+    return content;
 }
 
 void CreateStaging(sqlite3 *db, const Handle &handle,
                    const std::vector<unsigned char> &content) {
-    sqlite3_int64 capacity = static_cast<sqlite3_int64>(content.size());
-    if (handle.writable && capacity > 0 && capacity < kInitialStagingCapacity) {
-        capacity = kInitialStagingCapacity;
+    if (content.size() > static_cast<size_t>(kMaxStagedBytes)) {
+        throw SqlError("staged file is larger than 128 MiB", SQLITE_TOOBIG);
     }
+    const sqlite3_int64 chunk_count =
+        (static_cast<sqlite3_int64>(content.size()) + kContentChunkBytes - 1) /
+        kContentChunkBytes;
     Statement insert(db,
-        "INSERT INTO _vexfs_staging(handle_id,generation,content,logical_size,capacity) "
-        "VALUES(?1,?2,X'',?4,?3)");
+        "INSERT INTO _vexfs_staging(handle_id,generation,base_manifest_id,base_size,"
+        "base_visible_size,logical_size,capacity) VALUES(?1,?2,NULL,0,0,?3,?4)");
     insert.BindText(1, handle.id);
     insert.BindInt64(2, handle.dirty_generation);
-    insert.BindInt64(3, capacity);
+    insert.BindInt64(3, static_cast<sqlite3_int64>(content.size()));
     insert.BindInt64(4, static_cast<sqlite3_int64>(content.size()));
     insert.Done();
-    Statement data(db,
-        "INSERT INTO _vexfs_staging_data(handle_id,content) VALUES(?1,zeroblob(?2))");
-    data.BindText(1, handle.id);
-    data.BindInt64(2, capacity);
-    data.Done();
-    if (!content.empty()) {
-        const StagingInfo staging = FindStaging(db, handle);
-        WriteBlob(db, staging.rowid, 0, content.data(), static_cast<sqlite3_int64>(content.size()));
+    for (sqlite3_int64 chunk_no = 0; chunk_no < chunk_count; ++chunk_no) {
+        const sqlite3_int64 offset = chunk_no * kContentChunkBytes;
+        const size_t bytes = static_cast<size_t>(std::min<sqlite3_int64>(
+            kContentChunkBytes, static_cast<sqlite3_int64>(content.size()) - offset));
+        std::vector<unsigned char> chunk(content.begin() + offset,
+                                         content.begin() + offset + bytes);
+        StoreDirtyChunk(db, handle.id, chunk_no, chunk);
     }
 }
 
@@ -2053,75 +2125,41 @@ void CreateStagingFromVersion(sqlite3 *db, const Handle &handle, const Node &nod
     if (storage.size != node.size) {
         throw SqlError("current file size does not match manifest", SQLITE_CORRUPT);
     }
-    sqlite3_int64 capacity = storage.size;
-    if (handle.writable && capacity < kInitialStagingCapacity) {
-        capacity = kInitialStagingCapacity;
-    }
     Statement insert(db,
-        "INSERT INTO _vexfs_staging(handle_id,generation,content,logical_size,capacity) "
-        "VALUES(?1,?2,X'',?4,?3)");
+        "INSERT INTO _vexfs_staging(handle_id,generation,base_manifest_id,base_size,"
+        "base_visible_size,logical_size,capacity) VALUES(?1,?2,?3,?4,?4,?4,0)");
     insert.BindText(1, handle.id);
     insert.BindInt64(2, handle.dirty_generation);
-    insert.BindInt64(3, capacity);
+    insert.BindInt64(3, storage.manifest_id);
     insert.BindInt64(4, storage.size);
     insert.Done();
-    Statement data(db,
-        "INSERT INTO _vexfs_staging_data(handle_id,content) VALUES(?1,zeroblob(?2))");
-    data.BindText(1, handle.id);
-    data.BindInt64(2, capacity);
-    data.Done();
-    const StagingInfo staging = FindStaging(db, handle);
-    Statement chunks(db, R"SQL(
-SELECT entry.chunk_no,chunk.content,chunk.size,chunk.checksum
-FROM _vexfs_manifest_chunks entry
-JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
-WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
-)SQL");
-    chunks.BindInt64(1, storage.manifest_id);
-    vexfs::Sha256 file_hash;
-    sqlite3_int64 offset = 0;
-    sqlite3_int64 chunk_no = 0;
-    while (chunks.Row()) {
-        const std::vector<unsigned char> chunk = chunks.Blob(1);
-        const sqlite3_int64 expected_size = std::min<sqlite3_int64>(
-            kContentChunkBytes, storage.size - offset);
-        if (chunks.Int64(0) != chunk_no || expected_size <= 0 ||
-            chunks.Int64(2) != expected_size ||
-            static_cast<sqlite3_int64>(chunk.size()) != expected_size ||
-            vexfs::Sha256Hex(chunk.data(), chunk.size()) != chunks.Text(3)) {
-            throw SqlError("current file manifest chunk is corrupt", SQLITE_CORRUPT);
-        }
-        WriteBlob(db, staging.rowid, offset, chunk.data(), expected_size);
-        file_hash.Update(chunk.data(), chunk.size());
-        offset += expected_size;
-        ++chunk_no;
-    }
-    if (offset != storage.size || chunk_no != storage.chunk_count ||
-        vexfs::Hex(file_hash.Finish()) != storage.checksum) {
-        throw SqlError("current file manifest checksum mismatch", SQLITE_CORRUPT);
-    }
 }
 
 sqlite3_int64 StoreManifestFromStaging(sqlite3 *db, sqlite3_int64 workspace_id,
                                        sqlite3_int64 inode_id,
                                        sqlite3_int64 previous_manifest,
+                                       const Handle &handle,
                                        const StagingInfo &staging,
                                        std::string *checksum_out) {
-    if (staging.logical_size < 0 || staging.logical_size > staging.capacity ||
-        staging.logical_size > kMaxStagedBytes) {
+    if (staging.logical_size < 0 || staging.logical_size > kMaxStagedBytes ||
+        staging.base_size < 0 || staging.base_size > kMaxStagedBytes ||
+        staging.base_visible_size < 0 ||
+        staging.base_visible_size > staging.base_size || staging.capacity < 0 ||
+        staging.capacity > kMaxStagedBytes) {
         throw SqlError("staging size is corrupt", SQLITE_CORRUPT);
     }
-    sqlite3_blob *raw_blob = nullptr;
-    int rc = sqlite3_blob_open(db, "main", "_vexfs_staging_data", "content",
-                               staging.rowid, 0, &raw_blob);
-    if (rc != SQLITE_OK) throw SqlError("cannot open staging BLOB", rc);
-    std::unique_ptr<sqlite3_blob, BlobCloser> blob(raw_blob);
-    if (sqlite3_blob_bytes(blob.get()) != staging.capacity) {
-        throw SqlError("staging capacity does not match BLOB", SQLITE_CORRUPT);
-    }
-    std::vector<unsigned char> buffer(static_cast<size_t>(kContentChunkBytes));
+    Statement dirty_stats(db,
+        "SELECT count(*),COALESCE(sum(length(content)),0),COALESCE(max(chunk_no),-1) "
+        "FROM _vexfs_staging_chunks WHERE handle_id=?1");
+    dirty_stats.BindText(1, handle.id);
+    dirty_stats.Row();
     const sqlite3_int64 chunk_count =
         (staging.logical_size + kContentChunkBytes - 1) / kContentChunkBytes;
+    if (dirty_stats.Int64(1) != staging.capacity ||
+        (dirty_stats.Int64(0) > 0 && dirty_stats.Int64(2) >= chunk_count)) {
+        throw SqlError("staging chunk set is corrupt", SQLITE_CORRUPT);
+    }
+    std::vector<unsigned char> buffer(static_cast<size_t>(kContentChunkBytes));
     const std::string pending_checksum(64, '0');
     Statement manifest(db, R"SQL(
 INSERT INTO _vexfs_manifests(workspace_id,file_size,chunk_size,chunk_count,checksum)
@@ -2148,19 +2186,69 @@ VALUES(?1,?2,?3,?4,?5)
 INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
 VALUES(?1,?2,?3)
 )SQL");
+    Statement staged_chunk(db, R"SQL(
+SELECT dirty.content,base.id,base.content,base.size,base.checksum,base.inode_id
+FROM (SELECT 1) seed
+LEFT JOIN _vexfs_staging_chunks dirty
+  ON dirty.handle_id=?1 AND dirty.chunk_no=?2
+LEFT JOIN _vexfs_manifest_chunks base_entry
+  ON base_entry.manifest_id=?3 AND base_entry.chunk_no=?2
+LEFT JOIN _vexfs_chunks base ON base.id=base_entry.chunk_id
+)SQL");
     std::unordered_map<std::string, sqlite3_int64> new_chunks;
     vexfs::Sha256 file_hash;
     for (sqlite3_int64 chunk_no = 0, offset = 0; chunk_no < chunk_count;
          ++chunk_no, offset += kContentChunkBytes) {
         const int bytes = static_cast<int>(std::min<sqlite3_int64>(
             kContentChunkBytes, staging.logical_size - offset));
-        rc = sqlite3_blob_read(blob.get(), buffer.data(), bytes, static_cast<int>(offset));
-        if (rc != SQLITE_OK) throw SqlError("cannot read staging BLOB", rc);
+        std::fill(buffer.begin(), buffer.end(), 0);
+        sqlite3_int64 chunk_id = 0;
+        std::string base_checksum;
+        staged_chunk.BindText(1, handle.id);
+        staged_chunk.BindInt64(2, chunk_no);
+        staged_chunk.BindInt64(3, staging.base_manifest_id);
+        if (!staged_chunk.Row()) {
+            throw SqlError("cannot resolve staging chunk", SQLITE_CORRUPT);
+        }
+        if (staged_chunk.Type(0) != SQLITE_NULL) {
+            const int dirty_bytes = staged_chunk.BlobBytes(0);
+            if (dirty_bytes <= 0 || dirty_bytes > kContentChunkBytes ||
+                staged_chunk.BlobData(0) == nullptr) {
+                throw SqlError("staging chunk is corrupt", SQLITE_CORRUPT);
+            }
+            std::memcpy(buffer.data(), staged_chunk.BlobData(0),
+                        static_cast<size_t>(dirty_bytes));
+        } else if (offset < staging.base_visible_size) {
+            const sqlite3_int64 expected_base_size = std::min<sqlite3_int64>(
+                kContentChunkBytes, staging.base_size - offset);
+            if (staging.base_manifest_id <= 0 || expected_base_size <= 0 ||
+                staged_chunk.Type(1) == SQLITE_NULL || staged_chunk.Int64(3) != expected_base_size ||
+                staged_chunk.BlobBytes(2) != expected_base_size ||
+                staged_chunk.BlobData(2) == nullptr || staged_chunk.Text(4).size() != 64 ||
+                staged_chunk.Int64(5) != inode_id) {
+                throw SqlError("staging base chunk is corrupt", SQLITE_CORRUPT);
+            }
+            const sqlite3_int64 visible = std::min<sqlite3_int64>(
+                expected_base_size, staging.base_visible_size - offset);
+            std::memcpy(buffer.data(), staged_chunk.BlobData(2),
+                        static_cast<size_t>(visible));
+            base_checksum = staged_chunk.Text(4);
+            if (visible == expected_base_size && expected_base_size == bytes) {
+                chunk_id = staged_chunk.Int64(1);
+            } else if (vexfs::Sha256Hex(
+                           staged_chunk.BlobData(2),
+                           static_cast<size_t>(expected_base_size)) != base_checksum) {
+                throw SqlError("staging base chunk checksum mismatch", SQLITE_CORRUPT);
+            }
+        }
+        staged_chunk.Reset();
         file_hash.Update(buffer.data(), static_cast<size_t>(bytes));
         const std::string chunk_checksum =
             vexfs::Sha256Hex(buffer.data(), static_cast<size_t>(bytes));
-        sqlite3_int64 chunk_id = 0;
-        if (previous_manifest > 0) {
+        if (chunk_id > 0 && chunk_checksum != base_checksum) {
+            throw SqlError("staging base chunk checksum mismatch", SQLITE_CORRUPT);
+        }
+        if (chunk_id == 0 && previous_manifest > 0) {
             previous.BindInt64(1, previous_manifest);
             previous.BindInt64(2, chunk_no);
             previous.BindInt64(3, inode_id);
@@ -2206,20 +2294,50 @@ VALUES(?1,?2,?3)
 sqlite3_int64 StageWrite(sqlite3 *db, const Handle &handle, sqlite3_int64 offset,
                          const std::vector<unsigned char> &patch) {
     if (patch.empty()) return handle.dirty_generation;
-    const sqlite3_int64 required = offset + static_cast<sqlite3_int64>(patch.size());
-    StagingInfo staging = EnsureStagingCapacity(db, handle, FindStaging(db, handle), required);
-    if (offset > staging.logical_size) {
-        ZeroBlobRange(db, staging.rowid, staging.logical_size, offset - staging.logical_size);
+    if (offset < 0 || offset > kMaxStagedBytes ||
+        patch.size() > static_cast<size_t>(kMaxStagedBytes - offset)) {
+        throw SqlError("staged file is larger than 128 MiB", SQLITE_TOOBIG);
     }
-    WriteBlob(db, staging.rowid, offset, patch.data(), static_cast<sqlite3_int64>(patch.size()));
+    const sqlite3_int64 required = offset + static_cast<sqlite3_int64>(patch.size());
+    const StagingInfo staging = FindStaging(db, handle);
+    sqlite3_int64 capacity_delta = 0;
     const sqlite3_int64 logical_size = std::max(staging.logical_size, required);
+    size_t patch_offset = 0;
+    while (patch_offset < patch.size()) {
+        const sqlite3_int64 absolute = offset + static_cast<sqlite3_int64>(patch_offset);
+        const sqlite3_int64 chunk_no = absolute / kContentChunkBytes;
+        const sqlite3_int64 within = absolute % kContentChunkBytes;
+        const size_t bytes = std::min<size_t>(
+            patch.size() - patch_offset,
+            static_cast<size_t>(kContentChunkBytes - within));
+        const bool full_chunk = within == 0 && bytes == static_cast<size_t>(kContentChunkBytes);
+        sqlite3_int64 previous_dirty_bytes = 0;
+        std::vector<unsigned char> chunk;
+        if (full_chunk) {
+            previous_dirty_bytes = DirtyChunkSize(db, handle.id, chunk_no);
+            chunk.assign(patch.begin() + static_cast<std::ptrdiff_t>(patch_offset),
+                         patch.begin() + static_cast<std::ptrdiff_t>(patch_offset + bytes));
+        } else {
+            chunk = ReadEffectiveChunk(
+                db, handle, staging, chunk_no, &previous_dirty_bytes);
+            std::memcpy(chunk.data() + within, patch.data() + patch_offset, bytes);
+            const sqlite3_int64 chunk_offset = chunk_no * kContentChunkBytes;
+            const sqlite3_int64 stored_bytes = std::min<sqlite3_int64>(
+                kContentChunkBytes, logical_size - chunk_offset);
+            chunk.resize(static_cast<size_t>(stored_bytes));
+        }
+        StoreDirtyChunk(db, handle.id, chunk_no, chunk);
+        capacity_delta += static_cast<sqlite3_int64>(chunk.size()) - previous_dirty_bytes;
+        patch_offset += bytes;
+    }
     const sqlite3_int64 generation = handle.dirty_generation + 1;
     Statement stage(db,
-        "UPDATE _vexfs_staging SET generation=?1, logical_size=?2, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE handle_id=?3");
+        "UPDATE _vexfs_staging SET generation=?1,logical_size=?2,capacity=capacity+?3,"
+        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE handle_id=?4");
     stage.BindInt64(1, generation);
     stage.BindInt64(2, logical_size);
-    stage.BindText(3, handle.id);
+    stage.BindInt64(3, capacity_delta);
+    stage.BindText(4, handle.id);
     stage.Done();
     Statement update(db,
         "UPDATE _vexfs_handles SET dirty_generation=?1, "
@@ -2235,17 +2353,41 @@ sqlite3_int64 TruncateStaging(sqlite3 *db, const Handle &handle, sqlite3_int64 s
         throw SqlError("file size is out of range", SQLITE_RANGE);
     StagingInfo staging = FindStaging(db, handle);
     if (size == staging.logical_size) return handle.dirty_generation;
-    staging = EnsureStagingCapacity(db, handle, staging, size);
-    if (size > staging.logical_size) {
-        ZeroBlobRange(db, staging.rowid, staging.logical_size, size - staging.logical_size);
+    sqlite3_int64 base_visible_size = staging.base_visible_size;
+    if (size < staging.logical_size) {
+        const sqlite3_int64 remainder = size % kContentChunkBytes;
+        std::vector<unsigned char> boundary;
+        if (remainder != 0) {
+            boundary = ReadEffectiveChunk(db, handle, staging, size / kContentChunkBytes);
+            boundary.resize(static_cast<size_t>(remainder));
+        }
+        const sqlite3_int64 first_removed =
+            (size + kContentChunkBytes - 1) / kContentChunkBytes;
+        Statement remove(db,
+            "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1 AND chunk_no>=?2");
+        remove.BindText(1, handle.id);
+        remove.BindInt64(2, first_removed);
+        remove.Done();
+        if (remainder != 0) {
+            StoreDirtyChunk(db, handle.id, size / kContentChunkBytes, boundary);
+        }
+        base_visible_size = std::min(base_visible_size, size);
     }
+    Statement dirty_bytes(db,
+        "SELECT COALESCE(sum(length(content)),0) FROM _vexfs_staging_chunks "
+        "WHERE handle_id=?1");
+    dirty_bytes.BindText(1, handle.id);
+    dirty_bytes.Row();
     const sqlite3_int64 generation = handle.dirty_generation + 1;
     Statement stage(db,
-        "UPDATE _vexfs_staging SET generation=?1, logical_size=?2, "
-        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE handle_id=?3");
+        "UPDATE _vexfs_staging SET generation=?1,logical_size=?2,base_visible_size=?3,"
+        "capacity=?4,updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 "
+        "WHERE handle_id=?5");
     stage.BindInt64(1, generation);
     stage.BindInt64(2, size);
-    stage.BindText(3, handle.id);
+    stage.BindInt64(3, base_visible_size);
+    stage.BindInt64(4, dirty_bytes.Int64(0));
+    stage.BindText(5, handle.id);
     stage.Done();
     Statement update(db,
         "UPDATE _vexfs_handles SET dirty_generation=?1, "
@@ -2258,16 +2400,53 @@ sqlite3_int64 TruncateStaging(sqlite3 *db, const Handle &handle, sqlite3_int64 s
 
 std::vector<unsigned char> ReadStagingRange(sqlite3 *db, const Handle &handle,
                                             sqlite3_int64 offset, sqlite3_int64 length) {
-    Statement statement(db,
-        "SELECT CASE WHEN ?2>=logical_size THEN X'' "
-        "ELSE substr(d.content,?2+1,min(?3,logical_size-?2)) END "
-        "FROM _vexfs_staging s JOIN _vexfs_staging_data d ON d.handle_id=s.handle_id "
-        "WHERE s.handle_id=?1");
-    statement.BindText(1, handle.id);
-    statement.BindInt64(2, offset);
-    statement.BindInt64(3, length);
-    if (!statement.Row()) throw SqlError("staging area not found", SQLITE_NOTFOUND);
-    return statement.Blob(0);
+    if (offset < 0 || length < 0 || offset > kMaxStagedBytes ||
+        length > kMaxStagedBytes) {
+        throw SqlError("read range must be within 0..128 MiB", SQLITE_RANGE);
+    }
+    const StagingInfo staging = FindStaging(db, handle);
+    if (length == 0 || offset >= staging.logical_size) return {};
+    const sqlite3_int64 bytes = std::min<sqlite3_int64>(
+        length, staging.logical_size - offset);
+    std::vector<unsigned char> result(static_cast<size_t>(bytes));
+    sqlite3_int64 copied = 0;
+    while (copied < bytes) {
+        const sqlite3_int64 absolute = offset + copied;
+        const sqlite3_int64 chunk_no = absolute / kContentChunkBytes;
+        const sqlite3_int64 within = absolute % kContentChunkBytes;
+        const sqlite3_int64 take = std::min<sqlite3_int64>(
+            bytes - copied, kContentChunkBytes - within);
+        const std::vector<unsigned char> chunk =
+            ReadEffectiveChunk(db, handle, staging, chunk_no);
+        std::memcpy(result.data() + copied, chunk.data() + within,
+                    static_cast<size_t>(take));
+        copied += take;
+    }
+    return result;
+}
+
+bool FindActiveMountStaging(sqlite3 *db, sqlite3_int64 workspace_id,
+                            sqlite3_int64 inode_id, Handle *result) {
+    Statement statement(db, R"SQL(
+SELECT h.id,h.workspace_id,h.inode_id,h.writable,h.expected_version,
+       h.dirty_generation,h.published_generation,h.state,
+       COALESCE(h.owner_session,'')
+FROM _vexfs_handles h
+JOIN _vexfs_mount_sessions session
+  ON session.workspace_id=h.workspace_id AND session.session_id=h.owner_session
+WHERE h.workspace_id=?1 AND h.inode_id=?2 AND h.writable=1
+  AND h.state='open' AND h.dirty_generation>h.published_generation
+  AND session.lease_until>CAST(unixepoch('subsec')*1000 AS INTEGER)
+ORDER BY h.updated_at DESC,h.id DESC
+LIMIT 1
+)SQL");
+    statement.BindInt64(1, workspace_id);
+    statement.BindInt64(2, inode_id);
+    if (!statement.Row()) return false;
+    *result = {statement.Text(0), statement.Int64(1), statement.Int64(2),
+               statement.Int(3) != 0, statement.Int64(4), statement.Int64(5),
+               statement.Int64(6), statement.Text(7), statement.Text(8)};
+    return true;
 }
 
 Workspace WorkspaceById(sqlite3 *db, sqlite3_int64 id) {
@@ -2295,11 +2474,12 @@ Node NodeById(sqlite3 *db, sqlite3_int64 id, bool include_deleted = false) {
 sqlite3_int64 StoreVersionFromStaging(sqlite3 *db, const Workspace &workspace,
                                       const Node &node, const Handle &handle,
                                       sqlite3_int64 generation,
-                                      const std::string &message) {
+                                      const std::string &message,
+                                      bool transaction_owned = false) {
     // PublishHandleInTransaction always owns the surrounding savepoint. Keeping
     // another savepoint here added two SQL statements to every small-file close
     // without adding another rollback boundary.
-    AcquireWriteLock(db);
+    if (!transaction_owned) AcquireWriteLock(db);
     const StagingInfo staging = FindStaging(db, handle);
     if (staging.generation != generation) {
         throw SqlError("staged generation is stale or missing", SQLITE_NOTFOUND);
@@ -2321,10 +2501,12 @@ sqlite3_int64 StoreVersionFromStaging(sqlite3 *db, const Workspace &workspace,
     if (sqlite3_changes64(db) != 1) {
         throw SqlError("version conflict: file changed before publish", SQLITE_CONSTRAINT);
     }
-    const sqlite3_int64 commit = CreateCommit(db, workspace, message);
+    const sqlite3_int64 commit = transaction_owned
+        ? CreateCommitInTransaction(db, workspace, message)
+        : CreateCommit(db, workspace, message);
     std::string checksum;
     const sqlite3_int64 manifest_id = StoreManifestFromStaging(
-        db, workspace.id, node.id, previous_manifest, staging, &checksum);
+        db, workspace.id, node.id, previous_manifest, handle, staging, &checksum);
     Statement insert(db, R"SQL(
 INSERT INTO _vexfs_file_versions(
  inode_id,version_no,commit_id,manifest_id,size,checksum)
@@ -2338,11 +2520,23 @@ VALUES(?1,?2,?3,?4,?5,?6)
     insert.BindText(6, checksum);
     insert.Done();
     UpdateGrepIndexFromVersion(db, workspace.id, node.id, version);
+    Statement rebase(db,
+        "UPDATE _vexfs_staging SET base_manifest_id=?1,base_size=logical_size,"
+        "base_visible_size=logical_size,capacity=0,"
+        "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE handle_id=?2");
+    rebase.BindInt64(1, manifest_id);
+    rebase.BindText(2, handle.id);
+    rebase.Done();
+    Statement clear_overlay(db,
+        "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
+    clear_overlay.BindText(1, handle.id);
+    clear_overlay.Done();
     return version;
 }
 
 sqlite3_int64 PublishHandleInTransaction(sqlite3 *db, Handle handle,
-                                         sqlite3_int64 generation) {
+                                         sqlite3_int64 generation,
+                                         bool transaction_owned = false) {
     if (handle.state == "closed") throw SqlError("handle is closed", SQLITE_NOTFOUND);
     if (generation <= handle.published_generation) {
         return NodeById(db, handle.inode_id, true).version;
@@ -2357,7 +2551,7 @@ sqlite3_int64 PublishHandleInTransaction(sqlite3 *db, Handle handle,
     }
     Workspace workspace = WorkspaceById(db, handle.workspace_id);
     const sqlite3_int64 version = StoreVersionFromStaging(
-        db, workspace, node, handle, generation, "handle publish");
+        db, workspace, node, handle, generation, "handle publish", transaction_owned);
 
     Statement update(db,
         "UPDATE _vexfs_handles SET expected_version = ?1, published_generation = ?2, "
@@ -2635,7 +2829,40 @@ void ReadFunction(sqlite3_context *context, int, sqlite3_value **values) {
         EnsureSchema(db);
         const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         const Node node = Resolve(db, workspace, PathParts(RequiredText(values[1], "path")));
+        // A mounted workspace stores its mutable head in staging and seals version
+        // history in batches.  Other readers must still observe NFS FILE_SYNC
+        // writes immediately.  Ordinary SDK handles remain private because they
+        // do not own the active mount session.
+        Handle mounted;
+        if (node.kind == "file" &&
+            FindActiveMountStaging(db, workspace.id, node.id, &mounted)) {
+            ResultBlob(context, ReadStagingRange(db, mounted, 0, kMaxStagedBytes));
+            return;
+        }
         ResultBlob(context, ReadNode(db, node));
+    });
+}
+
+void ReadRangeFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const Node node = Resolve(db, workspace, PathParts(RequiredText(values[1], "path")));
+        const sqlite3_int64 offset = RequiredNonnegativeInteger(values[2], "offset");
+        const sqlite3_int64 length = RequiredNonnegativeInteger(values[3], "length");
+        if (node.kind != "file") throw SqlError("path is not a file", SQLITE_MISMATCH);
+        Handle mounted;
+        if (length != 0 &&
+            FindActiveMountStaging(db, workspace.id, node.id, &mounted)) {
+            ResultBlob(context, ReadStagingRange(db, mounted, offset, length));
+            return;
+        }
+        if (node.version == 0 || length == 0 || offset >= node.size) {
+            ResultBlob(context, std::vector<unsigned char>{});
+            return;
+        }
+        ResultBlob(context, ReadVersionRange(db, node.id, node.version, offset, length));
     });
 }
 
@@ -3670,10 +3897,15 @@ WHERE manifest.id IS NULL OR chunk.id IS NULL
         {
             Statement rows(db, R"SQL(
 SELECT h.id,h.inode_id,h.state,h.dirty_generation,h.published_generation,
-       s.generation,s.logical_size,s.capacity,length(d.content)
+       s.generation,s.base_manifest_id,s.base_size,s.base_visible_size,
+       s.logical_size,s.capacity,dirty.chunk_count,dirty.chunk_bytes,dirty.max_chunk
 FROM _vexfs_handles h
 LEFT JOIN _vexfs_staging s ON s.handle_id=h.id
-LEFT JOIN _vexfs_staging_data d ON d.handle_id=h.id
+LEFT JOIN (
+  SELECT handle_id,count(*) chunk_count,COALESCE(sum(length(content)),0) chunk_bytes,
+         max(chunk_no) max_chunk
+  FROM _vexfs_staging_chunks GROUP BY handle_id
+) dirty ON dirty.handle_id=h.id
 WHERE h.workspace_id=?1
 )SQL");
             rows.BindInt64(1, workspace.id);
@@ -3694,18 +3926,31 @@ WHERE h.workspace_id=?1
                 }
                 if (active) {
                     ++report.staging_objects;
-                    if (rows.Type(5) == SQLITE_NULL || rows.Type(8) == SQLITE_NULL) {
+                    const sqlite3_int64 dirty_chunks =
+                        rows.Type(11) == SQLITE_NULL ? 0 : rows.Int64(11);
+                    const sqlite3_int64 dirty_bytes =
+                        rows.Type(12) == SQLITE_NULL ? 0 : rows.Int64(12);
+                    const sqlite3_int64 expected_chunks = rows.Type(9) == SQLITE_NULL ? 0 :
+                        (rows.Int64(9) + kContentChunkBytes - 1) / kContentChunkBytes;
+                    if (rows.Type(5) == SQLITE_NULL ||
+                        (rows.Int64(10) > 0 && rows.Type(11) == SQLITE_NULL)) {
                         report.Add("VEXFS_STAGING_MISSING", object, "staging",
                                    "open or retained handle has no complete staging object",
                                    "discard the handle; recover unpublished work from backup if available");
-                    } else if (rows.Int64(5) != rows.Int64(3) || rows.Int64(6) < 0 ||
-                               rows.Int64(7) < rows.Int64(6) ||
-                               rows.Int64(7) > kMaxStagedBytes || rows.Int64(8) != rows.Int64(7)) {
+                    } else if (rows.Int64(5) != rows.Int64(3) || rows.Int64(7) < 0 ||
+                               rows.Int64(8) < 0 || rows.Int64(8) > rows.Int64(7) ||
+                               rows.Int64(8) > rows.Int64(9) || rows.Int64(9) < 0 ||
+                               rows.Int64(9) > kMaxStagedBytes || rows.Int64(10) < 0 ||
+                               rows.Int64(10) > kMaxStagedBytes ||
+                               (rows.Int64(7) > 0 &&
+                                (rows.Type(6) == SQLITE_NULL || rows.Int64(6) <= 0)) ||
+                               dirty_bytes != rows.Int64(10) ||
+                               (dirty_chunks > 0 && rows.Int64(13) >= expected_chunks)) {
                         report.Add("VEXFS_STAGING_INVALID", object, "staging",
                                    "staging generation, size, or capacity is inconsistent",
                                    "discard the handle; recover unpublished work from backup if available");
                     }
-                } else if (rows.Type(5) != SQLITE_NULL || rows.Type(8) != SQLITE_NULL) {
+                } else if (rows.Type(5) != SQLITE_NULL || rows.Type(11) != SQLITE_NULL) {
                     report.Add("VEXFS_CLOSED_HANDLE_STAGING", object, "staging",
                                "closed handle still owns staging data",
                                "run a future repair or garbage-collection command after backing up");
@@ -3722,7 +3967,7 @@ WHERE h.workspace_id=?1
                            "run a future repair or garbage-collection command after backing up");
             }
             Statement orphan_data(db,
-                "SELECT d.handle_id FROM _vexfs_staging_data d LEFT JOIN _vexfs_staging s "
+                "SELECT d.handle_id FROM _vexfs_staging_chunks d LEFT JOIN _vexfs_staging s "
                 "ON s.handle_id=d.handle_id WHERE s.handle_id IS NULL");
             while (orphan_data.Row()) {
                 report.Add("VEXFS_ORPHAN_STAGING_DATA", "handle:" + orphan_data.Text(0),
@@ -5684,13 +5929,22 @@ void HandleCreateFunction(sqlite3_context *context, int argument_count,
         const std::string workspace_name = RequiredText(values[0], "workspace");
         const std::string path = RequiredText(values[1], "path");
         const int mode = RequiredMode(values[2]);
-        const std::string request_id = RequiredText(values[3], "request_id");
-        const std::string owner_session = argument_count == 5
-            ? RequiredText(values[4], "owner_session") : std::string();
+        const bool owned_create = argument_count == 7;
+        const sqlite3_int64 uid = owned_create
+            ? RequiredOwnerId(values[3], "uid") : 0;
+        const sqlite3_int64 gid = owned_create
+            ? RequiredOwnerId(values[4], "gid") : 0;
+        const int request_index = owned_create ? 5 : 3;
+        const int owner_session_index = owned_create ? 6 : 4;
+        const std::string request_id = RequiredText(values[request_index], "request_id");
+        const std::string owner_session = argument_count == 5 || owned_create
+            ? RequiredText(values[owner_session_index], "owner_session") : std::string();
         RequestFingerprint fingerprint_builder("handle_create");
         fingerprint_builder.AddText(workspace_name);
         fingerprint_builder.AddText(path);
         fingerprint_builder.AddInt64(mode);
+        fingerprint_builder.AddInt64(uid);
+        fingerprint_builder.AddInt64(gid);
         fingerprint_builder.AddText(owner_session);
         const auto fingerprint = fingerprint_builder.Finish();
         const CachedRequest cached = FindRequest(db, request_id, "handle_create", fingerprint);
@@ -5711,6 +5965,15 @@ void HandleCreateFunction(sqlite3_context *context, int argument_count,
             throw SqlError("destination already exists", SQLITE_CONSTRAINT);
         }
         const sqlite3_int64 inode = CreateInode(db, workspace.id, "file", mode);
+        if (owned_create) {
+            Statement owner(db,
+                "UPDATE _vexfs_inodes SET uid=?1,gid=?2 WHERE workspace_id=?3 AND id=?4");
+            owner.BindInt64(1, uid);
+            owner.BindInt64(2, gid);
+            owner.BindInt64(3, workspace.id);
+            owner.BindInt64(4, inode);
+            owner.Done();
+        }
         AddDentry(db, workspace.id, parent.id, name, inode);
 
         const std::string handle_id = RandomHandleId();
@@ -5721,7 +5984,7 @@ void HandleCreateFunction(sqlite3_context *context, int argument_count,
         insert.BindText(1, handle_id);
         insert.BindInt64(2, workspace.id);
         insert.BindInt64(3, inode);
-        if (argument_count == 5) insert.BindText(4, owner_session);
+        if (argument_count == 5 || owned_create) insert.BindText(4, owner_session);
         else insert.BindNull(4);
         insert.Done();
 
@@ -5879,7 +6142,7 @@ void HandleAppendFunction(sqlite3_context *context, int, sqlite3_value **values)
         // reporting a normal write conflict.
         {
             Statement remove_data(db,
-                "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+                "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
             remove_data.BindText(1, handle.id);
             remove_data.Done();
             Statement remove_meta(db,
@@ -5988,7 +6251,7 @@ void HandlePublishCloseFunction(sqlite3_context *context, int, sqlite3_value **v
             "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?1");
         update.BindText(1, handle_id);
         update.Done();
-        Statement clear_data(db, "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+        Statement clear_data(db, "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
         clear_data.BindText(1, handle_id);
         clear_data.Done();
         Statement clear(db, "DELETE FROM _vexfs_staging WHERE handle_id=?1");
@@ -6028,7 +6291,7 @@ void HandleCloseFunction(sqlite3_context *context, int, sqlite3_value **values) 
         update.BindText(3, handle.id);
         update.Done();
         if (!retain) {
-            Statement clear_data(db, "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+            Statement clear_data(db, "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
             clear_data.BindText(1, handle.id);
             clear_data.Done();
             Statement clear(db, "DELETE FROM _vexfs_staging WHERE handle_id=?1");
@@ -6057,7 +6320,7 @@ void RetainOpenHandles(sqlite3 *db, const Workspace &workspace,
     update.BindText(2, session_id);
     update.Done();
     Statement clear_data(db,
-        "DELETE FROM _vexfs_staging_data WHERE handle_id IN "
+        "DELETE FROM _vexfs_staging_chunks WHERE handle_id IN "
         "(SELECT id FROM _vexfs_handles WHERE workspace_id=?1 AND state='closed')");
     clear_data.BindInt64(1, workspace.id);
     clear_data.Done();
@@ -6197,6 +6460,58 @@ void SynchronizeFunction(sqlite3_context *context, int argument_count, sqlite3_v
     });
 }
 
+void PublishCloseAllFunction(sqlite3_context *context, int argument_count,
+                             sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(
+            db, RequiredText(values[0], "workspace"));
+        const std::string owner_session = RequiredText(values[1], "owner_session");
+        if (owner_session.empty()) {
+            throw SqlError("owner_session must not be empty", SQLITE_MISMATCH);
+        }
+        const sqlite3_int64 limit = argument_count == 3
+            ? sqlite3_value_int64(values[2]) : 0;
+        if (limit < 0) {
+            throw SqlError("limit must be zero or positive", SQLITE_RANGE);
+        }
+        Savepoint savepoint(db, "vexfs_publish_close_all");
+        AcquireWriteLock(db);
+        Statement query(db,
+            "SELECT id,dirty_generation FROM _vexfs_handles "
+            "WHERE workspace_id=?1 AND owner_session=?2 AND state='open' "
+            "AND writable=1 AND dirty_generation>published_generation ORDER BY id "
+            "LIMIT ?3");
+        query.BindInt64(1, workspace.id);
+        query.BindText(2, owner_session);
+        query.BindInt64(3, limit == 0 ? -1 : limit);
+        std::vector<std::pair<std::string, sqlite3_int64>> pending;
+        while (query.Row()) pending.emplace_back(query.Text(0), query.Int64(1));
+        for (const auto &item : pending) {
+            // The batch already owns one rollback boundary. Avoid two extra
+            // SAVEPOINT statements per file while keeping the whole batch
+            // atomic if any publish fails.
+            PublishHandleInTransaction(
+                db, FindHandle(db, item.first), item.second, true);
+            Statement close(db,
+                "UPDATE _vexfs_handles SET state='closed',lease_until=NULL,"
+                "updated_at=CAST(strftime('%s','now') AS INTEGER)*1000 WHERE id=?1");
+            close.BindText(1, item.first);
+            close.Done();
+            Statement clear_data(db,
+                "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
+            clear_data.BindText(1, item.first);
+            clear_data.Done();
+            Statement clear(db, "DELETE FROM _vexfs_staging WHERE handle_id=?1");
+            clear.BindText(1, item.first);
+            clear.Done();
+        }
+        savepoint.Release();
+        sqlite3_result_int64(context, static_cast<sqlite3_int64>(pending.size()));
+    });
+}
+
 void ReclaimFunction(sqlite3_context *context, int, sqlite3_value **values) {
     Guard(context, [&] {
         sqlite3 *db = sqlite3_context_db_handle(context);
@@ -6218,7 +6533,7 @@ void ReclaimFunction(sqlite3_context *context, int, sqlite3_value **values) {
         std::vector<std::string> handles;
         while (query.Row()) handles.push_back(query.Text(0));
         for (const std::string &handle : handles) {
-            Statement clear_data(db, "DELETE FROM _vexfs_staging_data WHERE handle_id=?1");
+            Statement clear_data(db, "DELETE FROM _vexfs_staging_chunks WHERE handle_id=?1");
             clear_data.BindText(1, handle);
             clear_data.Done();
             Statement clear(db, "DELETE FROM _vexfs_staging WHERE handle_id=?1");
@@ -6260,6 +6575,7 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_write", 3, WriteFunction, SQLITE_UTF8},
         {"vexfs_append", 3, AppendFunction, SQLITE_UTF8},
         {"vexfs_read", 2, ReadFunction, SQLITE_UTF8},
+        {"vexfs_read_range", 4, ReadRangeFunction, SQLITE_UTF8},
         {"vexfs_grep", 5, GrepFunction, SQLITE_UTF8},
         {"vexfs_grep_index", 1, GrepIndexFunction, SQLITE_UTF8},
         {"vexfs_history", 2, HistoryFunction, SQLITE_UTF8},
@@ -6306,6 +6622,7 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_remove", 3, RemoveFunction, SQLITE_UTF8},
         {"vexfs_handle_create", 4, HandleCreateFunction, SQLITE_UTF8},
         {"vexfs_handle_create", 5, HandleCreateFunction, SQLITE_UTF8},
+        {"vexfs_handle_create", 7, HandleCreateFunction, SQLITE_UTF8},
         {"vexfs_handle_open", 4, HandleOpenFunction, SQLITE_UTF8},
         {"vexfs_handle_open", 5, HandleOpenFunction, SQLITE_UTF8},
         {"vexfs_handle_stage_write", 4, HandleStageWriteFunction, SQLITE_UTF8},
@@ -6320,6 +6637,8 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_mount_session_end", 2, SessionEndFunction, SQLITE_UTF8},
         {"vexfs_mount_synchronize", 2, SynchronizeFunction, SQLITE_UTF8},
         {"vexfs_mount_synchronize", 3, SynchronizeFunction, SQLITE_UTF8},
+        {"vexfs_mount_publish_close_all", 2, PublishCloseAllFunction, SQLITE_UTF8},
+        {"vexfs_mount_publish_close_all", 3, PublishCloseAllFunction, SQLITE_UTF8},
         {"vexfs_item_reclaim", 2, ReclaimFunction, SQLITE_UTF8},
     };
     // sqlite3_create_function_v2 exists throughout the supported SQLite range.  Its

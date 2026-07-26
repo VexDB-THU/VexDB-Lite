@@ -1082,6 +1082,9 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
         Call contract(session,
             "SELECT value FROM _vexfs_meta WHERE key='contract_version'");
         contract.Row();
+        Call layout(session,
+            "SELECT value FROM _vexfs_meta WHERE key='staging_layout'");
+        layout.Row();
         Call journal(session, "PRAGMA journal_mode");
         journal.Row();
         Call synchronous(session, "PRAGMA synchronous");
@@ -1117,9 +1120,12 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
         staging.Row();
         const char *filename = sqlite3_db_filename(session->db, "main");
         const std::string contract_version = contract.ResultText();
-        const bool schema_ready = contract_version == "0.9.0";
+        const std::string staging_layout = layout.ResultText();
+        const bool schema_ready = contract_version == "0.9.0" &&
+                                  staging_layout == "overlay-v1";
         const std::string value =
             "{\"schema_version\":\"" + JsonEscape(contract_version) +
+            "\",\"staging_layout\":\"" + JsonEscape(staging_layout) +
             "\",\"schema_ready\":" + (schema_ready ? "true" : "false") +
             ",\"backend\":\"sqlite\",\"connection\":\"" +
             JsonEscape(filename == nullptr ? "" : filename) +
