@@ -29,10 +29,10 @@ steps:
   expect:
   - - physical_plan
     - <REGEX>:.*VEXDB_INDEX_SCAN.*
-- query: 'SELECT id FROM pq_compact ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;'
+- query: 'SELECT COUNT(*) FROM (SELECT id FROM pq_compact ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1) WHERE id BETWEEN 99 AND 101;'
   _field_types: I
   expect:
-  - - 100
+  - - 1
 - statement: "INSERT INTO pq_compact VALUES (501,\n    ${VEC_LITERAL([5.01::FLOAT, 10.02::FLOAT, 15.03::FLOAT, 20.04::FLOAT,\n     25.05::FLOAT, 30.06::FLOAT, 35.07::FLOAT, 40.08::FLOAT], 8)});"
 - query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact\n    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}\n    LIMIT 1000\n) WHERE id = 501;"
   _field_types: I

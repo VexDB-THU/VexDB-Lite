@@ -5,6 +5,29 @@
 #include "rabitq/estimator.h"
 #include "pq.h"
 
+#include <algorithm>
+#include <cstdint>
+
+namespace {
+
+uint64_t NextReservoirRandom(uint64_t &state)
+{
+    // SplitMix64: deterministic across PG versions and platforms, with no
+    // dependency on backend-global PRNG state.
+    state += UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return z ^ (z >> 31);
+}
+
+uint64_t ReservoirIndex(uint64_t &state, uint64_t upper_bound)
+{
+    return upper_bound == 0 ? 0 : NextReservoirRandom(state) % upper_bound;
+}
+
+} // namespace
+
 QuantizerType extract_qt(const char *qt_type)
 {
     if (qt_type == nullptr) return QuantizerType::NONE;
@@ -71,9 +94,9 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
               DistPrecisionType::FLOAT, dimensions)
         : nullptr;
 
-    // Sequential scan, take first sample_nums non-null vectors. Not random
-    // sampling — fine for codebook training when the table is in roughly
-    // arbitrary insertion order. Random sampling can land here later.
+    // One-pass reservoir sampling keeps memory bounded and gives every valid
+    // row the same chance even when the heap is ordered by time, tenant or
+    // cluster. A fixed seed keeps CREATE INDEX output reproducible.
     samples->length = 0;
     Snapshot snap = GetActiveSnapshot();
 #if PG_VERSION_NUM >= 190000
@@ -93,25 +116,42 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     Datum values[INDEX_MAX_KEYS];
     bool isnull[INDEX_MAX_KEYS];
 
-    int collected = 0;
-    while (collected < sample_nums &&
-           table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    uint64_t seen = 0;
+    uint64_t scanned = 0;
+    // Do not mix the relation OID into the seed. The same ordered data should
+    // train the same codebook after dump/restore or in a freshly created test
+    // database, where OIDs are expected to differ.
+    uint64_t random_state = UINT64_C(0x6A09E667F3BCC909) ^
+                            (uint64_t)sample_nums ^ (uint64_t)dimensions;
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+        scanned++;
         econtext->ecxt_scantuple = slot;
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
         if (!isnull[0]) {
             FloatVector *fv = DatumGetFloatVector(values[0]);
             if (fv->dim == dimensions) {
-                float *sample = FloatVectorArrayGet(samples, collected);
-                std::memcpy(sample, fv->x, sizeof(float) * dimensions);
-                if (norm_func != nullptr) {
-                    norm_func(sample, dimensions, sample);
+                uint64_t sample_index;
+                if (seen < (uint64_t)sample_nums) {
+                    sample_index = seen;
+                } else {
+                    sample_index = ReservoirIndex(random_state, seen + 1);
                 }
-                collected++;
-                samples->length = collected;
+                if (sample_index < (uint64_t)sample_nums) {
+                    float *sample = FloatVectorArrayGet(samples, (int)sample_index);
+                    std::memcpy(sample, fv->x, sizeof(float) * dimensions);
+                    if (norm_func != nullptr) {
+                        norm_func(sample, dimensions, sample);
+                    }
+                }
+                seen++;
             }
         }
         ResetExprContext(econtext);
+        if ((scanned & UINT64_C(0xFFF)) == 0) {
+            CHECK_FOR_INTERRUPTS();
+        }
     }
+    samples->length = (int)std::min<uint64_t>(seen, (uint64_t)sample_nums);
     FreeExecutorState(estate);
     ExecDropSingleTupleTableSlot(slot);
     table_endscan(scan);

@@ -3,8 +3,10 @@ tags: [pg-only, regression, parallel, rabitq]
 description: |
   parallel_workers + quantizer=rabitq + 含 NULL 行时，必须保持索引正确。
   数据量必须超过 10000，使 RaBitQ 真正启用；maintenance_work_mem 低于
-  1GB 会从一开始进入磁盘构建。多个 PG worker 会共享图页，并通过
-  vector_file_write 分片 LWLock 保护小 code 的对齐块读改写。
+  1GB 会从第一条数据进入并行磁盘构建。多个 PG worker 会共享
+  图页，并通过 vector_file_write 分片 LWLock 保护小 code 的对齐块读改写。
+  每行向量必须唯一，否则算法的精确去重会让节点数不再等于行数，
+  失去这个用例验证 ID 跨过 10000 的本意。
 engines: [pg]
 steps:
   - statement: SET maintenance_work_mem = '512MB';
@@ -12,7 +14,10 @@ steps:
   - statement: CREATE TABLE t_1078974 (id bigint, v floatvector(32));
   - statement: |
       INSERT INTO t_1078974
-      SELECT i, ('[' || array_to_string(array(SELECT ((i+j*5) % 300)::float/15 FROM generate_series(0,31) j), ',') || ']')::floatvector(32)
+      SELECT i, ('[' || array_to_string(array(
+        SELECT (((i+j*5) % 300)::float/15 + i::float/100000)
+        FROM generate_series(0,31) j
+      ), ',') || ']')::floatvector(32)
       FROM generate_series(1, 12000) AS i;
   - statement: INSERT INTO t_1078974 VALUES (20000, NULL);
   - statement: >

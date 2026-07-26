@@ -448,6 +448,7 @@ public:
     size_t mirror_max_nodes_ = SIZE_MAX;
     size_t mirror_limit_bytes_ = 0;
     size_t mirror_claimed_bytes_ = 0;
+    size_t mirror_allocated_bytes_ = 0;
     duckdb::Allocator *mirror_allocator_ = nullptr;
 
     ~MemStore() {
@@ -492,11 +493,20 @@ public:
     }
 
     void FreeMirrorSlot(MirrorVectorSlot &slot) {
+        const size_t old_size = static_cast<size_t>(slot.size());
+        VEXDB_DUCK_ASSERT(old_size <= mirror_allocated_bytes_);
+        mirror_allocated_bytes_ = old_size <= mirror_allocated_bytes_
+            ? mirror_allocated_bytes_ - old_size : 0;
         slot.Reset();
     }
 
     void AllocateMirrorSlot(MirrorVectorSlot &slot, duckdb::idx_t bytes) {
+        const size_t old_size = static_cast<size_t>(slot.size());
+        VEXDB_DUCK_ASSERT(old_size <= mirror_allocated_bytes_);
+        mirror_allocated_bytes_ = old_size <= mirror_allocated_bytes_
+            ? mirror_allocated_bytes_ - old_size : 0;
         slot.Allocate(MirrorAllocator(), bytes);
+        mirror_allocated_bytes_ += static_cast<size_t>(slot.size());
     }
 
     void AssignMirrorSlot(MirrorVectorSlot &slot, const char *data, duckdb::idx_t bytes) {
@@ -523,6 +533,29 @@ public:
         if (shrink) {
             vectors.shrink_to_fit();
         }
+    }
+
+    size_t GetTrackedInMemorySize() const {
+        size_t bytes = mirror_allocated_bytes_;
+        bytes += elems.capacity() * sizeof(point_type);
+        bytes += vectors.capacity() * sizeof(MirrorVectorSlot);
+        bytes += base_points.capacity() * sizeof(BasePointRec);
+        bytes += upper_points.capacity() * sizeof(UpperPointRec);
+        bytes += async_ids.capacity() * sizeof(T);
+        bytes += id_to_node_ptr_.capacity() * sizeof(duckdb::IndexPointer);
+        bytes += upper_idx_to_ptr_.capacity() * sizeof(duckdb::IndexPointer);
+        bytes += node_ptr_to_id_.size() *
+                 (sizeof(duckdb::idx_t) + sizeof(T) + 2 * sizeof(void *));
+        // Base/upper neighbor arrays are fixed-width after construction. Count
+        // their separately allocated payload without walking every node.
+        bytes += base_points.size() *
+                 (static_cast<size_t>(m) * 2 * (sizeof(T) + sizeof(float)) +
+                  ((static_cast<size_t>(m) * 2 + 31) / 32) * sizeof(uint32));
+        bytes += upper_points.size() *
+                 (static_cast<size_t>(m) * 2 * sizeof(T) +
+                  static_cast<size_t>(m) * sizeof(float) +
+                  ((static_cast<size_t>(m) + 31) / 32) * sizeof(uint32));
+        return bytes;
     }
 
     std::vector<duckdb::IndexPointer> id_to_node_ptr_;
@@ -627,10 +660,11 @@ public:
             if (node_alloc_ && vector_alloc_) {
                 for (size_t i = cur_base; i < base_n; i++) {
                     auto node_ptr = node_alloc_->New();
-                    auto vec_ptr = vector_alloc_->New();
                     auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                     std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
-                    header->vector_ptr = vec_ptr;
+                    if (!compact_mode_) {
+                        header->vector_ptr = vector_alloc_->New();
+                    }
                     id_to_node_ptr_[i] = node_ptr;
                     node_ptr_to_id_[node_ptr.Get()] = static_cast<T>(i);
                 }
@@ -717,7 +751,12 @@ public:
                 auto node_ptr = node_alloc_->New();
                 auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                 std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
-                if (vector_alloc_) {
+                // ReleaseRawVectors resets vector_alloc_ and marks the store
+                // compact. Quantized incremental inserts have no raw payload,
+                // so allocating an unused vector segment here both wastes space
+                // and eventually exhausts a reset allocator whose sentinel was
+                // intentionally removed.
+                if (vector_alloc_ && !compact_mode_) {
                     header->vector_ptr = vector_alloc_->New();
                 }
                 id_to_node_ptr_[id] = node_ptr;

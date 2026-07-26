@@ -96,12 +96,14 @@ BEGIN
         ELSE 'none'
       END;
 
+      -- For 32 dimensions, pq_m=16 is the high-recall profile used by the
+      -- DuckDB 100k gate. pq_m=8 remains a valid higher-compression choice.
       create_sql :=
         'CREATE INDEX vex_bench_idx ON vex_bench_data USING vexdb_graph '
         || '(vec floatvector_l2_ops) WITH (m=16, ef_construction=160, parallel_workers=4, '
         || 'quantizer=' || quote_literal(expected_quantizer)
         || ', memory_mode=' || quote_literal(expected_memory_mode)
-        || CASE WHEN expected_quantizer = 'pq' THEN ', pq_m=8' ELSE '' END
+        || CASE WHEN expected_quantizer = 'pq' THEN ', pq_m=16' ELSE '' END
         || ')';
 
       started_at := clock_timestamp();
@@ -193,9 +195,35 @@ BEGIN
                            mode, round(recall_at_10::numeric, 4), uses_index, quantizer_active), ', ')
   INTO failed
   FROM vex_bench_results
-  WHERE recall_at_10 < 0.70 OR NOT uses_index OR NOT quantizer_active;
+  WHERE recall_at_10 < 0.80 OR NOT uses_index OR NOT quantizer_active;
   IF failed IS NOT NULL THEN
     RAISE EXCEPTION 'PG quantizer benchmark gate failed: %', failed;
+  END IF;
+END
+$$;
+
+DO $$
+DECLARE failed text;
+BEGIN
+  WITH medians AS (
+    SELECT mode,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY build_ms) AS build_ms,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY qps) AS qps
+    FROM vex_bench_results
+    GROUP BY mode
+  ), baseline AS (
+    SELECT build_ms, qps FROM medians WHERE mode = 'plain'
+  )
+  SELECT string_agg(format('%s(build_ratio=%s,qps_ratio=%s)',
+                           m.mode,
+                           round((m.build_ms / b.build_ms)::numeric, 4),
+                           round((m.qps / b.qps)::numeric, 4)), ', ')
+  INTO failed
+  FROM medians m CROSS JOIN baseline b
+  WHERE m.mode <> 'plain'
+    AND (m.build_ms / b.build_ms > 3.0 OR m.qps / b.qps < 0.60);
+  IF failed IS NOT NULL THEN
+    RAISE EXCEPTION 'PG quantizer performance gate failed: %', failed;
   END IF;
 END
 $$;

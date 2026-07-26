@@ -238,7 +238,8 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                         "vexdb_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", refine_factor);
                 }
             }
-            graph_index.SearchPQ(query_vec.data(), k, result_row_ids, result_distances, refine_factor);
+            graph_index.SearchPQ(query_vec.data(), k, ef, result_row_ids, result_distances,
+                                 refine_factor);
         } else {
             graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
         }

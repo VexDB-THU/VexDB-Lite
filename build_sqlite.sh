@@ -3,7 +3,8 @@
 # 仿 vexdb_pg 独立 CMake 模式（根 build.sh 深耦合 DuckDB 源码树，不复用）。
 #
 #   bash build_sqlite.sh build    # 配置 + 编译双形态 + smoke test 二进制
-#   bash build_sqlite.sh test     # build + 跑五层测试（smoke ×4 + spec）
+#   bash build_sqlite.sh test     # build + 跑完整功能/并行/spec 测试
+#   bash build_sqlite.sh benchmark # Release 量化器功能 + 性能门槛
 #   bash build_sqlite.sh package  # Release 编 macOS arm64+x86_64 → dist/ tarball + SHA256
 #   bash build_sqlite.sh ios      # Stage C：device+sim 静态库 → XCFramework（+sim smoke）
 #   bash build_sqlite.sh android  # Stage C：NDK arm64-v8a/x86_64 静态库 + loadable .so
@@ -15,6 +16,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)/vexdb_sqlite"
 BUILD_DIR="$DIR/build"
 CMD="${1:-build}"
 NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # 解析 cmake：优先 PATH，其次 conan/brew 常见位置（非交互 shell 常无 cmake on PATH）。
 CMAKE="$(command -v cmake || true)"
@@ -47,13 +49,30 @@ case "$CMD" in
             "$BUILD_DIR/m0_static_smoke"
             echo "=== M1 距离层冒烟 ==="
             "$BUILD_DIR/m1_distance_smoke"
+            echo "=== RaBitQ SIMD 分发冒烟 ==="
+            "$BUILD_DIR/simd_dispatch_smoke"
             echo "=== M2 虚拟表冒烟 ==="
             "$BUILD_DIR/m2_vtab_smoke"
             echo "=== M3 HNSW 冒烟 ==="
             "$BUILD_DIR/m3_hnsw_smoke"
+            echo "=== M3+ 4 万向量并行/持久化/有界写回归 ==="
+            "$BUILD_DIR/m3p_parallel_smoke"
+            echo "=== SQLite v3 固定持久化文件兼容 ==="
+            EXTENSION="$BUILD_DIR/vexdb_lite.dylib"
+            [ -f "$EXTENSION" ] || EXTENSION="$BUILD_DIR/vexdb_lite.so"
+            "$PYTHON_BIN" "$DIR/test/legacy_fixture_test.py" "$EXTENSION" \
+                "$DIR/test/fixtures/sqlite_quantizer_legacy_v3.db.gz"
             echo "=== M4 spec（L2 DSL 渲染 + runner） ==="
             bash "$DIR/../tests/spec/_lib/docker/run_sqlite.sh"
         fi
+        ;;
+    benchmark)
+        BUILD_TYPE=Release bash "$0" build
+        EXTENSION="$BUILD_DIR/vexdb_lite.dylib"
+        [ -f "$EXTENSION" ] || EXTENSION="$BUILD_DIR/vexdb_lite.so"
+        "$PYTHON_BIN" "$DIR/test/quantizer_benchmark.py" "$EXTENSION" \
+            --rows 20000 --queries 200 --repetitions 3 --pq-m 16 --check \
+            --min-pq-qps-ratio 0.70 --min-rabitq-qps-ratio 0.65
         ;;
     package)
         # macOS 双 arch 发版包：loadable dylib + 静态 .a + 公共头 + 文档。
@@ -169,7 +188,7 @@ case "$CMD" in
         echo "已清理 build 目录"
         ;;
     *)
-        echo "Usage: $0 [build|test|package|ios|android|vendor|clean]"
+        echo "Usage: $0 [build|test|benchmark|package|ios|android|vendor|clean]"
         exit 1
         ;;
 esac

@@ -1,17 +1,18 @@
-# PG 19devel + vexdb_lite 测试镜像
+# PG 16-19 + vexdb_lite 测试镜像（PG_GIT_TAG 选择版本）
 #
 # 多阶段构建:
-#   stage 1 (pg-build):  从源码 build PG 19devel
+#   stage 1 (pg-build):  从源码 build PG_GIT_TAG 指定的 PostgreSQL
 #   stage 2 (vex-build): build vexdb_lite 扩展, 链到上一阶段的 PG
 #   stage 3 (runtime):   运行环境 - 含 PG server + vexdb_lite 已安装
 #
 # Build:
-#   docker build -t vexdb-pg19 -f tests/spec/_lib/docker/Dockerfile .
+#   docker build --build-arg PG_GIT_TAG=REL_18_STABLE -t vexdb_pg18 \
+#       -f tests/spec/_lib/docker/Dockerfile .
 # Run:
-#   docker run --rm -v $(pwd)/build/spec/pg:/spec vexdb-pg19 \
+#   docker run --rm -v $(pwd)/build/spec/pg:/spec vexdb_pg18 \
 #       /opt/pg19/bin/psql -d test -f /spec/sql/types__floatvector_basic.sql
 
-# ─────────────────────────── stage 1: build PostgreSQL 19 ───────────────────────────
+# ─────────────────────────── stage 1: build PostgreSQL ──────────────────────────────
 FROM debian:trixie-slim AS pg-build
 
 # PostgreSQL master moves to the next major immediately after branching. Keep

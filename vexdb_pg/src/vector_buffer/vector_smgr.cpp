@@ -56,6 +56,7 @@
 #include "vector_buffer/vector_smgr.h"
 #include "vector_buffer/vector_buffer_manager.h"
 #include "vector_buffer/local_vec_cache.h"
+#include "graph_index/parallel_build_locks.h"
 #include "distance/core/distance.h"
 #include "module/parallel_counter.h"
 #include "module/size_format.h"
@@ -71,7 +72,11 @@ using namespace ann_helper;
 
 bool vector_shutdown_requested = false;
 LWLockPadded *VexVecWriteLocks = NULL;
-LWLockPadded *VexGraphBuildLocks = NULL;
+LWLockPadded *VexGraphBuildEntryLocks = NULL;
+LWLockPadded *VexGraphBuildEntryWaitLocks = NULL;
+LWLockPadded *VexGraphBuildStorageLocks = NULL;
+LWLockPadded *VexGraphBuildExtensionLocks = NULL;
+LWLockPadded *VexGraphBuildPointLocks = NULL;
 
 /*
  * MdfdVec - same layout as _MdfdVec in md.c
@@ -688,7 +693,15 @@ retry:
         // cur_pool.hit.inc();
     }
     if (unlikely(params.buf_offset & VecBufferLoc::invalid_mask)) {
-        cur_pool.locmap_for(sig)->erase_if(sig, [](auto &x) { return x.second.empty(); });
+        /* A failed VecBufferLoc constructor is stored as an invalid map value
+         * (invalid_mask), not as the all-zero empty value.  Keeping that value
+         * made every retry visit the same failed entry: each read evicted up to
+         * max_retry unrelated slots and then bypassed the cache, while the
+         * invalid keys accumulated forever.  Remove only the still-invalid
+         * value; a concurrent valid hit must remain untouched. */
+        cur_pool.locmap_for(sig)->erase_if(sig, [](auto &x) {
+            return !x.second.valid();
+        });
         if (unlikely(params.status != SMGR_RD_OK)) {
             report_read_vector_error(params.status, params.rel, params.loc);
         }
@@ -751,6 +764,19 @@ VecBufferLoc::VecBufferLoc(BufferParams &params)
     constexpr uint32 max_self_expand = 3u;
     uint32 self_expand_count = 0;
     while (!pool.pop_freelist(loc)) {
+        /* Once the global quota is exhausted there is nothing left for the
+         * expansion worker to add.  The old path still slept with exponential
+         * backoff before returning an invalid location; get_buffer() could
+         * only evict a slot after that return.  A full cache therefore paid
+         * several pointless sleeps on every cold miss and collapsed under
+         * concurrent random scans.  Fail this allocation immediately so the
+         * outer, map-unlocked path can evict and retry (or fall back to direct
+         * disk I/O after its bounded retries). */
+        if (mgr.nalloced >= NVecBuf) {
+            loc.set_empty();
+            loc.set_invalid();
+            break;
+        }
         if (spins % spins_per_delay == 0) {
             if (InterruptPending) {
                 loc.set_empty();
@@ -871,7 +897,11 @@ void init_vector_smgr()
     }
     VectorBufferLock = &(GetNamedLWLockTranche("vector_buffer")->lock);
     VexVecWriteLocks = GetNamedLWLockTranche("vector_file_write");
-    VexGraphBuildLocks = GetNamedLWLockTranche("graph_build_insert");
+    VexGraphBuildEntryLocks = GetNamedLWLockTranche("graph_build_entry");
+    VexGraphBuildEntryWaitLocks = GetNamedLWLockTranche("graph_build_entry_wait");
+    VexGraphBuildStorageLocks = GetNamedLWLockTranche("graph_build_storage");
+    VexGraphBuildExtensionLocks = GetNamedLWLockTranche("graph_build_extension");
+    VexGraphBuildPointLocks = GetNamedLWLockTranche("graph_build_point");
     void *mgr_mem = MemoryContextAlloc(vecbuf_shared_ctx, sizeof(VecBufferManager));
     VecBufMgr = new (mgr_mem) VecBufferManager();
     if (enable_vec_buffer_manager() && !VecBufMgr->buffer_inited) {
@@ -1397,6 +1427,23 @@ void truncate_vector_file(Relation rel)
     /* Truncate visibility map fork */
     ForkNumber fork = VECTOR_FORKNUM;
     BlockNumber nblocks = 0;
+#if PG_VERSION_NUM >= 180000
+    smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks, &nblocks);
+#else
+    smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks);
+#endif
+}
+
+void truncate_vector_file_to(Relation rel, size_t nbytes)
+{
+    RelationGetSmgr(rel);
+
+    if (!smgrexists(rel->rd_smgr, VECTOR_FORKNUM)) {
+        return;
+    }
+
+    ForkNumber fork = VECTOR_FORKNUM;
+    BlockNumber nblocks = (BlockNumber)((nbytes + BLCKSZ - 1) / BLCKSZ);
 #if PG_VERSION_NUM >= 180000
     smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks, &nblocks);
 #else

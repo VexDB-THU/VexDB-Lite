@@ -1,0 +1,70 @@
+name: duckdb_graph_index_quantized_update_reload
+tags: [duckdb, quantizer, mutation, persistence, regression]
+engines: [duckdb]
+description: Updated PQ and RaBitQ indexes must keep one live row version after checkpoint and restart.
+steps:
+  - raw_directive: load __TEST_DIR__/quantized_update_reload.db
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+
+  - statement: CREATE TABLE pq_reload_full (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_reload_full SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: CREATE INDEX idx_pq_reload_full ON pq_reload_full USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4)};
+  - statement: "UPDATE pq_reload_full SET vec = ${VEC_LITERAL([100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 0;"
+
+  - statement: CREATE TABLE pq_reload_compact (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: INSERT INTO pq_reload_compact SELECT * FROM pq_reload_full;
+  - statement: CREATE INDEX idx_pq_reload_compact ON pq_reload_compact USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, memory_mode='compact')};
+  - statement: "UPDATE pq_reload_compact SET vec = ${VEC_LITERAL([-100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 1;"
+
+  - statement: CREATE TABLE rq_reload_compact (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_reload_compact SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(1024)} t(i);"
+  - statement: CREATE INDEX idx_rq_reload_compact ON rq_reload_compact USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - statement: "UPDATE rq_reload_compact SET vec = ${VEC_LITERAL([100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 0;"
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_reload_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [512, 512]
+  - query: "SELECT id FROM pq_reload_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [1]
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_reload_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [512, 512]
+  - query: "SELECT id FROM pq_reload_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [2]
+  - statement: RESET ${GUC_PQ_SEARCH_MODE};
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM rq_reload_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 2000);"
+    _field_types: II
+    expect:
+      - [1024, 1024]
+  - query: "SELECT id FROM rq_reload_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [1]
+  - statement: DROP TABLE pq_reload_full;
+  - statement: DROP TABLE pq_reload_compact;
+  - statement: DROP TABLE rq_reload_compact;

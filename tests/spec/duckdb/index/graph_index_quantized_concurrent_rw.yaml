@@ -1,0 +1,74 @@
+name: duckdb_graph_index_quantized_concurrent_rw
+tags: [duckdb, quantizer, concurrency, mutation, regression]
+engines: [duckdb]
+description: Concurrent quantized index reads must stay safe while one writer replaces row versions.
+steps:
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 100;
+  - statement: CREATE TABLE pq_concurrent (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_concurrent SELECT i, ${VEC_LITERAL([
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT, sin(i*0.31)::FLOAT, cos(i*0.37)::FLOAT], 8)}
+      FROM ${RANGE(1024)} t(i);"
+  - statement: CREATE INDEX idx_pq_concurrent ON pq_concurrent USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, m=16, ef_construction=160)};
+  - statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+  - raw_directive: concurrentloop threadid 0 6
+    raw_body: '# one writer and five indexed readers'
+  - raw_directive: loop i 0 20
+    raw_body: ''
+  - raw_directive: onlyif threadid=0
+    raw_body: ''
+  - statement: "UPDATE pq_concurrent SET vec = ${VEC_LITERAL([
+      (10 + ${i})::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = ${i};"
+  - raw_directive: endloop
+  - raw_directive: loop i 0 20
+    raw_body: ''
+  - raw_directive: skipif threadid=0
+    raw_body: ''
+  - query: "SELECT count(*) FROM (SELECT id FROM pq_concurrent
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 10);"
+    _field_types: I
+    expect:
+      - [10]
+  - raw_directive: endloop
+  - raw_directive: endloop
+  - query: "SELECT count(*), count(DISTINCT id) FROM (SELECT id FROM pq_concurrent
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 2000);"
+    _field_types: II
+    expect:
+      - [1024, 1024]
+  - statement: RESET ${GUC_PQ_SEARCH_MODE};
+  - statement: DROP TABLE pq_concurrent;
+
+  - statement: CREATE TABLE rq_concurrent (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_concurrent SELECT i, ${VEC_LITERAL([
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT, sin(i*0.31)::FLOAT, cos(i*0.37)::FLOAT], 8)}
+      FROM ${RANGE(1024)} t(i);"
+  - statement: CREATE INDEX idx_rq_concurrent ON rq_concurrent USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - raw_directive: concurrentloop threadid 0 4
+    raw_body: '# one writer and three indexed readers'
+  - raw_directive: loop i 0 16
+    raw_body: ''
+  - raw_directive: onlyif threadid=0
+    raw_body: ''
+  - statement: "UPDATE rq_concurrent SET vec = ${VEC_LITERAL([
+      (10 + ${i})::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = ${i};"
+  - raw_directive: endloop
+  - raw_directive: loop i 0 16
+    raw_body: ''
+  - raw_directive: skipif threadid=0
+    raw_body: ''
+  - query: "SELECT count(*) FROM (SELECT id FROM rq_concurrent
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 10);"
+    _field_types: I
+    expect:
+      - [10]
+  - raw_directive: endloop
+  - raw_directive: endloop
+  - query: "SELECT count(*), count(DISTINCT id) FROM (SELECT id FROM rq_concurrent
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 2000);"
+    _field_types: II
+    expect:
+      - [1024, 1024]
+  - statement: DROP TABLE rq_concurrent;

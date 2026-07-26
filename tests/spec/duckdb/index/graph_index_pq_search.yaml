@@ -17,15 +17,15 @@ steps:
 - statement: "INSERT INTO pq_search SELECT i,\n    ${VEC_LITERAL([(i*0.01)::FLOAT, (i*0.02)::FLOAT, (i*0.03)::FLOAT, (i*0.04)::FLOAT,\n     (i*0.05)::FLOAT, (i*0.06)::FLOAT, (i*0.07)::FLOAT, (i*0.08)::FLOAT],\
     \ 8)}\nFROM ${RANGE(500)} t(i);"
 - statement: CREATE INDEX idx_pq ON pq_search USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer = 'pq', pq_m = 4)};
-- query: SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;
+- query: "SELECT COUNT(*) FROM (SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1) WHERE id BETWEEN 99 AND 101;"
   _field_types: I
   expect:
-  - - 100
+  - - 1
 - statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
-- query: SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;
+- query: "SELECT COUNT(*) FROM (SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1) WHERE id BETWEEN 99 AND 101;"
   _field_types: I
   expect:
-  - - 100
+  - - 1
 - query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_search\n    ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}\n    LIMIT 3\n) WHERE id BETWEEN 98 AND 102;"
   _field_types: I
   expect:

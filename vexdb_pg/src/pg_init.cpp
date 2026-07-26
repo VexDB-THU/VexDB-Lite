@@ -4,6 +4,7 @@
 #include "global_instance.h"
 #include "distance/core/distance.h"
 #include "vector_buffer/vector_smgr.h"
+#include "graph_index/parallel_build_locks.h"
 #include "guc_config.h"
 #include "graph_index/graph_index_state.h"
 #include "vector_buffer/shared_alloc_set.h"
@@ -93,7 +94,11 @@ vexdb_lite_shmem_request(void)
     RequestNamedLWLockTranche("vector_buffer", 1);
     RequestNamedLWLockTranche("graph_index_state", 1);
     RequestNamedLWLockTranche("vector_file_write", VEX_VEC_WRITE_LOCK_STRIPES);
-    RequestNamedLWLockTranche("graph_build_insert", VEX_GRAPH_BUILD_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_entry", VEX_GRAPH_BUILD_ENTRY_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_entry_wait", VEX_GRAPH_BUILD_ENTRY_WAIT_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_storage", VEX_GRAPH_BUILD_STORAGE_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_extension", VEX_GRAPH_BUILD_EXTENSION_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_point", VEX_GRAPH_BUILD_POINT_LOCK_STRIPES);
 }
 
 static void

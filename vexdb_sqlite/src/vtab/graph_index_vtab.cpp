@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -721,18 +722,32 @@ GraphBridge::SegRecReadFn MakeRecReader(GraphIndexVtab &vt) {
 
 // 全内存图占用估算（DiskStore 分流判定；记录定长可精确推算，留 ~10% 容器开销不计较）
 sqlite3_int64 EstimateGraphBytes(const GraphIndexVtab &vt, sqlite3_int64 n) {
+    auto sat_add = [](sqlite3_int64 a, sqlite3_int64 b) {
+        return a > std::numeric_limits<sqlite3_int64>::max() - b
+            ? std::numeric_limits<sqlite3_int64>::max()
+            : a + b;
+    };
+    auto sat_mul = [](sqlite3_int64 a, sqlite3_int64 b) {
+        if (a == 0 || b == 0) return sqlite3_int64(0);
+        return a > std::numeric_limits<sqlite3_int64>::max() / b
+            ? std::numeric_limits<sqlite3_int64>::max()
+            : a * b;
+    };
+    if (n <= 0) return 0;
     sqlite3_int64 code_bytes = 0;
     if (vt.quantizer == QuantizerType::PQ) {
         code_bytes = sqlite3_int64(vt.pq_m);
     } else if (vt.quantizer == QuantizerType::RABITQ) {
         code_bytes = sqlite3_int64(::rabitq::CodeSize(vt.dim));
     }
-    sqlite3_int64 vector_bytes = vt.compact_mode ? 0 : sqlite3_int64(vt.dim) * 4;
-    sqlite3_int64 per = vector_bytes + code_bytes            // raw mirror + 可选量化 code
-                      + sqlite3_int64(vt.m) * 2 * 8          // base neighbors+dists
-                      + 48;                                  // elems/tids/容器头
-    sqlite3_int64 upper = (n / std::max(1, vt.m)) * (sqlite3_int64(vt.m) * 3 * 4 + 64);
-    return n * per + upper;
+    sqlite3_int64 vector_bytes = vt.compact_mode
+        ? 0 : sat_mul(sqlite3_int64(vt.dim), 4);
+    sqlite3_int64 per = sat_add(vector_bytes, code_bytes);
+    per = sat_add(per, sat_mul(sqlite3_int64(vt.m), 16)); // base neighbors+dists
+    per = sat_add(per, 48);                               // elems/tids/容器头
+    sqlite3_int64 upper_per = sat_add(sat_mul(sqlite3_int64(vt.m), 12), 64);
+    sqlite3_int64 upper = sat_mul(n / std::max(1, vt.m), upper_per);
+    return sat_add(sat_mul(n, per), upper);
 }
 
 // 模式分流判定（统一三处调用点防漂移）。体量取 max(存活行数, 持久化节点数)：
@@ -822,7 +837,10 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
     // work_mem 的惯例：构建是一次性 maintenance 操作，临时放大仍有界；
     // phase 2 的写工作集是反向边触碰的 base 段，预算太紧会驱逐 dirty 段
     // 反复写回——写放大不可用）。
-    sqlite3_int64 build_budget = vt.graph_memory_limit * 4;
+    sqlite3_int64 build_budget = vt.graph_memory_limit >
+            std::numeric_limits<sqlite3_int64>::max() / 4
+        ? std::numeric_limits<sqlite3_int64>::max()
+        : vt.graph_memory_limit * 4;
     // 每行内存：图（vec+base+upper 摊销，对齐 EstimateGraphBytes）+ 预读数组
     sqlite3_int64 per_graph = EstimateGraphBytes(vt, 1024) / 1024 + 1;
     sqlite3_int64 per_row = per_graph + sqlite3_int64(vt.dim) * 4 + 16;
@@ -893,7 +911,7 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
     return SQLITE_OK;
 }
 
-// 仅尝试从 v2/v3 段打开图（按 limit 分流两模式），不重建。成功后 vt.graph
+// 仅尝试从 v2/v3/v4 段打开图（按 limit 分流两模式），不重建。成功后 vt.graph
 // 非空。供 EnsureGraph 与 DELETE 标记路径（图未加载时先 open 再标记）共用。
 void TryOpenGraph(GraphIndexVtab &vt) {
     if (vt.graph) return;
@@ -1286,17 +1304,20 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
         }
         std::vector<std::pair<double, int64_t>> hits;
         const size_t requested_k = size_t(k);
-        auto pq_candidate_k = [&](uint32_t search_ef) -> size_t {
+        auto pq_candidate_k = [&]() -> size_t {
             if (!vt.graph->UsesPQ()) return requested_k;
-            // 对齐 PG PQDistancer 的 1.25 倍 refine 候选。SQLite 的 compact
-            // 只删除索引侧 raw mirror，业务向量仍在 %_vectors，因此 full 和
-            // compact 都能把 ADC 候选按精确距离重排。此前只取前 k 个 ADC
-            // 结果再“重排”，候选已经丢失，20k×32 合成集 recall@10 仅约 0.23。
-            const double expanded =
-                std::ceil(double(std::max<size_t>(requested_k, search_ef)) * 1.25);
-            size_t candidates = std::max(requested_k, size_t(expanded));
+            // 图遍历宽度仍由 ef_search 控制，精排预算按 PQ 压缩强度调整：
+            // 子段维度越大，单个 code 越粗，需要保留更多 ADC 候选。32 维下
+            // pq_m=16(dsub=2) 取 4*k，pq_m=8(dsub=4) 取 8*k。旧逻辑固定
+            // 1.25*ef_search，默认 top-10 总是做 200 次 B-tree 点查。
+            const size_t dsub = vt.pq_m > 0 ? size_t(vt.dim) / vt.pq_m : 1;
+            const size_t refine_factor = std::max<size_t>(4, dsub * 2);
+            const size_t max_size = std::numeric_limits<size_t>::max();
+            size_t candidates = requested_k > max_size / refine_factor
+                ? max_size
+                : requested_k * refine_factor;
             size_t available = allowed.empty() ? size_t(CountVectors(vt)) : allowed.size();
-            return std::min(candidates, available);
+            return std::min(std::max(requested_k, candidates), available);
         };
         // DiskStore 段 I/O 可 throw（如写事务内 evict 脏段写回失败）——必须在
         // C 边界内 catch 转 SQL 错误，否则异常穿 SQLite C 帧 = UB/terminate。
@@ -1309,11 +1330,11 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
                 double sel = double(CountVectors(vt)) / double(allowed.size());
                 double base_ef = std::max<double>(double(k), double(vt.ef_search));
                 uint32_t ef_eff = uint32_t(base_ef * std::min(10.0, std::max(1.0, sel)));
-                vt.graph->Search(q.data, pq_candidate_k(ef_eff), ef_eff,
+                vt.graph->Search(q.data, pq_candidate_k(), ef_eff,
                                  [&](int64_t rid) { return allowed.count(rid) > 0; }, hits);
             } else {
                 uint32_t ef = uint32_t(vt.ef_search);
-                vt.graph->Search(q.data, pq_candidate_k(ef), ef, hits);
+                vt.graph->Search(q.data, pq_candidate_k(), ef, hits);
             }
         } catch (const std::exception &e) {
             return vt.SetError(e.what());

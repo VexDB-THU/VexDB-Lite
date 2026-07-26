@@ -69,9 +69,9 @@ void LoadInternal(ExtensionLoader &loader) {
                               "churn where recall has degraded.",
                               LogicalType::UBIGINT, Value::UBIGINT(10000));
     // off (default): search ignores PQ, runs HNSW on raw vectors.
-    // pq_only:       brute-force over PQ codes using a precomputed distance
-    //                table. Approximate but fast for small indexes; useful
-    //                as a way to verify PQ training is healthy.
+    // pq_only:       graph search over PQ codes using a precomputed distance
+    //                table. Approximate, scalable, and useful as a way to
+    //                verify PQ training is healthy.
     config.AddExtensionOption("vexdb_pq_search_mode",
                               "PQ search mode for GRAPH_INDEX: 'off' or 'pq_only'.",
                               LogicalType::VARCHAR, Value("off"));

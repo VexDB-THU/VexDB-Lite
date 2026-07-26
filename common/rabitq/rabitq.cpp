@@ -49,6 +49,56 @@ int RaBitQuantizer::quantize(float *vec, char *bin_data, char *ext_data)
     return closest_cluster;
 }
 
+void RaBitQuantizer::reconstruct(const void *raw_code, float *vec)
+{
+    std::unique_ptr<float, void (*)(void *)> scratch(
+        alloc_floatvector(_padded_dim, 1), free_vector);
+    reconstruct(raw_code, vec, scratch.get());
+}
+
+void RaBitQuantizer::reconstruct(const void *raw_code, float *vec,
+                                 float *padded_scratch)
+{
+    if (!raw_code || !vec || !padded_scratch) {
+        fail("cannot reconstruct a null RaBitQ code, vector, or scratch buffer");
+    }
+    const auto *code = static_cast<const uint8 *>(raw_code);
+    uint16 closest_cluster = 0;
+    std::memcpy(&closest_cluster, code, sizeof(closest_cluster));
+    if (closest_cluster >= HNSW_RABITQ_NUM_CLUSTERS) {
+        fail("RaBitQ code contains an invalid cluster id");
+    }
+
+    const size_t bin_size = RABITQ_BIN_DATA_SIZE(_padded_dim);
+    const size_t ext_code_size = RABITQ_EXT_CODE_SIZE(_padded_dim);
+    const auto *bin_code = code + kCodeHeaderSize;
+    const auto *ext_code = code + kCodeHeaderSize + bin_size;
+
+    float f_rescale_ex = 0.0f;
+    std::memcpy(&f_rescale_ex,
+                ext_code + ext_code_size + sizeof(float), sizeof(float));
+    if (!std::isfinite(f_rescale_ex)) {
+        fail("RaBitQ code contains a non-finite reconstruction factor");
+    }
+    const float residual_scale =
+        _metric == Metric::L2 ? -0.5f * f_rescale_ex : -f_rescale_ex;
+
+    float *rotated = padded_scratch;
+    const float *centroid =
+        _rotated_centroids + closest_cluster * _padded_dim;
+    for (int i = 0; i < _padded_dim; ++i) {
+        uint64 word = 0;
+        std::memcpy(&word, bin_code + (i / 64) * sizeof(uint64), sizeof(word));
+        const bool positive = ((word >> (63 - (i % 64))) & 1U) != 0;
+        const float magnitude = positive
+            ? static_cast<float>(ext_code[i]) + 0.5f
+            : static_cast<float>(255U - ext_code[i]) + 0.5f;
+        rotated[i] = centroid[i] +
+                     (positive ? magnitude : -magnitude) * residual_scale;
+    }
+    _rotator->inverse_rotate_inplace(rotated, vec);
+}
+
 void RaBitQuantizer::pack_bin_code(int *bin_code_int, uint64 *__restrict__ bin_code)
 {
     constexpr int kTypeBits = sizeof(uint64) * 8;

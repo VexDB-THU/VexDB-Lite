@@ -375,10 +375,17 @@ public:
     // 段级 dirty 追踪（mem 模式增量落盘：xSync 只 UPSERT 变更段，免每 commit
     // 清段+全量重写——1M 驻留图单行 insert 原要重写 ~0.8GB）。仅单线程增量
     // 写期启用；并行 BuildBulk 期关闭（防 8 线程标记 race），构建后由 bridge
-    // 标 full_dirty 走全量。upper/elems/meta 常驻三件套体量小，每次全量重写
-    // 不入段追踪。
+    // 标 full_dirty 走全量。v4 也把 elems/upper 切成 64 条记录的小段，避免
+    // 单行 INSERT/DELETE 在百万行图上重写 O(N) row-id/upper 元数据。
     bool track_dirty_ = true;
+    std::unordered_set<uint32> dirty_elem_segs_, dirty_upper_segs_;
     std::unordered_set<uint32> dirty_base_segs_, dirty_vec_segs_;
+    void mark_elem_dirty(T id) {
+        if (track_dirty_) dirty_elem_segs_.insert(uint32(size_t(id) / VEX_SEG_RECORDS));
+    }
+    void mark_upper_dirty(T id) {
+        if (track_dirty_) dirty_upper_segs_.insert(uint32(size_t(id) / VEX_SEG_RECORDS));
+    }
     void mark_base_dirty(T id) {
         if (track_dirty_) dirty_base_segs_.insert(uint32(size_t(id) / VEX_SEG_RECORDS));
     }
@@ -504,6 +511,7 @@ public:
         std::shared_lock<std::shared_mutex> _lk(elems_mutex_);
         std::unique_lock<std::shared_mutex> _tl(GraphIndexPoint::tid_lock());
         elems[id].tids.push_back(tid);
+        mark_elem_dirty(id);
     }
     void add_elem(PointExtensionContext &, T id, Span<const ItemPointerData> tids) {
         std::shared_lock<std::shared_mutex> _lk(elems_mutex_);
@@ -511,6 +519,7 @@ public:
         for (const auto &tid : tids) {
             elems[id].tids.push_back(tid);
         }
+        mark_elem_dirty(id);
     }
 
     void add_vector(T id, const char *query) {
@@ -699,6 +708,7 @@ public:
                                   BitSpan<uint32>(bp.stat_words.data(), bp.neighbors.size()));
         } else {
             auto &up = upper_points[idx];
+            mark_upper_dirty(idx);
             return std::make_pair(up.dists.data(), BitSpan<uint32>(up.stat_words.data(), size_t(m)));
         }
     }
@@ -722,6 +732,7 @@ public:
             if (size_t(pruned) < size_t(m)) {
                 up.neighbors_info[pruned] = newpoint_id;
                 up.neighbors_info[size_t(m) + size_t(pruned)] = newpoint_cur_layer_idx;
+                mark_upper_dirty(cur_layer_idx);
             }
         }
     }
@@ -732,6 +743,7 @@ public:
     }
     void set_upper_neighbors(T idx, const T *neighbors_info) {
         upper_points[idx].neighbors_info.assign(neighbors_info, neighbors_info + m * 2);
+        mark_upper_dirty(idx);
     }
 
     void add_basepoint(T id, const T *neighbors_id) {
@@ -763,6 +775,7 @@ public:
         up.lower_layer_idx = lower_layer_idx;
         up.id = id;
         up.neighbors_info.assign(neighbors_info, neighbors_info + m * 2);
+        mark_upper_dirty(cur_layer_idx);
         unlock_point<false, false>(cur_layer_idx);
     }
 
@@ -875,7 +888,8 @@ public:
     GraphIndexEntryInfo entry_info;
     std::vector<point_type> elems;          // 常驻：id → rowids
     std::vector<UpperPointRec> upper_points;  // 常驻：upper 层全量
-    bool upper_dirty = false;               // upper/elems/meta 的写改标记（xSync 全量重写，体量小）
+    bool upper_dirty = false;               // entry/meta 有改动
+    std::unordered_set<uint32> dirty_elem_segs_, dirty_upper_segs_;
 
     size_t next_base_id_ = 0;
     size_t next_upper_id_ = 0;
@@ -907,6 +921,13 @@ public:
     size_t cache_budget_bytes() const { return cache_budget_; }
     size_t quantizer_code_size() const { return size_t(quantizer_code_size_); }
     size_t rabitq_code_size() const { return quantizer_code_size(); }
+    void mark_elem_dirty(T id) {
+        dirty_elem_segs_.insert(uint32(size_t(id) / SEG_RECORDS));
+    }
+    void mark_upper_dirty(T id) {
+        dirty_upper_segs_.insert(uint32(size_t(id) / SEG_RECORDS));
+        upper_dirty = true;
+    }
 
     const char *get_quantizer_code(T id) {
         if (quantizer_code_size_ == 0) {
@@ -958,11 +979,13 @@ public:
     void add_elem(PointExtensionContext &, T id, const ItemPointerData &tid) {
         if (elems.size() <= size_t(id)) elems.resize(size_t(id) + 1);
         elems[id].tids.push_back(tid);
+        mark_elem_dirty(id);
         upper_dirty = true;
     }
     void add_elem(PointExtensionContext &, T id, Span<const ItemPointerData> tids) {
         if (elems.size() <= size_t(id)) elems.resize(size_t(id) + 1);
         for (const auto &tid : tids) elems[id].tids.push_back(tid);
+        mark_elem_dirty(id);
         upper_dirty = true;
     }
     template <typename Func>
@@ -1096,6 +1119,7 @@ public:
             return std::make_pair(dists, BitSpan<uint32>(stat_scratch_.data(), size_t(m) * 2));
         } else {
             auto &up = upper_points[idx];
+            dirty_upper_segs_.insert(uint32(size_t(idx) / SEG_RECORDS));
             upper_dirty = true;
             return std::make_pair(up.dists.data(), BitSpan<uint32>(stat_scratch_.data(), size_t(m)));
         }
@@ -1116,6 +1140,7 @@ public:
                 auto &up = upper_points[cur_layer_idx];
                 up.neighbors_info[pruned] = newpoint_id;
                 up.neighbors_info[size_t(m) + size_t(pruned)] = newpoint_cur_layer_idx;
+                dirty_upper_segs_.insert(uint32(size_t(cur_layer_idx) / SEG_RECORDS));
                 upper_dirty = true;
             }
         }
@@ -1126,6 +1151,7 @@ public:
     }
     void set_upper_neighbors(T idx, const T *neighbors_info) {
         upper_points[idx].neighbors_info.assign(neighbors_info, neighbors_info + size_t(m) * 2);
+        dirty_upper_segs_.insert(uint32(size_t(idx) / SEG_RECORDS));
         upper_dirty = true;
     }
     void add_basepoint(T id, const T *neighbors_id) {
@@ -1141,6 +1167,7 @@ public:
         up.lower_layer_idx = lower_layer_idx;
         up.id = id;
         up.neighbors_info.assign(neighbors_info, neighbors_info + size_t(m) * 2);
+        dirty_upper_segs_.insert(uint32(size_t(cur_layer_idx) / SEG_RECORDS));
         upper_dirty = true;
     }
 
@@ -1186,7 +1213,7 @@ public:
         }
     }
     bool has_dirty() const {
-        if (upper_dirty) return true;
+        if (upper_dirty || !dirty_elem_segs_.empty() || !dirty_upper_segs_.empty()) return true;
         for (auto &kv : base_cache_.segs)
             if (kv.second.dirty) return true;
         for (auto &kv : vec_cache_.segs)

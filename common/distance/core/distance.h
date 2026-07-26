@@ -32,6 +32,7 @@ constexpr size_t vector_aligned_size = 64ul;
 #if defined(PG_VEXDB_TARGET_PG)
 extern "C" {
 #include "postgres.h"
+#include "miscadmin.h"
 #include "utils/rel.h"
 }
 #elif (defined(PG_VEXDB_TARGET_DUCK) || defined(PG_VEXDB_TARGET_SQLITE))
@@ -434,13 +435,24 @@ inline void free_vector(void *vec) {
 bool is_aligned(const void *ptr);
 
 /* Random number generator for level assignment.
- * thread_local: 并行 build 的多个 worker 并发调用（get_insert_level），共享
- * mt19937 状态是数据竞争（TSan 坐实，SQLite M3+ 揪出；duck 并行 build 同样
- * 命中）。每线程独立流对 HNSW level 的几何分布无影响。种子混入线程序号哈希
- * 避免各线程产生相同 level 序列。*/
+ *
+ * DuckDB/SQLite build with threads, so the thread id gives each worker an
+ * independent stream and avoids sharing mt19937 state. PostgreSQL build with
+ * processes: every worker's only C++ thread can have the same thread-id hash.
+ * Seeding those processes identically makes their level choices move in
+ * lockstep, repeatedly forcing the entry lock into exclusive mode and
+ * serializing an otherwise parallel disk build. Mix in MyProcPid for PG so
+ * sibling workers retain the same geometric distribution but not the same
+ * sequence.
+ */
 inline double RandomDouble() {
+#if defined(PG_VEXDB_TARGET_PG)
+    thread_local std::mt19937 rng(42u ^
+        (static_cast<unsigned>(MyProcPid) * 0x9e3779b9u));
+#else
     thread_local std::mt19937 rng(42u + static_cast<unsigned>(
         std::hash<std::thread::id>{}(std::this_thread::get_id())));
+#endif
     thread_local std::uniform_real_distribution<double> dist(0.0, 1.0);
     return dist(rng);
 }

@@ -16,6 +16,9 @@
 #include "storage/itemptr.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
+#if defined(PG_VEXDB_TARGET_PG)
+#include "graph_index/parallel_build_locks.h"
+#endif
 #include "storage/lmgr.h"
 
 namespace disk_container {
@@ -153,9 +156,16 @@ public:
 
     static BlockNumber get_plain_store(Relation rel, bool need_xlog, ForkNumber fork = MAIN_FORKNUM)
     {
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *extension_lock = vex_graph_build_extension_lock(rel);
+        vex_graph_build_lock_acquire(extension_lock, LW_EXCLUSIVE);
+#endif
         LockRelationForExtension(rel, ExclusiveLock);
         Buffer buffer = ReadBufferExtended(rel, fork, P_NEW, RBM_NORMAL, NULL);
         UnlockRelationForExtension(rel, ExclusiveLock);
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(extension_lock);
+#endif
         LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
         Page page = BufferGetPage(buffer);
         PageInit(page, BLCKSZ, sizeof(PlainStoreOpaqueData));
@@ -535,6 +545,10 @@ private:
 
     Buffer get_new_page_locked(BlockNumber &blkno)
     {
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *extension_lock = vex_graph_build_extension_lock(_rel);
+        vex_graph_build_lock_acquire(extension_lock, LW_EXCLUSIVE);
+#endif
         LockRelationForExtension(_rel, ExclusiveLock);
         Buffer buffer = ReadBuffer(_rel, P_NEW);
         UnlockRelationForExtension(_rel, ExclusiveLock);
@@ -575,6 +589,9 @@ private:
             });
             UnlockReleaseBuffer(old_last_buffer);
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(extension_lock);
+#endif
         return buffer;
     }
 

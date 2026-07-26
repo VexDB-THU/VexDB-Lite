@@ -14,6 +14,7 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 FILTER="${1:-}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-python3 "$ROOT_DIR/tests/spec/_lib/render.py" --engine sqlite --out build/spec >/dev/null || exit 1
-exec python3 "$ROOT_DIR/tests/spec/_lib/docker/sqlite_spec_runner.py" "$ROOT_DIR" "$FILTER"
+"$PYTHON_BIN" "$ROOT_DIR/tests/spec/_lib/render.py" --engine sqlite --out build/spec >/dev/null || exit 1
+exec "$PYTHON_BIN" "$ROOT_DIR/tests/spec/_lib/docker/sqlite_spec_runner.py" "$ROOT_DIR" "$FILTER"

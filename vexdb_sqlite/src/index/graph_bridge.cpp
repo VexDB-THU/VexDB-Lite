@@ -28,6 +28,18 @@ namespace {
 using SqliteStore = MemStore<uint32, GraphIndexPoint>;
 using SqliteDiskStore = DiskStore<uint32, GraphIndexPoint>;
 using SqMetricList = MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>;
+
+template <typename T>
+class VtlDestroyGuard {
+public:
+    explicit VtlDestroyGuard(T &value) : value_(value) {}
+    VtlDestroyGuard(const VtlDestroyGuard &) = delete;
+    VtlDestroyGuard &operator=(const VtlDestroyGuard &) = delete;
+    ~VtlDestroyGuard() { ann_helper::optional_destroy(value_); }
+
+private:
+    T &value_;
+};
 using SqDTypeList = DistPrecisionTypeList<DistPrecisionType::FLOAT>;
 
 Metric ToCoreMetric(VexMetric m) {
@@ -287,13 +299,13 @@ auto RunWithAlgo(Metric metric, uint16_t dim, int ef_construction, int m, Store 
         });
 }
 
-// ---- 序列化格式 v3（段式，M9'：%_graph(kind, seg, data)；全部小端定长记录）----
+// ---- 序列化格式 v4（段式，M9'：%_graph(kind, seg, data)；全部小端定长记录）----
 // v1（全量镜像分块）已废弃：EnsureGraph 读不出 meta 段 → fall through 重建。
-// v3 = elems 支持空壳节点（tid 摘除：DELETE/UPDATE 增量化，对齐 MySQL 二级
-// 索引 delete-mark+insert 范式）。空壳节点 v2 解析器也兼容（cnt=0 正常读，
-// 查询零输出），读侧接受 v2；写侧统一 v3。
+// v3 = elems 支持空壳节点（tid 摘除：DELETE/UPDATE 增量化）；
+// v4 = elems/upper 也按 64 条记录分段，避免单行写重写 O(N) 元数据。
+// 读侧接受 v2/v3；写侧统一 v4。
 constexpr uint32_t kGraphBlobMagic = 0x47535856;  // 'VXSG'
-constexpr uint32_t kGraphBlobVersion = 3;
+constexpr uint32_t kGraphBlobVersion = 4;
 constexpr uint32_t kGraphBlobMinVersion = 2;
 
 struct BlobHeader {
@@ -342,10 +354,9 @@ struct GraphBridge::Impl {
     bool rowid_map_built = false;
     size_t dead_nodes = 0;
     bool elems_dirty = false;  // tid 摘除待落盘（disk 模式 HasDirty 用）
-    // mem 模式落盘形态：true=段与持久化不一致需清段+全量重写（重建/BuildBulk
-    // 后首次落盘）；false=可按 MemStore 段级 dirty 集增量 UPSERT（增量
-    // Insert/RemoveTid 的 commit 免每次重写全图——1M 驻留图单行 insert 原要
-    // 清段+重写 ~0.8GB）。
+    // true=段与持久化不一致，需全量写元数据段。mem 重建时调用方会先清旧
+    // 段；从 v2/v3 打开的图只需把旧的单 BLOB elems/upper 迁移成 v4 分段，
+    // base/vec/code 的既有段格式不变。
     bool full_dirty = false;
     QuantizerType quantizer_type = QuantizerType::NONE;
     bool quantizer_use = false;
@@ -740,6 +751,8 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         Impl &im;
         ~RestoreGuard() {
             im.store.track_dirty_ = true;
+            im.store.dirty_elem_segs_.clear();
+            im.store.dirty_upper_segs_.clear();
             im.store.dirty_base_segs_.clear();
             im.store.dirty_vec_segs_.clear();
             im.full_dirty = true;
@@ -864,9 +877,13 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
         };
         auto search = [&](auto &algo) {
             if (filter) {
-                emit(algo.search(pctx, reinterpret_cast<const char *>(q), ef, node_filter));
+                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef, node_filter);
+                VtlDestroyGuard results_guard(results);
+                emit(results);
             } else {
-                emit(algo.search(pctx, reinterpret_cast<const char *>(q), ef));
+                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef);
+                VtlDestroyGuard results_guard(results);
+                emit(results);
             }
         };
 
@@ -918,11 +935,13 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
 
 bool GraphBridge::RemoveTid(int64_t rowid) {
     auto &im = *impl_;
-    auto with_elems = [&](auto &elems) -> bool {
+    auto with_store = [&](auto &store) -> bool {
+        auto &elems = store.elems;
         if (!im.rowid_map_built) im.build_rowid_map(elems);
         auto it = im.rowid_to_node.find(rowid);
         if (it == im.rowid_to_node.end()) return false;
-        auto &tids = elems[it->second].tids;
+        const auto node_id = it->second;
+        auto &tids = elems[node_id].tids;
         for (size_t i = 0; i < tids.size(); i++) {
             if (tids[i].row_id == rowid) {
                 tids.erase(tids.begin() + i);
@@ -930,11 +949,12 @@ bool GraphBridge::RemoveTid(int64_t rowid) {
             }
         }
         if (tids.empty()) im.dead_nodes++;
+        store.mark_elem_dirty(node_id);
         im.rowid_to_node.erase(it);
         im.elems_dirty = true;
         return true;
     };
-    return im.disk ? with_elems(im.disk->elems) : with_elems(im.store.elems);
+    return im.disk ? with_store(*im.disk) : with_store(im.store);
 }
 
 size_t GraphBridge::DeadNodeCount() const {
@@ -974,7 +994,7 @@ size_t GraphBridge::CacheBudgetBytes() const {
 }
 
 bool GraphBridge::HasDirty() const {
-    return impl_->elems_dirty || impl_->quantizer_fixed_dirty ||
+    return impl_->full_dirty || impl_->elems_dirty || impl_->quantizer_fixed_dirty ||
            !impl_->quantizer_dirty_code_segs.empty() ||
            (impl_->disk && impl_->disk->has_dirty());
 }
@@ -1251,6 +1271,47 @@ bool ParseElemsBlob(const std::vector<char> &blob, size_t base_n,
     return true;
 }
 
+template <typename ElemsVec>
+void BuildElemsSegment(const ElemsVec &elems, size_t begin, size_t records,
+                       std::vector<char> &out) {
+    out.clear();
+    for (size_t i = begin; i < begin + records; i++) {
+        const auto &tids = elems[i].tids;
+        AppendPod(out, uint32_t(tids.size()));
+        for (const auto &tid : tids) AppendPod(out, int64_t(tid.row_id));
+    }
+}
+
+bool ParseElemsSegment(const std::vector<char> &blob, size_t begin, size_t records,
+                       std::vector<GraphIndexPoint> &elems, std::string &err) {
+    const char *p = blob.data();
+    const char *end = p + blob.size();
+    for (size_t i = begin; i < begin + records; i++) {
+        uint32_t count = 0;
+        if (!ReadPod(p, end, count) ||
+            count > static_cast<uint32_t>((end - p) / sizeof(int64_t))) {
+            err = "graph v4 elems segment is truncated";
+            return false;
+        }
+        auto &tids = elems[i].tids;
+        tids.resize(count);
+        for (uint32_t j = 0; j < count; j++) {
+            int64_t rowid = 0;
+            if (!ReadPod(p, end, rowid)) {
+                err = "graph v4 elems segment is truncated in rowids";
+                return false;
+            }
+            tids[j] = ItemPointerData{};
+            tids[j].row_id = rowid;
+        }
+    }
+    if (p != end) {
+        err = "graph v4 elems segment has trailing data";
+        return false;
+    }
+    return true;
+}
+
 template <typename UpperVec>
 void BuildUpperBlob(const UpperVec &ups, size_t upper_n, int m, std::vector<char> &out) {
     const size_t nb = size_t(m) * 2;
@@ -1286,6 +1347,53 @@ bool ParseUpperBlob(const std::vector<char> &blob, size_t upper_n, int m,
         }
         std::memcpy(up.neighbors_info.data(), p, nb * sizeof(uint32));
         p += nb * sizeof(uint32);
+        std::memcpy(up.dists.data(), p, size_t(m) * sizeof(float));
+        p += size_t(m) * sizeof(float);
+    }
+    return true;
+}
+
+template <typename UpperVec>
+void BuildUpperSegment(const UpperVec &ups, size_t begin, size_t records, int m,
+                       std::vector<char> &out) {
+    const size_t neighbor_count = size_t(m) * 2;
+    out.clear();
+    out.reserve(records * (sizeof(uint32) * 2 +
+                           neighbor_count * sizeof(uint32) + size_t(m) * sizeof(float)));
+    for (size_t i = begin; i < begin + records; i++) {
+        const auto &up = ups[i];
+        AppendPod(out, up.lower_layer_idx);
+        AppendPod(out, up.id);
+        out.insert(out.end(), reinterpret_cast<const char *>(up.neighbors_info.data()),
+                   reinterpret_cast<const char *>(up.neighbors_info.data() + neighbor_count));
+        out.insert(out.end(), reinterpret_cast<const char *>(up.dists.data()),
+                   reinterpret_cast<const char *>(up.dists.data() + size_t(m)));
+    }
+}
+
+bool ParseUpperSegment(const std::vector<char> &blob, size_t begin, size_t records,
+                       int m, std::vector<UpperRec> &ups, std::string &err) {
+    const size_t neighbor_count = size_t(m) * 2;
+    const size_t record_bytes = sizeof(uint32) * 2 +
+                                neighbor_count * sizeof(uint32) +
+                                size_t(m) * sizeof(float);
+    if (blob.size() != records * record_bytes) {
+        err = "graph v4 upper segment is truncated";
+        return false;
+    }
+    const char *p = blob.data();
+    const char *end = p + blob.size();
+    for (size_t i = begin; i < begin + records; i++) {
+        auto &up = ups[i];
+        up.neighbors_info.resize(neighbor_count);
+        up.dists.resize(size_t(m));
+        up.stat_words.assign((size_t(m) + 31) / 32, 0);
+        if (!ReadPod(p, end, up.lower_layer_idx) || !ReadPod(p, end, up.id)) {
+            err = "graph v4 upper segment is truncated";
+            return false;
+        }
+        std::memcpy(up.neighbors_info.data(), p, neighbor_count * sizeof(uint32));
+        p += neighbor_count * sizeof(uint32);
         std::memcpy(up.dists.data(), p, size_t(m) * sizeof(float));
         p += size_t(m) * sizeof(float);
     }
@@ -1396,18 +1504,49 @@ bool GraphBridge::SerializeV2(const SegWriteFn &write) {
     };
 
     if (im.disk) {
-        // DiskStore：常驻部分（meta/elems/upper/deleted）全量重写，base/vec/code
-        // 只写 dirty 段；compact 从不打开 vec 段，因此不会产生 vec dirty。
+        // DiskStore：meta 很小，始终写；elems/upper/base/vec/code 只写 dirty
+        // 段。v2/v3 载入后的首次写会通过 full_dirty 一次性迁移元数据段。
         auto &ds = *im.disk;
         const size_t base_n = ds.elems.size();
         const size_t upper_n = ds.upper_points.size();
         BuildMetaBlob(im.dim, im.m, im.ef_construction, im.metric, base_n, upper_n,
                       ds.entry_info, buf);
         if (!write(kKindMeta, 0, buf)) return false;
-        BuildElemsBlob(ds.elems, base_n, buf);
-        if (!write(kKindElems, 0, buf)) return false;
-        BuildUpperBlob(ds.upper_points, upper_n, im.m, buf);
-        if (!write(kKindUpper, 0, buf)) return false;
+        auto write_elem_seg = [&](size_t seg) -> bool {
+            const size_t begin = seg * kSegRecords;
+            if (begin >= base_n) return true;
+            BuildElemsSegment(ds.elems, begin,
+                              std::min(kSegRecords, base_n - begin), buf);
+            return write(kKindElems, uint32_t(seg), buf);
+        };
+        auto write_upper_seg = [&](size_t seg) -> bool {
+            const size_t begin = seg * kSegRecords;
+            if (begin >= upper_n) return true;
+            BuildUpperSegment(ds.upper_points, begin,
+                              std::min(kSegRecords, upper_n - begin), im.m, buf);
+            return write(kKindUpper, uint32_t(seg), buf);
+        };
+        if (im.full_dirty) {
+            const size_t elem_segs = (base_n + kSegRecords - 1) / kSegRecords;
+            const size_t upper_segs = (upper_n + kSegRecords - 1) / kSegRecords;
+            for (size_t seg = 0; seg < elem_segs; seg++) {
+                if (!write_elem_seg(seg)) return false;
+            }
+            for (size_t seg = 0; seg < upper_segs; seg++) {
+                if (!write_upper_seg(seg)) return false;
+            }
+        } else {
+            for (auto it = ds.dirty_elem_segs_.begin();
+                 it != ds.dirty_elem_segs_.end();) {
+                if (!write_elem_seg(*it)) return false;
+                it = ds.dirty_elem_segs_.erase(it);
+            }
+            for (auto it = ds.dirty_upper_segs_.begin();
+                 it != ds.dirty_upper_segs_.end();) {
+                if (!write_upper_seg(*it)) return false;
+                it = ds.dirty_upper_segs_.erase(it);
+            }
+        }
         bool ok = true;
         ds.flush_dirty_segs([&](int kind, uint32 seg, const std::vector<char> &data) -> bool {
             bool w = write(kind, seg, data);
@@ -1415,15 +1554,17 @@ bool GraphBridge::SerializeV2(const SegWriteFn &write) {
             return w;  // 失败段保留 dirty，重试 flush 时重写
         });
         if (ok) {
+            im.full_dirty = false;
+            ds.dirty_elem_segs_.clear();
+            ds.dirty_upper_segs_.clear();
             ds.upper_dirty = false;
             im.elems_dirty = false;
         }
         return ok && write_quantizer();
     }
 
-    // 全内存：常驻三件套全量重写 + base/vec 段（full=全部段，调用方已清旧段；
-    // 增量=仅 MemStore 段级 dirty 集，UPSERT 覆盖——单行 insert 的 commit 从
-    // 重写全图降为 ~每邻居触碰段，1M 驻留图 ~0.8GB → 几百 KB）。
+    // 全内存：meta 始终写，其余全部按 64 条记录分段。full=全部段（调用方
+    // 已清旧段）；增量=仅 dirty 集，单行提交与总行数无关。
     auto &st = im.store;
     const size_t base_n = st.base_points.size();
     const size_t upper_n = st.upper_points.size();
@@ -1434,11 +1575,21 @@ bool GraphBridge::SerializeV2(const SegWriteFn &write) {
     BuildMetaBlob(im.dim, im.m, im.ef_construction, im.metric, base_n, upper_n,
                   st.entry_info, buf);
     if (!write(kKindMeta, 0, buf)) return false;
-    BuildElemsBlob(st.elems, base_n, buf);
-    if (!write(kKindElems, 0, buf)) return false;
-    BuildUpperBlob(st.upper_points, upper_n, im.m, buf);
-    if (!write(kKindUpper, 0, buf)) return false;
-    im.elems_dirty = false;
+
+    auto write_elem_seg = [&](size_t seg) -> bool {
+        const size_t begin = seg * kSegRecords;
+        if (begin >= base_n) return true;
+        BuildElemsSegment(st.elems, begin,
+                          std::min(kSegRecords, base_n - begin), buf);
+        return write(kKindElems, uint32_t(seg), buf);
+    };
+    auto write_upper_seg = [&](size_t seg) -> bool {
+        const size_t begin = seg * kSegRecords;
+        if (begin >= upper_n) return true;
+        BuildUpperSegment(st.upper_points, begin,
+                          std::min(kSegRecords, upper_n - begin), im.m, buf);
+        return write(kKindUpper, uint32_t(seg), buf);
+    };
 
     auto write_base_seg = [&](size_t seg) -> bool {
         buf.assign(kSegRecords * base_rec, 0);
@@ -1469,6 +1620,13 @@ bool GraphBridge::SerializeV2(const SegWriteFn &write) {
 
     if (im.full_dirty) {
         const size_t n_segs = (base_n + kSegRecords - 1) / kSegRecords;
+        const size_t upper_segs = (upper_n + kSegRecords - 1) / kSegRecords;
+        for (size_t seg = 0; seg < n_segs; seg++) {
+            if (!write_elem_seg(seg)) return false;
+        }
+        for (size_t seg = 0; seg < upper_segs; seg++) {
+            if (!write_upper_seg(seg)) return false;
+        }
         for (size_t seg = 0; seg < n_segs; seg++) {
             if (!write_base_seg(seg)) return false;
         }
@@ -1478,11 +1636,23 @@ bool GraphBridge::SerializeV2(const SegWriteFn &write) {
             }
         }
         im.full_dirty = false;
+        im.elems_dirty = false;
+        st.dirty_elem_segs_.clear();
+        st.dirty_upper_segs_.clear();
         st.dirty_base_segs_.clear();
         st.dirty_vec_segs_.clear();
         return write_quantizer();
     }
     // 增量：失败段保留在 dirty 集供重试
+    for (auto it = st.dirty_elem_segs_.begin(); it != st.dirty_elem_segs_.end();) {
+        if (!write_elem_seg(*it)) return false;
+        it = st.dirty_elem_segs_.erase(it);
+    }
+    for (auto it = st.dirty_upper_segs_.begin(); it != st.dirty_upper_segs_.end();) {
+        if (!write_upper_seg(*it)) return false;
+        it = st.dirty_upper_segs_.erase(it);
+    }
+    im.elems_dirty = false;
     for (auto it = st.dirty_base_segs_.begin(); it != st.dirty_base_segs_.end();) {
         if (!write_base_seg(*it)) return false;
         it = st.dirty_base_segs_.erase(it);
@@ -1532,10 +1702,28 @@ std::unique_ptr<GraphBridge> GraphBridge::OpenV2(const SegReadFn &read, uint16_t
     st.ResizeForReload(base_n, upper_n);
 
     std::vector<char> buf;
-    if (!read(kKindElems, 0, buf) || !ParseElemsBlob(buf, base_n, st.elems, err))
-        return nullptr;
-    if (!read(kKindUpper, 0, buf) || !ParseUpperBlob(buf, upper_n, m, st.upper_points, err))
-        return nullptr;
+    if (h.version >= 4) {
+        const size_t elem_segs = (base_n + kSegRecords - 1) / kSegRecords;
+        const size_t upper_segs = (upper_n + kSegRecords - 1) / kSegRecords;
+        for (size_t seg = 0; seg < elem_segs; seg++) {
+            const size_t begin = seg * kSegRecords;
+            const size_t records = std::min(kSegRecords, base_n - begin);
+            if (!read(kKindElems, uint32_t(seg), buf) ||
+                !ParseElemsSegment(buf, begin, records, st.elems, err)) return nullptr;
+        }
+        for (size_t seg = 0; seg < upper_segs; seg++) {
+            const size_t begin = seg * kSegRecords;
+            const size_t records = std::min(kSegRecords, upper_n - begin);
+            if (!read(kKindUpper, uint32_t(seg), buf) ||
+                !ParseUpperSegment(buf, begin, records, m, st.upper_points, err)) return nullptr;
+        }
+    } else {
+        if (!read(kKindElems, 0, buf) ||
+            !ParseElemsBlob(buf, base_n, st.elems, err)) return nullptr;
+        if (!read(kKindUpper, 0, buf) ||
+            !ParseUpperBlob(buf, upper_n, m, st.upper_points, err)) return nullptr;
+        bridge->impl_->full_dirty = true;
+    }
     bridge->impl_->dead_nodes = CountDeadNodes(st.elems);
 
     const size_t n_segs = (base_n + kSegRecords - 1) / kSegRecords;
@@ -1602,16 +1790,36 @@ std::unique_ptr<GraphBridge> GraphBridge::OpenV2Disk(const SegReadFn &read,
 
     const size_t base_n = size_t(h.base_count);
     const size_t upper_n = size_t(h.upper_count);
-    std::vector<char> buf;
-    if (!read(kKindElems, 0, buf) || !ParseElemsBlob(buf, base_n, ds.elems, err))
-        return nullptr;
-    if (!read(kKindUpper, 0, buf) || !ParseUpperBlob(buf, upper_n, m, ds.upper_points, err))
-        return nullptr;
-    im.dead_nodes = CountDeadNodes(ds.elems);
     ds.reset_capacity(base_n, upper_n);
+    std::vector<char> buf;
+    if (h.version >= 4) {
+        const size_t elem_segs = (base_n + kSegRecords - 1) / kSegRecords;
+        const size_t upper_segs = (upper_n + kSegRecords - 1) / kSegRecords;
+        for (size_t seg = 0; seg < elem_segs; seg++) {
+            const size_t begin = seg * kSegRecords;
+            const size_t records = std::min(kSegRecords, base_n - begin);
+            if (!read(kKindElems, uint32_t(seg), buf) ||
+                !ParseElemsSegment(buf, begin, records, ds.elems, err)) return nullptr;
+        }
+        for (size_t seg = 0; seg < upper_segs; seg++) {
+            const size_t begin = seg * kSegRecords;
+            const size_t records = std::min(kSegRecords, upper_n - begin);
+            if (!read(kKindUpper, uint32_t(seg), buf) ||
+                !ParseUpperSegment(buf, begin, records, m, ds.upper_points, err)) return nullptr;
+        }
+    } else {
+        if (!read(kKindElems, 0, buf) ||
+            !ParseElemsBlob(buf, base_n, ds.elems, err)) return nullptr;
+        if (!read(kKindUpper, 0, buf) ||
+            !ParseUpperBlob(buf, upper_n, m, ds.upper_points, err)) return nullptr;
+        im.full_dirty = true;
+    }
+    im.dead_nodes = CountDeadNodes(ds.elems);
     ds.entry_info.set(size_t(h.entry_id), size_t(h.entry_cur_layer_idx),
                       int_fast8_t(h.entry_level));
     ds.upper_dirty = false;
+    ds.dirty_elem_segs_.clear();
+    ds.dirty_upper_segs_.clear();
     if (!ReadQuantizer(read, im, base_n, err)) return nullptr;
     return bridge;
 }

@@ -1,35 +1,71 @@
-name: graph_index_pq_disk_build_fallback
-tags:
-- pg-only
-- pq-v1
+name: graph_index_pq_disk_build
+tags: [pg-only, pq, compact, disk-build, regression]
+engines: [pg]
 description: |
-  PQ encode-at-flush requires the in-memory mem_store path so flush
-  can walk raw vectors once. When maintenance_work_mem is too low
-  build_state falls back to DISK (streaming raw floats directly to
-  vec storage); init_quantizer detects this and NOTICE-fallbacks to
-  plain HNSW with an errhint about maintenance_work_mem.
-
-  Catches: PQ enabled on disk-build path (which would write raw 32-bit
-  floats into 8-byte code slots → silent corruption), or hard ERROR
-  instead of NOTICE+fallback.
-
-engines:
-- pg
+  maintenance_work_mem below 1GB starts the PG graph build directly on disk.
+  PQ must remain active on that path instead of falling back to plain HNSW,
+  and compact mode must store PQ codes without keeping a raw-vector mirror.
 steps:
-# Tight maintenance_work_mem forces disk-build path with the row count
-# below. 64MB is well under the disk-fallback threshold for 100k rows
-# × 128-d FloatVector (520 B/tuple × 100k = 52MB raw vec alone, plus
-# graph + basepoint + upperpoint pools).
-- statement: SET maintenance_work_mem = '64MB';
-- statement: DROP TABLE IF EXISTS pq_disk;
-- statement: CREATE TABLE pq_disk (id INTEGER, vec floatvector(128));
-- statement: "INSERT INTO pq_disk SELECT i, ('[' || array_to_string(array(SELECT (i + j) % 256 FROM generate_series(0,127) AS s(j)), ',') || ']')::floatvector FROM generate_series(0, 99999) AS t(i);"
-- statement: CREATE INDEX idx_pq_disk ON pq_disk USING vexdb_graph (vec) WITH (quantizer='pq', pq_m=8);
-# Either: build_state became DISK and PQ NOTICE-fell back (use_pq=f),
-# or there was enough mem after all and PQ succeeded (use_pq=t).
-# Both are acceptable; what we catch is corruption — the scan must
-# return sensible results either way.
-- query: SELECT COUNT(*) FROM (SELECT id FROM pq_disk ORDER BY vec <-> (SELECT vec FROM pq_disk WHERE id = 0) LIMIT 5) sub;
-  expect:
-    - "5"
-- statement: DROP TABLE pq_disk;
+  - statement: SET maintenance_work_mem = '64MB';
+  - statement: DROP FUNCTION IF EXISTS __pq_disk_vec32(int);
+  - statement: |
+      CREATE FUNCTION __pq_disk_vec32(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 31) AS j
+      $$;
+  - statement: CREATE TABLE pq_disk (id int PRIMARY KEY, vec floatvector(32));
+  - statement: |
+      INSERT INTO pq_disk
+      SELECT i, __pq_disk_vec32(i)
+      FROM generate_series(1, 2048) AS i;
+
+  - statement: |
+      CREATE INDEX idx_pq_disk_full
+      ON pq_disk USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=8, memory_mode=full,
+            m=16, ef_construction=100, parallel_workers=0);
+  - query: |
+      SELECT memory_mode, quantizer, use_pq,
+             pq_codes_bytes > 0, pq_codebook_bytes > 0
+      FROM vexdb_index_info() WHERE indexname='idx_pq_disk_full';
+    expect: [[full, pq, t, t, t]]
+  - query: |
+      SELECT count(*) FROM (
+        SELECT id FROM pq_disk
+        ORDER BY vec <-> __pq_disk_vec32(777) LIMIT 10
+      ) AS ann;
+    expect: [[10]]
+  - statement: DROP INDEX idx_pq_disk_full;
+
+  - statement: |
+      CREATE INDEX idx_pq_disk_compact
+      ON pq_disk USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=8, memory_mode=compact,
+            m=16, ef_construction=100, parallel_workers=0);
+  - query: |
+      SELECT memory_mode, quantizer, use_pq,
+             pq_codes_bytes > 0, pq_codebook_bytes > 0
+      FROM vexdb_index_info() WHERE indexname='idx_pq_disk_compact';
+    expect: [[compact, pq, t, t, t]]
+  - query: |
+      SELECT content::text FROM index_inspect('idx_pq_disk_compact')
+      WHERE attribute = 'Vector Storage';
+    expect: [["PQ Code"]]
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*) FROM (
+        SELECT id FROM pq_disk
+        ORDER BY vec <-> __pq_disk_vec32(777) LIMIT 10
+      ) AS ann;
+    expect: [[10]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE pq_disk;
+  - statement: DROP FUNCTION __pq_disk_vec32(int);

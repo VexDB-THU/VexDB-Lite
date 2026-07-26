@@ -14,6 +14,9 @@
 #include "storage/bufpage.h"
 #include "storage/bufmgr.h"
 #include "commands/tablespace.h"
+#if defined(PG_VEXDB_TARGET_PG)
+#include "graph_index/parallel_build_locks.h"
+#endif
 
 namespace disk_container {
 
@@ -126,6 +129,10 @@ public:
          * before ReadBuffer() in another backend can see that block.  Hold the
          * extension lock for the whole batch to keep the returned range
          * contiguous, matching the DiskVector layout contract. */
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *extension_lock = vex_graph_build_extension_lock(_rel);
+        vex_graph_build_lock_acquire(extension_lock, LW_EXCLUSIVE);
+#endif
         LockRelationForExtension(_rel, ExclusiveLock);
         BlockNumber res = InvalidBlockNumber;
         for (size_t n = 0; n < num_page; ++n) {
@@ -142,6 +149,9 @@ public:
             UnlockReleaseBuffer(buffer);
         }
         UnlockRelationForExtension(_rel, ExclusiveLock);
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(extension_lock);
+#endif
         return res;
     }
 

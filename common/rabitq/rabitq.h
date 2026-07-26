@@ -42,6 +42,11 @@ public:
 
     void train();
     int quantize(float *vec, char *bin_data, char *ext_data = NULL);
+    // Reconstruct a stable centroid-plus-residual approximation from a stored
+    // code. Used for compact graph maintenance; raw source vectors remain
+    // intentionally unavailable.
+    void reconstruct(const void *raw_code, float *vec);
+    void reconstruct(const void *raw_code, float *vec, float *padded_scratch);
     void quantize_scalar(float *vec, float *centroid, int total_bits, uint16 *total_code,
                          float &delta, float &vl, ScalarQuantizerType sqtype = RECONSTRUCTION);
 
@@ -70,6 +75,9 @@ public:
     float *get_centroids() { return _centroids; }
     float *get_rotated_centroids() { return _rotated_centroids; }
     void rotate(float *vec, float *rotated) { _rotator->rotate(vec, rotated); }
+    void inverse_rotate(const float *rotated, float *vec) {
+        _rotator->inverse_rotate(rotated, vec);
+    }
     double get_query_rescaling_factor() { return get_const_scaling_factors(_padded_dim, query_kNumBits - 1); }
     void set_rescaling_factor(double rescaling_factor) {
         if (!std::isfinite(rescaling_factor) || rescaling_factor <= 0.0) {

@@ -158,6 +158,37 @@ int main() {
                 check(std::fabs(r4 - r) < 1e-9, "disk-mode (seg fallback) recall identical");
             }
 
+            // v4 增量元数据门槛：单行 DiskStore insert 只能写一个 elems
+            // 小段和有限个 upper 小段，不能退回整表 O(N) BLOB 重写。
+            size_t elem_writes = 0;
+            size_t upper_writes = 0;
+            size_t elem_bytes = 0;
+            auto bounded_writer = [&](int kind, uint32_t seg,
+                                      const std::vector<char> &d) -> bool {
+                segs[{kind, seg}] = d;
+                if (kind == 1) {
+                    elem_writes++;
+                    elem_bytes += d.size();
+                } else if (kind == 2) {
+                    upper_writes++;
+                }
+                return true;
+            };
+            auto g5 = GraphBridge::OpenV2Disk(
+                reader, bounded_writer, rec_reader, kDim, 16, 100,
+                VexMetric::L2, false, /*cache_budget=*/1, err);
+            check(g5 != nullptr, "v4 disk open for bounded metadata write ok");
+            if (g5) {
+                std::vector<float> added(kDim, 11.0f);
+                g5->Insert(added.data(), 880000);
+                check(g5->SerializeV2(bounded_writer),
+                      "v4 bounded metadata dirty flush ok");
+                check(elem_writes == 1, "single insert writes exactly one elems segment");
+                check(elem_bytes <= 4096, "single insert elems write stays page-sized");
+                check(upper_writes <= 32,
+                      "single insert writes a bounded number of upper segments");
+            }
+
             // RaBitQ 直接持久化测试：绕过 SQL 层的损坏后自动重建，证明
             // OpenV2/OpenV2Disk 本身能恢复量化器，并拒绝损坏的固定数据和编码。
             std::map<std::pair<int, uint32_t>, std::vector<char>> empty_rq_segs;

@@ -18,10 +18,12 @@
 #include "quantizer/annkmeans.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace vex {
@@ -29,12 +31,62 @@ namespace quantizer {
 
 namespace {
 
+template <typename T>
+class ScopedPQAllocation {
+public:
+    ScopedPQAllocation(const PQAllocator &allocator, size_t count, bool zero)
+        : allocator_(allocator) {
+        if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+            VEX_QUANT_ERROR("k-means: allocation size overflow");
+        }
+        const size_t bytes = count * sizeof(T);
+        ptr_ = static_cast<T *>(zero ? allocator_.AllocZero(bytes)
+                                     : allocator_.Alloc(bytes));
+        if (!ptr_ && bytes != 0) {
+            VEX_QUANT_ERRORF("k-means: failed to allocate %zu bytes", bytes);
+        }
+    }
+
+    ScopedPQAllocation(const ScopedPQAllocation &) = delete;
+    ScopedPQAllocation &operator=(const ScopedPQAllocation &) = delete;
+    ~ScopedPQAllocation() { allocator_.Free(ptr_); }
+
+    T *get() const { return ptr_; }
+
+private:
+    const PQAllocator &allocator_;
+    T *ptr_ = nullptr;
+};
+
+size_t SaturatingAdd(size_t a, size_t b) {
+    if (a > std::numeric_limits<size_t>::max() - b) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a + b;
+}
+
+size_t SaturatingMul(size_t a, size_t b) {
+    if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {
+        return std::numeric_limits<size_t>::max();
+    }
+    return a * b;
+}
+
 PQFloatArray AllocFloatArray(const PQContext &ctx, size_t maxlen, size_t dim) {
     PQFloatArray arr;
     arr.maxlen = maxlen;
     arr.length = 0;
     arr.dim    = dim;
-    arr.data   = static_cast<float *>(ctx.allocator.AllocZero(maxlen * dim * sizeof(float)));
+    const size_t count = SaturatingMul(maxlen, dim);
+    if (count == std::numeric_limits<size_t>::max() ||
+        count > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        VEX_QUANT_ERROR("k-means: float array size overflow");
+    }
+    const size_t bytes = count * sizeof(float);
+    arr.data = static_cast<float *>(ctx.allocator.AllocZero(bytes));
+    if (!arr.data && bytes != 0) {
+        VEX_QUANT_ERRORF("k-means: failed to allocate %zu bytes", bytes);
+    }
     return arr;
 }
 
@@ -77,7 +129,8 @@ void InitCenters(const KMeansState &state,
     centers.Set(0, samples.Get(ctx.random.RandomInt() % num_samples));
     centers.length = 1;
 
-    auto *weight = static_cast<float *>(ctx.allocator.Alloc(num_samples * sizeof(float)));
+    ScopedPQAllocation<float> weight_owner(ctx.allocator, num_samples, false);
+    auto *weight = weight_owner.get();
     for (size_t j = 0; j < num_samples; j++) {
         weight[j] = FLT_MAX;
     }
@@ -114,8 +167,6 @@ void InitCenters(const KMeansState &state,
         centers.Set(i + 1, samples.Get(j));
         centers.length++;
     }
-
-    ctx.allocator.Free(weight);
 }
 
 // Fast path when samples.length <= centers.maxlen: copy unique samples and
@@ -166,15 +217,10 @@ void ElkanKmeans(const KMeansState &state,
     size_t num_centers = centers.maxlen;
     size_t num_samples = samples.length;
 
-    // Memory cap check (matches openGauss's logic).
-    size_t total_size = (sizeof(int) * num_centers) +                       // center_counts
-                        (sizeof(int) * num_samples) +                       // closest_centers
-                        (sizeof(float) * num_samples * num_centers) +       // lower_bound
-                        (sizeof(float) * num_samples) +                     // upper_bound
-                        (sizeof(float) * num_centers) +                     // s
-                        (sizeof(float) * num_centers * num_centers) +       // halfcdist
-                        (sizeof(float) * num_centers) +                     // newcdist
-                        (sizeof(float) * num_centers * dim);                // newCenters
+    // Keep the internal guard aligned with the public estimator used by host
+    // adapters. It includes InitCenters' weight buffer, which overlaps the
+    // other Elkan allocations and was previously missing from the check.
+    size_t total_size = EstimateKMeansScratchBytes(num_samples, num_centers, dim);
     if (avg_work_mem_kb > 0 && total_size > static_cast<size_t>(avg_work_mem_kb) * 1024UL) {
         VEX_QUANT_ERRORF("k-means: working set %zu MB exceeds avg_work_mem %d MB",
                          total_size / (1024 * 1024) + 1, avg_work_mem_kb / 1024);
@@ -183,15 +229,32 @@ void ElkanKmeans(const KMeansState &state,
         VEX_QUANT_ERROR("k-means: indexing overflow (numCenters^2 > INT_MAX)");
     }
 
-    auto *center_counts   = static_cast<int *>(ctx.allocator.AllocZero(num_centers * sizeof(int)));
-    auto *closest_centers = static_cast<int *>(ctx.allocator.AllocZero(num_samples * sizeof(int)));
-    auto *lower_bound     = static_cast<float *>(ctx.allocator.AllocZero(num_samples * num_centers * sizeof(float)));
-    auto *upper_bound     = static_cast<float *>(ctx.allocator.AllocZero(num_samples * sizeof(float)));
-    auto *s               = static_cast<float *>(ctx.allocator.AllocZero(num_centers * sizeof(float)));
-    auto *halfcdist       = static_cast<float *>(ctx.allocator.AllocZero(num_centers * num_centers * sizeof(float)));
-    auto *newcdist        = static_cast<float *>(ctx.allocator.AllocZero(num_centers * sizeof(float)));
+    ScopedPQAllocation<int> center_counts_owner(ctx.allocator, num_centers, true);
+    ScopedPQAllocation<int> closest_centers_owner(ctx.allocator, num_samples, true);
+    ScopedPQAllocation<float> lower_bound_owner(
+        ctx.allocator, SaturatingMul(num_samples, num_centers), true);
+    ScopedPQAllocation<float> upper_bound_owner(ctx.allocator, num_samples, true);
+    ScopedPQAllocation<float> s_owner(ctx.allocator, num_centers, true);
+    ScopedPQAllocation<float> halfcdist_owner(
+        ctx.allocator, SaturatingMul(num_centers, num_centers), true);
+    ScopedPQAllocation<float> newcdist_owner(ctx.allocator, num_centers, true);
+
+    auto *center_counts = center_counts_owner.get();
+    auto *closest_centers = closest_centers_owner.get();
+    auto *lower_bound = lower_bound_owner.get();
+    auto *upper_bound = upper_bound_owner.get();
+    auto *s = s_owner.get();
+    auto *halfcdist = halfcdist_owner.get();
+    auto *newcdist = newcdist_owner.get();
 
     PQFloatArray new_centers = AllocFloatArray(ctx, num_centers, dim);
+    // AllocFloatArray owns its allocation; use a tiny local guard without
+    // reallocating so exceptions from distance/parallel callbacks clean it.
+    struct FloatArrayGuard {
+        const PQContext &ctx;
+        PQFloatArray &array;
+        ~FloatArrayGuard() { FreeFloatArray(ctx, array); }
+    } new_centers_guard{ctx, new_centers};
     new_centers.length = num_centers;
 
     auto procinfo    = state.distance_fn;
@@ -215,9 +278,9 @@ void ElkanKmeans(const KMeansState &state,
         closest_centers[j] = best;
     });
 
-    bool changes = false;
+    std::atomic<bool> changes{false};
     for (int iteration = 0; iteration < 500; iteration++) {
-        changes = false;
+        changes.store(false, std::memory_order_relaxed);
 
         // Step 1a: pairwise center-to-center distances (halved).
         ctx.parallel.Run(num_centers, [&](size_t j) {
@@ -270,18 +333,20 @@ void ElkanKmeans(const KMeansState &state,
                     if (dxc < dxcx) {
                         closest_centers[j] = static_cast<int>(k);
                         upper_bound[j]     = static_cast<float>(dxc);
-                        changes            = true;
+                        changes.store(true, std::memory_order_relaxed);
                     }
                 }
             }
         });
 
         // Step 4a: zero new_centers + counts.
-        ctx.parallel.Run(num_centers, [&](size_t j) {
+        // Empty-center replacement consumes RNG state. Keep this loop serial
+        // so a parallel executor cannot make the codebook depend on task order.
+        for (size_t j = 0; j < num_centers; j++) {
             float *vec = new_centers.Get(j);
             for (size_t k = 0; k < dim; k++) vec[k] = 0.0f;
             center_counts[j] = 0;
-        });
+        }
 
         // Step 4b: accumulate (must be serial — multiple j may map to same center).
         for (size_t j = 0; j < num_samples; j++) {
@@ -338,19 +403,10 @@ void ElkanKmeans(const KMeansState &state,
             std::memcpy(centers.Get(j), new_centers.Get(j), dim * sizeof(float));
         });
 
-        if (!changes && iteration != 0) {
+        if (!changes.load(std::memory_order_relaxed) && iteration != 0) {
             break;
         }
     }
-
-    FreeFloatArray(ctx, new_centers);
-    ctx.allocator.Free(center_counts);
-    ctx.allocator.Free(closest_centers);
-    ctx.allocator.Free(lower_bound);
-    ctx.allocator.Free(upper_bound);
-    ctx.allocator.Free(s);
-    ctx.allocator.Free(halfcdist);
-    ctx.allocator.Free(newcdist);
 }
 
 void CheckCenters(const KMeansState &state, PQFloatArray centers) {
@@ -385,6 +441,35 @@ void CheckCenters(const KMeansState &state, PQFloatArray centers) {
 }
 
 } // namespace
+
+size_t EstimateKMeansScratchBytes(size_t num_samples,
+                                  size_t num_centers,
+                                  size_t dim) {
+    if (num_samples == 0 || num_centers == 0 || dim == 0) {
+        return 0;
+    }
+
+    // QuickCenters only owns a sample-order vector; CheckCenters later owns a
+    // center-order vector. They do not overlap.
+    if (num_samples <= num_centers) {
+        return SaturatingMul(std::max(num_samples, num_centers), sizeof(size_t));
+    }
+
+    size_t bytes = 0;
+    auto add = [&](size_t count, size_t elem_size) {
+        bytes = SaturatingAdd(bytes, SaturatingMul(count, elem_size));
+    };
+    add(num_centers, sizeof(int));                         // center_counts
+    add(num_samples, sizeof(int));                         // closest_centers
+    add(SaturatingMul(num_samples, num_centers), sizeof(float)); // lower_bound
+    add(num_samples, sizeof(float));                       // upper_bound
+    add(num_centers, sizeof(float));                       // s
+    add(SaturatingMul(num_centers, num_centers), sizeof(float)); // halfcdist
+    add(num_centers, sizeof(float));                       // newcdist
+    add(SaturatingMul(num_centers, dim), sizeof(float));   // new_centers
+    add(num_samples, sizeof(float));                       // InitCenters weight
+    return bytes;
+}
 
 void AnnKmeans(const KMeansState &state,
                PQFloatArray samples,

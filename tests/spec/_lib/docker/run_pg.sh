@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# PG 19 + vexdb_lite 测试 runner
+# PG 16-19 + vexdb_lite 测试 runner（默认 PG 19）
 #
 # 用法:
 #   bash run_pg.sh build              # 构建镜像 (首次 ~30min: build PG + vexdb_lite)
@@ -7,6 +7,8 @@
 #   bash run_pg.sh down               # 停止 + 删容器
 #   bash run_pg.sh shell              # psql 进入容器 test 数据库
 #   bash run_pg.sh test [pattern]     # 跑 spec 测试, 默认全部. pattern 例: 'types__*'
+#   PG_MAJOR=18 bash run_pg.sh test   # 指定 PostgreSQL 大版本
+#   bash run_pg.sh matrix             # 依次构建并测试 PG 16/17/18/19
 #   bash run_pg.sh logs               # 查看 PG server 日志
 #   bash run_pg.sh status             # 容器状态
 #
@@ -17,10 +19,22 @@ ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 # PG source lives inside this repo (vexdb_lite/duckdb). The legacy
 # separate ~/PersonalProjects/PG_VEXDB checkout was retired 2026-05-13.
 PG_VEXDB_SRC="${PG_VEXDB_SRC:-$ROOT_DIR}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 SPEC_DIR="${ROOT_DIR}/build/spec/pg"
 RESULTS_DIR="${SPEC_DIR}/results"
-IMAGE="vexdb_pg19:latest"
-CONTAINER="vexdb_pg19-test"
+PG_MAJOR="${PG_MAJOR:-19}"
+case "$PG_MAJOR" in
+    16|17|18|19) ;;
+    *) echo "PG_MAJOR must be one of: 16, 17, 18, 19" >&2; exit 2 ;;
+esac
+PG_GIT_TAG="${PG_GIT_TAG:-REL_${PG_MAJOR}_STABLE}"
+IMAGE="vexdb_pg${PG_MAJOR}:latest"
+CONTAINER="vexdb_pg${PG_MAJOR}-test"
+if [[ "$PG_MAJOR" == "19" ]]; then
+    PG_HOST_PORT="${PG_HOST_PORT:-5433}"
+else
+    PG_HOST_PORT="${PG_HOST_PORT:-$((5400 + PG_MAJOR))}"
+fi
 
 YEL=$'\033[1;33m'; GRN=$'\033[0;32m'; RED=$'\033[0;31m'; NC=$'\033[0m'
 info() { printf '%s[pg]%s %s\n' "$YEL" "$NC" "$*"; }
@@ -60,13 +74,14 @@ cmd_build() {
         tar -xf -
     )
 
-    info "docker build (首次 ~30min, build PG 19devel + vexdb_lite)"
+    info "docker build (首次 ~30min, build PG ${PG_MAJOR} + vexdb_lite)"
     # CI 通过 BUILDX_EXTRA_ARGS 传 cache 参数 (例: --cache-from type=gha --cache-to type=gha,mode=max)
     if [[ -n "${BUILDX_EXTRA_ARGS:-}" ]]; then
         # shellcheck disable=SC2086  # 故意让 BUILDX_EXTRA_ARGS 按空格 split
-        docker buildx build $BUILDX_EXTRA_ARGS --load --tag "$IMAGE" /tmp/vexdb_pg-ctx
+        docker buildx build $BUILDX_EXTRA_ARGS --load --tag "$IMAGE" \
+            --build-arg "PG_GIT_TAG=$PG_GIT_TAG" /tmp/vexdb_pg-ctx
     else
-        docker build --tag "$IMAGE" /tmp/vexdb_pg-ctx
+        docker build --tag "$IMAGE" --build-arg "PG_GIT_TAG=$PG_GIT_TAG" /tmp/vexdb_pg-ctx
     fi
     ok "镜像就绪: $IMAGE"
 }
@@ -79,7 +94,8 @@ cmd_up() {
     else
         info "首次启动 container"
         # 默认只绑 localhost; 跨主机访问需 PG_PUBLISH_HOST=0.0.0.0 显式打开
-        docker run -d --name "$CONTAINER" -p "${PG_PUBLISH_HOST:-127.0.0.1}:5433:5432" "$IMAGE"
+        docker run -d --name "$CONTAINER" \
+            -p "${PG_PUBLISH_HOST:-127.0.0.1}:${PG_HOST_PORT}:5432" "$IMAGE"
     fi
     wait_pg_ready
 }
@@ -88,7 +104,7 @@ wait_pg_ready() {
     info "等待 PG ready..."
     for _ in $(seq 1 30); do
         if docker exec "$CONTAINER" psql -d test -c 'SELECT 1' >/dev/null 2>&1; then
-            ok "PG ready on localhost:5433 db=test (容器内 5432)"
+            ok "PG ready on localhost:${PG_HOST_PORT} db=test (容器内 5432)"
             return 0
         fi
         sleep 1
@@ -156,16 +172,26 @@ cmd_status() {
     docker ps -a --filter "name=$CONTAINER" --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
 }
 
+cmd_render() {
+    info "render spec → ${SPEC_DIR#$ROOT_DIR/}"
+    # The rendered file name comes from the spec's `name`, not its YAML path.
+    # Recreate this engine directory so a renamed spec cannot leave an old SQL
+    # file behind and make a full run report a false extra pass/failure.
+    rm -rf "$SPEC_DIR"
+    "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/render.py" --engine pg --out "${ROOT_DIR}/build/spec"
+}
+
 cmd_test() {
     require_docker
     local pattern="${1:-*}"
-    [[ -d "$SPEC_DIR/sql" ]] || { fail "spec 未渲染. 先跑 python3 tests/spec/_lib/render.py --engine pg --out build/spec"; exit 1; }
+    cmd_render
     docker ps --format '{{.Names}}' | grep -qx "$CONTAINER" || cmd_up
 
     mkdir -p "$RESULTS_DIR"
     rm -f "$RESULTS_DIR"/*.diff "$RESULTS_DIR"/summary.txt
 
-    local pass=0 fail=0 list=()
+    local pass=0 failed_count=0
+    local -a failures=()
     for sql_file in "$SPEC_DIR/sql/"$pattern.sql; do
         [[ -e "$sql_file" ]] || continue
         local name="$(basename "$sql_file" .sql)"
@@ -199,33 +225,47 @@ EOF
         awk 'NF || prev_nf { print } { prev_nf = NF }' "$actual" > "${actual}.tmp" && mv "${actual}.tmp" "$actual"
 
         if [[ -f "$expected" ]]; then
-            if python3 "${ROOT_DIR}/tests/spec/_lib/docker/compare.py" "$expected" "$actual" 2>"$diff_file"; then
+            if "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/docker/compare.py" "$expected" "$actual" 2>"$diff_file"; then
                 pass=$((pass+1))
                 rm -f "$diff_file"
                 printf '  %s%s%s %s\n' "$GRN" "PASS" "$NC" "$name"
             else
-                fail=$((fail+1))
-                list+=("$name")
+                failed_count=$((failed_count+1))
+                failures+=("$name")
                 printf '  %sFAIL%s %s (see %s)\n' "$RED" "$NC" "$name" "${diff_file#$ROOT_DIR/}"
             fi
         else
-            fail=$((fail+1))
-            list+=("$name")
+            failed_count=$((failed_count+1))
+            failures+=("$name")
             printf '  %sFAIL%s %s (no expected)\n' "$RED" "$NC" "$name"
         fi
     done
 
     {
         echo "=== PG spec test summary ==="
-        echo "passed: $pass / $((pass+fail))"
-        if (( fail > 0 )); then
+        echo "passed: $pass / $((pass+failed_count))"
+        if (( failed_count > 0 )); then
             echo ""
             echo "failures:"
-            printf '  %s\n' "${list[@]}"
+            printf '  %s\n' "${failures[@]}"
         fi
     } | tee "$RESULTS_DIR/summary.txt"
 
-    (( fail == 0 ))
+    (( failed_count == 0 ))
+}
+
+cmd_matrix() {
+    require_docker
+    local major
+    for major in 16 17 18 19; do
+        info "=== PostgreSQL $major matrix ==="
+        PG_MAJOR="$major" "$0" build
+        PG_MAJOR="$major" "$0" down
+        PG_MAJOR="$major" "$0" up
+        PG_MAJOR="$major" "$0" test
+        PG_MAJOR="$major" "$0" down
+    done
+    ok "PostgreSQL 16/17/18/19 matrix passed"
 }
 
 case "${1:-}" in
@@ -234,6 +274,7 @@ case "${1:-}" in
     down)   cmd_down ;;
     shell)  cmd_shell ;;
     test)   shift; cmd_test "$@" ;;
+    matrix) cmd_matrix ;;
     logs)   cmd_logs ;;
     status) cmd_status ;;
     "" | -h | --help) sed -n '2,16p' "$0" ;;

@@ -100,13 +100,13 @@ public:
 
     float get_distance_est_single(const void *, const void *code, uint16_t) const {
         if (!code) fail("estimate code is missing");
-        auto parts = Decode(code);
+        auto parts = DecodeForDistance(code);
         return estimator_.get_bin_dist(parts.cluster_id, parts.bin_data);
     }
 
     float get_distance_single(const void *, const void *code, uint16_t) const {
         if (!code) fail("full code is missing");
-        auto parts = Decode(code);
+        auto parts = DecodeForDistance(code);
         return estimator_.get_full_dist(parts.cluster_id, parts.bin_data, parts.ext_data);
     }
 
@@ -135,15 +135,19 @@ private:
         char *ext_data;
     };
 
-    CodeParts Decode(const void *raw_code) const {
+    CodeParts DecodeForDistance(const void *raw_code) const {
         if (!raw_code) {
             fail("code is missing");
         }
         auto *code = const_cast<uint8_t *>(static_cast<const uint8_t *>(raw_code));
         uint16_t cluster_id = 0;
         std::memcpy(&cluster_id, code, sizeof(cluster_id));
-        if (!CodeHasValidCluster(code) || !CodeHasFiniteFactors(code, dim_)) {
-            fail("code contains invalid values");
+        // Factor finiteness is checked once when a code is encoded or loaded.
+        // Repeating six memcpy/isfinite checks for every graph edge dominated
+        // short-vector searches. Keep the cluster bound check here because it
+        // protects the estimator's centroid array from an out-of-range access.
+        if (cluster_id >= HNSW_RABITQ_NUM_CLUSTERS) {
+            fail("code contains an invalid cluster id");
         }
         auto *bin_data = reinterpret_cast<char *>(code + cid_size_);
         return {cluster_id, bin_data, bin_data + bin_size_};

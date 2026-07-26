@@ -22,12 +22,9 @@ extern "C" {
 
 #define VERIFY_BUFFER false
 #define VEX_VEC_WRITE_LOCK_STRIPES 128
-#define VEX_GRAPH_BUILD_LOCK_STRIPES 128
 
 /* Cross-process locks for aligned-block read/modify/write in vec_write. */
 extern LWLockPadded *VexVecWriteLocks;
-/* Cross-process locks for one compound disk graph insertion. */
-extern LWLockPadded *VexGraphBuildLocks;
 
 /* SMGR_READ_STATUS enum */
 enum SMGR_READ_STATUS {
@@ -98,6 +95,7 @@ extern void write_vector(Relation rel, size_t loc, size_t elem_size, const char 
 /* File management */
 extern void create_vec_data(Relation rel, bool need_wal);
 extern void truncate_vector_file(Relation rel);
+extern void truncate_vector_file_to(Relation rel, size_t nbytes);
 
 /* Cache management */
 extern void vec_invalidate_buffer_cache(Oid relNode, size_t loc, size_t elem_size);

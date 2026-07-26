@@ -37,6 +37,10 @@ public:
 
     void build();
     void rotate(float *data, float *rotated);
+    void inverse_rotate(const float *rotated, float *data);
+    // Destructively consumes one padded, aligned work buffer. Rebuild paths
+    // reuse this buffer across rows to avoid one heap allocation per vector.
+    void inverse_rotate_inplace(float *work, float *data);
 
     char *get_random_matrix() { return (char *)_flip.data(); }
     size_t get_random_matrix_size() const { return sizeof(uint8) * _flip.size(); }

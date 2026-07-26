@@ -20,6 +20,7 @@ SPEC_DIR="${ROOT_DIR}/build/spec/duckdb"
 VEX_TEST_DIR="${DUCK_VEX_TEST:-${ROOT_DIR}/vexdb_duckdb/test/sql/vex}"
 SPEC_RUN_DIR="${VEX_TEST_DIR}/spec_run"
 BUILD_DUCK="${ROOT_DIR}/build_duck.sh"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 YEL=$'\033[1;33m'; GRN=$'\033[0;32m'; RED=$'\033[0;31m'; NC=$'\033[0m'
 info() { printf '%s[duck-spec]%s %s\n' "$YEL" "$NC" "$*"; }
@@ -29,7 +30,7 @@ fail() { printf '%s[duck-spec]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 cmd_render() {
     info "render spec → ${SPEC_DIR#$ROOT_DIR/}"
     rm -rf "$SPEC_DIR"
-    python3 "${ROOT_DIR}/tests/spec/_lib/render.py" --engine duckdb --out "${ROOT_DIR}/build/spec"
+    "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/render.py" --engine duckdb --out "${ROOT_DIR}/build/spec"
 }
 
 cmd_deploy() {

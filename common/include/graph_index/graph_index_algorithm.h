@@ -98,6 +98,10 @@ public:
         PointExtensionContext &ctx;
         const char *query;
         ItemPointerData tid;
+        // Published by insert() for adapters that maintain row-id side maps.
+        // It is the newly allocated node id, or the existing node id when the
+        // vector was deduplicated into an existing graph point.
+        T result_id = static_cast<T>(INVALID_VECTOR_ID);
         static constexpr void check_round() {}
         static constexpr bool round_full() { return true; }
         static constexpr void destroy() {}
@@ -181,17 +185,20 @@ public:
         int_fast8_t insert_level = get_insert_level(m);
 retry:
         const bool bottom_only = false && !retried;
-        auto [entry_info, shared_lock] = bottom_only
+        auto entry_lock_state = bottom_only
             ? store.template get_entry<true, true>(insert_level)
             : store.template get_entry<true, false>(insert_level);
+        auto entry_info = entry_lock_state.first;
+        bool shared_lock = entry_lock_state.second;
         int_fast8_t entry_level = entry_info.level;
         if (graph_is_empty(entry_level)) {
             /* graph is empty, insert the first point */
-            store.template assign_vector_id<true>();
-            init_range_elem<InsertContext>(ctx.ctx, 0, ctx);
+            T id = store.template assign_vector_id<true>();
+            init_range_elem<InsertContext>(ctx.ctx, id, ctx);
             add_first_basepoint();
-            store.add_vector(distancer, 0, ctx.query);
-            store.set_entrypoint(0, 0, 0);
+            store.add_vector(distancer, id, ctx.query);
+            store.set_entrypoint(id, id, 0);
+            ctx.result_id = id;
             store.release_entry_lock(shared_lock);
             return;
         }
@@ -483,6 +490,7 @@ private:
                 }
                 return insert_range_tid<InsertContext>(ctx.ctx, ctx, pt);
             })) {
+                ctx.result_id = p.id;
                 return InsertStrategy::Trivial;
             }
         }
@@ -493,6 +501,7 @@ private:
     {
         int_fast8_t search_level = (int_fast8_t)nbr_record.size();
         T id = store.template assign_vector_id<true>();
+        ctx.result_id = id;
         init_range_elem<InsertContext>(ctx.ctx, id, ctx);
         CONSTEXPR_IF (use_dist_cache) {
             dist_cache.emplace((m + ef_construction) * (1 + search_level));
@@ -792,7 +801,19 @@ private:
             }
             closest.emplace(nbr.val, i, dist, nbr.id);
         }
-        closest.emplace(store.get_data(new_point_id), (T)INVALID_VECTOR_ID, self.dist, self.id);
+        /*
+         * DiskStore caches pair distances by candidate IDs.  The candidate
+         * below contains the new point's vector, so its cache identity must
+         * also be new_point_id.  Reusing self.id aliases it with the existing
+         * reverse-edge target: a cached distance between self and one of its
+         * old neighbors is then incorrectly reused as the distance from the
+         * new point to that neighbor.  MemStore did not expose this because
+         * its stats path deliberately uses self.id only as a marker and does
+         * not enable the pair-distance cache.
+         */
+        const T inserted_candidate_id = use_dist_cache ? new_point_id : self.id;
+        closest.emplace(store.get_data(new_point_id), (T)INVALID_VECTOR_ID,
+                        self.dist, inserted_candidate_id);
 
         const auto elem_closer = [&](const Vec<PruneNeighbor> &set, const PruneNeighbor &p) -> bool {
             for (const PruneNeighbor &ri : set) {

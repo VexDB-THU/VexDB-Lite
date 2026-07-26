@@ -209,15 +209,20 @@ cmd_unittest() {
 
 _compile_one() {
     local src="$1" out="$2"; shift 2
+    local boost_include
+    boost_include=$(sed -n 's/^Boost_INCLUDE_DIR:PATH=//p' "$DUCK_BUILD/CMakeCache.txt" | head -1)
     [[ -f "$src" ]]      || fail "missing source: $src"
     [[ -f "$LIBDUCKDB" ]]|| fail "missing $LIBDUCKDB — run: $0 build"
     [[ -f "$LIBLOADER" ]]|| fail "missing $LIBLOADER — run: $0 build"
+    [[ -n "$boost_include" && -f "$boost_include/boost/preprocessor/seq.hpp" ]] \
+        || fail "Boost include path missing from DuckDB CMake cache"
     info "compile $(basename "$src") → $(basename "$out")"
     "$CXX_BIN" -std=c++17 -O2 \
         "$src" \
         -I"$DUCK_SRC/src/include" \
         -I"$DUCK_SRC/extension/core_functions/include" \
         -I"$VEX_INCLUDE" \
+        -I"$boost_include" \
         "$@" \
         "$LIBDUCKDB" \
         "$LIBLOADER" \
@@ -229,6 +234,13 @@ cmd_bin() {
     _compile_one "$VEX_TEST/smoke_create_index.cpp"        "$DUCK_BIN/smoke_create_index"
     _compile_one "$VEX_TEST/explain_literal_query.cpp"     "$DUCK_BIN/explain_literal_query"        "$LIBCORE"
     _compile_one "$VEX_TEST/crash_recovery.cpp"            "$DUCK_BIN/crash_recovery"               "$LIBVEX" "$LIBCORE"
+    _compile_one "$VEX_TEST/create_legacy_quantizer_fixture.cpp" "$DUCK_BIN/create_legacy_quantizer_fixture" "$LIBCORE"
+    _compile_one "$VEX_TEST/rabitq_reconstruct_smoke.cpp"  "$DUCK_BIN/rabitq_reconstruct_smoke" \
+        -DPG_VEXDB_TARGET_DUCK -I"$PROJECT_DIR/common" -I"$PROJECT_DIR/common/include" \
+        "$LIBVEX" "$LIBCORE"
+    _compile_one "$VEX_TEST/pq_failure_cleanup_smoke.cpp" "$DUCK_BIN/pq_failure_cleanup_smoke" \
+        -DPG_VEXDB_TARGET_DUCK -I"$PROJECT_DIR/common" -I"$PROJECT_DIR/common/include" \
+        "$LIBVEX" "$LIBCORE"
     _compile_one "$VEX_TEST/benchmark/vex_sift_sql_benchmark.cpp" "$DUCK_BIN/vex_sift_sql_benchmark" "$LIBCORE"
     _compile_one "$VEX_TEST/benchmark/vex_rabitq_synthetic_benchmark.cpp" "$DUCK_BIN/vex_rabitq_synthetic_benchmark" "$LIBCORE"
     ok "binaries built under $DUCK_BIN/"
@@ -246,9 +258,15 @@ cmd_data() {
 }
 
 cmd_smoke() {
-    [[ -f "$DUCK_BIN/smoke_create_index" ]] || cmd_bin
+    [[ -f "$DUCK_BIN/smoke_create_index" && \
+       -f "$DUCK_BIN/rabitq_reconstruct_smoke" && \
+       -f "$DUCK_BIN/pq_failure_cleanup_smoke" ]] || cmd_bin
     info "running smoke_create_index"
     "$DUCK_BIN/smoke_create_index" "$EXTENSION_PATH"
+    info "running rabitq_reconstruct_smoke"
+    "$DUCK_BIN/rabitq_reconstruct_smoke"
+    info "running pq_failure_cleanup_smoke"
+    "$DUCK_BIN/pq_failure_cleanup_smoke"
 }
 
 cmd_explain() {
@@ -294,7 +312,7 @@ cmd_bench_rabitq() {
 }
 
 cmd_all() {
-    cmd_setup; cmd_data; cmd_build; cmd_bin; cmd_smoke; cmd_bench_10k
+    cmd_setup; cmd_data; cmd_build; cmd_bin; cmd_smoke; cmd_bench_10k; cmd_bench_rabitq
 }
 
 cmd_clean() {

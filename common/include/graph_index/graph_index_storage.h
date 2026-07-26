@@ -34,6 +34,9 @@
 #include "ann_utils.h"
 #include "floatvector.h"
 #include "index_inspect.h"
+#if defined(PG_VEXDB_TARGET_PG)
+#include "graph_index/parallel_build_locks.h"
+#endif
 
 PERF_DECLARE_CATS(MemPerfCats, true, read, write, calc, lock);
 PERF_DECLARE_CATS(DiskPerfCats, false, read_node, read_neighbor, read_vec, write_node, write_neighbor, write_vec, calc, lock, fetch);
@@ -679,12 +682,14 @@ public:
     using point_type_data = typename elem_type::Data;
     static constexpr bool use_dist_cache = true;
 
-    DiskStore(Relation index, Relation heap, Buffer metabuf, bool need_wal)
+    DiskStore(Relation index, Relation heap, Buffer metabuf, bool need_wal,
+              bool parallel_build = false)
         : index(index),
           heap(heap),
           metap(GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf))),
           metabuf(metabuf),
           need_wal(need_wal),
+          parallel_build(parallel_build),
           m(metap->m),
           dim(metap->dimension),
           precision_type(metap->precision_type),
@@ -816,6 +821,18 @@ public:
     T assign_vector_id()
     {
         DO_PERF(write_node);
+#if defined(PG_VEXDB_TARGET_PG)
+        /*
+         * One short lock protects all graph DiskVector metadata updates for
+         * this index.  DiskVector::append() nests reserve() under its existing
+         * heavyweight page lock; putting a non-reentrant LWLock directly in
+         * that path would self-deadlock.  The outer storage lock keeps ID and
+         * capacity publication serialized without covering node writes or
+         * graph search.
+         */
+        LWLock *storage_lock = parallel_build ? vex_graph_build_storage_lock(index) : NULL;
+        vex_graph_build_lock_acquire(storage_lock, LW_EXCLUSIVE);
+#endif
         GIStateInput input;
         graph_index_get_state(index, GIStateOper::GET_UNDER_VACUUM, input);
         bool can_reuse = !input.bool_val.val;
@@ -848,6 +865,9 @@ public:
                 id = upper_layer.append();
             }
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(storage_lock);
+#endif
         STOP_PERF(write_node);
         return id;
     }
@@ -1018,13 +1038,55 @@ public:
         DO_PERF(lock);
         bool shared = true;
         CONSTEXPR_IF (with_lock) {
+#if defined(PG_VEXDB_TARGET_PG)
+            LWLock *entry_lock = parallel_build ? vex_graph_build_entry_lock(index) : NULL;
+            LWLock *entry_wait_lock = parallel_build ? vex_graph_build_entry_wait_lock(index) : NULL;
+            /* Stop new shared holders from passing an exclusive upgrader. */
+            vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+            vex_graph_build_lock_release(entry_wait_lock);
+            vex_graph_build_lock_acquire(entry_lock, LW_SHARED);
+#endif
             /* wait vacuum to operate atomically */
             LockPage(index, metablkno, ShareLock);
             if ((!force_share_flag && unlikely(insert_level > metap->entry_level)) ||
                 unlikely(metap->entry_level < 0)) {
                 UnlockPage(index, metablkno, ShareLock);
+#if defined(PG_VEXDB_TARGET_PG)
+                vex_graph_build_lock_release(entry_lock);
+                vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+                vex_graph_build_lock_acquire(entry_lock, LW_EXCLUSIVE);
+                vex_graph_build_lock_release(entry_wait_lock);
+#endif
                 LockPage(index, metablkno, ExclusiveLock);
                 shared = false;
+#if defined(PG_VEXDB_TARGET_PG)
+                if (parallel_build) {
+                    /*
+                     * Several workers can observe the same old entry level
+                     * before any of them obtains the exclusive lock.  Only
+                     * the first one still needs exclusivity; keeping every
+                     * stale upgrader exclusive serializes several complete
+                     * high-level insertions.  Entry level is monotonic during
+                     * CREATE INDEX, so after the first worker publishes the
+                     * requested level it is safe to join the normal shared
+                     * insertion path using the new entry point.
+                     */
+                    LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+                    bool upgrade_still_needed =
+                        ((!force_share_flag && insert_level > metap->entry_level) ||
+                         metap->entry_level < 0);
+                    LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+                    if (!upgrade_still_needed) {
+                        UnlockPage(index, metablkno, ExclusiveLock);
+                        vex_graph_build_lock_release(entry_lock);
+                        vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+                        vex_graph_build_lock_release(entry_wait_lock);
+                        vex_graph_build_lock_acquire(entry_lock, LW_SHARED);
+                        LockPage(index, metablkno, ShareLock);
+                        shared = true;
+                    }
+                }
+#endif
             }
         }
         init_entrypoint();
@@ -1039,6 +1101,11 @@ public:
         } else {
             UnlockPage(index, metablkno, ExclusiveLock);
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            vex_graph_build_lock_release(vex_graph_build_entry_lock(index));
+        }
+#endif
     }
 
     void init_entrypoint()
@@ -1070,7 +1137,14 @@ public:
     void add_elem(PointExtensionContext &ctx, T id, Span<const point_type_data> d, bool is_async = false)
     {
         DO_PERF(write_node);
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *storage_lock = parallel_build ? vex_graph_build_storage_lock(index) : NULL;
+        vex_graph_build_lock_acquire(storage_lock, LW_EXCLUSIVE);
+#endif
         elems.extend(id + 1);
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(storage_lock);
+#endif
         point_type elem(ctx, d, is_async);
         elems.template set<AccessorLockType::WriteLock>(id, elem);
         STOP_PERF(write_node);
@@ -1369,9 +1443,38 @@ public:
     uint_fast32_t get_cluster_rate() const { return metap->cluster_rate; }
     DistPrecisionType get_precision() const { return metap->precision_type; }
 
-    /* no used */
-    template <bool, bool> static constexpr void lock_point(T) {}
-    template <bool, bool> static constexpr void unlock_point(T) {}
+    /*
+     * During a parallel build, readers take a shared point lock across copying
+     * and scoring one neighbor list, while writers take the exclusive form
+     * across the complete read/prune/write sequence.  Runtime scans keep their
+     * existing buffer-lock-only fast path, so this build fix does not add one
+     * named LWLock acquisition per visited node to query execution.
+     */
+    template <bool is_base_layer, bool shared_lock>
+    void lock_point(T id)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            LWLock *point_lock = vex_graph_build_point_lock(index, (uint64)id, is_base_layer);
+            vex_graph_build_lock_acquire(point_lock, shared_lock ? LW_SHARED : LW_EXCLUSIVE);
+        }
+#else
+        (void)id;
+#endif
+    }
+
+    template <bool is_base_layer, bool shared_lock>
+    void unlock_point(T id)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            vex_graph_build_lock_release(
+                vex_graph_build_point_lock(index, (uint64)id, is_base_layer));
+        }
+#else
+        (void)id;
+#endif
+    }
     template <bool is_base_layer>
     static constexpr Pair<float *, BitSpan<uint>> get_neighbor_stats(T id)
         { return Pair<float *, BitSpan<uint>>(nullptr, nullptr, 0, 0); }
@@ -1422,6 +1525,7 @@ private:
     Buffer statbuf{InvalidBuffer};
 
     bool need_wal;
+    bool parallel_build;
     uint_fast16_t m;
     uint_fast16_t dim;
     DistPrecisionType precision_type;
@@ -1450,7 +1554,8 @@ using DiskStoreVariant = Variant<
     DiskStore<size_t>
 >;
 
-inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation heap, Buffer metabuf, bool need_wal)
+inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation heap, Buffer metabuf,
+                              bool need_wal, bool parallel_build = false)
 {
     if (need_wal) {
         need_wal = RelationNeedsWAL(index);
@@ -1460,9 +1565,9 @@ inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation he
         Assert(metap->id_type == IdType::U32);
         Assert(false);
     } else if (metap->id_type == IdType::U32) {
-        var.template emplace<DiskStore<uint32>>(index, heap, metabuf, need_wal);
+        var.template emplace<DiskStore<uint32>>(index, heap, metabuf, need_wal, parallel_build);
     } else {
-        var.template emplace<DiskStore<size_t>>(index, heap, metabuf, need_wal);
+        var.template emplace<DiskStore<size_t>>(index, heap, metabuf, need_wal, parallel_build);
     }
 }
 

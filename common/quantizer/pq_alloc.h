@@ -140,8 +140,8 @@ struct PQFloatArray {
 };
 
 // Random number callbacks. K-means and PQ use these for centroid init.
-// Default implementation seeds with std::mt19937(42) — deterministic, matches
-// openGauss's pinned-seed behavior for reproducible builds.
+// The default SplitMix64 state is owned by each context, so a new training run
+// starts from a fixed seed and does not inherit process/thread history.
 struct PQRandom {
     using IntFn    = uint32_t (*)(void *user);
     using DoubleFn = double   (*)(void *user);
@@ -149,9 +149,15 @@ struct PQRandom {
     IntFn    int_fn    = nullptr;
     DoubleFn double_fn = nullptr;
     void    *user      = nullptr;
+    mutable uint64_t fallback_state = 42;
 
     uint32_t RandomInt() const;
     double   RandomDouble() const;
+    void Seed(uint64_t seed) {
+        // SplitMix64 permits zero, but avoid a trivially recognizable initial
+        // state in dumps while keeping the mapping stable across platforms.
+        fallback_state = seed ^ 0x9e3779b97f4a7c15ULL;
+    }
 };
 
 // Parallel task executor. Backends supply an implementation that can fan out
