@@ -124,6 +124,18 @@ steps:
 - query: SELECT CAST(vexfs_read_version('default', '/notes/2026/hello.txt', 1) AS TEXT);
   expect:
   - - hello
+- query: SELECT json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.changed'), json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.from_size'), json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.to_size');
+  expect:
+  - - 1
+    - 5
+    - 11
+- query: SELECT json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 3, 3), '$.changed');
+  expect:
+  - - 0
+- statement: UPDATE _vexfs_manifests SET chunk_count=2049 WHERE id=(SELECT manifest_id FROM _vexfs_file_versions WHERE inode_id=4 AND version_no=1);
+- query: SELECT vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3);
+  expect_error: file version content reference is corrupt
+- statement: UPDATE _vexfs_manifests SET chunk_count=1 WHERE id=(SELECT manifest_id FROM _vexfs_file_versions WHERE inode_id=4 AND version_no=1);
 - query: SELECT vexfs_restore_version('default', '/notes/2026/hello.txt', 1, 3);
   expect:
   - - 4
@@ -283,3 +295,14 @@ steps:
 - query: SELECT vexfs_snapshot_drop('default', 'gc-protected');
   expect:
   - - 1
+- query: SELECT vexfs_write('default', '/multi.bin', zeroblob(65537));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/multi.bin', zeroblob(131073));
+  expect:
+  - - 2
+- query: SELECT json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.changed'), json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.from_size'), json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.to_size');
+  expect:
+  - - 1
+    - 65537
+    - 131073

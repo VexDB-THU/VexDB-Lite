@@ -101,11 +101,26 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
   bash tests/eval/vexfs/run_pg_restart_recovery.sh
 
-# 断电等价 Gate：strict 写入并 fsync、SIGKILL gateway、PG immediate restart、
-# 重挂载读取与 deep check；只写一个小文件，容器 memory.max 必须不超过 1 GiB。
+# 断电等价 Gate：strict 写入并 fsync、校验 mount source/fsid 和 gateway 进程
+# 启动身份、SIGKILL gateway、PG immediate restart、重挂载读取与 deep check；
+# 只写一个小文件，容器 memory.max 必须不超过 1 GiB。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXFS_EVAL_MOUNT_CLI=/absolute/path/to/current/vexdb \
   bash tests/eval/vexfs/run_pg_strict_crash_recovery.sh
+
+# 连续 crash soak；首轮失败立即停止，默认 20 轮、最多 100 轮。
+# 每次运行自动使用唯一数据库名，数据库已存在时拒绝执行，不会预先 drop。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+VEXFS_EVAL_MOUNT_CLI=/absolute/path/to/current/vexdb \
+VEXFS_PG_STRICT_CRASH_ROUNDS=20 \
+  bash tests/eval/vexfs/run_pg_strict_crash_soak.sh
+
+# 先保留 gateway 的主 libpq/publisher TCP 连接但停止双向转发，再真实关闭两条连接
+# 并让新连接进入 blackhole。验证两类故障都在约 5 秒内有界失败、10 秒内恢复，
+# 同时覆盖断线期间 visibility 重同步、后台 publisher、唯一数据库、deep check 和 OOM。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+VEXFS_EVAL_MOUNT_CLI=/absolute/path/to/current/vexdb \
+  bash tests/eval/vexfs/run_pg_network_cut_recovery.sh
 
 # 完整数据库 pg_dump/pg_restore
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \

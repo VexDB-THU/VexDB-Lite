@@ -89,13 +89,10 @@ std::string PgScalar(PGconn *connection, const char *sql) {
     return value;
 }
 
-bool WaitForBackendIdle(PGconn *control, int backend_pid) {
+bool WaitForScalarValue(PGconn *control, const char *sql, const char *expected) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    const std::string sql =
-        "SELECT coalesce((SELECT state='idle' FROM pg_stat_activity WHERE pid=" +
-        std::to_string(backend_pid) + "),false)";
     while (std::chrono::steady_clock::now() < deadline) {
-        if (PgScalar(control, sql.c_str()) == "t") return true;
+        if (PgScalar(control, sql) == expected) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return false;
@@ -349,11 +346,9 @@ int main(int argc, char **argv) {
     }
     if (!Expect(PQstatus(unknown) == CONNECTION_OK,
                 "unknown-result query sent") ||
-        !Expect(WaitForBackendIdle(control, PQbackendPID(unknown)),
-                "unknown-result server commit completed") ||
-        !Expect(PgScalar(control,
+        !Expect(WaitForScalarValue(control,
             "SELECT convert_from(vexfs_read('pg-runtime-contract',"
-            "'/project/unknown-result.txt'),'UTF8')") == "unknown",
+            "'/project/unknown-result.txt'),'UTF8')", "unknown"),
             "unknown-result commit visible before response read")) {
         PQfinish(unknown);
         return 1;
@@ -542,6 +537,29 @@ int main(int argc, char **argv) {
 
     if (!Expect(TerminateRuntimeConnection(control, backend_pid),
                 "terminate runtime connection")) return 1;
+    if (!CheckStatus("peer write while listener disconnected", vexfs_mount_write_file(
+            peer, "/project/missed-notification.txt", "missed", 6,
+            &version, &error), error)) return 1;
+    vexfs_mount_visibility visibility_after_disconnect{};
+    const vexfs_mount_status first_visibility_after_disconnect =
+        vexfs_mount_refresh_visibility(session, &visibility_after_disconnect, &error);
+    ++checks;
+    if (first_visibility_after_disconnect != VEXFS_MOUNT_OK &&
+        first_visibility_after_disconnect != VEXFS_MOUNT_DATABASE_ERROR)
+        return Fail("visibility disconnect status", &error);
+    bool resync_invalidated_cache = first_visibility_after_disconnect == VEXFS_MOUNT_OK &&
+        visibility_after_disconnect.external_commit == 1;
+    if (!resync_invalidated_cache) {
+        if (first_visibility_after_disconnect == VEXFS_MOUNT_DATABASE_ERROR) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        }
+        if (!CheckStatus("visibility reconnect next operation",
+                vexfs_mount_refresh_visibility(
+                    session, &visibility_after_disconnect, &error), error)) return 1;
+        resync_invalidated_cache = visibility_after_disconnect.external_commit == 1;
+    }
+    if (!Expect(resync_invalidated_cache,
+                "reconnect invalidates notifications missed while disconnected")) return 1;
     bytes = {};
     const vexfs_mount_status first_after_disconnect =
         vexfs_mount_stat(session, "/project/main.txt", &bytes, &error);

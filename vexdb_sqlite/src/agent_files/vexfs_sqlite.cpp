@@ -1025,15 +1025,18 @@ WHERE v.inode_id=?1 AND v.version_no=?2
     if (!statement.Row()) {
         throw SqlError("file version not found: " + std::to_string(version), SQLITE_NOTFOUND);
     }
+    const sqlite3_int64 size = statement.Int64(1);
+    const sqlite3_int64 chunk_count = statement.Int64(8);
+    const sqlite3_int64 expected_chunk_count = size < 0 || size > kMaxStagedBytes
+        ? -1 : (size + kContentChunkBytes - 1) / kContentChunkBytes;
     if (statement.Type(0) == SQLITE_NULL || statement.Int64(0) <= 0 ||
-        statement.Int64(1) < 0 || statement.Int64(1) != statement.Int64(3) ||
+        size < 0 || size > kMaxStagedBytes || size != statement.Int64(3) ||
         statement.Text(4).size() != 64 || statement.Text(4) != statement.Text(5) ||
         statement.Text(4) != statement.Text(6) ||
-        statement.Int64(7) != kContentChunkBytes || statement.Int64(8) < 0) {
+        statement.Int64(7) != kContentChunkBytes || chunk_count != expected_chunk_count) {
         throw SqlError("file version content reference is corrupt", SQLITE_CORRUPT);
     }
-    return {statement.Int64(0), statement.Int64(1), statement.Int64(2),
-            statement.Int64(8), statement.Text(4)};
+    return {statement.Int64(0), size, statement.Int64(2), chunk_count, statement.Text(4)};
 }
 
 std::vector<unsigned char> ReadVersionContent(sqlite3 *db, sqlite3_int64 inode_id,
@@ -3159,8 +3162,10 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
 )SQL");
         from_rows.BindInt64(1, from.manifest_id);
         to_rows.BindInt64(1, to.manifest_id);
-        vexfs::Sha256 from_hash;
-        vexfs::Sha256 to_hash;
+        std::vector<vexfs::ManifestChunkChecksum> from_manifest_chunks;
+        std::vector<vexfs::ManifestChunkChecksum> to_manifest_chunks;
+        from_manifest_chunks.reserve(static_cast<size_t>(from.chunk_count));
+        to_manifest_chunks.reserve(static_cast<size_t>(to.chunk_count));
         bool changed = from.size != to.size;
         bool binary = false;
         sqlite3_int64 chunk_no = 0;
@@ -3168,9 +3173,13 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
         sqlite3_int64 to_chunks = 0;
         sqlite3_int64 from_bytes_total = 0;
         sqlite3_int64 to_bytes_total = 0;
+        bool from_done = false;
+        bool to_done = false;
         while (true) {
-            const bool has_from = from_rows.Row();
-            const bool has_to = to_rows.Row();
+            const bool has_from = !from_done && from_rows.Row();
+            const bool has_to = !to_done && to_rows.Row();
+            if (!has_from) from_done = true;
+            if (!has_to) to_done = true;
             if (!has_from && !has_to) break;
             std::vector<unsigned char> from_chunk;
             std::vector<unsigned char> to_chunk;
@@ -3182,7 +3191,8 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
                     vexfs::Sha256Hex(from_chunk.data(), from_chunk.size()) != from_rows.Text(3)) {
                     throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
                 }
-                from_hash.Update(from_chunk.data(), from_chunk.size());
+                from_manifest_chunks.push_back({
+                    static_cast<uint64_t>(from_chunk.size()), from_rows.Text(3)});
                 from_bytes_total += static_cast<sqlite3_int64>(from_chunk.size());
                 ++from_chunks;
             }
@@ -3194,7 +3204,8 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
                     vexfs::Sha256Hex(to_chunk.data(), to_chunk.size()) != to_rows.Text(3)) {
                     throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
                 }
-                to_hash.Update(to_chunk.data(), to_chunk.size());
+                to_manifest_chunks.push_back({
+                    static_cast<uint64_t>(to_chunk.size()), to_rows.Text(3)});
                 to_bytes_total += static_cast<sqlite3_int64>(to_chunk.size());
                 ++to_chunks;
             }
@@ -3206,8 +3217,12 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
         }
         if (from_bytes_total != from.size || to_bytes_total != to.size ||
             from_chunks != from.chunk_count || to_chunks != to.chunk_count ||
-            vexfs::Hex(from_hash.Finish()) != from.checksum ||
-            vexfs::Hex(to_hash.Finish()) != to.checksum) {
+            vexfs::ManifestChecksum(
+                static_cast<uint64_t>(from.size),
+                static_cast<uint64_t>(kContentChunkBytes), from_manifest_chunks) != from.checksum ||
+            vexfs::ManifestChecksum(
+                static_cast<uint64_t>(to.size),
+                static_cast<uint64_t>(kContentChunkBytes), to_manifest_chunks) != to.checksum) {
             throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
         }
         const std::string json =

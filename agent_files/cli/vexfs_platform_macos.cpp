@@ -207,6 +207,23 @@ std::string NormalizedPath(const std::string &path) {
     return std::filesystem::absolute(path).lexically_normal().string();
 }
 
+std::string NormalizedMountTarget(const std::string &path) {
+    // Never resolve a live mount target through the mounted filesystem. A dead
+    // NFS vnode can make weakly_canonical() time out or fail, which used to
+    // change /private/var/... back to /var/... and therefore change the state
+    // record hash during crash recovery.
+    std::string normalized =
+        std::filesystem::absolute(path).lexically_normal().string();
+    const auto expand_private_alias = [&normalized](const char *alias) {
+        const std::string prefix(alias);
+        if (normalized == prefix || normalized.rfind(prefix + "/", 0) == 0)
+            normalized = "/private" + normalized;
+    };
+    expand_private_alias("/var");
+    expand_private_alias("/tmp");
+    return normalized;
+}
+
 std::filesystem::path MountRegistryDirectory() {
     return std::filesystem::path(HomeDirectory()) /
         "Library/Application Support/VexDB-Lite/mounts";
@@ -215,6 +232,8 @@ std::filesystem::path MountRegistryDirectory() {
 bool IsLoopbackNfsSource(const std::string &source) {
     return source == "127.0.0.1:/" || source.rfind("127.0.0.1:", 0) == 0;
 }
+
+bool ProtectedNfsGatewayRecordMatchesMount(const std::string &mount_point);
 
 std::vector<VexFSPlatformMountEntry> MountedVolumes() {
     struct statfs *entries = nullptr;
@@ -229,11 +248,37 @@ std::vector<VexFSPlatformMountEntry> MountedVolumes() {
     }
     mounts = VexFSPlatformAttachMountRegistry(std::move(mounts), MountRegistryDirectory());
     mounts.erase(std::remove_if(mounts.begin(), mounts.end(), [](const auto &mount) {
-        // A loopback NFS mount is VexFS only when the protected registry proves
-        // the target/source identity. Do not claim unrelated localhost exports.
-        return mount.type == "nfs" && mount.backend.empty();
+        // A loopback NFS mount is VexFS only when both protected records and the
+        // live kernel mount identity agree. Do not claim unrelated localhost exports.
+        return mount.type == "nfs" &&
+            (mount.backend.empty() || !ProtectedNfsGatewayRecordMatchesMount(mount.target));
     }), mounts.end());
     return mounts;
+}
+
+struct MountedFileSystemIdentity {
+    std::string type;
+    std::string source;
+    int32_t fsid_first = 0;
+    int32_t fsid_second = 0;
+};
+
+bool MountedFileSystemIdentityAt(const std::string &path,
+                                 MountedFileSystemIdentity *identity) {
+    const std::string normalized = NormalizedMountTarget(path);
+    struct statfs *entries = nullptr;
+    const int count = getmntinfo(&entries, MNT_NOWAIT);
+    for (int index = 0; index < count; ++index) {
+        if (NormalizedMountTarget(entries[index].f_mntonname) != normalized) continue;
+        if (identity != nullptr) {
+            identity->type = entries[index].f_fstypename;
+            identity->source = entries[index].f_mntfromname;
+            identity->fsid_first = entries[index].f_fsid.val[0];
+            identity->fsid_second = entries[index].f_fsid.val[1];
+        }
+        return true;
+    }
+    return false;
 }
 
 std::string ProductVersion() {
@@ -251,14 +296,8 @@ bool ProductVersionSupported(const std::string &version, const std::string &driv
 }
 
 std::string MountedFileSystemAt(const std::string &path) {
-    const std::string normalized = NormalizedPath(path);
-    struct statfs *entries = nullptr;
-    const int count = getmntinfo(&entries, MNT_NOWAIT);
-    for (int index = 0; index < count; ++index) {
-        if (NormalizedPath(entries[index].f_mntonname) == normalized)
-            return entries[index].f_fstypename;
-    }
-    return {};
+    MountedFileSystemIdentity identity;
+    return MountedFileSystemIdentityAt(path, &identity) ? identity.type : std::string();
 }
 
 void PrepareMountPoint(const std::string &path) {
@@ -354,7 +393,7 @@ std::filesystem::path NfsGatewayStateRoot() {
 std::filesystem::path NfsGatewayStateDirectory(const std::string &mount_point) {
     std::ostringstream name;
     name << "mount-" << std::hex << std::setw(16) << std::setfill('0')
-         << StableHash(NormalizedPath(mount_point));
+         << StableHash(NormalizedMountTarget(mount_point));
     return NfsGatewayStateRoot() / name.str();
 }
 
@@ -363,6 +402,11 @@ struct NfsGatewayRecord {
     uint16_t port = 0;
     std::filesystem::path executable;
     std::filesystem::path resource_directory;
+    std::string mount_source;
+    int32_t mount_fsid_first = 0;
+    int32_t mount_fsid_second = 0;
+    uint64_t process_start_tvsec = 0;
+    uint64_t process_start_tvusec = 0;
 };
 
 std::filesystem::path NfsGatewayRecordPath(const std::string &mount_point) {
@@ -380,9 +424,13 @@ void WriteNfsGatewayRecord(const std::string &mount_point,
     {
         std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
         if (!output) throw std::runtime_error("cannot write NFS gateway state");
-        output << "VEXFS_NFS_GATEWAY_V1\n" << record.pid << '\n' << record.port << '\n'
+        output << "VEXFS_NFS_GATEWAY_V3\n" << record.pid << '\n' << record.port << '\n'
                << std::quoted(record.executable.string()) << '\n'
-               << std::quoted(record.resource_directory.string()) << '\n';
+               << std::quoted(record.resource_directory.string()) << '\n'
+               << std::quoted(record.mount_source) << '\n'
+               << record.mount_fsid_first << '\n' << record.mount_fsid_second << '\n'
+               << record.process_start_tvsec << '\n'
+               << record.process_start_tvusec << '\n';
         if (!output) throw std::runtime_error("cannot finish NFS gateway state");
     }
     if (chmod(temporary.c_str(), 0600) != 0) {
@@ -399,26 +447,78 @@ void WriteNfsGatewayRecord(const std::string &mount_point,
 }
 
 bool ReadNfsGatewayRecord(const std::string &mount_point, NfsGatewayRecord *record) {
-    std::ifstream input(NfsGatewayRecordPath(mount_point), std::ios::binary);
+    const std::filesystem::path path = NfsGatewayRecordPath(mount_point);
+    struct stat status{};
+    if (lstat(path.c_str(), &status) != 0 || !S_ISREG(status.st_mode) ||
+        status.st_uid != geteuid() || (status.st_mode & 0077) != 0) return false;
+    std::ifstream input(path, std::ios::binary);
     std::string version;
     long long pid = -1;
     unsigned int port = 0;
     std::string executable;
     std::string resource;
-    if (!std::getline(input, version) || version != "VEXFS_NFS_GATEWAY_V1" ||
-        !(input >> pid >> port >> std::quoted(executable) >> std::quoted(resource)) ||
-        pid <= 0 || port == 0 || port > 65535) return false;
+    std::string mount_source;
+    int32_t mount_fsid_first = 0;
+    int32_t mount_fsid_second = 0;
+    uint64_t process_start_tvsec = 0;
+    uint64_t process_start_tvusec = 0;
+    if (!std::getline(input, version) || version != "VEXFS_NFS_GATEWAY_V3" ||
+        !(input >> pid >> port >> std::quoted(executable) >> std::quoted(resource)
+          >> std::quoted(mount_source) >> mount_fsid_first >> mount_fsid_second
+          >> process_start_tvsec >> process_start_tvusec) ||
+        pid <= 0 || port == 0 || port > 65535 || process_start_tvsec == 0 ||
+        process_start_tvusec >= 1'000'000) return false;
     record->pid = static_cast<pid_t>(pid);
     record->port = static_cast<uint16_t>(port);
     record->executable = executable;
     record->resource_directory = resource;
+    record->mount_source = mount_source;
+    record->mount_fsid_first = mount_fsid_first;
+    record->mount_fsid_second = mount_fsid_second;
+    record->process_start_tvsec = process_start_tvsec;
+    record->process_start_tvusec = process_start_tvusec;
     return true;
+}
+
+bool ProtectedNfsGatewayRecordMatchesMount(const std::string &mount_point) {
+    NfsGatewayRecord gateway;
+    if (!ReadNfsGatewayRecord(mount_point, &gateway) || gateway.mount_source.empty() ||
+        gateway.resource_directory.empty() ||
+        NormalizedPath(gateway.executable.string()) !=
+            NormalizedPath(NfsGatewayExecutable().string())) return false;
+    const std::string normalized_target = NormalizedMountTarget(mount_point);
+    struct statfs *entries = nullptr;
+    const int count = getmntinfo(&entries, MNT_NOWAIT);
+    for (int index = 0; index < count; ++index) {
+        if (NormalizedMountTarget(entries[index].f_mntonname) != normalized_target) continue;
+        return std::string(entries[index].f_fstypename) == "nfs" &&
+            IsLoopbackNfsSource(entries[index].f_mntfromname) &&
+            gateway.mount_source == entries[index].f_mntfromname &&
+            gateway.mount_fsid_first == entries[index].f_fsid.val[0] &&
+            gateway.mount_fsid_second == entries[index].f_fsid.val[1];
+    }
+    return false;
+}
+
+bool ProcessStartIdentity(pid_t pid, uint64_t *seconds, uint64_t *microseconds) {
+    proc_bsdinfo info{};
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info)) != sizeof(info)) {
+        return false;
+    }
+    if (seconds != nullptr) *seconds = info.pbi_start_tvsec;
+    if (microseconds != nullptr) *microseconds = info.pbi_start_tvusec;
+    return info.pbi_start_tvsec != 0 && info.pbi_start_tvusec < 1'000'000;
 }
 
 bool ProcessMatchesGateway(const NfsGatewayRecord &record) {
     char path[PROC_PIDPATHINFO_MAXSIZE]{};
     if (proc_pidpath(record.pid, path, sizeof(path)) <= 0) return false;
-    return NormalizedPath(path) == NormalizedPath(record.executable.string());
+    uint64_t seconds = 0;
+    uint64_t microseconds = 0;
+    return NormalizedPath(path) == NormalizedPath(record.executable.string()) &&
+        ProcessStartIdentity(record.pid, &seconds, &microseconds) &&
+        seconds == record.process_start_tvsec &&
+        microseconds == record.process_start_tvusec;
 }
 
 uint16_t AvailableLoopbackPort() {
@@ -510,6 +610,12 @@ NfsGatewayRecord StartNfsGateway(const std::string &backend,
         if (LoopbackPortReady(port)) {
             NfsGatewayRecord record{child, port, executable, resource_directory};
             try {
+                if (!ProcessStartIdentity(
+                        child, &record.process_start_tvsec,
+                        &record.process_start_tvusec)) {
+                    throw std::runtime_error(
+                        "cannot record NFS gateway process identity");
+                }
                 WriteNfsGatewayRecord(mount_point, record);
             } catch (...) {
                 kill(child, SIGTERM);
@@ -540,6 +646,7 @@ void StopNfsGateway(const std::string &mount_point) {
     // falling back to SIGKILL. The filesystem is already detached at this point.
     for (int attempt = 0; attempt < 600; ++attempt) {
         if (kill(record.pid, 0) != 0 && errno == ESRCH) return;
+        if (!ProcessMatchesGateway(record)) return;
         usleep(50 * 1000);
     }
     if (ProcessMatchesGateway(record)) kill(record.pid, SIGKILL);
@@ -995,9 +1102,9 @@ int VexFSPlatformMount(const std::string &backend, const std::string &connection
     if (mounted_type == "vexfs" || mounted_type == "nfs") {
         const std::string requested_database = backend == VEXFS_RUNTIME_BACKEND_SQLITE
             ? NormalizedPath(connection) : connection;
-        const std::string requested_target = NormalizedPath(mount_point);
+        const std::string requested_target = NormalizedMountTarget(mount_point);
         for (const auto &mount : MountedVolumes()) {
-            if (NormalizedPath(mount.target) != requested_target) continue;
+            if (NormalizedMountTarget(mount.target) != requested_target) continue;
             if (mount.backend == backend && mount.database == requested_database &&
                 mount.workspace == workspace) return 0;
             throw std::runtime_error(
@@ -1059,9 +1166,20 @@ int VexFSPlatformMount(const std::string &backend, const std::string &connection
                 DisarmMountPointGuard(mount_point);
                 return result;
             }
+            MountedFileSystemIdentity mounted_identity;
+            if (!MountedFileSystemIdentityAt(mount_point, &mounted_identity) ||
+                mounted_identity.type != "nfs" ||
+                !IsLoopbackNfsSource(mounted_identity.source)) {
+                throw std::runtime_error(
+                    "mounted NFS identity cannot be recorded as VexFS");
+            }
+            gateway.mount_source = mounted_identity.source;
+            gateway.mount_fsid_first = mounted_identity.fsid_first;
+            gateway.mount_fsid_second = mounted_identity.fsid_second;
+            WriteNfsGatewayRecord(mount_point, gateway);
             mount_point_guard.Arm();
             VexFSPlatformRememberMount(MountRegistryDirectory(),
-                {"127.0.0.1:/", NormalizedPath(mount_point), "nfs", backend,
+                {"127.0.0.1:/", NormalizedMountTarget(mount_point), "nfs", backend,
                  backend == VEXFS_RUNTIME_BACKEND_SQLITE
                      ? NormalizedPath(connection) : connection,
                  workspace});
@@ -1121,7 +1239,8 @@ int VexFSPlatformUnmount(const std::string &mount_point, bool force) {
     if (mounted_type.empty()) {
         StopNfsGateway(mount_point);
         RemoveNfsGatewayState(mount_point);
-        VexFSPlatformForgetMount(MountRegistryDirectory(), mount_point);
+        VexFSPlatformForgetMount(MountRegistryDirectory(),
+                                 NormalizedMountTarget(mount_point));
         RemoveStalePostgreSQLPassfiles();
         DisarmMountPointGuard(mount_point);
         return 0;
@@ -1129,17 +1248,50 @@ int VexFSPlatformUnmount(const std::string &mount_point, bool force) {
     if (mounted_type != "vexfs" && mounted_type != "nfs")
         throw std::runtime_error("mount point is not VexFS: " + mounted_type);
     std::filesystem::path resource_directory;
-    const std::string normalized_target = NormalizedPath(mount_point);
+    const std::string normalized_target = NormalizedMountTarget(mount_point);
     bool verified_mount = false;
     for (const auto &mount : MountedVolumes()) {
-        if (NormalizedPath(mount.target) == normalized_target) {
+        if (NormalizedMountTarget(mount.target) == normalized_target) {
             resource_directory = mount.source;
             verified_mount = true;
             break;
         }
     }
-    if (!verified_mount)
-        throw std::runtime_error("mount point identity cannot be verified as VexFS");
+    bool gateway_record_available = false;
+    bool gateway_executable_matches = false;
+    bool gateway_mount_matches = false;
+    if (!verified_mount && mounted_type == "nfs") {
+        // The general mount registry may be missing after a crash or manual
+        // cleanup even though the kernel still has the loopback NFS mount. The
+        // per-target gateway record survives the crash and binds that live
+        // mount by source and fsid before detach is allowed.
+        NfsGatewayRecord gateway;
+        gateway_record_available = ReadNfsGatewayRecord(mount_point, &gateway);
+        gateway_executable_matches = gateway_record_available &&
+            NormalizedPath(gateway.executable.string()) ==
+                NormalizedPath(NfsGatewayExecutable().string());
+        MountedFileSystemIdentity current_mount;
+        gateway_mount_matches = gateway_record_available &&
+            MountedFileSystemIdentityAt(mount_point, &current_mount) &&
+            current_mount.type == "nfs" && IsLoopbackNfsSource(current_mount.source) &&
+            !gateway.mount_source.empty() && current_mount.source == gateway.mount_source &&
+            current_mount.fsid_first == gateway.mount_fsid_first &&
+            current_mount.fsid_second == gateway.mount_fsid_second;
+        if (gateway_executable_matches && gateway_mount_matches &&
+            !gateway.resource_directory.empty()) {
+            resource_directory = gateway.resource_directory;
+            verified_mount = true;
+        }
+    }
+    if (!verified_mount) {
+        throw std::runtime_error(
+            "mount point identity cannot be verified as VexFS "
+            "(gateway_record=" + std::string(gateway_record_available ? "present" : "missing") +
+            ", gateway_executable=" +
+            std::string(gateway_executable_matches ? "matching" : "not-matching") +
+            ", gateway_mount=" +
+            std::string(gateway_mount_matches ? "matching" : "not-matching") + ")");
+    }
     int result = 1;
     // fseventsd/Spotlight can briefly hold a newly mounted FSKit volume even
     // when no user process has an open file. Keep this a normal (non-force)
@@ -1154,7 +1306,7 @@ int VexFSPlatformUnmount(const std::string &mount_point, bool force) {
                 StopNfsGateway(mount_point);
                 RemoveNfsGatewayState(mount_point);
             }
-            VexFSPlatformForgetMount(MountRegistryDirectory(), mount_point);
+            VexFSPlatformForgetMount(MountRegistryDirectory(), normalized_target);
             bool resource_still_mounted = false;
             for (const auto &mount : MountedVolumes()) {
                 if (!resource_directory.empty() &&

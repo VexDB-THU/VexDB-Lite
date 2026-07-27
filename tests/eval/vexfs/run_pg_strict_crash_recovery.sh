@@ -8,11 +8,13 @@ WORKSPACE="${VEXDB_PG_WORKSPACE:-strict-crash}"
 CLI="${VEXFS_EVAL_MOUNT_CLI:-$ROOT/vexdb_sqlite/build/vexdb}"
 DSN="${VEXDB_PG_DSN:-}"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/vexfs-pg-strict-crash.XXXXXX")"
+TMP="$(cd "$TMP" && pwd -P)"
 TEST_HOME="$TMP/home"
 MOUNT_POINT="$TMP/mount"
 MOUNTED=0
 DATABASE_CREATED=0
 CHECKS=0
+GATEWAY_RECORD_BACKUP=""
 
 fail() {
     echo "$*" >&2
@@ -26,6 +28,9 @@ is_test_mount_live() {
 cleanup() {
     local status=$?
     trap - EXIT INT TERM
+    if [ -n "$GATEWAY_RECORD_BACKUP" ] && [ -f "$GATEWAY_RECORD_BACKUP" ]; then
+        cp "$GATEWAY_RECORD_BACKUP" "${GATEWAY_RECORD_BACKUP%.backup}"
+    fi
     if [ "$MOUNTED" -eq 1 ]; then
         HOME="$TEST_HOME" "$CLI" fs --backend pg --dsn "$DSN" \
             --workspace "$WORKSPACE" unmount --force "$MOUNT_POINT" \
@@ -36,6 +41,9 @@ cleanup() {
         /sbin/umount -f "$MOUNT_POINT" >/dev/null 2>&1 || true
         sleep 0.25
     done
+    HOME="$TEST_HOME" "$CLI" fs --backend pg --dsn "$DSN" \
+        --workspace "$WORKSPACE" unmount --force "$MOUNT_POINT" \
+        >/dev/null 2>&1 || true
     if is_test_mount_live; then
         echo "测试清理失败，NFS 挂载仍存在：$MOUNT_POINT" >&2
         status=1
@@ -71,8 +79,6 @@ if [ -z "$DSN" ]; then
 fi
 
 mkdir -p "$TEST_HOME" "$MOUNT_POINT"
-docker exec "$CONTAINER" dropdb -U postgres --if-exists --force "$DATABASE" \
-    >/dev/null 2>&1 || true
 docker exec "$CONTAINER" createdb -U postgres "$DATABASE"
 DATABASE_CREATED=1
 docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q \
@@ -120,6 +126,44 @@ GATEWAY_COMMAND="$(/bin/ps -p "$GATEWAY_PID" -o command= 2>/dev/null || true)"
    "$GATEWAY_COMMAND" == *"--workspace $WORKSPACE"* ]] || \
     fail "拒绝终止身份不匹配的 gateway PID $GATEWAY_PID：$GATEWAY_COMMAND"
 CHECKS=$((CHECKS + 1))
+
+# A stale record can point at a PID reused by another gateway with the same
+# executable. The recorded process start identity must prevent killing it.
+STALE_MOUNT_POINT="$TMP/stale-mount"
+mkdir -p "$STALE_MOUNT_POINT"
+STALE_GATEWAY_RECORD="$(/usr/bin/python3 - "$TEST_HOME" "$STALE_MOUNT_POINT" "$GATEWAY_RECORD" <<'PY'
+import pathlib
+import sys
+
+home = pathlib.Path(sys.argv[1])
+mount_point = sys.argv[2].encode()
+source = pathlib.Path(sys.argv[3])
+value = 1469598103934665603
+for byte in mount_point:
+    value ^= byte
+    value = (value * 1099511628211) & ((1 << 64) - 1)
+directory = home / "Library/Application Support/VexDB-Lite/nfs-gateways" / f"mount-{value:016x}"
+directory.mkdir(parents=True, exist_ok=True)
+directory.chmod(0o700)
+lines = source.read_text().splitlines()
+if len(lines) != 10 or lines[0] != "VEXFS_NFS_GATEWAY_V3":
+    raise SystemExit("unexpected gateway record format")
+lines[9] = str((int(lines[9]) + 1) % 1_000_000)
+destination = directory / "gateway.record"
+destination.write_text("\n".join(lines) + "\n")
+destination.chmod(0o600)
+print(destination)
+PY
+)"
+[ -f "$STALE_GATEWAY_RECORD" ] || fail "无法生成 PID 复用负向测试记录"
+HOME="$TEST_HOME" "$CLI" fs --backend pg --dsn "$DSN" \
+    --workspace "$WORKSPACE" unmount --force "$STALE_MOUNT_POINT" >/dev/null
+kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || \
+    fail "进程启动身份不匹配时误杀了当前 gateway"
+[ "$(cat "$MOUNT_POINT/durable.txt")" = 'strict-after-crash' ] || \
+    fail "PID 复用负向测试影响了真实挂载"
+CHECKS=$((CHECKS + 3))
+
 kill -9 "$GATEWAY_PID"
 for _ in $(seq 1 50); do
     kill -0 "$GATEWAY_PID" >/dev/null 2>&1 || break
@@ -127,6 +171,30 @@ for _ in $(seq 1 50); do
 done
 kill -0 "$GATEWAY_PID" >/dev/null 2>&1 && fail "gateway SIGKILL 后仍存活"
 CHECKS=$((CHECKS + 1))
+
+GATEWAY_RECORD_BACKUP="$GATEWAY_RECORD.backup"
+cp "$GATEWAY_RECORD" "$GATEWAY_RECORD_BACKUP"
+/usr/bin/python3 - "$GATEWAY_RECORD" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+lines = path.read_text().splitlines()
+if len(lines) != 10 or lines[0] != "VEXFS_NFS_GATEWAY_V3":
+    raise SystemExit("unexpected gateway record format")
+lines[6] = str(int(lines[6]) + 1)
+temporary = path.with_suffix(".identity-mismatch")
+temporary.write_text("\n".join(lines) + "\n")
+temporary.chmod(0o600)
+temporary.replace(path)
+PY
+if HOME="$TEST_HOME" "${FS[@]}" unmount --force "$MOUNT_POINT" >/dev/null 2>&1; then
+    fail "挂载 fsid 不匹配时不应允许 VexFS 卸载"
+fi
+is_test_mount_live || fail "身份校验失败后 NFS 挂载被错误卸载"
+cp "$GATEWAY_RECORD_BACKUP" "$GATEWAY_RECORD"
+GATEWAY_RECORD_BACKUP=""
+CHECKS=$((CHECKS + 2))
 
 HOME="$TEST_HOME" "${FS[@]}" unmount --force "$MOUNT_POINT" >/dev/null
 MOUNTED=0

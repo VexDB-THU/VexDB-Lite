@@ -4,6 +4,10 @@
 #include "agent_files/vexfs_sqlite.h"
 #include "vexdb_sqlite.h"
 
+#if defined(_WIN32) && defined(VEXFS_HAVE_LIBPQ)
+#include <winsock2.h>
+#endif
+
 #if defined(VEXFS_HAVE_LIBPQ)
 #include <libpq-fe.h>
 #endif
@@ -25,6 +29,9 @@
 #else
 #include <cerrno>
 #include <fcntl.h>
+#if defined(VEXFS_HAVE_LIBPQ)
+#include <poll.h>
+#endif
 #include <signal.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -37,6 +44,7 @@ struct vexfs_mount_session {
     PGconn *publisher_pg = nullptr;
 #endif
     bool postgresql = false;
+    std::string connection;
     std::string workspace;
     std::string principal;
     std::string session_id;
@@ -48,6 +56,8 @@ struct vexfs_mount_session {
     uint32_t operation_timeout_ms = 0;
     std::chrono::steady_clock::time_point next_heartbeat{};
     std::chrono::steady_clock::time_point next_visibility_poll{};
+    std::chrono::steady_clock::time_point next_pg_reconnect_attempt{};
+    std::chrono::steady_clock::time_point next_publisher_reconnect_attempt{};
     uint64_t contract_calls = 0;
     uint64_t ordinary_mutation_calls = 0;
     uint64_t full_boundary_calls = 0;
@@ -59,6 +69,7 @@ struct vexfs_mount_session {
     uint64_t mutation_epoch = 0;
     uint64_t observed_mutation_epoch = 0;
     bool visibility_initialized = false;
+    bool pg_visibility_resync_required = false;
     std::recursive_mutex mutex;
     std::mutex publisher_mutex;
 };
@@ -91,15 +102,223 @@ class CallError : public std::runtime_error {
     std::string backend;
 };
 
+#if defined(VEXFS_HAVE_LIBPQ)
+constexpr uint32_t kPostgreSQLTransportTimeoutMs = 5000;
+
+uint32_t PostgreSQLTransportTimeout(uint32_t operation_timeout_ms) {
+    return operation_timeout_ms == 0
+        ? kPostgreSQLTransportTimeoutMs
+        : std::min(operation_timeout_ms, kPostgreSQLTransportTimeoutMs);
+}
+
+enum class PostgreSQLSocketWaitResult {
+    kReady,
+    kTimeout,
+    kFailed,
+};
+
+PostgreSQLSocketWaitResult WaitPostgreSQLSocket(
+        PGconn *connection, bool readable, bool writable,
+        std::chrono::steady_clock::time_point deadline) {
+    const int descriptor = connection == nullptr ? -1 : PQsocket(connection);
+    if (descriptor < 0) return PostgreSQLSocketWaitResult::kFailed;
+    for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return PostgreSQLSocketWaitResult::kTimeout;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - now);
+        const long timeout_ms = std::max<long>(1, static_cast<long>(remaining.count()));
+#if defined(_WIN32)
+        fd_set read_set;
+        fd_set write_set;
+        FD_ZERO(&read_set);
+        FD_ZERO(&write_set);
+        if (readable) FD_SET(static_cast<SOCKET>(descriptor), &read_set);
+        if (writable) FD_SET(static_cast<SOCKET>(descriptor), &write_set);
+        timeval timeout{};
+        timeout.tv_sec = timeout_ms / 1000;
+        timeout.tv_usec = (timeout_ms % 1000) * 1000;
+        const int result = select(0, readable ? &read_set : nullptr,
+                                  writable ? &write_set : nullptr, nullptr, &timeout);
+        if (result > 0) return PostgreSQLSocketWaitResult::kReady;
+        if (result == 0) return PostgreSQLSocketWaitResult::kTimeout;
+        if (WSAGetLastError() == WSAEINTR) continue;
+        return PostgreSQLSocketWaitResult::kFailed;
+#else
+        pollfd item{};
+        item.fd = descriptor;
+        item.events = static_cast<short>((readable ? POLLIN : 0) |
+                                         (writable ? POLLOUT : 0));
+        const int result = poll(&item, 1, static_cast<int>(timeout_ms));
+        if (result > 0) return PostgreSQLSocketWaitResult::kReady;
+        if (result == 0) return PostgreSQLSocketWaitResult::kTimeout;
+        if (errno == EINTR) continue;
+        return PostgreSQLSocketWaitResult::kFailed;
+#endif
+    }
+}
+
+void DropPostgreSQLConnection(PGconn **connection) {
+    if (connection == nullptr || *connection == nullptr) return;
+    PQfinish(*connection);
+    *connection = nullptr;
+}
+
+[[noreturn]] void FailPostgreSQLTransport(PGconn **connection,
+                                          const std::string &message) {
+    DropPostgreSQLConnection(connection);
+    throw CallError(kPgDatabaseError, message, VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+}
+
+PGresult *ExecutePostgreSQLQuery(
+        PGconn **connection, uint32_t operation_timeout_ms, const char *sql,
+        int parameter_count = 0, const Oid *types = nullptr,
+        const char *const *values = nullptr, const int *lengths = nullptr,
+        const int *formats = nullptr) {
+    if (connection == nullptr || *connection == nullptr ||
+        PQstatus(*connection) != CONNECTION_OK) {
+        throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    PGconn *raw = *connection;
+    if (PQsetnonblocking(raw, 1) != 0) {
+        const std::string message = PQerrorMessage(raw);
+        FailPostgreSQLTransport(connection,
+            "cannot enable nonblocking PostgreSQL I/O: " + message);
+    }
+    if (PQsendQueryParams(raw, sql, parameter_count, types, values, lengths,
+                          formats, 0) == 0) {
+        const std::string message = PQerrorMessage(raw);
+        FailPostgreSQLTransport(connection,
+            "cannot send PostgreSQL query: " + message);
+    }
+
+    const auto timeout = std::chrono::milliseconds(
+        PostgreSQLTransportTimeout(operation_timeout_ms));
+    auto idle_deadline = std::chrono::steady_clock::now() + timeout;
+    for (;;) {
+        const int pending = PQflush(raw);
+        if (pending == 0) break;
+        if (pending < 0) {
+            const std::string message = PQerrorMessage(raw);
+            FailPostgreSQLTransport(connection,
+                "cannot flush PostgreSQL query: " + message);
+        }
+        const PostgreSQLSocketWaitResult wait =
+            WaitPostgreSQLSocket(raw, false, true, idle_deadline);
+        if (wait == PostgreSQLSocketWaitResult::kTimeout) {
+            FailPostgreSQLTransport(connection,
+                "PostgreSQL query send timed out after " +
+                    std::to_string(PostgreSQLTransportTimeout(operation_timeout_ms)) +
+                    " ms without network progress");
+        }
+        if (wait == PostgreSQLSocketWaitResult::kFailed) {
+            FailPostgreSQLTransport(connection,
+                "PostgreSQL socket failed while sending a query");
+        }
+        idle_deadline = std::chrono::steady_clock::now() + timeout;
+    }
+
+    PGresult *result = nullptr;
+    for (;;) {
+        while (PQisBusy(raw) != 0) {
+            const PostgreSQLSocketWaitResult wait =
+                WaitPostgreSQLSocket(raw, true, false, idle_deadline);
+            if (wait == PostgreSQLSocketWaitResult::kTimeout) {
+                FailPostgreSQLTransport(connection,
+                    "PostgreSQL query response timed out after " +
+                        std::to_string(PostgreSQLTransportTimeout(operation_timeout_ms)) +
+                        " ms without network progress");
+            }
+            if (wait == PostgreSQLSocketWaitResult::kFailed || PQconsumeInput(raw) == 0) {
+                const std::string message = PQerrorMessage(raw);
+                FailPostgreSQLTransport(connection,
+                    "cannot receive PostgreSQL query result: " + message);
+            }
+            idle_deadline = std::chrono::steady_clock::now() + timeout;
+        }
+        PGresult *additional = PQgetResult(raw);
+        if (additional == nullptr) break;
+        if (result != nullptr) PQclear(result);
+        result = additional;
+    }
+    if (result == nullptr) {
+        const std::string message = PQerrorMessage(raw);
+        FailPostgreSQLTransport(connection,
+            "PostgreSQL query returned no result: " + message);
+    }
+    return result;
+}
+
+PGconn *ConnectPostgreSQL(const std::string &connection_string,
+                          uint32_t operation_timeout_ms,
+                          const char *connection_name) {
+    PGconn *connection = PQconnectStart(connection_string.c_str());
+    if (connection == nullptr) {
+        throw CallError(kPgDatabaseError,
+                        std::string("cannot allocate ") + connection_name,
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(PostgreSQLTransportTimeout(operation_timeout_ms));
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            PQfinish(connection);
+            throw CallError(kPgDatabaseError,
+                            std::string(connection_name) + " timed out after " +
+                                std::to_string(PostgreSQLTransportTimeout(
+                                    operation_timeout_ms)) + " ms",
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        const PostgresPollingStatusType status = PQconnectPoll(connection);
+        if (status == PGRES_POLLING_OK) {
+            if (PQsetnonblocking(connection, 1) == 0) return connection;
+            const std::string message = PQerrorMessage(connection);
+            PQfinish(connection);
+            throw CallError(kPgDatabaseError,
+                            std::string("cannot enable nonblocking ") + connection_name +
+                                ": " + message,
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        if (status == PGRES_POLLING_FAILED) {
+            const std::string message = PQerrorMessage(connection);
+            PQfinish(connection);
+            throw CallError(kPgDatabaseError,
+                            std::string(connection_name) + " failed: " + message,
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        if (status == PGRES_POLLING_ACTIVE) continue;
+        const PostgreSQLSocketWaitResult wait = WaitPostgreSQLSocket(
+            connection, status == PGRES_POLLING_READING,
+            status == PGRES_POLLING_WRITING, deadline);
+        if (wait != PostgreSQLSocketWaitResult::kReady) {
+            PQfinish(connection);
+            throw CallError(kPgDatabaseError,
+                            std::string(connection_name) +
+                                (wait == PostgreSQLSocketWaitResult::kTimeout
+                                    ? " timed out after " : " socket failed within ") +
+                                std::to_string(PostgreSQLTransportTimeout(
+                                    operation_timeout_ms)) + " ms",
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+    }
+}
+#endif
+
 class Call {
   public:
     Call(sqlite3 *db, const char *sql) : db_(db) { PrepareSQLite(sql); }
-    Call(vexfs_mount_session *session, const char *sql) {
+    Call(vexfs_mount_session *session, const char *sql, bool publisher = false) {
         if (session == nullptr) throw CallError(SQLITE_MISUSE, "mount session is NULL");
 #if defined(VEXFS_HAVE_LIBPQ)
         if (session->postgresql) {
-            EnsurePostgreSQLConnection(session);
-            pg_ = session->pg;
+            if (publisher) EnsurePostgreSQLPublisherConnection(session);
+            else EnsurePostgreSQLConnection(session);
+            session_ = session;
+            publisher_ = publisher;
+            pg_slot_ = publisher ? &session->publisher_pg : &session->pg;
+            pg_ = *pg_slot_;
+            pg_timeout_ms_ = session->operation_timeout_ms;
             if (pg_ == nullptr || PQstatus(pg_) != CONNECTION_OK) {
                 throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
                                 VEXFS_RUNTIME_BACKEND_POSTGRESQL);
@@ -111,16 +330,6 @@ class Call {
         db_ = session->db;
         PrepareSQLite(sql);
     }
-#if defined(VEXFS_HAVE_LIBPQ)
-    Call(PGconn *connection, const char *sql) {
-        if (connection == nullptr || PQstatus(connection) != CONNECTION_OK) {
-            throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
-                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-        }
-        pg_ = connection;
-        PreparePostgreSQL(sql);
-    }
-#endif
     ~Call() {
         if (statement_ != nullptr) sqlite3_finalize(statement_);
 #if defined(VEXFS_HAVE_LIBPQ)
@@ -334,15 +543,25 @@ class Call {
             lengths[index] = static_cast<int>(parameter.value.size());
             formats[index] = parameter.format;
         }
-        pg_result_ = PQexecParams(
-            pg_, pg_sql_.c_str(), static_cast<int>(pg_parameters_.size()),
-            types.empty() ? nullptr : types.data(),
-            values.empty() ? nullptr : values.data(),
-            lengths.empty() ? nullptr : lengths.data(),
-            formats.empty() ? nullptr : formats.data(), 0);
-        if (pg_result_ == nullptr) {
-            throw CallError(kPgDatabaseError, PQerrorMessage(pg_),
-                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        try {
+            pg_result_ = ExecutePostgreSQLQuery(
+                pg_slot_, pg_timeout_ms_, pg_sql_.c_str(),
+                static_cast<int>(pg_parameters_.size()),
+                types.empty() ? nullptr : types.data(),
+                values.empty() ? nullptr : values.data(),
+                lengths.empty() ? nullptr : lengths.data(),
+                formats.empty() ? nullptr : formats.data());
+        } catch (...) {
+            if (session_ != nullptr) {
+                const auto retry_at =
+                    std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                if (publisher_) session_->next_publisher_reconnect_attempt = retry_at;
+                else {
+                    session_->next_pg_reconnect_attempt = retry_at;
+                    session_->pg_visibility_resync_required = true;
+                }
+            }
+            throw;
         }
         const ExecStatusType status = PQresultStatus(pg_result_);
         if (status != PGRES_TUPLES_OK) {
@@ -410,7 +629,11 @@ class Call {
     sqlite3 *db_ = nullptr;
     sqlite3_stmt *statement_ = nullptr;
 #if defined(VEXFS_HAVE_LIBPQ)
+    vexfs_mount_session *session_ = nullptr;
+    PGconn **pg_slot_ = nullptr;
     PGconn *pg_ = nullptr;
+    uint32_t pg_timeout_ms_ = 0;
+    bool publisher_ = false;
     PGresult *pg_result_ = nullptr;
     std::string pg_sql_;
     std::vector<PgParameter> pg_parameters_;
@@ -420,84 +643,126 @@ class Call {
 };
 
 #if defined(VEXFS_HAVE_LIBPQ)
-void RequirePostgreSQLCommand(PGconn *connection, PGresult *result,
-                              const char *operation) {
+void RequirePostgreSQLCommand(PGconn **connection, uint32_t operation_timeout_ms,
+                              const char *sql, const char *operation) {
+    PGresult *result = ExecutePostgreSQLQuery(
+        connection, operation_timeout_ms, sql);
     if (result != nullptr && PQresultStatus(result) == PGRES_COMMAND_OK) {
         PQclear(result);
         return;
     }
     const std::string message = result == nullptr
-        ? PQerrorMessage(connection) : PQresultErrorMessage(result);
+        ? "PostgreSQL command returned no result" : PQresultErrorMessage(result);
     if (result != nullptr) PQclear(result);
     throw CallError(kPgDatabaseError,
                     std::string(operation) + ": " + message,
                     VEXFS_RUNTIME_BACKEND_POSTGRESQL);
 }
 
+void ReconnectPostgreSQLConnection(PGconn **connection,
+                                   const std::string &connection_string,
+                                   uint32_t operation_timeout_ms,
+                                   const char *connection_name) {
+    DropPostgreSQLConnection(connection);
+    *connection = ConnectPostgreSQL(connection_string, operation_timeout_ms,
+                                    connection_name);
+}
+
 void EnsurePostgreSQLConnection(vexfs_mount_session *session) {
-    if (session == nullptr || !session->postgresql || session->pg == nullptr) {
+    if (session == nullptr || !session->postgresql || session->connection.empty()) {
         throw CallError(kPgDatabaseError, "PostgreSQL connection is not available",
                         VEXFS_RUNTIME_BACKEND_POSTGRESQL);
     }
-    if (PQstatus(session->pg) == CONNECTION_OK) return;
+    if (session->pg != nullptr && PQstatus(session->pg) == CONNECTION_OK) {
+        session->next_pg_reconnect_attempt = {};
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < session->next_pg_reconnect_attempt) {
+        throw CallError(kPgDatabaseError,
+                        "PostgreSQL reconnect is cooling down after a failed attempt",
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
 
     // Only reconnect before a new operation.  A command interrupted in flight
     // has an unknown commit state, so this layer never replays it implicitly.
-    PQreset(session->pg);
-    if (PQstatus(session->pg) != CONNECTION_OK) {
-        throw CallError(kPgDatabaseError, PQerrorMessage(session->pg),
-                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-    }
-    if (session->operation_timeout_ms != 0) {
-        const std::string command = "SET statement_timeout TO " +
-            std::to_string(session->operation_timeout_ms);
-        RequirePostgreSQLCommand(session->pg, PQexec(session->pg, command.c_str()),
-                                 "restore statement timeout");
-    }
-    RequirePostgreSQLCommand(session->pg, PQexec(session->pg, "LISTEN vexfs_change"),
-                             "restore change notifications");
-    if (session->session_started) {
-        const char *values[] = {session->workspace.c_str(), session->session_id.c_str()};
-        PGresult *start = PQexecParams(
-            session->pg, "SELECT vexfs_mount_session_start($1,$2)", 2,
-            nullptr, values, nullptr, nullptr, 0);
-        if (start == nullptr || PQresultStatus(start) != PGRES_TUPLES_OK) {
-            const std::string message = start == nullptr
-                ? PQerrorMessage(session->pg) : PQresultErrorMessage(start);
-            if (start != nullptr) PQclear(start);
-            throw CallError(kPgDatabaseError,
-                            "restore mount session: " + message,
-                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    try {
+        ReconnectPostgreSQLConnection(&session->pg, session->connection,
+                                      session->operation_timeout_ms,
+                                      "PostgreSQL connection reconnect");
+        if (session->operation_timeout_ms != 0) {
+            const std::string command = "SET statement_timeout TO " +
+                std::to_string(session->operation_timeout_ms);
+            RequirePostgreSQLCommand(&session->pg, session->operation_timeout_ms,
+                                     command.c_str(), "restore statement timeout");
         }
-        PQclear(start);
-        session->next_heartbeat =
-            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        RequirePostgreSQLCommand(&session->pg, session->operation_timeout_ms,
+                                 "LISTEN vexfs_change",
+                                 "restore change notifications");
+        if (session->session_started) {
+            Call start(session, "SELECT vexfs_mount_session_start(?1,?2)");
+            start.Text(1, session->workspace.c_str());
+            start.Text(2, session->session_id.c_str());
+            start.Row();
+            session->next_heartbeat =
+                std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        }
+        // LISTEN notifications emitted while the socket was gone cannot be
+        // replayed. Keep this flag until visibility has been read successfully.
+        session->pg_visibility_resync_required = true;
+        session->next_pg_reconnect_attempt = {};
+    } catch (...) {
+        DropPostgreSQLConnection(&session->pg);
+        session->pg_visibility_resync_required = true;
+        // NFS can retransmit one metadata RPC while this reconnect is still in
+        // progress. Make queued duplicates fail fast instead of starting a
+        // second full reconnect and extending one filesystem call indefinitely.
+        session->next_pg_reconnect_attempt =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        throw;
     }
 }
 
 void EnsurePostgreSQLPublisherConnection(vexfs_mount_session *session) {
-    if (session == nullptr || !session->postgresql || session->publisher_pg == nullptr) {
+    if (session == nullptr || !session->postgresql || session->connection.empty()) {
         throw CallError(kPgDatabaseError,
                         "PostgreSQL publisher connection is not available",
                         VEXFS_RUNTIME_BACKEND_POSTGRESQL);
     }
-    if (PQstatus(session->publisher_pg) == CONNECTION_OK) return;
+    if (session->publisher_pg != nullptr &&
+        PQstatus(session->publisher_pg) == CONNECTION_OK) {
+        session->next_publisher_reconnect_attempt = {};
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < session->next_publisher_reconnect_attempt) {
+        throw CallError(kPgDatabaseError,
+                        "PostgreSQL publisher reconnect is cooling down after a failed attempt",
+                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+    }
 
     // As with the foreground connection, never replay a command whose commit
     // result is unknown. The gateway keeps the claimed generations and retries
     // them only after the database reports their current state.
-    PQreset(session->publisher_pg);
-    if (PQstatus(session->publisher_pg) != CONNECTION_OK) {
-        throw CallError(kPgDatabaseError, PQerrorMessage(session->publisher_pg),
-                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-    }
-    if (session->operation_timeout_ms != 0) {
-        const std::string command = "SET statement_timeout TO " +
-            std::to_string(session->operation_timeout_ms);
-        RequirePostgreSQLCommand(
-            session->publisher_pg,
-            PQexec(session->publisher_pg, command.c_str()),
-            "restore publisher statement timeout");
+    try {
+        ReconnectPostgreSQLConnection(&session->publisher_pg, session->connection,
+                                      session->operation_timeout_ms,
+                                      "PostgreSQL publisher reconnect");
+        if (session->operation_timeout_ms != 0) {
+            const std::string command = "SET statement_timeout TO " +
+                std::to_string(session->operation_timeout_ms);
+            RequirePostgreSQLCommand(
+                &session->publisher_pg, session->operation_timeout_ms,
+                command.c_str(), "restore publisher statement timeout");
+        }
+        session->next_publisher_reconnect_attempt = {};
+    } catch (...) {
+        DropPostgreSQLConnection(&session->publisher_pg);
+        session->next_publisher_reconnect_attempt =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        throw;
     }
 }
 #endif
@@ -615,11 +880,11 @@ vexfs_mount_status GuardPublisher(vexfs_mount_session *session,
 
 void RequireSession(vexfs_mount_session *session) {
     if (session == nullptr ||
-        (session->db == nullptr
+        (!session->postgresql && session->db == nullptr)
 #if defined(VEXFS_HAVE_LIBPQ)
-         && session->pg == nullptr
+        || (session->postgresql && session->connection.empty())
 #endif
-        )) {
+        ) {
         throw CallError(SQLITE_MISUSE, "mount session is NULL");
     }
     if (session->session_started) {
@@ -934,6 +1199,7 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                 "sqlite backend is single-user and only accepts the local principal");
         }
         vexfs_mount_session *session = new vexfs_mount_session();
+        session->connection = config->connection;
         session->workspace = config->workspace;
         session->principal = config->principal == nullptr ? "" : config->principal;
         session->session_id = RandomSessionId();
@@ -944,53 +1210,22 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
 #if defined(VEXFS_HAVE_LIBPQ)
         if (postgresql_backend) {
             session->postgresql = true;
-            session->pg = PQconnectdb(config->connection);
-            if (session->pg == nullptr || PQstatus(session->pg) != CONNECTION_OK) {
-                const std::string message = session->pg == nullptr
-                    ? "cannot allocate PostgreSQL connection"
-                    : PQerrorMessage(session->pg);
-                if (session->pg != nullptr) PQfinish(session->pg);
-                delete session;
-                throw CallError(kPgDatabaseError, message,
-                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-            }
-            session->publisher_pg = PQconnectdb(config->connection);
-            if (session->publisher_pg == nullptr
-                || PQstatus(session->publisher_pg) != CONNECTION_OK) {
-                const std::string message = session->publisher_pg == nullptr
-                    ? "cannot allocate PostgreSQL publisher connection"
-                    : PQerrorMessage(session->publisher_pg);
-                if (session->publisher_pg != nullptr) {
-                    PQfinish(session->publisher_pg);
-                }
-                PQfinish(session->pg);
-                delete session;
-                throw CallError(kPgDatabaseError, message,
-                                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-            }
             try {
+                session->pg = ConnectPostgreSQL(
+                    session->connection, session->operation_timeout_ms,
+                    "PostgreSQL connection");
+                session->publisher_pg = ConnectPostgreSQL(
+                    session->connection, session->operation_timeout_ms,
+                    "PostgreSQL publisher connection");
                 if (config->operation_timeout_ms != 0) {
                     const std::string command = "SET statement_timeout TO " +
                         std::to_string(config->operation_timeout_ms);
-                    PGresult *result = PQexec(session->pg, command.c_str());
-                    if (result == nullptr || PQresultStatus(result) != PGRES_COMMAND_OK) {
-                        const std::string message = result == nullptr
-                            ? PQerrorMessage(session->pg) : PQresultErrorMessage(result);
-                        if (result != nullptr) PQclear(result);
-                        throw CallError(kPgDatabaseError, message,
-                                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-                    }
-                    PQclear(result);
-                    result = PQexec(session->publisher_pg, command.c_str());
-                    if (result == nullptr || PQresultStatus(result) != PGRES_COMMAND_OK) {
-                        const std::string message = result == nullptr
-                            ? PQerrorMessage(session->publisher_pg)
-                            : PQresultErrorMessage(result);
-                        if (result != nullptr) PQclear(result);
-                        throw CallError(kPgDatabaseError, message,
-                                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-                    }
-                    PQclear(result);
+                    RequirePostgreSQLCommand(
+                        &session->pg, session->operation_timeout_ms,
+                        command.c_str(), "set statement timeout");
+                    RequirePostgreSQLCommand(
+                        &session->publisher_pg, session->operation_timeout_ms,
+                        command.c_str(), "set publisher statement timeout");
                 }
                 Call version(session, "SELECT vexfs_pg_adapter_version()");
                 version.Row();
@@ -1011,17 +1246,9 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                     create.Text(1, config->workspace);
                     create.Row();
                 }
-                {
-                    PGresult *listen = PQexec(session->pg, "LISTEN vexfs_change");
-                    if (listen == nullptr || PQresultStatus(listen) != PGRES_COMMAND_OK) {
-                        const std::string message = listen == nullptr
-                            ? PQerrorMessage(session->pg) : PQresultErrorMessage(listen);
-                        if (listen != nullptr) PQclear(listen);
-                        throw CallError(kPgDatabaseError, message,
-                                        VEXFS_RUNTIME_BACKEND_POSTGRESQL);
-                    }
-                    PQclear(listen);
-                }
+                RequirePostgreSQLCommand(
+                    &session->pg, session->operation_timeout_ms,
+                    "LISTEN vexfs_change", "listen for change notifications");
                 if (!no_create) {
                     Call start(session, "SELECT vexfs_mount_session_start(?1,?2)");
                     start.Text(1, config->workspace);
@@ -1047,8 +1274,8 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
                     } catch (...) {
                     }
                 }
-                PQfinish(session->publisher_pg);
-                PQfinish(session->pg);
+                DropPostgreSQLConnection(&session->publisher_pg);
+                DropPostgreSQLConnection(&session->pg);
                 delete session;
                 throw;
             }
@@ -1151,9 +1378,9 @@ extern "C" vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config 
 
 extern "C" void vexfs_mount_session_close(vexfs_mount_session *session) {
     if (session == nullptr) return;
-    if (session->db != nullptr
+    if (session->db != nullptr || session->postgresql
 #if defined(VEXFS_HAVE_LIBPQ)
-        || session->pg != nullptr
+        || session->pg != nullptr || session->publisher_pg != nullptr
 #endif
     ) {
         std::lock_guard<std::recursive_mutex> lock(session->mutex);
@@ -1945,8 +2172,18 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
         }
         if (session->postgresql) {
 #if defined(VEXFS_HAVE_LIBPQ)
+            // PQconsumeInput does not reconnect a broken connection. Every
+            // other PG operation reaches EnsurePostgreSQLConnection through
+            // the session-backed Call constructor; visibility polling must use the same boundary
+            // or an NFS metadata request can stay permanently stuck after one
+            // real TCP disconnect.
+            EnsurePostgreSQLConnection(session);
             if (PQconsumeInput(session->pg) == 0) {
-                throw CallError(kPgDatabaseError, PQerrorMessage(session->pg),
+                const std::string message = PQerrorMessage(session->pg);
+                DropPostgreSQLConnection(&session->pg);
+                session->pg_visibility_resync_required = true;
+                session->next_pg_reconnect_attempt = {};
+                throw CallError(kPgDatabaseError, message,
                                 VEXFS_RUNTIME_BACKEND_POSTGRESQL);
             }
             bool notification = false;
@@ -1958,8 +2195,10 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
             const bool local_mutation = session->visibility_initialized &&
                 session->mutation_epoch != session->observed_mutation_epoch;
             const bool periodic_poll = now >= session->next_visibility_poll;
+            const bool visibility_resync = session->pg_visibility_resync_required;
             int external_workspace_commit = 0;
-            if (!session->visibility_initialized || notification || local_mutation || periodic_poll) {
+            if (!session->visibility_initialized || notification || local_mutation ||
+                periodic_poll || visibility_resync) {
                 Call head(session, "SELECT vexfs_workspace_head(?1)");
                 head.Text(1, session->workspace.c_str());
                 head.Row();
@@ -1969,12 +2208,17 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
                 const int64_t current_head = head.ResultInt64();
                 const uint64_t current_generation = static_cast<uint64_t>(
                     std::max<int64_t>(0, generation.ResultInt64()));
-                external_workspace_commit = session->visibility_initialized && notification &&
-                    current_head != session->observed_workspace_head ? 1 : 0;
+                const bool visibility_changed =
+                    current_head != session->observed_workspace_head ||
+                    current_generation != session->cache_generation;
+                external_workspace_commit = session->visibility_initialized &&
+                    (visibility_resync ||
+                     (visibility_changed && (notification || !local_mutation))) ? 1 : 0;
                 session->observed_workspace_head = current_head;
                 session->cache_generation = current_generation;
                 session->observed_mutation_epoch = session->mutation_epoch;
                 session->visibility_initialized = true;
+                session->pg_visibility_resync_required = false;
                 session->next_visibility_poll = now + std::chrono::seconds(1);
             }
             visibility->workspace_head = session->observed_workspace_head;
@@ -2503,8 +2747,7 @@ extern "C" vexfs_mount_status vexfs_mount_handle_publish_close_background(
                             "handle, durability and version output are required",
                             VEXFS_RUNTIME_BACKEND_POSTGRESQL);
         }
-        Call call(session->publisher_pg,
-                  "SELECT vexfs_handle_publish_close(?1,?2,?3)");
+        Call call(session, "SELECT vexfs_handle_publish_close(?1,?2,?3)", true);
         call.Text(1, handle);
         call.Int64(2, generation);
         call.Text(3, durability);
@@ -2614,8 +2857,8 @@ extern "C" vexfs_mount_status vexfs_mount_publish_close_claimed(
                             "durability, claims and result output are required",
                             VEXFS_RUNTIME_BACKEND_POSTGRESQL);
         }
-        Call call(session->publisher_pg,
-            "SELECT vexfs_mount_publish_close_claimed(?1,?2,?3,?4::jsonb)");
+        Call call(session,
+            "SELECT vexfs_mount_publish_close_claimed(?1,?2,?3,?4::jsonb)", true);
         call.Text(1, session->workspace.c_str());
         call.Text(2, session->session_id.c_str());
         call.Text(3, durability);
