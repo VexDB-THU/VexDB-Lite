@@ -48,6 +48,36 @@ steps:
 - query: SELECT vexfs_read('pg-a2', '/large.bin') = convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8');
   expect:
   - - true
+- query: SELECT convert_from(vexfs_read_range('pg-a2', '/large.bin', 65530, 20), 'UTF8'), octet_length(vexfs_read_range('pg-a2', '/large.bin', 131072, 64));
+  expect:
+  - - aaaaaabbbbbbbbbbbbbb
+    - 7
+- query: SELECT vexfs_read_range('pg-a2', '/large.bin', -1, 1);
+  expect_error: VEXFS_INVALID_RANGE
+- query: SELECT vexfs_mount_session_start('pg-a2', 'range-session');
+  expect:
+  - - 1
+- query: SELECT vexfs_write_range('pg-a2', '/large.bin', 65534, convert_to('RANGE', 'UTF8'), 'range-write-1', 'range-session', 'full');
+  expect:
+  - - 4
+- query: SELECT vexfs_write_range('pg-a2', '/large.bin', 65534, convert_to('RANGE', 'UTF8'), 'range-write-1', 'range-session', 'full');
+  expect:
+  - - 4
+- query: SELECT convert_from(vexfs_read_range('pg-a2', '/large.bin', 65530, 16), 'UTF8'), count(*) FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') GROUP BY 1;
+  expect:
+  - - aaaaRANGEbbbbbbb
+    - 4
+- query: SELECT count(*) FROM _vexfs.manifest_chunks AS old_entry JOIN _vexfs.manifest_chunks AS new_entry ON new_entry.chunk_id=old_entry.chunk_id WHERE old_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=1) AND new_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=4);
+  expect:
+  - - 1
+- query: SELECT vexfs_write_range('pg-a2', '/large.bin', 134217728, ''::bytea, 'range-write-empty', 'range-session', 'full'), (SELECT size_bytes FROM _vexfs.inodes WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND current_version=4), (SELECT count(*) FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2'));
+  expect:
+  - - 4
+    - 131079
+    - 4
+- query: SELECT vexfs_mount_session_end('pg-a2', 'range-session');
+  expect:
+  - - 1
 - query: SELECT (vexfs_check('pg-a2', 0)->>'ok')::boolean, vexfs_check('pg-a2', 0)->>'mode', vexfs_check('pg-a2', 0)->>'content_model';
   expect:
   - - true
@@ -56,14 +86,16 @@ steps:
 - query: SELECT (vexfs_check('pg-a2', 1)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->'checked'->>'canonical_versions')::bigint, (vexfs_check('pg-a2', 1)->>'issue_count')::integer;
   expect:
   - - true
-    - 2
+    - 3
     - 0
-- statement: UPDATE _vexfs.chunks SET content=set_byte(content, 0, (get_byte(content, 0)+1)%256) WHERE chunk_id=(SELECT entry.chunk_id FROM _vexfs.file_versions AS f JOIN _vexfs.manifest_chunks AS entry ON entry.manifest_id=f.manifest_id WHERE f.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND f.version_no=1 ORDER BY entry.chunk_no LIMIT 1);
+- statement: UPDATE _vexfs.chunks SET content=set_byte(content, 0, (get_byte(content, 0)+1)%256) WHERE chunk_id=(SELECT entry.chunk_id FROM _vexfs.file_versions AS f JOIN _vexfs.manifest_chunks AS entry ON entry.manifest_id=f.manifest_id WHERE f.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND f.version_no=4 ORDER BY entry.chunk_no LIMIT 1);
 - query: SELECT (vexfs_check('pg-a2', 0)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->>'issue_count')::integer > 0;
   expect:
   - - true
     - false
     - true
+- query: SELECT vexfs_write_range('pg-a2', '/large.bin', 0, convert_to('x', 'UTF8'), 'range-after-corruption', NULL, 'full');
+  expect_error: VEXFS_CHECKSUM_MISMATCH
 - query: SELECT vexfs_read('pg-a2', '/large.bin');
   expect_error: VEXFS_CHECKSUM_MISMATCH
 - query: SELECT vexfs_check('pg-a2', 2);

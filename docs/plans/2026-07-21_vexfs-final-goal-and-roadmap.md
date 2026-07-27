@@ -4,21 +4,15 @@
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
 - 日期：2026-07-24
 - 分支：`feature/agent_files`
-- 文档版本：3.1
+- 文档版本：3.2
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
-- 当前阶段：Phase 2 PostgreSQL 功能与验收已完成；最后一次数据审计已让所有变更记录
-  认证用户、workspace、commit、对象和前后版本，并保留 workspace 删除证据。PG 16–19、
-  Linux 真挂载、format v2 和备份性能已经按当前审计实现复跑。当前源码的
-  `preview.37` Developer ID 包已通过 92 项文档 smoke、19 项 package Gate 和包内 PG runtime，
-  已安装到两台 M1 并在远端通过 libpq 读写。真机复测确认 FSKit 已启用；用户再次唤醒系统后，
-  本机 PG FSKit 13/13 场景、凭据生命周期和 macOS↔Linux 跨 gateway 已通过。该包没有 Apple
-  公证票据，仍不能作为正式分发结论；两台 Mac 当前又通过文件/快照往返 50 项和 extension、
-  网络、数据库故障恢复 25 项。最初产品场景也已由两台 Mac 各运行一次真实 OpenCode 完成
-  串行闭环：7 + 9 + 21 条检查通过，两个完整工作区快照可比较并一键恢复。安装器的旧 UUID
-  刷新逻辑已经修复。macOS 默认 NFS adapter、AppleDouble 隔离、NFSv3 LINK/COMMIT、
-  安装包 gateway 和 35 项真机 eval 已完成。原定 FSKit `preview.38` 不再是 0.1 阻塞项。
-  下一步是从干净提交生成签名公证包，在未启用 FSKit 的干净 Mac 跑安装 Gate，并补
-  gateway crash、sleep/wake、文件锁和长期 Coding Agent 负载。
+- 当前阶段：Phase 2 PostgreSQL 数据库合同和本机默认 NFS 验收已完成。PG VexFS spec 8/8、
+  libpq runtime 105 项、macOS 默认 NFS 14/14 场景共 252 项检查全部通过，无跳过。两个独立
+  gateway 已同时挂载同一 PG workspace 并完成双向 `fsync`、版本、快照和清理。PG 已加入
+  64 KiB range read/COW、同 session 批量发布、正确的 NFS `UNSTABLE → COMMIT` 持久化语义
+  和 250 ms 跨 gateway 元数据刷新。历史 FSKit 两 Mac、macOS↔Linux、PG 16–19、备份、
+  format v2 和真实 OpenCode 证据继续有效，但当前默认 NFS 源码对应的新公证包和第二台 Mac
+  NFS 复验还没有完成。下一步先做发行 Gate；数据库方向随后进入 DuckDB adapter。
 
 ## 0. 2026-07-24 路线调整
 
@@ -62,9 +56,9 @@ VexFS FSKit extension。
 
 同时确认两个性能和实现边界：
 
-1. NFSv3 没有 macOS named attributes。macOS 26.3.1 为新文件写入
-   `com.apple.provenance` 时会尝试写 `._文件名`。当前 gateway 已将 raw AppleDouble 数据吸收为
-   目标 inode xattr，用户树和数据库 dentry 都为 0 个 `._*`。
+1. NFSv3 没有透明的 macOS named attributes。macOS 26.3.1 会尝试用 `._文件名` 写
+   AppleDouble。当前产品选择 Bash 目录干净：gateway 明确返回不支持，不创建 `._*`；数据库
+   xattr 合同仍保留，需要透明挂载 xattr 时使用 FSKit 或后续 NFSv4。
 2. 当前真实 SQLite adapter 创建 1,000 个 2-byte 文件为 4.862788 秒、205.643 files/s；同轮
    APFS 为 0.059030 秒、16940.431 files/s，约慢 82.4 倍。它与此前 FSKit 约 175 files/s
    同级，0.1 可用但不是性能达标终点。
@@ -158,7 +152,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 - 不为了宣传“更快 grep”而阻塞挂载正确性、备份和跨机器工作区；
 - 不在核心文件合同中加入 Agent 专用的 prompt、memory 或语义字段。
 
-## 5. 当前基线：2026-07-24
+## 5. 当前基线：2026-07-26
 
 | 范围 | 当前事实 | 主要缺口 |
 |---|---|---|
@@ -166,11 +160,11 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试；PG 已执行 ACL 和继承 | SQLite 尚未执行完整 ACL 授权；特殊文件不支持 |
 | 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、原生备份、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 自动维护、history/staging/index/total quota 和 DuckDB 导入端未完成 |
 | 长期校验 | `chunked-v1` 使用不可变 manifest、64 KiB 块和逐块/整文件 SHA-256；只读 check 覆盖结构、引用、顺序、大小和流式内容校验 | 自动 repair 和跨文件通用去重不在当前范围 |
-| macOS | 默认 NFS 已连接 SQLite runtime，45 项完整真机 eval、13 项 OpenCode eval 和 30 项 package smoke 通过；hardlink、COMMIT/fsync、AppleDouble 隔离、Git、单机锁、npm/Cargo、重挂载和快照恢复均已验证；macOS 13.0 deployment target 构建通过。preview.40 ad-hoc 完整打包通过 99 项文档/安装检查、18 项干净包安装 eval、哈希和签名校验；既有 FSKit 仍保留并有 preview.22/preview.37 真机证据 | 默认 NFS 尚未从干净提交生成公证包，也未在 macOS 13–15 或未启用 FSKit 的干净 Mac 验证；重复 crash/sleep-wake、跨机器锁、长期 Agent 和 x86_64 待补 |
+| macOS | 默认 NFS 已连接 SQLite 和 PG runtime；PG 14/14 场景、252 项检查通过，SQLite 完整真机 eval、OpenCode、package smoke、hardlink、COMMIT/fsync、Git、单机锁、npm/Cargo、重挂载和快照恢复均有证据；NFSv3 xattr 明确不支持且不生成 `._*`；macOS 13.0 deployment target 构建通过；既有 FSKit 仍保留历史真机证据 | 当前默认 NFS 源码尚未从干净提交生成公证包，也未在 macOS 13–15 或未启用 FSKit 的干净 Mac 验证；重复 crash/sleep-wake、跨机器锁、长期 Agent 和 x86_64 待补 |
 | Linux | libfuse3 真实挂载已通过 root 和 uid 1000 各 9 组；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；异常撤销后底层目录保持 0500，显式卸载恢复 0700；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
-| 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、当前源码下的 macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项，以及双机 extension 崩溃、网络中断和数据库停机 25 项 | 当前审计源码对应的公证包尚未生成，需要重跑双机安装 Gate；局域网直连 FSKit 还需要 macOS 本地网络授权；PG 文本索引尚未实现 |
-| 性能规模 | SQLite 直连已完成 10 万文件；默认 NFS 1,000 小文件为 4.862788 秒、205.643 files/s，同轮 APFS 0.059030 秒、16940.431 files/s；此前 FSKit 为约 175 files/s | NFS 小文件仍比 APFS 慢约 82.4 倍；0.2 需批量提交、写回合并、metadata cache，并重跑 1 万/10 万和真实 Coding Agent |
+| 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项和故障恢复 25 项；当前默认 NFS 又完成本机双 gateway 15 项，PG `pg_trgm` 索引已实现 | 当前默认 NFS 源码对应的公证包和第二台 Mac NFS 复验尚未完成；同时覆盖同一文件只报告版本冲突，不自动合并 |
+| 性能规模 | SQLite 直连已完成 10 万文件；SQLite staging 已改成 base manifest + 变长脏块覆盖；SQLite NFS 三轮 1,000 小文件中位数 904.400 files/s，16 MiB 写 383.600 MiB/s；quick 挂载 eval 的 8 MiB 写为 310.118 MiB/s、100 次随机覆盖为 3,522.124 ops/s；PG NFS 仍使用独立基线 | 小文件达到 AgentFS 的 97%，顺序写为 2.18 倍，随机写约 80%；仍需补 1 万文件、长 Agent、冷读、严格持久化和完整 SHA-256 发布成本基线 |
 
 “合同中已保存”不等于“所有平台已经完整执行”。例如 owner/group 和便携 ACL 已经可以保存、读取和恢复，但身份认证、权限判断和各系统的原生 ACL 映射仍属于后续阶段。
 
@@ -184,8 +178,8 @@ vexdb fs --workspace workspace snapshot restore before-refactor
    本机 13 个真实 mount Gate 通过；另一台没有源码和完整 Xcode 的 M1 也完成安装、真实挂载、
    Git、快照、deep check 和 archive v2 的 30 项 smoke；
 4. **长期安全与分块内容模型已完成**：checksum/check、retention/GC、live quota、SQLite format v2
-   逻辑 export/import、chunk + manifest 和 append 合并发布已进入 spec、runtime/CLI smoke 和 eval；
-   下一步集中解决小文件写入性能，并补 macOS x86_64 交付验证。
+   逻辑 export/import、chunk + manifest、base manifest + 脏块 staging 和 append 合并发布已进入
+   runtime/CLI smoke 和 eval；下一步验证 1 万文件、长期工作区和 macOS x86_64 交付。
 
 当前不把主要开发重心完全移出 Phase 1；但已按用户决定完成 PostgreSQL `0.4.0-alpha.1`：
 SQL 合同、长期内容模型、完整性检查、空间管理、format v2、ACL、审计、libpq HostStore、
@@ -314,8 +308,8 @@ SQLite 证据。当前 format v2 已支持 SQLite 和 PostgreSQL，DuckDB adapte
 
 当前完成证据：
 
-- 适配器版本为 `0.4.0-alpha.1`，7 个 PG spec、151 项公共合同/并发 eval、32 项 CLI runtime、
-  74 项 runtime 合同、
+- 适配器版本为 `0.4.0-alpha.1`，8 个 PG VexFS spec、151 项公共合同/并发 eval、32 项 CLI runtime、
+  105 项当前 libpq runtime 合同、
   数据库重启恢复、16/17/18/19 版本矩阵均通过；
 - ACL、真实 role、跨 gateway 锁和缓存失效已经进入 PostgreSQL 合同；审计精确记录
   `session_user`/role OID、workspace、commit、path/inode 和 before/after version，workspace
@@ -337,6 +331,12 @@ SQLite 证据。当前 format v2 已支持 SQLite 和 PostgreSQL，DuckDB adapte
   固定在 `5433` 的另一套 PostgreSQL；
 - 两台 Mac 的局域网 TCP、libpq 和 runtime 已通过。直连 FSKit 的最后一步需要用户在第二台
   Mac 的系统设置中打开 VexDB Lite 的“本地网络”权限；Apple 不允许程序替用户打开该开关。
+- 当前默认 NFS 在本机连续通过 14/14 场景、252 项检查；两个独立 gateway 同挂一个 PG
+  workspace，第一端创建并 `fsync`、第二端继承并覆盖、第一端刷新读回，最后验证两个版本、
+  快照、`pending_handles=0` 和 `staging_bytes=0`；
+- NFS 普通 WRITE 正确返回 `UNSTABLE`，COMMIT/fsync/500 ms idle batch/卸载用 `full` 发布；
+  PG 同 session 批量发布在一个事务内完成。千文件不再出现修复前的 60 秒 `rg` 超时，正式
+  file version/commit/request 分别为 1.002/1.066/3.013 每文件。
 
 完成条件：
 
@@ -345,9 +345,10 @@ SQLite 证据。当前 format v2 已支持 SQLite 和 PostgreSQL，DuckDB adapte
 - PostgreSQL 原生备份恢复后文件、历史、权限和业务表处于同一时间点；
 - macOS 和 Linux 使用同一 mount 一致性测试，不增加 PostgreSQL 专用文件语义。
 
-当前完成条件已经由本机、Linux、跨系统和双机故障 Gate 证明，Phase 2 状态改为“功能与验收
-完成”。从当前干净提交生成并公证 `preview.38` 仍是必要的发行任务，但不再被误写成
-PostgreSQL 文件合同缺口；之后再决定先做 Windows 还是 DuckDB。
+当前数据库合同和本机默认 NFS 完成条件已经由本机、Linux、跨系统、历史双机和故障 Gate
+证明，Phase 2 状态为“功能与本机验收完成”。从当前干净提交生成并公证新包、在第二台 Mac
+按默认 NFS 重跑共享 workspace，仍是发行任务，但不再被误写成 PostgreSQL 文件合同缺口；
+数据库方向下一步进入 DuckDB adapter，Windows mount adapter 按独立平台路线推进。
 
 ### Phase 3：Windows 与跨系统预览 — 未开始
 

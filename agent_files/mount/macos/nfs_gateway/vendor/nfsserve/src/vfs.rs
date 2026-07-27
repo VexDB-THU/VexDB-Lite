@@ -120,12 +120,18 @@ pub trait NFSFileSystem: Sync {
     /// EOF must be flagged if the end of the file is reached by the read.
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3>;
 
-    /// Writes the contents of a file returning (bytes, EOF)
+    /// Writes file contents and returns (attributes, committed_to_stable_storage).
     /// Note that offset/count may go past the end of the file and that
     /// in that case, the file is extended.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
+    async fn write(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        stable_requested: bool,
+    ) -> Result<(fattr3, bool), nfsstat3>;
 
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
@@ -223,7 +229,7 @@ pub trait NFSFileSystem: Sync {
         let res = fsinfo3 {
             obj_attributes: dir_attr,
             rtmax: 1024 * 1024,
-            rtpref: 1024 * 124,
+            rtpref: 1024 * 1024,
             rtmult: 1024 * 1024,
             wtmax: 1024 * 1024,
             wtpref: 1024 * 1024,

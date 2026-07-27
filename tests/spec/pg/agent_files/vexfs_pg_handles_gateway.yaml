@@ -16,6 +16,54 @@ steps:
   expect:
   - - 1
 - statement: CREATE TEMP TABLE handle_ids(name text PRIMARY KEY, handle text NOT NULL);
+- statement: INSERT INTO handle_ids SELECT 'owned-create', created.handle FROM vexfs_handle_create_stat('pg-handles', '/owned.txt', 416, 501, 20, 'create-owned', 'gateway-a') AS created;
+- query: SELECT count(*), min((vexfs_stat('pg-handles', '/owned.txt')->>'version')::bigint), min((vexfs_stat('pg-handles', '/owned.txt')->>'uid')::bigint), min((vexfs_stat('pg-handles', '/owned.txt')->>'gid')::bigint), min(octet_length(vexfs_read_range('pg-handles', '/owned.txt', 0, 64))) FROM vexfs_list('pg-handles', '/') WHERE name='owned.txt';
+  expect:
+  - - 1
+    - 0
+    - 501
+    - 20
+    - 0
+- query: SELECT (vexfs_check('pg-handles', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_read_range('pg-handles', '/owned.txt', -1, 1);
+  expect_error: VEXFS_INVALID_RANGE
+- query: SELECT vexfs_read_range('pg-handles', '/owned.txt', 0, 134217729);
+  expect_error: VEXFS_INVALID_RANGE
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='owned-create'), 0, convert_to('owned-data', 'UTF8'), 'stage-owned');
+  expect:
+  - - 2
+- query: SELECT vexfs_handle_publish_close((SELECT handle FROM handle_ids WHERE name='owned-create'), 2, 'full');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/owned.txt'), 'UTF8'), (vexfs_stat('pg-handles', '/owned.txt')->>'mode')::integer;
+  expect:
+  - - owned-data
+    - 416
+- statement: INSERT INTO handle_ids VALUES ('batch-a', vexfs_handle_create('pg-handles', '/batch-a.txt', 420, 501, 20, 'create-batch-a', 'gateway-a'));
+- statement: INSERT INTO handle_ids VALUES ('batch-b', vexfs_handle_create('pg-handles', '/batch-b.txt', 420, 501, 20, 'create-batch-b', 'gateway-a'));
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='batch-a'), 0, convert_to('batch-a', 'UTF8'), 'stage-batch-a'), vexfs_handle_stage_write((SELECT handle FROM handle_ids WHERE name='batch-b'), 0, convert_to('batch-b', 'UTF8'), 'stage-batch-b');
+  expect:
+  - - 2
+    - 2
+- query: SELECT vexfs_mount_publish_close_all('pg-handles', 'gateway-a', 'full', 1);
+  expect:
+  - - 1
+- query: SELECT count(*) FROM _vexfs.handles WHERE handle_id IN ((SELECT handle FROM handle_ids WHERE name='batch-a'), (SELECT handle FROM handle_ids WHERE name='batch-b')) AND state='closed';
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_publish_close_all('pg-handles', 'gateway-a', 'full');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-handles', '/batch-a.txt'), 'UTF8'), convert_from(vexfs_read('pg-handles', '/batch-b.txt'), 'UTF8'), (SELECT count(*) FROM _vexfs.handles WHERE handle_id IN ((SELECT handle FROM handle_ids WHERE name='batch-a'), (SELECT handle FROM handle_ids WHERE name='batch-b')) AND state='closed');
+  expect:
+  - - batch-a
+    - batch-b
+    - 2
+- query: SELECT vexfs_mount_publish_close_all('pg-handles', 'gateway-a', 'full');
+  expect:
+  - - 0
 - statement: INSERT INTO handle_ids VALUES ('reader', vexfs_handle_open('pg-handles', '/value.txt', 'r', 'open-reader', 'gateway-a'));
 - statement: INSERT INTO handle_ids VALUES ('a', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'open-a', 'gateway-a'));
 - statement: INSERT INTO handle_ids VALUES ('b', vexfs_handle_open('pg-handles', '/value.txt', 'rw', 'open-b', 'gateway-b'));

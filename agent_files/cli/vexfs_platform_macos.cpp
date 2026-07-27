@@ -527,7 +527,10 @@ void StopNfsGateway(const std::string &mount_point) {
     NfsGatewayRecord record;
     if (!ReadNfsGatewayRecord(mount_point, &record) || !ProcessMatchesGateway(record)) return;
     kill(record.pid, SIGTERM);
-    for (int attempt = 0; attempt < 40; ++attempt) {
+    // SIGTERM starts a graceful database-backed staging flush. Large small-file
+    // bursts are committed in bounded batches, so allow them to finish before
+    // falling back to SIGKILL. The filesystem is already detached at this point.
+    for (int attempt = 0; attempt < 600; ++attempt) {
         if (kill(record.pid, 0) != 0 && errno == ESRCH) return;
         usleep(50 * 1000);
     }
@@ -1028,11 +1031,12 @@ int VexFSPlatformMount(const std::string &backend, const std::string &connection
                 gateway = StartNfsGateway(backend, resource.connection, workspace,
                                           mount_point, resource.directory);
             }
-            // Keep I/O bounded if the per-mount gateway exits, but allow one
-            // request to wait longer than the runtime's 30-second database
-            // busy timeout. dumbtimer makes the 10-second interval explicit.
+            // Keep I/O bounded if the per-mount gateway exits. Keep the normal
+            // adaptive RTT estimator: dumbtimer makes sparse fsync workloads
+            // wait one fixed timeout for every dirty NFS block on macOS.
             const std::string options =
-                "vers=3,tcp,locallocks,soft,dumbtimer,timeo=100,retrans=4,"
+                "vers=3,tcp,locallocks,soft,timeo=10,retrans=4,"
+                "rsize=1048576,wsize=1048576,"
                 "deadtimeout=60,actimeo=1,port=" +
                 std::to_string(gateway.port) + ",mountport=" +
                 std::to_string(gateway.port);

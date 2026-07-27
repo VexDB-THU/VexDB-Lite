@@ -3465,7 +3465,7 @@ MOUNT_CONFORMANCE_CAPABILITIES = (
     "chmod-exec",
     "hardlink",
     "symlink",
-    "xattr",
+    "xattr-when-platform-driver-supports-it",
     "unicode-name",
     "stable-errno",
     "snapshot-restore",
@@ -3530,7 +3530,7 @@ def prepare_real_mount_adapter(ctx: Context, base: Path,
             raise EvalSkip("macOS NFS gateway 或系统 mount_nfs 不可用")
     if system == "Linux" and not details.get("mount_ready"):
         raise EvalSkip(f"libfuse3 adapter={details.get('extension', 'unknown')}")
-    mount_point.mkdir()
+    mount_point.mkdir(parents=True)
     return RealMountAdapter(name, cli, database, mount_point, prefix, details,
                             backend, connection_identity)
 
@@ -3546,6 +3546,20 @@ def expect_mount_errno(ctx: Context, operation: Callable[[], Any], expected: int
                 f"{message}: expected errno={expected}, actual={error.errno} ({error})")
         return
     raise EvalFailure(f"{message}: 预期 errno={expected} 但操作成功")
+
+
+def expect_mount_errno_one_of(ctx: Context, operation: Callable[[], Any],
+                              expected: set[int], message: str) -> None:
+    ctx.checks += 1
+    try:
+        operation()
+    except OSError as error:
+        if error.errno not in expected:
+            raise EvalFailure(
+                f"{message}: expected errno in {sorted(expected)}, "
+                f"actual={error.errno} ({error})")
+        return
+    raise EvalFailure(f"{message}: 预期失败但操作成功")
 
 
 def system_setxattr(path: Path, name: str, value: bytes) -> None:
@@ -3639,9 +3653,35 @@ def mount_adapter_unmount(ctx: Context, adapter: RealMountAdapter,
     result = run_process(adapter.prefix + ["unmount", str(adapter.mount_point)],
                          check=False, timeout=60)
     ctx.equal(result.returncode, 0, f"{adapter.name} {label}卸载退出码")
+    target_status: list[dict[str, Any]] | None = None
     if adapter.name == "fskit":
         # FSKit 在 umount 返回后仍会异步释放 volume identity；重挂载前给系统收尾时间。
         time.sleep(2.0)
+    elif adapter.name == "nfs":
+        # umount 返回与 getmntinfo/注册表视图收敛不是同一个时刻。
+        # 按目标轮询，既不依赖固定机器速度，也不受其他 VexFS 挂载影响。
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            status = run_process(
+                adapter.prefix + ["--json", "mount", "status",
+                                  str(adapter.mount_point)],
+                check=False, timeout=10)
+            try:
+                target_status = json.loads(status.stdout)
+                if target_status == []:
+                    break
+            except json.JSONDecodeError:
+                pass
+            time.sleep(0.1)
+    if target_status is None:
+        status = run_process(
+            adapter.prefix + ["--json", "mount", "status", str(adapter.mount_point)],
+            check=False, timeout=10)
+        try:
+            target_status = json.loads(status.stdout)
+        except json.JSONDecodeError:
+            target_status = None
+    ctx.equal(target_status, [], f"{adapter.name} {label}目标卸载状态")
 
 
 def run_shared_mount_operations(ctx: Context, adapter: RealMountAdapter) -> dict[str, Any]:
@@ -3711,9 +3751,18 @@ def run_shared_mount_operations(ctx: Context, adapter: RealMountAdapter) -> dict
 
     xattr_name = "user.vexfs.conformance"
     xattr_value = b"stored-in-database\x00binary"
-    system_setxattr(data, xattr_name, xattr_value)
-    ctx.equal(system_getxattr(data, xattr_name), xattr_value, "共享合同 xattr 读取")
-    ctx.check(xattr_name in system_listxattr(data), "共享合同 xattr 列表")
+    xattr_supported = adapter.name != "nfs"
+    if xattr_supported:
+        system_setxattr(data, xattr_name, xattr_value)
+        ctx.equal(system_getxattr(data, xattr_name), xattr_value, "共享合同 xattr 读取")
+        ctx.check(xattr_name in system_listxattr(data), "共享合同 xattr 列表")
+    else:
+        expect_mount_errno_one_of(
+            ctx,
+            lambda: system_setxattr(data, xattr_name, xattr_value),
+            {errno.EPERM, errno.ENOTSUP},
+            "macOS NFSv3 必须明确拒绝无法无污染持久化的 xattr",
+        )
 
     script = root / "run.sh"
     script.write_text("#!/bin/sh\nprintf 'vexfs-conformance\\n'\n", encoding="utf-8")
@@ -3736,8 +3785,9 @@ def run_shared_mount_operations(ctx: Context, adapter: RealMountAdapter) -> dict
         "hardlink_inode_equal": data.stat().st_ino == hardlink.stat().st_ino,
         "hardlink_count": data.stat().st_nlink,
         "symlink_target": os.readlink(symlink),
+        "xattr_supported": xattr_supported,
         "xattr_name": xattr_name,
-        "xattr_value": system_getxattr(data, xattr_name),
+        "xattr_value": system_getxattr(data, xattr_name) if xattr_supported else b"",
         "unicode": unicode_file.read_text(encoding="utf-8"),
         "script_output": run_process([str(script)], cwd=root).stdout,
         "entries": sorted(path.name for path in root.iterdir()),
@@ -3757,8 +3807,9 @@ def verify_shared_mount_after_restore(ctx: Context, adapter: RealMountAdapter,
     ctx.equal(data.stat().st_ino, hardlink.stat().st_ino, "恢复后 hardlink inode")
     ctx.equal(data.stat().st_nlink, expected["hardlink_count"], "恢复后 hardlink count")
     ctx.equal(os.readlink(symlink), expected["symlink_target"], "恢复后 symlink")
-    ctx.equal(system_getxattr(data, expected["xattr_name"]), expected["xattr_value"],
-              "恢复后 xattr")
+    if expected["xattr_supported"]:
+        ctx.equal(system_getxattr(data, expected["xattr_name"]), expected["xattr_value"],
+                  "恢复后 xattr")
     ctx.equal(unicode_file.read_text(encoding="utf-8"), expected["unicode"],
               "恢复后 Unicode")
     ctx.equal(run_process([str(script)], cwd=root).stdout, expected["script_output"],
@@ -3770,13 +3821,13 @@ def verify_shared_mount_after_restore(ctx: Context, adapter: RealMountAdapter,
         "mode": expected["mode"],
         "hardlink_count": data.stat().st_nlink,
         "symlink_target": os.readlink(symlink),
-        "xattrs": system_listxattr(data),
+        "xattrs": system_listxattr(data) if expected["xattr_supported"] else [],
         "unicode_name": unicode_file.name,
     }
 
 
 @case("mount.cross-platform-conformance", "mount",
-      "macOS FSKit 与 Linux FUSE 执行同一份挂载、元数据、快照和重挂载合同")
+      "macOS NFS 与 Linux FUSE 执行共享挂载合同，并验证 NFSv3 xattr 边界")
 def cross_platform_mount_conformance(ctx: Context) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-conformance-") as directory:
         base = Path(directory)
@@ -3828,19 +3879,94 @@ def cross_platform_mount_conformance(ctx: Context) -> dict[str, Any]:
             mount_adapter_unmount(ctx, adapter, "第二次")
 
         after = json.loads(run_process(adapter.prefix + ["--json", "doctor"]).stdout)
-        ctx.equal(after["mount_count"], 0, "共享合同卸载后无挂载")
+        target_status = json.loads(run_process(
+            adapter.prefix + ["--json", "mount", "status",
+                              str(adapter.mount_point)], check=False).stdout)
+        ctx.equal(target_status, [], "共享合同目标卸载后无挂载")
         ctx.equal(after["database"]["pending_handles"], 0, "共享合同无未发布句柄")
         ctx.equal(after["database"]["retained_handles"], 0, "共享合同无保留句柄")
         ctx.equal(after["database"]["staging_bytes"], 0, "共享合同无暂存字节")
         return {
             "contract_version": MOUNT_CONFORMANCE_VERSION,
             "adapter": adapter.name,
-            "capabilities": list(MOUNT_CONFORMANCE_CAPABILITIES),
+            "capabilities": [capability for capability in MOUNT_CONFORMANCE_CAPABILITIES
+                             if adapter.name != "nfs" or not capability.startswith("xattr-")],
+            "limitations": (["macos-nfsv3-mounted-xattr"]
+                            if adapter.name == "nfs" else []),
             "doctor_before": adapter.doctor_before,
             "doctor_after": after,
             "mounts": mounts,
             "snapshot_commit": snapshot_commit,
             "restored": restored,
+        }
+
+
+@case("mount.pg-shared-workspace", "mount",
+      "两个独立 NFS gateway 同时挂载一个 PG workspace 并双向继承")
+def pg_shared_workspace(ctx: Context) -> dict[str, Any]:
+    backend = os.environ.get("VEXFS_MOUNT_BACKEND", "sqlite").lower()
+    if backend not in {"pg", "postgres", "postgresql"}:
+        raise EvalSkip("共享 workspace 用例只适用于 PostgreSQL")
+    if platform.system() != "Darwin":
+        raise EvalSkip("当前共享 gateway 用例需要 macOS NFS")
+    with tempfile.TemporaryDirectory(prefix="vexfs-pg-shared-") as directory:
+        base = Path(directory)
+        first = prepare_real_mount_adapter(ctx, base / "first", "pg-shared-local")
+        second = prepare_real_mount_adapter(ctx, base / "second", "pg-shared-local")
+        first_mounted = False
+        second_mounted = False
+        try:
+            mount_adapter_mount(ctx, first)
+            first_mounted = True
+            mount_adapter_mount(ctx, second)
+            second_mounted = True
+
+            first_project = first.mount_point / "workspace"
+            second_project = second.mount_point / "workspace"
+            first_project.mkdir()
+            first_file = first_project / "shared.txt"
+            descriptor = os.open(first_file, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o644)
+            try:
+                os.write(descriptor, b"created-by-first\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            time.sleep(1.2)
+            ctx.equal(second_project.joinpath("shared.txt").read_bytes(),
+                      b"created-by-first\n", "第二个 gateway 继承第一个写入")
+
+            second_file = second_project / "shared.txt"
+            descriptor = os.open(second_file, os.O_TRUNC | os.O_WRONLY)
+            try:
+                os.write(descriptor, b"modified-by-second\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            time.sleep(1.2)
+            ctx.equal(first_file.read_bytes(), b"modified-by-second\n",
+                      "第一个 gateway 刷新第二个写入")
+        finally:
+            if second_mounted:
+                mount_adapter_unmount(ctx, second, "PG 共享第二挂载")
+            if first_mounted:
+                mount_adapter_unmount(ctx, first, "PG 共享第一挂载")
+
+        snapshot_commit = int(run_process(
+            first.prefix + ["snapshot", "create", "two-gateway"]).stdout.strip())
+        ctx.check(snapshot_commit > 0, "共享 workspace 快照")
+        history = json.loads(run_process(
+            first.prefix + ["--json", "history", "/workspace/shared.txt", "--limit", "100"]
+        ).stdout)
+        ctx.check(len(history) >= 2, "共享文件保留两个 gateway 的版本")
+        after = json.loads(run_process(first.prefix + ["--json", "doctor"]).stdout)
+        ctx.equal(after["database"]["pending_handles"], 0, "共享 workspace 无待发布句柄")
+        ctx.equal(after["database"]["staging_bytes"], 0, "共享 workspace 无暂存字节")
+        return {
+            "backend": first.backend,
+            "gateways": 2,
+            "snapshot_commit": snapshot_commit,
+            "file_versions": len(history),
+            "doctor_after": after,
         }
 
 
@@ -4621,7 +4747,6 @@ test "$(/bin/cat "$1/project/sub/result.txt")" = agent
         reverse = run_process(prefix + ["cat", "/project/sub/result.txt"])
         ctx.equal(reverse.stdout, b"agent\n", "数据库 CLI 反向读取挂载写入")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
-        ctx.equal(after["mount_count"], 0, "卸载后挂载数")
         ctx.equal(after["database"]["pending_handles"], 0, "卸载后未发布句柄")
         ctx.equal(after["database"]["retained_handles"], 0, "卸载后保留句柄")
         ctx.equal(after["database"]["staging_bytes"], 0, "卸载后暂存字节")
@@ -4787,10 +4912,86 @@ def real_mount_posix_metadata(ctx: Context) -> dict[str, Any]:
                 "database_verified": True}
 
 
-@case("mount.performance", "mount", "真实 FSKit 分块顺序写和随机覆盖性能")
+@case("mount.sqlite-live-cli-wal", "mount",
+      "SQLite 真实挂载在大 WAL 下允许第二个 CLI 反复读取且网关继续工作")
+def real_mount_sqlite_live_cli_wal(ctx: Context) -> dict[str, Any]:
+    if platform.system() != "Darwin":
+        raise EvalSkip("SQLite WAL 多进程真机回归当前只在 macOS NFS 执行")
+    with tempfile.TemporaryDirectory(prefix="vexfs-mount-wal-peer-") as directory:
+        base = Path(directory)
+        adapter = prepare_real_mount_adapter(ctx, base, "wal-peer")
+        if adapter.backend != "sqlite":
+            raise EvalSkip("SQLite WAL 多进程回归不适用于 PostgreSQL backend")
+        mount_adapter_mount(ctx, adapter)
+        shm = Path(f"{adapter.database}-shm")
+        wal = Path(f"{adapter.database}-wal")
+        try:
+            root = adapter.mount_point / "wal-load"
+            root.mkdir()
+            for index in range(1_000):
+                (root / f"f-{index:04d}.txt").write_bytes(b"x\n")
+            large = root / "large.bin"
+            with large.open("wb", buffering=MIB) as stream:
+                for _ in range(8):
+                    stream.write(b"v" * MIB)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            ctx.check(shm.exists() and wal.exists(), "真实挂载必须建立 WAL sidecar")
+            shm_before = shm.stat()
+            wal_before = wal.stat()
+            cli_reads = 100
+            for _ in range(cli_reads):
+                result = run_process(adapter.prefix + ["cat", "/wal-load/f-0500.txt"])
+                ctx.equal(result.stdout, b"x\n", "第二个 CLI 读取挂载中的 workspace")
+            shm_after_peer = shm.stat()
+            wal_after_peer = wal.stat()
+            ctx.equal(shm_after_peer.st_ino, shm_before.st_ino,
+                      "第二个 CLI 不得替换 SQLite SHM")
+            ctx.check(shm_after_peer.st_size >= shm_before.st_size,
+                      "第二个 CLI 不得截断 SQLite SHM")
+
+            continued_files = 250
+            for index in range(continued_files):
+                (root / f"after-peer-{index:04d}.txt").write_text(
+                    f"after-peer-{index:04d}\n")
+            ctx.equal((root / "after-peer-0249.txt").read_text(),
+                      "after-peer-0249\n", "第二个 CLI 退出后挂载网关继续读写")
+            reverse = run_process(
+                adapter.prefix + ["cat", "/wal-load/after-peer-0249.txt"])
+            ctx.equal(reverse.stdout, b"after-peer-0249\n",
+                      "挂载后续写入仍可由 CLI 读取")
+            mounts = json.loads(run_process(
+                adapter.prefix + ["--json", "mount", "status",
+                                  str(adapter.mount_point)]).stdout)
+            ctx.equal(len(mounts), 1, "WAL peer 压力后网关仍在运行")
+        finally:
+            mount_adapter_unmount(ctx, adapter, "SQLite WAL peer")
+        after = json.loads(run_process(adapter.prefix + ["--json", "doctor"]).stdout)
+        ctx.equal(after["mount_count"], adapter.doctor_before["mount_count"],
+                  "WAL peer 回归卸载后恢复原有挂载数")
+        ctx.equal(after["database"]["pending_handles"], 0,
+                  "WAL peer 回归卸载后未发布句柄")
+        return {
+            "cli": str(adapter.cli),
+            "small_files_before_peer": 1_000,
+            "large_mib_before_peer": 8,
+            "cli_peer_reads": cli_reads,
+            "continued_files": continued_files,
+            "shm_inode_before": shm_before.st_ino,
+            "shm_inode_after_peer": shm_after_peer.st_ino,
+            "shm_bytes_before": shm_before.st_size,
+            "shm_bytes_after_peer": shm_after_peer.st_size,
+            "wal_bytes_before": wal_before.st_size,
+            "wal_bytes_after_peer": wal_after_peer.st_size,
+            "doctor_after": after,
+        }
+
+
+@case("mount.performance", "mount", "真实挂载的分块顺序写、范围读和随机覆盖性能")
 def real_mount_performance(ctx: Context) -> dict[str, Any]:
     if platform.system() != "Darwin":
-        raise EvalSkip("真实 FSKit mount 只在 macOS 执行")
+        raise EvalSkip("真实 macOS mount 性能测试只在 macOS 执行")
     sequential_mib = {"quick": 8, "full": 32, "stress": 64}[ctx.mode.name]
     random_writes = {"quick": 100, "full": 1_000, "stress": 2_000}[ctx.mode.name]
     with tempfile.TemporaryDirectory(prefix="vexfs-mount-perf-") as directory:
@@ -4825,10 +5026,10 @@ def real_mount_performance(ctx: Context) -> dict[str, Any]:
             random_seconds = time.perf_counter() - started
             for offset in sampled_offsets:
                 ctx.equal(os.pread(fd, len(patch), offset), patch,
-                          "FSKit 随机覆盖读回")
+                          "挂载盘范围读取必须读回随机覆盖")
             os.close(fd)
             fd = -1
-            ctx.equal(path.stat().st_size, sequential_mib * MIB, "FSKit 性能文件长度")
+            ctx.equal(path.stat().st_size, sequential_mib * MIB, "挂载盘性能文件长度")
             ctx.budget("mount_sequential_seconds", sequential_seconds, 60.0)
             ctx.budget("mount_random_seconds", random_seconds, 120.0)
         finally:
@@ -4836,7 +5037,6 @@ def real_mount_performance(ctx: Context) -> dict[str, Any]:
                 os.close(fd)
             mount_adapter_unmount(ctx, adapter, "性能测试")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
-        ctx.equal(after["mount_count"], 0, "FSKit 性能测试卸载后挂载数")
         return {
             "cli": str(adapter.cli),
             "backend": adapter.backend,
@@ -4849,6 +5049,171 @@ def real_mount_performance(ctx: Context) -> dict[str, Any]:
             "random_operations_per_second": round(
                 random_writes / max(random_seconds, 1e-9), 3),
             "doctor_after": after,
+        }
+
+
+@case("mount.scale-read-after-small-files", "mount",
+      "创建大量小文件后写入、完整读取并重挂载冷读大文件")
+def real_mount_scale_read_after_small_files(ctx: Context) -> dict[str, Any]:
+    if platform.system() != "Darwin":
+        raise EvalSkip("小文件后大文件读取回归当前只在 macOS NFS 执行")
+    file_count = {"quick": 1_000, "full": 3_000, "stress": 5_000}[
+        ctx.mode.name]
+    large_mib = {"quick": 8, "full": 16, "stress": 32}[ctx.mode.name]
+    with FailureArtifactDirectory(ctx, "vexfs-mount-scale-read-") as directory:
+        base = Path(directory)
+        adapter = prepare_real_mount_adapter(ctx, base, "scale-read")
+        root = adapter.mount_point / "scale-read"
+        large = root / "large.bin"
+        block = bytes(range(256)) * 4096
+        expected_hash = hashlib.sha256(block * large_mib).hexdigest()
+
+        def read_all() -> tuple[int, str]:
+            digest = hashlib.sha256()
+            total = 0
+            with large.open("rb", buffering=MIB) as stream:
+                for chunk in iter(lambda: stream.read(MIB), b""):
+                    total += len(chunk)
+                    digest.update(chunk)
+            return total, digest.hexdigest()
+
+        mount_adapter_mount(ctx, adapter)
+        try:
+            root.mkdir()
+            started = time.perf_counter()
+            for index in range(file_count):
+                (root / f"f-{index:05d}.txt").write_bytes(b"x\n")
+            create_seconds = time.perf_counter() - started
+
+            started = time.perf_counter()
+            with large.open("wb", buffering=MIB) as stream:
+                for _ in range(large_mib):
+                    stream.write(block)
+                stream.flush()
+                os.fsync(stream.fileno())
+            write_seconds = time.perf_counter() - started
+
+            started = time.perf_counter()
+            first_bytes, first_hash = read_all()
+            first_read_seconds = time.perf_counter() - started
+            ctx.equal(first_bytes, large_mib * MIB,
+                      "大量小文件后的首次完整读取长度")
+            ctx.equal(first_hash, expected_hash,
+                      "大量小文件后的首次完整读取校验和")
+        finally:
+            mount_adapter_unmount(ctx, adapter, "规模读取首次")
+
+        database_stat = json.loads(run_process(
+            adapter.prefix + ["stat", "/scale-read/large.bin"]).stdout)
+        ctx.equal(database_stat["size"], large_mib * MIB,
+                  "数据库权威视图中的大文件长度")
+
+        mount_adapter_mount(ctx, adapter)
+        try:
+            started = time.perf_counter()
+            cold_bytes, cold_hash = read_all()
+            cold_read_seconds = time.perf_counter() - started
+            ctx.equal(cold_bytes, large_mib * MIB, "重挂载冷读长度")
+            ctx.equal(cold_hash, expected_hash, "重挂载冷读校验和")
+        finally:
+            mount_adapter_unmount(ctx, adapter, "规模读取重挂载")
+
+        integrity = json.loads(run_process(
+            adapter.prefix + ["--json", "check", "--quick"]).stdout)
+        ctx.equal(integrity["ok"], True, "规模读取后的数据库检查")
+        ctx.equal(integrity["versions"], file_count + 1,
+                  "卸载前的全部小文件和大文件必须形成正式版本")
+        ctx.equal(integrity["checked"]["manifests"], file_count + 1,
+                  "卸载后 manifest 数量必须覆盖全部文件")
+        doctor_after = json.loads(run_process(
+            adapter.prefix + ["--json", "doctor"]).stdout)
+        ctx.equal(doctor_after["database"]["pending_handles"], 0,
+                  "卸载后不能遗留未发布 handle")
+        ctx.equal(doctor_after["database"]["staging_bytes"], 0,
+                  "卸载后不能遗留脏 staging 字节")
+        ctx.budget("mount_scale_create_seconds", create_seconds, 1_200.0)
+        ctx.budget("mount_scale_first_read_seconds", first_read_seconds, 60.0)
+        ctx.budget("mount_scale_cold_read_seconds", cold_read_seconds, 60.0)
+        return {
+            "adapter": adapter.name,
+            "backend": adapter.backend,
+            "small_files": file_count,
+            "create_seconds": round(create_seconds, 6),
+            "files_per_second": round(file_count / max(create_seconds, 1e-9), 3),
+            "large_mib": large_mib,
+            "write_seconds": round(write_seconds, 6),
+            "write_mib_per_second": round(large_mib / max(write_seconds, 1e-9), 3),
+            "first_read_seconds": round(first_read_seconds, 6),
+            "first_read_mib_per_second": round(
+                large_mib / max(first_read_seconds, 1e-9), 3),
+            "cold_read_seconds": round(cold_read_seconds, 6),
+            "cold_read_mib_per_second": round(
+                large_mib / max(cold_read_seconds, 1e-9), 3),
+            "sha256": expected_hash,
+            "database_version": database_stat["version"],
+            "doctor_after": doctor_after,
+            "integrity": integrity,
+        }
+
+
+@case("mount.external-cache-invalidation", "mount",
+      "第二个数据库会话提交后，真实挂载只失效外部修改的元数据缓存")
+def real_mount_external_cache_invalidation(ctx: Context) -> dict[str, Any]:
+    if platform.system() != "Darwin":
+        raise EvalSkip("外部提交缓存失效当前只在 macOS 真实挂载执行")
+    with FailureArtifactDirectory(ctx, "vexfs-mount-external-cache-") as directory:
+        base = Path(directory)
+        adapter = prepare_real_mount_adapter(ctx, base, "external-cache")
+        shared = adapter.mount_point / "shared.txt"
+        peer = adapter.mount_point / "peer.txt"
+        mount_adapter_mount(ctx, adapter)
+        try:
+            with shared.open("wb") as stream:
+                stream.write(b"old\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            ctx.equal(shared.read_bytes(), b"old\n", "外部提交前的挂载内容")
+            initial_names = {entry.name for entry in adapter.mount_point.iterdir()}
+            ctx.check("peer.txt" not in initial_names, "peer 文件在外部提交前不存在")
+            time.sleep(1.0)
+
+            run_process(adapter.prefix + ["write", "/shared.txt"],
+                        input_data=b"new-from-peer\n")
+            run_process(adapter.prefix + ["write", "/peer.txt"],
+                        input_data=b"peer-created\n")
+
+            started = time.perf_counter()
+            deadline = started + 5.0
+            observed_shared = b""
+            observed_peer = False
+            while time.perf_counter() < deadline:
+                try:
+                    observed_shared = shared.read_bytes()
+                    observed_peer = peer.exists() and peer.read_bytes() == b"peer-created\n"
+                    if observed_shared == b"new-from-peer\n" and observed_peer:
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            detection_seconds = time.perf_counter() - started
+            ctx.equal(observed_shared, b"new-from-peer\n",
+                      "挂载读取第二个会话覆盖后的内容")
+            ctx.check(observed_peer, "挂载目录发现第二个会话创建的文件")
+            ctx.check("peer.txt" in {entry.name for entry in adapter.mount_point.iterdir()},
+                      "外部提交后目录缓存已失效")
+        finally:
+            mount_adapter_unmount(ctx, adapter, "外部提交缓存失效")
+
+        ctx.equal(run_process(adapter.prefix + ["cat", "/shared.txt"]).stdout,
+                  b"new-from-peer\n", "数据库权威内容保存 peer 覆盖")
+        ctx.equal(run_process(adapter.prefix + ["cat", "/peer.txt"]).stdout,
+                  b"peer-created\n", "数据库权威内容保存 peer 新文件")
+        return {
+            "adapter": adapter.name,
+            "backend": adapter.backend,
+            "detection_seconds": round(detection_seconds, 6),
+            "shared_content": observed_shared.decode().strip(),
+            "peer_visible": observed_peer,
         }
 
 
@@ -4869,13 +5234,21 @@ def real_mount_git_workspace(ctx: Context) -> dict[str, Any]:
         prefix = adapter.prefix
         mount_adapter_mount(ctx, adapter)
         project = mount_point / "project"
+        mounted_xattr_supported = adapter.name != "nfs"
         try:
             project.mkdir()
-            run_process([xattr, "-w", "com.vexfs.eval", "stored-in-sqlite", str(project)])
-            xattr_value = run_process(
-                [xattr, "-p", "com.vexfs.eval", str(project)], timeout=120)
-            ctx.equal(xattr_value.stdout.strip(), b"stored-in-sqlite",
-                      "挂载盘扩展属性读写")
+            if mounted_xattr_supported:
+                run_process([xattr, "-w", "com.vexfs.eval", "stored-in-sqlite", str(project)])
+                xattr_value = run_process(
+                    [xattr, "-p", "com.vexfs.eval", str(project)], timeout=120)
+                ctx.equal(xattr_value.stdout.strip(), b"stored-in-sqlite",
+                          "挂载盘扩展属性读写")
+            else:
+                rejected_xattr = run_process(
+                    [xattr, "-w", "com.vexfs.eval", "stored-in-sqlite", str(project)],
+                    check=False, timeout=120)
+                ctx.check(rejected_xattr.returncode != 0,
+                          "macOS NFSv3 明确拒绝 AppleDouble xattr")
             environment = os.environ.copy()
             environment.update({
                 "GIT_CONFIG_NOSYSTEM": "1",
@@ -4945,17 +5318,17 @@ def real_mount_git_workspace(ctx: Context) -> dict[str, Any]:
 
         mount_adapter_mount(ctx, adapter)
         try:
-            persisted_xattr = run_process(
-                [xattr, "-p", "com.vexfs.eval", str(project)], timeout=120)
-            ctx.equal(persisted_xattr.stdout.strip(), b"stored-in-sqlite",
-                      "重挂载后扩展属性持久化")
+            if mounted_xattr_supported:
+                persisted_xattr = run_process(
+                    [xattr, "-p", "com.vexfs.eval", str(project)], timeout=120)
+                ctx.equal(persisted_xattr.stdout.strip(), b"stored-in-sqlite",
+                          "重挂载后扩展属性持久化")
             ctx.equal(run_process([git, "status", "--porcelain"], cwd=project,
                                   env=environment, timeout=120).stdout,
                       b"", "重挂载后 Git 工作区状态")
         finally:
             mount_adapter_unmount(ctx, adapter, "Git 第二次")
         after = json.loads(run_process(prefix + ["--json", "doctor"]).stdout)
-        ctx.equal(after["mount_count"], 0, "Git 测试卸载后挂载数")
         ctx.equal(after["database"]["pending_handles"], 0, "Git 测试未发布句柄")
         ctx.equal(after["database"]["retained_handles"], 0, "Git 测试保留句柄")
         ctx.equal(after["database"]["staging_bytes"], 0, "Git 测试暂存字节")
@@ -4965,6 +5338,7 @@ def real_mount_git_workspace(ctx: Context) -> dict[str, Any]:
             "git": run_process([git, "--version"]).stdout.decode().strip(),
             "filemode": True,
             "symlinks": True,
+            "mounted_xattr_supported": mounted_xattr_supported,
             "commands": ["xattr", "init", "config", "chmod", "symlink", "add",
                          "commit", "checkout", "status", "gc"],
             "doctor_after": after,

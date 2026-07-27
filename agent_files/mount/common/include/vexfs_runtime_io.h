@@ -36,12 +36,24 @@ vexfs_mount_status vexfs_mount_readlink(vexfs_mount_session *session, int64_t in
 vexfs_mount_status vexfs_mount_write_file(vexfs_mount_session *session, const char *path,
                                           const void *data, uint64_t size,
                                           int64_t *version, vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_write_file_range(vexfs_mount_session *session,
+                                                const char *path, uint64_t offset,
+                                                const void *data, uint64_t size,
+                                                const char *request_id,
+                                                const char *durability,
+                                                int64_t *version,
+                                                vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_append_file(vexfs_mount_session *session, int64_t inode,
                                            const void *data, uint64_t size,
                                            int64_t *version, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_read_file(vexfs_mount_session *session, const char *path,
                                          vexfs_mount_bytes *content,
                                          vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_read_file_range(vexfs_mount_session *session,
+                                               const char *path, uint64_t offset,
+                                               uint64_t length,
+                                               vexfs_mount_bytes *content,
+                                               vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_stat(vexfs_mount_session *session, const char *path,
                                     vexfs_mount_bytes *json, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_path_for_inode(vexfs_mount_session *session, int64_t inode,
@@ -97,12 +109,28 @@ vexfs_mount_status vexfs_mount_handle_create(vexfs_mount_session *session,
                                              const char *request_id,
                                              vexfs_mount_bytes *handle,
                                              vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_handle_create_owned_durable(
+    vexfs_mount_session *session, const char *path, uint32_t mode,
+    int64_t uid, int64_t gid, const char *request_id,
+    const char *durability, vexfs_mount_bytes *handle,
+    vexfs_mount_error *error);
+// 创建文件时同时返回 stat。PostgreSQL adapter 会在同一条 SQL 内完成，
+// 避免远程挂载在 CREATE 后再发一次 vexfs_stat 往返。
+vexfs_mount_status vexfs_mount_handle_create_owned_stat_durable(
+    vexfs_mount_session *session, const char *path, uint32_t mode,
+    int64_t uid, int64_t gid, const char *request_id,
+    const char *durability, vexfs_mount_bytes *handle,
+    vexfs_mount_bytes *stat_json, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_handle_stage_write(vexfs_mount_session *session,
                                                   const char *handle, uint64_t offset,
                                                   const void *data, uint64_t size,
                                                   const char *request_id,
                                                   int64_t *generation,
                                                   vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_handle_stage_write_durable(
+    vexfs_mount_session *session, const char *handle, uint64_t offset,
+    const void *data, uint64_t size, const char *request_id,
+    const char *durability, int64_t *generation, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_handle_append(vexfs_mount_session *session,
                                              const char *handle, const void *data,
                                              uint64_t size, const char *request_id,
@@ -136,6 +164,19 @@ vexfs_mount_status vexfs_mount_handle_close(vexfs_mount_session *session,
 vexfs_mount_status vexfs_mount_synchronize(vexfs_mount_session *session,
                                            const char *request_id, int64_t *published,
                                            vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_publish_close_all(
+    vexfs_mount_session *session, const char *durability,
+    int64_t *published, vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_publish_close_batch(
+    vexfs_mount_session *session, const char *durability, int64_t max_count,
+    int64_t *published, vexfs_mount_error *error);
+// PostgreSQL-only background path. It uses a dedicated libpq connection and
+// publishes exactly the handle generations encoded in claims_json, so callers
+// do not need to hold the gateway-wide RuntimeState mutex during database I/O.
+vexfs_mount_status vexfs_mount_publish_close_claimed(
+    vexfs_mount_session *session, const char *durability,
+    const char *claims_json, vexfs_mount_bytes *result_json,
+    vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_reclaim(vexfs_mount_session *session,
                                        const char *request_id, int64_t *reclaimed,
                                        vexfs_mount_error *error);

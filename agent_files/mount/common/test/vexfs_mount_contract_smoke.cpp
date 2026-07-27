@@ -109,21 +109,17 @@ int RunBenchmark(int file_count) {
         std::snprintf(file_path, sizeof(file_path), "/files/f%06d.txt", index);
         std::snprintf(request, sizeof(request), "create-%06d", index);
         vexfs_mount_bytes handle{};
+        vexfs_mount_bytes item_stat{};
         auto call_started = std::chrono::steady_clock::now();
-        if (vexfs_mount_handle_create(session, file_path, 0644, request,
-                                      &handle, &error) != VEXFS_MOUNT_OK)
+        if (vexfs_mount_handle_create_owned_stat_durable(
+                session, file_path, 0644, getuid(), getgid(), request, "none",
+                &handle, &item_stat, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark create", error);
         create_call_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - call_started).count();
         const std::string handle_id(static_cast<const char *>(handle.data),
                                     static_cast<size_t>(handle.size));
         vexfs_mount_free(handle.data);
-        vexfs_mount_bytes item_stat{};
-        call_started = std::chrono::steady_clock::now();
-        if (vexfs_mount_stat(session, file_path, &item_stat, &error) != VEXFS_MOUNT_OK)
-            return Fail("benchmark stat", error);
-        stat_call_seconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - call_started).count();
         const int64_t inode = JsonInteger(item_stat, "inode");
         vexfs_mount_free(item_stat.data);
         call_started = std::chrono::steady_clock::now();
@@ -135,21 +131,31 @@ int RunBenchmark(int file_count) {
         int64_t generation = 0;
         std::snprintf(request, sizeof(request), "write-%06d", index);
         call_started = std::chrono::steady_clock::now();
-        if (vexfs_mount_handle_stage_write(
+        if (vexfs_mount_handle_stage_write_durable(
                 session, handle_id.c_str(), 0, payload, sizeof(payload) - 1,
-                request, &generation, &error) != VEXFS_MOUNT_OK)
+                request, "none", &generation, &error) != VEXFS_MOUNT_OK)
             return Fail("benchmark stage", error);
         stage_call_seconds += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - call_started).count();
-        int64_t version = 0;
-        call_started = std::chrono::steady_clock::now();
-        if (vexfs_mount_handle_publish_close(session, handle_id.c_str(), generation,
-                                             "data", &version, &error) !=
-                VEXFS_MOUNT_OK || version != 1)
-            return Fail("benchmark publish close", error);
-        publish_call_seconds += std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - call_started).count();
     }
+    const auto publish_started = std::chrono::steady_clock::now();
+    int64_t batch_published = 0;
+    int64_t total_published = 0;
+    while (total_published < file_count) {
+        if (vexfs_mount_publish_close_batch(session, "full", 64,
+                                            &batch_published, &error) !=
+                VEXFS_MOUNT_OK || batch_published <= 0 || batch_published > 64) {
+            return Fail("benchmark bounded publish close", error);
+        }
+        total_published += batch_published;
+    }
+    if (total_published != file_count) {
+        std::fprintf(stderr, "benchmark batch published=%lld expected=%d\n",
+                     static_cast<long long>(total_published), file_count);
+        return Fail("benchmark batch publish close", error);
+    }
+    publish_call_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - publish_started).count();
     const double create_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     const int64_t commits = Scalar(path, "SELECT count(*) FROM _vexfs_commits") - commits_before;
@@ -489,6 +495,27 @@ int main(int argc, char **argv) {
     if (vexfs_mount_write_file(session, "/agent/versioned.txt", "new", 3, &version, &error) !=
             VEXFS_MOUNT_OK || version != 2)
         return Fail("version update", error);
+    std::string range_source(70032, 'x');
+    range_source.replace(65530, 16, "0123456789abcdef");
+    if (vexfs_mount_write_file(session, "/agent/range.bin", range_source.data(),
+                               range_source.size(), &version, &error) != VEXFS_MOUNT_OK)
+        return Fail("range seed", error);
+    vexfs_mount_bytes range_content{};
+    if (vexfs_mount_read_file_range(session, "/agent/range.bin", 65530, 16,
+                                    &range_content, &error) != VEXFS_MOUNT_OK ||
+        !Equals(range_content, "0123456789abcdef"))
+        return Fail("range read across chunks", error);
+    vexfs_mount_free(range_content.data);
+    if (vexfs_mount_write_file_range(session, "/agent/range.bin", 65534,
+                                     "RANGE", 5, "range-write-1", "full",
+                                     &version, &error) != VEXFS_MOUNT_OK)
+        return Fail("range write", error);
+    range_content = {};
+    if (vexfs_mount_read_file_range(session, "/agent/range.bin", 65530, 16,
+                                    &range_content, &error) != VEXFS_MOUNT_OK ||
+        !Equals(range_content, "0123RANGE9abcdef"))
+        return Fail("range read after write", error);
+    vexfs_mount_free(range_content.data);
     vexfs_mount_bytes history{};
     if (vexfs_mount_history(session, "/agent/versioned.txt", &history, &error) != VEXFS_MOUNT_OK ||
         !Contains(history, "\"version\":2") || !Contains(history, "\"version\":1"))

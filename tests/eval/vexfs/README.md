@@ -28,6 +28,11 @@ VEXFS_EVAL_NATIVE_SEARCH_TIMEOUT_SECONDS=900 \
   tests/eval/vexfs/python.sh tests/eval/vexfs/run.py --mode stress --filter mount.scale-tree \
   --mount-cli /absolute/path/to/vexfs --fail-on-skip
 
+# 固定复现“1000 小文件后写 8 MiB、完整读、重挂载冷读”；失败时保留现场
+tests/eval/vexfs/python.sh tests/eval/vexfs/run.py --mode quick \
+  --filter mount.scale-read-after-small-files \
+  --mount-cli /absolute/path/to/vexdb --fail-on-skip
+
 # 把性能预算也作为硬 Gate；默认只记录指标，避免不同机器误报
 tests/eval/vexfs/python.sh tests/eval/vexfs/run.py --mode full --enforce-performance
 
@@ -116,8 +121,19 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG19_MATRIX_CONTAINER=vexdb_pg19-vexfs-dev \
   bash tests/eval/vexfs/run_pg_version_matrix.sh
 
-# macOS：真实 FSKit 的 13 组公共 mount 合同
+# macOS：默认通过真实 NFSv3 gateway 运行公共 mount 合同
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
+  bash tests/eval/vexfs/run_pg_macos_mount.sh
+
+# PG overlay/publisher 专项：真实挂载性能、1000 小文件后冷读、跨会话缓存失效
+VEXFS_MACOS_PG_CASES='mount.performance mount.scale-read-after-small-files mount.external-cache-invalidation' \
+VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
+  bash tests/eval/vexfs/run_pg_macos_mount.sh
+
+# 强持久化：fsync、强制卸载、重挂载读取；strict 性能数字单独记录
+VEXFS_NFS_STRICT_DURABILITY=1 \
+VEXFS_MACOS_PG_CASES='mount.force-unmount mount.performance' \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
   bash tests/eval/vexfs/run_pg_macos_mount.sh
 
@@ -238,6 +254,9 @@ vexdb_sqlite/build/eval/vexfs-linux-mount/{root,uid-1000}/<run-id>/report.json
 - 备份：运行中的 SQLite online backup、恢复、未发布 staging 可见性。
 - PostgreSQL 备份性能：有界验证 `pg_dump/pg_restore`、`pg_basebackup` + `pg_verifybackup` +
   克隆启动、format v2 PG → SQLite；同时检查容器 1 GiB 内存上限、`oom_kill` 和 CLI 峰值 RSS。
+- PostgreSQL staging：基础 manifest + 64 KiB 脏块、范围读写、truncate 缩短后零填充、
+  未变化 chunk 复用、精确 generation claim、断线重试幂等、后台发布不持有前台 runtime 锁；
+  调度器覆盖全局空闲、4 MiB 脏写、1024 文件、30 秒最长等待和活跃 handle 隔离。
 - 随机模型：真实数据库状态与 Python 参考文件树持续比对。
 - 性能：大量小文件、大文件顺序读写、分块 staging、随机 4 KiB 覆盖、备份吞吐；
   `performance.mount-contract-small-files` 额外模拟原子创建、macOS provenance xattr、
@@ -291,6 +310,16 @@ loopback gateway，不要求用户启用 FSKit；会真实运行 `mkdir`、`cat`
 `mv`、`find`、`rm` 等命令。`run_macos_nfs_mount.sh` 是更完整的发版前 Gate，还覆盖
 hardlink、fsync、Git、AppleDouble 隔离、重挂载和快照恢复。条件不满足时必须失败或明确
 报告 `SKIP`，不能用 C ABI smoke 冒充真实挂载通过。
+
+`mount.scale-read-after-small-files` 专门覆盖曾经出现过的规模退化：quick 模式先创建
+1000 个小文件，再写入并完整读取 8 MiB 文件，随后卸载、重挂载并校验冷读 SHA-256。
+full/stress 模式分别提高到 3000/5000 个小文件和 16/32 MiB；所有读取都采用 1 MiB
+流式缓冲，不会把整个工作区一次性装进内存。
+
+`mount.external-cache-invalidation` 覆盖缓存优化的正确性：先通过真实挂载填充文件和目录
+缓存，再由第二个独立数据库会话覆盖一个文件并创建一个文件；挂载端必须在 5 秒内看到
+新内容和新目录项。它防止为了小文件性能把缓存改成永不失效，也会在卸载后通过 CLI 再次
+核对数据库权威内容。
 
 `mount.real-linux-bash-git` 是 Linux 环境 Gate。构建中存在 `vexfs-fuse`，且
 `/dev/fuse`、`fusermount3` 和 Git 可用时，它会以真实挂载目录验证完整 Git

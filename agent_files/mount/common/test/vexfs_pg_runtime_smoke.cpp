@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <chrono>
 #include <fstream>
 #include <string>
@@ -130,6 +131,9 @@ int main(int argc, char **argv) {
         if (control != nullptr) PQfinish(control);
         return 1;
     }
+    const std::string database_principal = PQuser(control);
+    const std::string principal_json =
+        "\"principal\":\"" + database_principal + "\"";
     DropWorkspace(control, workspace);
 
     vexfs_mount_config config{};
@@ -159,12 +163,125 @@ int main(int argc, char **argv) {
                 "diagnostics adapter version") ||
         !Expect(diagnostics.find("\"security_mode\":\"database-role\"") != std::string::npos,
                 "diagnostics security") ||
-        !Expect(diagnostics.find("\"principal\":\"postgres\"") != std::string::npos,
+        !Expect(diagnostics.find(principal_json) != std::string::npos,
                 "diagnostics principal") ||
         !Expect(backend_pid > 0, "diagnostics backend pid")) return 1;
 
     if (!CheckStatus("mkdir", vexfs_mount_mkdir(session, "/project", &error), error)) return 1;
     int64_t version = 0;
+    vexfs_mount_bytes owned_handle_bytes{};
+    vexfs_mount_bytes owned_stat_bytes{};
+    if (!CheckStatus("owned handle create with stat", vexfs_mount_handle_create_owned_stat_durable(
+            session, "/project/owned.txt", 04755, 501, 20,
+            "create-owned", "full", &owned_handle_bytes, &owned_stat_bytes, &error), error))
+        return 1;
+    const std::string owned_handle = Take(&owned_handle_bytes);
+    const std::string owned_stat = Take(&owned_stat_bytes);
+    if (!Expect(JsonInteger(owned_stat, "version") == 0,
+                "owned create visible before first publish") ||
+        !Expect(JsonInteger(owned_stat, "mode") == 04755,
+                "owned create special mode") ||
+        !Expect(JsonInteger(owned_stat, "uid") == 501, "owned create uid") ||
+        !Expect(JsonInteger(owned_stat, "gid") == 20, "owned create gid")) return 1;
+    int64_t owned_generation = 0;
+    if (!CheckStatus("owned create stage", vexfs_mount_handle_stage_write(
+            session, owned_handle.c_str(), 0, "owned", 5, "stage-owned",
+            &owned_generation, &error), error) ||
+        !Expect(owned_generation == 2, "owned create generation") ||
+        !CheckStatus("owned create publish close", vexfs_mount_handle_publish_close(
+            session, owned_handle.c_str(), owned_generation, "full", &version, &error),
+            error) ||
+        !Expect(version == 1, "owned create first version") ||
+        !CheckStatus("owned create read", vexfs_mount_read_file(
+            session, "/project/owned.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "owned", "owned create content")) return 1;
+    vexfs_mount_bytes batch_a_bytes{};
+    vexfs_mount_bytes batch_b_bytes{};
+    if (!CheckStatus("batch create a", vexfs_mount_handle_create_owned_durable(
+            session, "/project/batch-a.txt", 0644, 501, 20,
+            "create-batch-a", "none", &batch_a_bytes, &error), error) ||
+        !CheckStatus("batch create b", vexfs_mount_handle_create_owned_durable(
+            session, "/project/batch-b.txt", 0644, 501, 20,
+            "create-batch-b", "none", &batch_b_bytes, &error), error)) return 1;
+    const std::string batch_a = Take(&batch_a_bytes);
+    const std::string batch_b = Take(&batch_b_bytes);
+    int64_t batch_a_generation = 0;
+    int64_t batch_b_generation = 0;
+    if (!CheckStatus("batch stage a", vexfs_mount_handle_stage_write_durable(
+            session, batch_a.c_str(), 0, "batch-a", 7,
+            "stage-batch-a", "none", &batch_a_generation, &error), error) ||
+        !CheckStatus("batch stage b", vexfs_mount_handle_stage_write_durable(
+            session, batch_b.c_str(), 0, "batch-b", 7,
+            "stage-batch-b", "none", &batch_b_generation, &error), error) ||
+        !Expect(batch_a_generation == 2 && batch_b_generation == 2,
+                "batch staged generations")) return 1;
+    int64_t batch_published = 0;
+    if (!CheckStatus("bounded batch publish", vexfs_mount_publish_close_batch(
+            session, "full", 1, &batch_published, &error), error) ||
+        !Expect(batch_published == 1, "bounded batch publish count") ||
+        !CheckStatus("batch publish remainder", vexfs_mount_publish_close_all(
+            session, "full", &batch_published, &error), error) ||
+        !Expect(batch_published == 1, "batch publish remainder count") ||
+        !CheckStatus("batch publish replay", vexfs_mount_publish_close_all(
+            session, "full", &batch_published, &error), error) ||
+        !Expect(batch_published == 0, "batch publish is idempotent") ||
+        !CheckStatus("batch read a", vexfs_mount_read_file(
+            session, "/project/batch-a.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "batch-a", "batch content a") ||
+        !CheckStatus("batch read b", vexfs_mount_read_file(
+            session, "/project/batch-b.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "batch-b", "batch content b")) return 1;
+
+    vexfs_mount_bytes claimed_handle_bytes{};
+    if (!CheckStatus("claimed create", vexfs_mount_handle_create_owned_durable(
+            session, "/project/claimed.txt", 0644, 501, 20,
+            "create-claimed", "none", &claimed_handle_bytes, &error), error)) return 1;
+    const std::string claimed_handle = Take(&claimed_handle_bytes);
+    int64_t claimed_generation = 0;
+    if (!CheckStatus("claimed stage", vexfs_mount_handle_stage_write_durable(
+            session, claimed_handle.c_str(), 0, "claimed", 7,
+            "stage-claimed", "none", &claimed_generation, &error), error)) return 1;
+    const std::string claims = "[{\"handle\":\"" + claimed_handle +
+        "\",\"generation\":" + std::to_string(claimed_generation) + "}]";
+    if (!Expect(PgCommand(control,
+            "BEGIN; SELECT 1 FROM _vexfs.workspaces "
+            "WHERE name='pg-runtime-contract' FOR UPDATE"),
+            "lock workspace for publisher concurrency")) return 1;
+    std::atomic<bool> publisher_started{false};
+    vexfs_mount_status publisher_status = VEXFS_MOUNT_DATABASE_ERROR;
+    vexfs_mount_error publisher_error{};
+    vexfs_mount_bytes publisher_result{};
+    std::thread publisher([&] {
+        publisher_started.store(true);
+        publisher_status = vexfs_mount_publish_close_claimed(
+            session, "full", claims.c_str(), &publisher_result, &publisher_error);
+    });
+    while (!publisher_started.load()) std::this_thread::yield();
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    const auto foreground_started = std::chrono::steady_clock::now();
+    const vexfs_mount_status foreground_status = vexfs_mount_stat(
+        session, "/project/owned.txt", &bytes, &error);
+    const auto foreground_elapsed = std::chrono::steady_clock::now() - foreground_started;
+    const bool unlocked = PgCommand(control, "ROLLBACK");
+    publisher.join();
+    if (!CheckStatus("foreground stat during blocked publisher", foreground_status, error) ||
+        !Expect(Take(&bytes).find("\"inode\":") != std::string::npos,
+                "foreground stat result during publisher") ||
+        !Expect(foreground_elapsed < std::chrono::seconds(1),
+                "background publisher does not hold foreground runtime mutex") ||
+        !Expect(unlocked, "unlock workspace after concurrency probe") ||
+        !CheckStatus("claimed publisher", publisher_status, publisher_error)) return 1;
+    const std::string claimed_result = Take(&publisher_result);
+    if (!Expect(claimed_result.find(claimed_handle) != std::string::npos,
+                "claimed publisher result") ||
+        !CheckStatus("claimed publisher replay", vexfs_mount_publish_close_claimed(
+            session, "full", claims.c_str(), &bytes, &error), error) ||
+        !Expect(Take(&bytes).find(claimed_handle) != std::string::npos,
+                "claimed publisher replay result") ||
+        !CheckStatus("claimed content", vexfs_mount_read_file(
+            session, "/project/claimed.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "claimed", "claimed content value")) return 1;
+
     if (!CheckStatus("write v1", vexfs_mount_write_file(
             session, "/project/main.txt", "alpha\n", 6, &version, &error), error) ||
         !Expect(version == 1, "write version 1")) return 1;
@@ -192,13 +309,13 @@ int main(int argc, char **argv) {
         !CheckStatus("xattr get", vexfs_mount_xattr_get(
             session, inode, "user.runtime", &bytes, &error), error) ||
         !Expect(Take(&bytes) == "value", "xattr value")) return 1;
-    const char acl[] =
-        "[{\"principal\":\"postgres\",\"effect\":\"allow\","
+    const std::string acl =
+        "[{\"principal\":\"" + database_principal + "\",\"effect\":\"allow\","
         "\"permissions\":\"read,write,execute,metadata\",\"inherit\":1}]";
     if (!CheckStatus("acl set", vexfs_mount_acl_set(
-            session, inode, acl, sizeof(acl) - 1, &error), error) ||
+            session, inode, acl.data(), acl.size(), &error), error) ||
         !CheckStatus("acl get", vexfs_mount_acl_get(session, inode, &bytes, &error), error) ||
-        !Expect(Take(&bytes).find("\"principal\":\"postgres\"") != std::string::npos,
+        !Expect(Take(&bytes).find(principal_json) != std::string::npos,
                 "acl content")) return 1;
 
     if (!CheckStatus("hardlink", vexfs_mount_link(
@@ -230,7 +347,7 @@ int main(int argc, char **argv) {
     const std::string enabled_index = Take(&bytes);
     if (!Expect(enabled_index.find("\"enabled\":true") != std::string::npos &&
                 enabled_index.find("\"dirty\":false") != std::string::npos &&
-                enabled_index.find("\"indexed_files\":1") != std::string::npos,
+                enabled_index.find("\"indexed_files\":5") != std::string::npos,
                 "trigram index enabled") ||
         !CheckStatus("indexed grep", vexfs_mount_grep(
             session, "/project", "alpha", 0, 100, &bytes, &error), error)) return 1;
@@ -238,6 +355,26 @@ int main(int argc, char **argv) {
     if (!Expect(indexed_grep.find("\"match_count\":2") != std::string::npos &&
                 indexed_grep.find("\"index_used\":true") != std::string::npos,
                 "trigram indexed grep")) return 1;
+
+    std::string range_source(70032, 'x');
+    range_source.replace(65530, 16, "0123456789abcdef");
+    if (!CheckStatus("range seed", vexfs_mount_write_file(
+            session, "/project/range.bin", range_source.data(), range_source.size(),
+            &version, &error), error) ||
+        !CheckStatus("range read", vexfs_mount_read_file_range(
+            session, "/project/range.bin", 65530, 16, &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "0123456789abcdef", "range read across chunks")) return 1;
+    if (!CheckStatus("range write", vexfs_mount_write_file_range(
+            session, "/project/range.bin", 65534, "RANGE", 5,
+            "pg-range-write-1", "full", &version, &error), error)) return 1;
+    const int64_t range_version = version;
+    if (!CheckStatus("range write replay", vexfs_mount_write_file_range(
+            session, "/project/range.bin", 65534, "RANGE", 5,
+            "pg-range-write-1", "full", &version, &error), error) ||
+        !Expect(version == range_version, "range write replay version") ||
+        !CheckStatus("range read after write", vexfs_mount_read_file_range(
+            session, "/project/range.bin", 65530, 16, &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "0123RANGE9abcdef", "range read after write")) return 1;
 
     vexfs_mount_bytes handle_bytes{};
     if (!CheckStatus("handle create", vexfs_mount_handle_create(

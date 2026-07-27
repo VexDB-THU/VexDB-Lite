@@ -11,7 +11,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const RUNTIME_ABI_VERSION: u32 = 1;
@@ -21,7 +21,22 @@ const XATTR_DELETE: c_int = 3;
 const TIME_ACCESS: u32 = 1;
 const TIME_MODIFY: u32 = 2;
 const APPLEDOUBLE_XATTR: &str = "io.vexdb.macos.appledouble";
+// NFSv3 can only expose macOS xattrs as visible `._name` files. Keep the
+// default Bash workspace clean and report mounted xattrs as unsupported;
+// native VexFS xattr APIs remain available through the database/runtime.
+const APPLEDOUBLE_SIDECARS_ENABLED: bool = false;
 const SIDECAR_INODE_START: u64 = u64::MAX - 1024;
+const METADATA_CACHE_LIMIT: usize = 100_000;
+const METADATA_CACHE_TTL_MS: i64 = 250;
+const DEFERRED_PUBLISH_IDLE_MS: i64 = 500;
+const DEFERRED_PUBLISH_MAX_AGE_MS: i64 = 30_000;
+const DEFERRED_PUBLISH_DIRTY_BYTES: u64 = 4 * 1024 * 1024;
+const DEFERRED_PUBLISH_BATCH_BYTES: u64 = 8 * 1024 * 1024;
+const DEFERRED_PUBLISH_FILE_THRESHOLD: usize = 1_024;
+// Remote PostgreSQL may spend tens of milliseconds publishing one version.
+// Keep one background lock hold below the macOS NFS retransmit window; a large
+// batch makes unrelated foreground reads look like a dead server.
+const DEFERRED_PUBLISH_BATCH_SIZE: i64 = 8;
 
 #[repr(C)]
 pub struct VexfsNfsGatewayConfig {
@@ -60,6 +75,13 @@ struct RuntimeError {
     message: [c_char; 512],
 }
 
+#[repr(C)]
+struct RuntimeVisibility {
+    workspace_head: i64,
+    cache_generation: u64,
+    external_commit: c_int,
+}
+
 enum RuntimeSessionOpaque {}
 type RuntimeStatus = c_int;
 
@@ -88,9 +110,16 @@ extern "C" {
         json: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
-    fn vexfs_mount_read_file(
+    fn vexfs_mount_refresh_visibility(
+        session: *mut RuntimeSessionOpaque,
+        visibility: *mut RuntimeVisibility,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
+    fn vexfs_mount_read_file_range(
         session: *mut RuntimeSessionOpaque,
         path: *const c_char,
+        offset: u64,
+        length: u64,
         content: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
@@ -176,21 +205,26 @@ extern "C" {
         handle: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
-    fn vexfs_mount_handle_create(
+    fn vexfs_mount_handle_create_owned_stat_durable(
         session: *mut RuntimeSessionOpaque,
         path: *const c_char,
         mode: u32,
+        uid: i64,
+        gid: i64,
         request_id: *const c_char,
+        durability: *const c_char,
         handle: *mut RuntimeBytes,
+        stat_json: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
-    fn vexfs_mount_handle_stage_write(
+    fn vexfs_mount_handle_stage_write_durable(
         session: *mut RuntimeSessionOpaque,
         handle: *const c_char,
         offset: u64,
         data: *const c_void,
         size: u64,
         request_id: *const c_char,
+        durability: *const c_char,
         generation: *mut i64,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
@@ -200,6 +234,14 @@ extern "C" {
         size: u64,
         request_id: *const c_char,
         generation: *mut i64,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
+    fn vexfs_mount_handle_read(
+        session: *mut RuntimeSessionOpaque,
+        handle: *const c_char,
+        offset: u64,
+        length: u64,
+        content: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
     fn vexfs_mount_handle_publish_close(
@@ -222,6 +264,20 @@ extern "C" {
         session: *mut RuntimeSessionOpaque,
         request_id: *const c_char,
         published: *mut i64,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
+    fn vexfs_mount_publish_close_batch(
+        session: *mut RuntimeSessionOpaque,
+        durability: *const c_char,
+        max_count: i64,
+        published: *mut i64,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
+    fn vexfs_mount_publish_close_claimed(
+        session: *mut RuntimeSessionOpaque,
+        durability: *const c_char,
+        claims_json: *const c_char,
+        result_json: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
     fn vexfs_mount_free(memory: *mut c_void);
@@ -287,14 +343,48 @@ struct Sidecar {
     updated_at_ms: i64,
 }
 
+struct PendingWrite {
+    handle: CString,
+    generation: i64,
+    logical_size: u64,
+    updated_at_ms: i64,
+    first_dirty_at_ms: i64,
+    dirty_bytes: u64,
+    publishing_generation: Option<i64>,
+}
+
+#[derive(Clone)]
+struct PublishCandidate {
+    inode: fileid3,
+    handle: CString,
+    generation: i64,
+    logical_size: u64,
+}
+
+#[derive(Deserialize)]
+struct PublishedClaim {
+    handle: String,
+    generation: i64,
+    #[allow(dead_code)]
+    version: i64,
+}
+
 struct RuntimeState {
     session: *mut RuntimeSessionOpaque,
+    postgresql_backend: bool,
     root_inode: fileid3,
     uid: u32,
     gid: u32,
+    strict_durability: bool,
     next_sidecar_inode: fileid3,
     sidecars_by_key: HashMap<SidecarKey, fileid3>,
     sidecars: HashMap<fileid3, Sidecar>,
+    pending_writes: HashMap<fileid3, PendingWrite>,
+    paths: HashMap<fileid3, String>,
+    inodes_by_path: HashMap<String, fileid3>,
+    stats: HashMap<fileid3, FileStat>,
+    directory_entries: HashMap<fileid3, HashMap<Vec<u8>, fileid3>>,
+    metadata_cache_checked_at_ms: i64,
 }
 
 unsafe impl Send for RuntimeState {}
@@ -309,7 +399,7 @@ impl Drop for RuntimeState {
 }
 
 pub struct VexfsNfs {
-    state: Mutex<RuntimeState>,
+    state: Arc<Mutex<RuntimeState>>,
     request_prefix: String,
     request_sequence: AtomicU64,
 }
@@ -377,6 +467,45 @@ fn runtime_result(status: RuntimeStatus) -> Result<(), nfsstat3> {
     }
 }
 
+fn publish_claimed_batch(
+    session: *mut RuntimeSessionOpaque,
+    candidates: &[PublishCandidate],
+) -> Result<Vec<PublishedClaim>, nfsstat3> {
+    let claims: Result<Vec<serde_json::Value>, nfsstat3> = candidates
+        .iter()
+        .map(|candidate| {
+            Ok(serde_json::json!({
+                "handle": candidate
+                    .handle
+                    .to_str()
+                    .map_err(|_| nfsstat3::NFS3ERR_IO)?,
+                "generation": candidate.generation,
+            }))
+        })
+        .collect();
+    let claims = CString::new(
+        serde_json::to_string(&claims?).map_err(|_| nfsstat3::NFS3ERR_IO)?,
+    )
+    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+    let durability = CString::new("full").unwrap();
+    let mut result = RuntimeBytes {
+        data: ptr::null_mut(),
+        size: 0,
+    };
+    let mut error = empty_error();
+    let status = unsafe {
+        vexfs_mount_publish_close_claimed(
+            session,
+            durability.as_ptr(),
+            claims.as_ptr(),
+            &mut result,
+            &mut error,
+        )
+    };
+    runtime_result(status)?;
+    serde_json::from_str(&bytes_to_string(result)?).map_err(|_| nfsstat3::NFS3ERR_IO)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -417,7 +546,56 @@ fn stat_attr(stat: &FileStat) -> fattr3 {
 }
 
 impl RuntimeState {
+    fn refresh_metadata_cache_if_stale(&mut self) -> Result<(), nfsstat3> {
+        let now = now_ms();
+        if now.saturating_sub(self.metadata_cache_checked_at_ms) < METADATA_CACHE_TTL_MS {
+            return Ok(());
+        }
+        let mut visibility = RuntimeVisibility {
+            workspace_head: 0,
+            cache_generation: 0,
+            external_commit: 0,
+        };
+        let mut error = empty_error();
+        runtime_result(unsafe {
+            vexfs_mount_refresh_visibility(self.session, &mut visibility, &mut error)
+        })?;
+        // Local create/write/publish paths update their cached entries directly.
+        // Only another database connection can make those entries stale. Paths
+        // stay available so already-issued NFS file handles remain usable.
+        if visibility.external_commit != 0 {
+            self.stats.clear();
+            self.directory_entries.clear();
+        }
+        self.metadata_cache_checked_at_ms = now;
+        Ok(())
+    }
+
+    fn clear_metadata_cache(&mut self) {
+        self.paths.clear();
+        self.inodes_by_path.clear();
+        self.stats.clear();
+        self.directory_entries.clear();
+    }
+
+    fn cache_stat(&mut self, path: &str, stat: &FileStat) {
+        if self.stats.len() >= METADATA_CACHE_LIMIT {
+            self.clear_metadata_cache();
+        }
+        let inode = stat.inode as u64;
+        self.paths.insert(inode, path.to_string());
+        self.inodes_by_path.insert(path.to_string(), inode);
+        self.stats.insert(inode, stat.clone());
+    }
+
     fn stat_path(&mut self, path: &str) -> Result<FileStat, nfsstat3> {
+        self.refresh_metadata_cache_if_stale()?;
+        if let Some(inode) = self.inodes_by_path.get(path) {
+            if let Some(stat) = self.stats.get(inode) {
+                return Ok(stat.clone());
+            }
+        }
+        let path_text = path.to_string();
         let path = checked_cstring(path)?;
         let mut bytes = RuntimeBytes {
             data: ptr::null_mut(),
@@ -427,12 +605,18 @@ impl RuntimeState {
         let status =
             unsafe { vexfs_mount_stat(self.session, path.as_ptr(), &mut bytes, &mut error) };
         runtime_result(status)?;
-        serde_json::from_str(&bytes_to_string(bytes)?).map_err(|_| nfsstat3::NFS3ERR_IO)
+        let stat: FileStat =
+            serde_json::from_str(&bytes_to_string(bytes)?).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        self.cache_stat(&path_text, &stat);
+        Ok(stat)
     }
 
     fn path_for_inode(&mut self, inode: fileid3) -> Result<String, nfsstat3> {
         if self.sidecars.contains_key(&inode) {
             return Err(nfsstat3::NFS3ERR_INVAL);
+        }
+        if let Some(path) = self.paths.get(&inode) {
+            return Ok(path.clone());
         }
         let mut bytes = RuntimeBytes {
             data: ptr::null_mut(),
@@ -443,7 +627,10 @@ impl RuntimeState {
             vexfs_mount_path_for_inode(self.session, inode as i64, &mut bytes, &mut error)
         };
         runtime_result(status)?;
-        bytes_to_string(bytes)
+        let path = bytes_to_string(bytes)?;
+        self.paths.insert(inode, path.clone());
+        self.inodes_by_path.insert(path.clone(), inode);
+        Ok(path)
     }
 
     fn child_path(&mut self, parent: fileid3, name: &[u8]) -> Result<String, nfsstat3> {
@@ -460,6 +647,7 @@ impl RuntimeState {
     }
 
     fn list(&mut self, path: &str) -> Result<Vec<ListEntry>, nfsstat3> {
+        let path_text = path.to_string();
         let path = checked_cstring(path)?;
         let mut bytes = RuntimeBytes {
             data: ptr::null_mut(),
@@ -469,18 +657,82 @@ impl RuntimeState {
         let status =
             unsafe { vexfs_mount_list(self.session, path.as_ptr(), &mut bytes, &mut error) };
         runtime_result(status)?;
-        serde_json::from_str(&bytes_to_string(bytes)?).map_err(|_| nfsstat3::NFS3ERR_IO)
+        let entries: Vec<ListEntry> =
+            serde_json::from_str(&bytes_to_string(bytes)?).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        if let Ok(parent) = self.stat_path(&path_text) {
+            let parent_inode = parent.inode as u64;
+            let mut cached = HashMap::new();
+            for entry in &entries {
+                let inode = entry.inode as u64;
+                cached.insert(entry.name.as_bytes().to_vec(), inode);
+                let child_path = if path_text == "/" {
+                    format!("/{}", entry.name)
+                } else {
+                    format!("{path_text}/{}", entry.name)
+                };
+                let stat: FileStat = entry.clone().into();
+                self.cache_stat(&child_path, &stat);
+            }
+            self.directory_entries.insert(parent_inode, cached);
+        }
+        Ok(entries)
     }
 
-    fn read_file(&mut self, path: &str) -> Result<Vec<u8>, nfsstat3> {
+    fn read_file_range(
+        &mut self,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, nfsstat3> {
         let path = checked_cstring(path)?;
         let mut bytes = RuntimeBytes {
             data: ptr::null_mut(),
             size: 0,
         };
         let mut error = empty_error();
-        let status =
-            unsafe { vexfs_mount_read_file(self.session, path.as_ptr(), &mut bytes, &mut error) };
+        let status = unsafe {
+            vexfs_mount_read_file_range(
+                self.session,
+                path.as_ptr(),
+                offset,
+                length,
+                &mut bytes,
+                &mut error,
+            )
+        };
+        runtime_result(status)?;
+        Ok(take_bytes(bytes))
+    }
+
+    fn read_inode_range(
+        &mut self,
+        inode: fileid3,
+        path: &str,
+        offset: u64,
+        length: u64,
+    ) -> Result<Vec<u8>, nfsstat3> {
+        let Some(pending) = self.pending_writes.get(&inode) else {
+            return self.read_file_range(path, offset, length);
+        };
+        if pending.publishing_generation.is_some() {
+            return Err(nfsstat3::NFS3ERR_JUKEBOX);
+        }
+        let handle = pending.handle.clone();
+        let mut bytes = RuntimeBytes {
+            data: ptr::null_mut(),
+            size: 0,
+        };
+        let mut error = empty_error();
+        let status = unsafe {
+            vexfs_mount_handle_read(
+                self.session,
+                handle.as_ptr(),
+                offset,
+                length,
+                &mut bytes,
+                &mut error,
+            )
+        };
         runtime_result(status)?;
         Ok(take_bytes(bytes))
     }
@@ -499,92 +751,150 @@ impl RuntimeState {
         mode: u32,
         prefix: &str,
         sequence: &AtomicU64,
-    ) -> Result<(), nfsstat3> {
+    ) -> Result<(CString, FileStat), nfsstat3> {
         let path = checked_cstring(path)?;
         let request = Self::request_id(prefix, sequence, "create");
+        let durability = CString::new(if self.strict_durability {
+            "full"
+        } else {
+            "none"
+        })
+        .unwrap();
         let mut handle = RuntimeBytes {
+            data: ptr::null_mut(),
+            size: 0,
+        };
+        let mut stat_json = RuntimeBytes {
             data: ptr::null_mut(),
             size: 0,
         };
         let mut error = empty_error();
         let status = unsafe {
-            vexfs_mount_handle_create(
+            vexfs_mount_handle_create_owned_stat_durable(
                 self.session,
                 path.as_ptr(),
                 mode & 0o7777,
+                self.uid as i64,
+                self.gid as i64,
                 request.as_ptr(),
+                durability.as_ptr(),
                 &mut handle,
+                &mut stat_json,
                 &mut error,
             )
         };
         runtime_result(status)?;
         let handle = checked_cstring(&bytes_to_string(handle)?)?;
-        let durability = CString::new("full").unwrap();
-        let mut version = 0;
-        let status = unsafe {
-            vexfs_mount_handle_publish_close(
-                self.session,
-                handle.as_ptr(),
-                1,
-                durability.as_ptr(),
-                &mut version,
-                &mut error,
-            )
-        };
-        if status != 0 {
-            self.close_failed_handle(&handle, prefix, sequence);
-        }
-        runtime_result(status)
+        let stat =
+            serde_json::from_str(&bytes_to_string(stat_json)?).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        Ok((handle, stat))
     }
 
-    fn write_file(
+    fn stage_file_write(
         &mut self,
+        inode: fileid3,
         path: &str,
         offset: u64,
         data: &[u8],
         prefix: &str,
         sequence: &AtomicU64,
     ) -> Result<(), nfsstat3> {
-        let path = checked_cstring(path)?;
-        let mode = CString::new("rw").unwrap();
-        let open_request = Self::request_id(prefix, sequence, "open-write");
-        let mut handle = RuntimeBytes {
-            data: ptr::null_mut(),
-            size: 0,
-        };
+        if self
+            .pending_writes
+            .get(&inode)
+            .is_some_and(|pending| pending.publishing_generation.is_some())
+        {
+            return Err(nfsstat3::NFS3ERR_JUKEBOX);
+        }
+        if !self.pending_writes.contains_key(&inode) {
+            let path = checked_cstring(path)?;
+            let mode = CString::new("rw").unwrap();
+            let request = Self::request_id(prefix, sequence, "open-staged-write");
+            let mut handle = RuntimeBytes {
+                data: ptr::null_mut(),
+                size: 0,
+            };
+            let mut error = empty_error();
+            let status = unsafe {
+                vexfs_mount_handle_open(
+                    self.session,
+                    path.as_ptr(),
+                    mode.as_ptr(),
+                    request.as_ptr(),
+                    &mut handle,
+                    &mut error,
+                )
+            };
+            runtime_result(status)?;
+            let logical_size = self
+                .stat_path(std::str::from_utf8(path.as_bytes()).unwrap())?
+                .size
+                .max(0) as u64;
+            let dirty_at = now_ms();
+            self.pending_writes.insert(
+                inode,
+                PendingWrite {
+                    handle: checked_cstring(&bytes_to_string(handle)?)?,
+                    generation: 0,
+                    logical_size,
+                    updated_at_ms: dirty_at,
+                    first_dirty_at_ms: dirty_at,
+                    dirty_bytes: 0,
+                    publishing_generation: None,
+                },
+            );
+        }
+        let handle = self.pending_writes.get(&inode).unwrap().handle.clone();
+        let request = Self::request_id(prefix, sequence, "stage-write");
+        // NFS UNSTABLE writes become durable at COMMIT.  Making every incoming
+        // block FULL turns a sequential file into thousands of fsync calls.
+        let durability = CString::new("none").unwrap();
+        let mut generation = 0;
         let mut error = empty_error();
         let status = unsafe {
-            vexfs_mount_handle_open(
-                self.session,
-                path.as_ptr(),
-                mode.as_ptr(),
-                open_request.as_ptr(),
-                &mut handle,
-                &mut error,
-            )
-        };
-        runtime_result(status)?;
-        let handle = checked_cstring(&bytes_to_string(handle)?)?;
-        let write_request = Self::request_id(prefix, sequence, "write");
-        let mut generation = 0;
-        let status = unsafe {
-            vexfs_mount_handle_stage_write(
+            vexfs_mount_handle_stage_write_durable(
                 self.session,
                 handle.as_ptr(),
                 offset,
                 data.as_ptr().cast(),
                 data.len() as u64,
-                write_request.as_ptr(),
+                request.as_ptr(),
+                durability.as_ptr(),
                 &mut generation,
                 &mut error,
             )
         };
-        if status != 0 {
-            self.close_failed_handle(&handle, prefix, sequence);
-            return Err(runtime_to_nfs(status));
+        runtime_result(status)?;
+        let pending = self.pending_writes.get_mut(&inode).unwrap();
+        pending.generation = generation;
+        pending.logical_size = pending
+            .logical_size
+            .max(offset.saturating_add(data.len() as u64));
+        pending.dirty_bytes = pending.dirty_bytes.saturating_add(data.len() as u64);
+        let updated_at_ms = now_ms();
+        pending.updated_at_ms = updated_at_ms;
+        let logical_size = pending.logical_size;
+        if let Some(stat) = self.stats.get_mut(&inode) {
+            stat.size = logical_size.min(i64::MAX as u64) as i64;
+            stat.updated_at = updated_at_ms;
+            stat.changed_at = updated_at_ms;
         }
-        let durability = CString::new("full").unwrap();
+        Ok(())
+    }
+
+    fn publish_pending(&mut self, inode: fileid3, durability: &str) -> Result<bool, nfsstat3> {
+        let Some(pending) = self.pending_writes.get(&inode) else {
+            return Ok(false);
+        };
+        if pending.publishing_generation.is_some() {
+            return Err(nfsstat3::NFS3ERR_JUKEBOX);
+        }
+        let handle = pending.handle.clone();
+        let generation = pending.generation;
+        let logical_size = pending.logical_size;
+        let durability = CString::new(durability).unwrap();
         let mut version = 0;
+        let mut error = empty_error();
         let status = unsafe {
             vexfs_mount_handle_publish_close(
                 self.session,
@@ -595,19 +905,244 @@ impl RuntimeState {
                 &mut error,
             )
         };
-        if status != 0 {
-            self.close_failed_handle(&handle, prefix, sequence);
+        runtime_result(status)?;
+        self.pending_writes.remove(&inode);
+        if let Some(stat) = self.stats.get_mut(&inode) {
+            stat.size = logical_size.min(i64::MAX as u64) as i64;
+            stat.updated_at = now_ms();
+            stat.changed_at = stat.updated_at;
         }
-        runtime_result(status)
+        Ok(true)
+    }
+
+    fn publish_pending_batch(
+        &mut self,
+        durability: &str,
+        max_count: i64,
+    ) -> Result<usize, nfsstat3> {
+        if self.pending_writes.is_empty() || max_count <= 0 {
+            return Ok(0);
+        }
+        let mut handles: Vec<(fileid3, Vec<u8>, u64)> = self
+            .pending_writes
+            .iter()
+            .map(|(inode, pending)| {
+                (
+                    *inode,
+                    pending.handle.as_bytes().to_vec(),
+                    pending.logical_size,
+                )
+            })
+            .collect();
+        handles.sort_by(|left, right| left.1.cmp(&right.1));
+        handles.truncate(max_count as usize);
+        let durability = CString::new(durability).unwrap();
+        let mut published = 0;
+        let mut error = empty_error();
+        let status = unsafe {
+            vexfs_mount_publish_close_batch(
+                self.session,
+                durability.as_ptr(),
+                max_count,
+                &mut published,
+                &mut error,
+            )
+        };
+        runtime_result(status)?;
+        let published = published.max(0) as usize;
+        if published > handles.len() {
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+        let now = now_ms();
+        for (inode, _, logical_size) in handles.into_iter().take(published) {
+            self.pending_writes.remove(&inode);
+            if let Some(stat) = self.stats.get_mut(&inode) {
+                stat.size = logical_size.min(i64::MAX as u64) as i64;
+                stat.updated_at = now;
+                stat.changed_at = now;
+            }
+        }
+        Ok(published)
+    }
+
+    fn claim_deferred_publish_batch(&mut self, now: i64) -> Vec<PublishCandidate> {
+        let available: Vec<fileid3> = self
+            .pending_writes
+            .iter()
+            .filter(|(_, pending)| pending.publishing_generation.is_none())
+            .map(|(inode, _)| *inode)
+            .collect();
+        if available.is_empty() {
+            return Vec::new();
+        }
+        let dirty_bytes = available.iter().fold(0_u64, |total, inode| {
+            total.saturating_add(
+                self.pending_writes
+                    .get(inode)
+                    .map(|pending| pending.dirty_bytes.max(1))
+                    .unwrap_or(0),
+            )
+        });
+        let oldest_age = available
+            .iter()
+            .filter_map(|inode| self.pending_writes.get(inode))
+            .map(|pending| now.saturating_sub(pending.first_dirty_at_ms))
+            .max()
+            .unwrap_or(0);
+        let latest_update = available
+            .iter()
+            .filter_map(|inode| self.pending_writes.get(inode))
+            .map(|pending| pending.updated_at_ms)
+            .max()
+            .unwrap_or(now);
+        let globally_idle = now.saturating_sub(latest_update) >= DEFERRED_PUBLISH_IDLE_MS;
+        let force = available.len() >= DEFERRED_PUBLISH_FILE_THRESHOLD
+            || dirty_bytes >= DEFERRED_PUBLISH_DIRTY_BYTES
+            || oldest_age >= DEFERRED_PUBLISH_MAX_AGE_MS;
+        if !globally_idle && !force {
+            return Vec::new();
+        }
+
+        let mut ordered = available;
+        ordered.sort_by(|left, right| {
+            let left_pending = self.pending_writes.get(left).unwrap();
+            let right_pending = self.pending_writes.get(right).unwrap();
+            left_pending
+                .updated_at_ms
+                .cmp(&right_pending.updated_at_ms)
+                .then_with(|| left_pending.handle.as_bytes().cmp(right_pending.handle.as_bytes()))
+        });
+
+        let mut claimed = Vec::new();
+        let mut claimed_bytes = 0_u64;
+        for inode in ordered {
+            if claimed.len() >= DEFERRED_PUBLISH_BATCH_SIZE as usize {
+                break;
+            }
+            let pending = self.pending_writes.get(&inode).unwrap();
+            // Thresholds wake the publisher during a long foreground burst,
+            // but they must never close the handle currently receiving NFS
+            // WRITE calls.  Older idle files may be drained concurrently; the
+            // active file is published by COMMIT/fsync or after it becomes idle.
+            if !globally_idle
+                && now.saturating_sub(pending.updated_at_ms) < DEFERRED_PUBLISH_IDLE_MS
+            {
+                continue;
+            }
+            let candidate_bytes = pending.dirty_bytes.max(1);
+            if !claimed.is_empty()
+                && claimed_bytes.saturating_add(candidate_bytes)
+                    > DEFERRED_PUBLISH_BATCH_BYTES
+            {
+                break;
+            }
+            claimed_bytes = claimed_bytes.saturating_add(candidate_bytes);
+            claimed.push(PublishCandidate {
+                inode,
+                handle: pending.handle.clone(),
+                generation: pending.generation,
+                logical_size: pending.logical_size,
+            });
+        }
+        for candidate in &claimed {
+            if let Some(pending) = self.pending_writes.get_mut(&candidate.inode) {
+                if pending.generation == candidate.generation {
+                    pending.publishing_generation = Some(candidate.generation);
+                }
+            }
+        }
+        claimed
+    }
+
+    fn release_publish_claims(&mut self, candidates: &[PublishCandidate]) {
+        for candidate in candidates {
+            if let Some(pending) = self.pending_writes.get_mut(&candidate.inode) {
+                if pending.publishing_generation == Some(candidate.generation) {
+                    pending.publishing_generation = None;
+                }
+            }
+        }
+    }
+
+    fn complete_publish_claims(
+        &mut self,
+        candidates: &[PublishCandidate],
+        published: &[PublishedClaim],
+    ) -> Result<usize, nfsstat3> {
+        if published.len() != candidates.len() {
+            self.release_publish_claims(candidates);
+            return Err(nfsstat3::NFS3ERR_IO);
+        }
+        for candidate in candidates {
+            let handle = candidate
+                .handle
+                .to_str()
+                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            if !published
+                .iter()
+                .any(|item| item.handle == handle && item.generation == candidate.generation)
+            {
+                self.release_publish_claims(candidates);
+                return Err(nfsstat3::NFS3ERR_IO);
+            }
+        }
+        let updated_at = now_ms();
+        let mut completed = 0;
+        for candidate in candidates {
+            let matches = self.pending_writes.get(&candidate.inode).is_some_and(|pending| {
+                pending.handle.as_bytes() == candidate.handle.as_bytes()
+                    && pending.generation == candidate.generation
+                    && pending.publishing_generation == Some(candidate.generation)
+            });
+            if !matches {
+                continue;
+            }
+            self.pending_writes.remove(&candidate.inode);
+            if let Some(stat) = self.stats.get_mut(&candidate.inode) {
+                stat.size = candidate.logical_size.min(i64::MAX as u64) as i64;
+                stat.updated_at = updated_at;
+                stat.changed_at = updated_at;
+            }
+            completed += 1;
+        }
+        Ok(completed)
     }
 
     fn truncate_file(
         &mut self,
+        inode: fileid3,
         path: &str,
         size: u64,
         prefix: &str,
         sequence: &AtomicU64,
     ) -> Result<(), nfsstat3> {
+        if let Some(pending) = self.pending_writes.get(&inode) {
+            if pending.publishing_generation.is_some() {
+                return Err(nfsstat3::NFS3ERR_JUKEBOX);
+            }
+            let handle = pending.handle.clone();
+            let request = Self::request_id(prefix, sequence, "truncate-pending");
+            let mut generation = 0;
+            let mut error = empty_error();
+            let status = unsafe {
+                vexfs_mount_handle_truncate(
+                    self.session,
+                    handle.as_ptr(),
+                    size,
+                    request.as_ptr(),
+                    &mut generation,
+                    &mut error,
+                )
+            };
+            runtime_result(status)?;
+            let pending = self.pending_writes.get_mut(&inode).unwrap();
+            pending.generation = generation;
+            pending.logical_size = size;
+            pending.updated_at_ms = now_ms();
+            pending.dirty_bytes = pending.dirty_bytes.saturating_add(1);
+            self.publish_pending(inode, "full")?;
+            return Ok(());
+        }
         let path = checked_cstring(path)?;
         let mode = CString::new("rw").unwrap();
         let open_request = Self::request_id(prefix, sequence, "open-truncate");
@@ -846,18 +1381,6 @@ impl VexfsNfs {
     }
 }
 
-impl Drop for VexfsNfs {
-    fn drop(&mut self) {
-        let request = self.request_id("shutdown-sync");
-        let Ok(state) = self.state.lock() else { return };
-        let mut published = 0;
-        let mut error = empty_error();
-        unsafe {
-            vexfs_mount_synchronize(state.session, request.as_ptr(), &mut published, &mut error);
-        }
-    }
-}
-
 #[async_trait]
 impl NFSFileSystem for VexfsNfs {
     fn capabilities(&self) -> VFSCapabilities {
@@ -870,6 +1393,7 @@ impl NFSFileSystem for VexfsNfs {
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        state.refresh_metadata_cache_if_stale()?;
         if filename.as_ref() == b"." {
             return Ok(dirid);
         }
@@ -883,7 +1407,16 @@ impl NFSFileSystem for VexfsNfs {
             return Ok(state.stat_path(parent)?.inode as u64);
         }
         if RuntimeState::target_name(filename.as_ref()).is_some() {
+            if !APPLEDOUBLE_SIDECARS_ENABLED {
+                return Err(nfsstat3::NFS3ERR_NOENT);
+            }
             return state.lookup_sidecar(dirid, filename.as_ref());
+        }
+        if let Some(entries) = state.directory_entries.get(&dirid) {
+            return entries
+                .get(filename.as_ref())
+                .copied()
+                .ok_or(nfsstat3::NFS3ERR_NOENT);
         }
         let path = state.child_path(dirid, filename.as_ref())?;
         Ok(state.stat_path(&path)?.inode as u64)
@@ -895,7 +1428,12 @@ impl NFSFileSystem for VexfsNfs {
             return state.sidecar_attr(id);
         }
         let path = state.path_for_inode(id)?;
-        Ok(stat_attr(&state.stat_path(&path)?))
+        let mut attr = stat_attr(&state.stat_path(&path)?);
+        if let Some(pending) = state.pending_writes.get(&id) {
+            attr.size = pending.logical_size;
+            attr.used = pending.logical_size;
+        }
+        Ok(attr)
     }
 
     async fn setattr(&self, id: fileid3, attrs: sattr3) -> Result<fattr3, nfsstat3> {
@@ -936,7 +1474,13 @@ impl NFSFileSystem for VexfsNfs {
             })?;
         }
         if let set_size3::size(size) = attrs.size {
-            state.truncate_file(&path, size, &self.request_prefix, &self.request_sequence)?;
+            state.truncate_file(
+                id,
+                &path,
+                size,
+                &self.request_prefix,
+                &self.request_sequence,
+            )?;
         }
         let now = now_ms();
         let (accessed, access_mask) = match attrs.atime {
@@ -967,6 +1511,7 @@ impl NFSFileSystem for VexfsNfs {
                 )
             })?;
         }
+        state.stats.remove(&id);
         Ok(stat_attr(&state.stat_path(&path)?))
     }
 
@@ -977,18 +1522,29 @@ impl NFSFileSystem for VexfsNfs {
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        let data = if let Some(sidecar) = state.sidecars.get(&id) {
-            sidecar.data.clone()
-        } else {
-            let path = state.path_for_inode(id)?;
-            state.read_file(&path)?
-        };
-        let start = (offset as usize).min(data.len());
-        let end = start.saturating_add(count as usize).min(data.len());
-        Ok((data[start..end].to_vec(), end == data.len()))
+        if let Some(sidecar) = state.sidecars.get(&id) {
+            let start = (offset as usize).min(sidecar.data.len());
+            let end = start.saturating_add(count as usize).min(sidecar.data.len());
+            return Ok((sidecar.data[start..end].to_vec(), end == sidecar.data.len()));
+        }
+        let path = state.path_for_inode(id)?;
+        let stat = state.stat_path(&path)?;
+        let data = state.read_inode_range(id, &path, offset, count as u64)?;
+        let size = state
+            .pending_writes
+            .get(&id)
+            .map(|pending| pending.logical_size)
+            .unwrap_or(stat.size.max(0) as u64);
+        Ok((data, offset.saturating_add(count as u64) >= size))
     }
 
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(
+        &self,
+        id: fileid3,
+        offset: u64,
+        data: &[u8],
+        stable_requested: bool,
+    ) -> Result<(fattr3, bool), nfsstat3> {
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if state.sidecars.contains_key(&id) {
             let sidecar = state.sidecars.get_mut(&id).unwrap();
@@ -999,17 +1555,53 @@ impl NFSFileSystem for VexfsNfs {
             sidecar.data[offset..offset + data.len()].copy_from_slice(data);
             sidecar.updated_at_ms = now_ms();
             state.persist_sidecar(id)?;
-            return state.sidecar_attr(id);
+            if state.strict_durability && stable_requested {
+                let request = self.request_id("nfs-sidecar-write");
+                let mut published = 0;
+                let mut error = empty_error();
+                runtime_result(unsafe {
+                    vexfs_mount_synchronize(
+                        state.session,
+                        request.as_ptr(),
+                        &mut published,
+                        &mut error,
+                    )
+                })?;
+            }
+            return Ok((
+                state.sidecar_attr(id)?,
+                !state.strict_durability || stable_requested,
+            ));
         }
         let path = state.path_for_inode(id)?;
-        state.write_file(
+        state.stage_file_write(
+            id,
             &path,
             offset,
             data,
             &self.request_prefix,
             &self.request_sequence,
         )?;
-        Ok(stat_attr(&state.stat_path(&path)?))
+        if state.strict_durability && stable_requested {
+            state.publish_pending(id, "full")?;
+            return Ok((stat_attr(&state.stat_path(&path)?), true));
+        }
+        let mut attr = stat_attr(&state.stat_path(&path)?);
+        if let Some(pending) = state.pending_writes.get(&id) {
+            attr.size = pending.logical_size;
+            attr.used = pending.logical_size;
+        }
+        // Balanced mode coalesces small files in database-backed staging, but
+        // once one handle has accumulated enough write traffic it must make
+        // the NFS client issue COMMIT at fsync/close. Otherwise a large active
+        // file can sit behind thousands of older idle files in the background
+        // queue and still be unpublished when the gateway is stopped.
+        let requires_foreground_commit = state
+            .pending_writes
+            .get(&id)
+            .is_some_and(|pending| pending.dirty_bytes >= DEFERRED_PUBLISH_DIRTY_BYTES);
+        // Strict mode reports UNSTABLE unless this request was actually FULL.
+        Ok((attr, !state.strict_durability && !requires_foreground_commit))
     }
 
     async fn create(
@@ -1024,6 +1616,9 @@ impl NFSFileSystem for VexfsNfs {
             set_mode3::Void => 0o644,
         };
         if RuntimeState::target_name(filename.as_ref()).is_some() {
+            if !APPLEDOUBLE_SIDECARS_ENABLED {
+                return Err(nfsstat3::NFS3ERR_NOTSUPP);
+            }
             let key = SidecarKey {
                 parent: dirid,
                 name: filename.as_ref().to_vec(),
@@ -1036,19 +1631,26 @@ impl NFSFileSystem for VexfsNfs {
             return Ok((inode, state.sidecar_attr(inode)?));
         }
         let path = state.child_path(dirid, filename.as_ref())?;
-        state.create_file(&path, mode, &self.request_prefix, &self.request_sequence)?;
-        let stat = state.stat_path(&path)?;
-        let mut error = empty_error();
-        runtime_result(unsafe {
-            vexfs_mount_chown(
-                state.session,
-                stat.inode,
-                state.uid as i64,
-                state.gid as i64,
-                &mut error,
-            )
-        })?;
-        let stat = state.stat_path(&path)?;
+        let (handle, stat) =
+            state.create_file(&path, mode, &self.request_prefix, &self.request_sequence)?;
+        state.cache_stat(&path, &stat);
+        let dirty_at = now_ms();
+        state.pending_writes.insert(
+            stat.inode as u64,
+            PendingWrite {
+                handle,
+                generation: 1,
+                logical_size: 0,
+                updated_at_ms: dirty_at,
+                first_dirty_at_ms: dirty_at,
+                dirty_bytes: 0,
+                publishing_generation: None,
+            },
+        );
+        if let Some(entries) = state.directory_entries.get_mut(&dirid) {
+            entries.insert(filename.as_ref().to_vec(), stat.inode as u64);
+        }
+        state.stats.remove(&dirid);
         Ok((stat.inode as u64, stat_attr(&stat)))
     }
 
@@ -1084,19 +1686,47 @@ impl NFSFileSystem for VexfsNfs {
                 &mut error,
             )
         })?;
+        state.stats.remove(&(stat.inode as u64));
         let stat = state.stat_path(&path)?;
+        if let Some(entries) = state.directory_entries.get_mut(&dirid) {
+            entries.insert(dirname.as_ref().to_vec(), stat.inode as u64);
+        }
+        state
+            .directory_entries
+            .insert(stat.inode as u64, HashMap::new());
+        state.stats.remove(&dirid);
         Ok((stat.inode as u64, stat_attr(&stat)))
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if RuntimeState::target_name(filename.as_ref()).is_some() {
+            if !APPLEDOUBLE_SIDECARS_ENABLED {
+                return Err(nfsstat3::NFS3ERR_NOENT);
+            }
             return state.remove_sidecar(dirid, filename.as_ref());
         }
         let path = state.child_path(dirid, filename.as_ref())?;
-        let path = checked_cstring(&path)?;
+        let inode = state.stat_path(&path).ok().map(|stat| stat.inode as u64);
+        if let Some(inode) = inode {
+            state.publish_pending(inode, "none")?;
+        }
+        let path_c = checked_cstring(&path)?;
         let mut error = empty_error();
-        runtime_result(unsafe { vexfs_mount_remove(state.session, path.as_ptr(), 0, &mut error) })
+        runtime_result(unsafe {
+            vexfs_mount_remove(state.session, path_c.as_ptr(), 0, &mut error)
+        })?;
+        if let Some(inode) = inode {
+            state.paths.remove(&inode);
+            state.stats.remove(&inode);
+            state.directory_entries.remove(&inode);
+        }
+        state.inodes_by_path.remove(&path);
+        if let Some(entries) = state.directory_entries.get_mut(&dirid) {
+            entries.remove(filename.as_ref());
+        }
+        state.stats.remove(&dirid);
+        Ok(())
     }
 
     async fn rename(
@@ -1110,6 +1740,9 @@ impl NFSFileSystem for VexfsNfs {
         let from_sidecar = RuntimeState::target_name(from_filename.as_ref()).is_some();
         let to_sidecar = RuntimeState::target_name(to_filename.as_ref()).is_some();
         if from_sidecar || to_sidecar {
+            if !APPLEDOUBLE_SIDECARS_ENABLED {
+                return Err(nfsstat3::NFS3ERR_NOTSUPP);
+            }
             if !from_sidecar || !to_sidecar {
                 return Err(nfsstat3::NFS3ERR_INVAL);
             }
@@ -1127,8 +1760,16 @@ impl NFSFileSystem for VexfsNfs {
             let new_inode = state.allocate_sidecar(key, target, data, 0o600);
             return state.persist_sidecar(new_inode);
         }
-        let source = checked_cstring(&state.child_path(from_dirid, from_filename.as_ref())?)?;
-        let destination = checked_cstring(&state.child_path(to_dirid, to_filename.as_ref())?)?;
+        let source_path = state.child_path(from_dirid, from_filename.as_ref())?;
+        let destination_path = state.child_path(to_dirid, to_filename.as_ref())?;
+        if let Ok(stat) = state.stat_path(&source_path) {
+            state.publish_pending(stat.inode as u64, "none")?;
+        }
+        if let Ok(stat) = state.stat_path(&destination_path) {
+            state.publish_pending(stat.inode as u64, "none")?;
+        }
+        let source = checked_cstring(&source_path)?;
+        let destination = checked_cstring(&destination_path)?;
         let mut error = empty_error();
         runtime_result(unsafe {
             vexfs_mount_rename(
@@ -1138,7 +1779,9 @@ impl NFSFileSystem for VexfsNfs {
                 1,
                 &mut error,
             )
-        })
+        })?;
+        state.clear_metadata_cache();
+        Ok(())
     }
 
     async fn link(
@@ -1153,6 +1796,7 @@ impl NFSFileSystem for VexfsNfs {
         {
             return Err(nfsstat3::NFS3ERR_NOTSUPP);
         }
+        state.publish_pending(id, "none")?;
         let source_path = state.path_for_inode(id)?;
         let destination_path = state.child_path(dirid, filename.as_ref())?;
         let source = checked_cstring(&source_path)?;
@@ -1166,21 +1810,29 @@ impl NFSFileSystem for VexfsNfs {
                 &mut error,
             )
         })?;
+        state.inodes_by_path.insert(destination_path.clone(), id);
+        if let Some(entries) = state.directory_entries.get_mut(&dirid) {
+            entries.insert(filename.as_ref().to_vec(), id);
+        }
+        state.stats.remove(&id);
+        state.stats.remove(&dirid);
         Ok(stat_attr(&state.stat_path(&source_path)?))
     }
 
     async fn commit(&self, id: fileid3, _offset: u64, _count: u32) -> Result<fattr3, nfsstat3> {
-        let request = self.request_id("nfs-commit");
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
         if state.sidecars.contains_key(&id) {
             state.persist_sidecar(id)?;
             return state.sidecar_attr(id);
         }
-        let mut published = 0;
-        let mut error = empty_error();
-        runtime_result(unsafe {
-            vexfs_mount_synchronize(state.session, request.as_ptr(), &mut published, &mut error)
-        })?;
+        if state.publish_pending(id, "full")? {
+            let path = state.path_for_inode(id)?;
+            return Ok(stat_attr(&state.stat_path(&path)?));
+        }
+        // NFS COMMIT applies only to this file/range. macOS may emit a final
+        // COMMIT for an inode that is already clean while unmounting. Treating
+        // that as a workspace-wide synchronize publishes unrelated handles
+        // without closing them and leaves stale staging metadata behind.
         let path = state.path_for_inode(id)?;
         Ok(stat_attr(&state.stat_path(&path)?))
     }
@@ -1206,10 +1858,18 @@ impl NFSFileSystem for VexfsNfs {
         };
         let end = start.saturating_add(max_entries).min(entries.len());
         let complete = end == entries.len();
+        let pending_sizes: HashMap<fileid3, u64> = state
+            .pending_writes
+            .iter()
+            .map(|(inode, pending)| (*inode, pending.logical_size))
+            .collect();
         let entries = entries[start..end]
             .iter()
             .map(|entry| {
-                let stat: FileStat = entry.clone().into();
+                let mut stat: FileStat = entry.clone().into();
+                if let Some(size) = pending_sizes.get(&(entry.inode as u64)) {
+                    stat.size = (*size).min(i64::MAX as u64) as i64;
+                }
                 DirEntry {
                     fileid: entry.inode as u64,
                     name: entry.name.as_bytes().into(),
@@ -1231,7 +1891,8 @@ impl NFSFileSystem for VexfsNfs {
         _attrs: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
         let mut state = self.state.lock().map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        let path = checked_cstring(&state.child_path(dirid, linkname.as_ref())?)?;
+        let path_text = state.child_path(dirid, linkname.as_ref())?;
+        let path = checked_cstring(&path_text)?;
         let mut error = empty_error();
         runtime_result(unsafe {
             vexfs_mount_symlink(
@@ -1242,8 +1903,11 @@ impl NFSFileSystem for VexfsNfs {
                 &mut error,
             )
         })?;
-        let path = path.to_str().map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        let stat = state.stat_path(path)?;
+        let stat = state.stat_path(&path_text)?;
+        if let Some(entries) = state.directory_entries.get_mut(&dirid) {
+            entries.insert(linkname.as_ref().to_vec(), stat.inode as u64);
+        }
+        state.stats.remove(&dirid);
         Ok((stat.inode as u64, stat_attr(&stat)))
     }
 
@@ -1304,6 +1968,7 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
     if config.port == 0 {
         return Err("NFS gateway port is required".to_string());
     }
+    let postgresql_backend = backend == "postgresql";
     let backend_c = CString::new(backend).map_err(|_| "backend contains NUL")?;
     let connection_c = CString::new(connection).map_err(|_| "connection contains NUL")?;
     let workspace_c = CString::new(workspace).map_err(|_| "workspace contains NUL")?;
@@ -1330,20 +1995,30 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
     }
     let mut state = RuntimeState {
         session,
+        postgresql_backend,
         root_inode: 1,
         uid: unsafe { libc::getuid() },
         gid: unsafe { libc::getgid() },
+        strict_durability: std::env::var_os("VEXFS_NFS_STRICT_DURABILITY")
+            .is_some_and(|value| value != "0"),
         next_sidecar_inode: SIDECAR_INODE_START,
         sidecars_by_key: HashMap::new(),
         sidecars: HashMap::new(),
+        pending_writes: HashMap::new(),
+        paths: HashMap::new(),
+        inodes_by_path: HashMap::new(),
+        stats: HashMap::new(),
+        directory_entries: HashMap::new(),
+        metadata_cache_checked_at_ms: now_ms(),
     };
     let root = state
         .stat_path("/")
         .map_err(|status| format!("root stat failed: {status:?}"))?;
     state.root_inode = root.inode as u64;
     let prefix = format!("nfs-{}-{}", unsafe { libc::getpid() }, now_ms());
+    let shared_state = Arc::new(Mutex::new(state));
     let filesystem = VexfsNfs {
-        state: Mutex::new(state),
+        state: Arc::clone(&shared_state),
         request_prefix: prefix,
         request_sequence: AtomicU64::new(1),
     };
@@ -1354,6 +2029,72 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async move {
+        let publish_state = Arc::clone(&shared_state);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+            loop {
+                interval.tick().await;
+                let now = now_ms();
+                let publish_job = {
+                    let Ok(mut state) = publish_state.lock() else {
+                        return;
+                    };
+                    if state.postgresql_backend {
+                        let candidates = state.claim_deferred_publish_batch(now);
+                        if candidates.is_empty() {
+                            None
+                        } else {
+                            Some((state.session as usize, candidates))
+                        }
+                    } else {
+                        let cutoff = now.saturating_sub(DEFERRED_PUBLISH_IDLE_MS);
+                        let idle = state
+                            .pending_writes
+                            .values()
+                            .map(|pending| pending.updated_at_ms)
+                            .max()
+                            .is_some_and(|updated_at_ms| updated_at_ms <= cutoff);
+                        if idle {
+                            if let Err(status) = state
+                                .publish_pending_batch("full", DEFERRED_PUBLISH_BATCH_SIZE)
+                            {
+                                eprintln!(
+                                    "vexfs-nfs-gateway: deferred batch publish failed: {status:?}"
+                                );
+                            }
+                        }
+                        None
+                    }
+                };
+                let Some((session, candidates)) = publish_job else {
+                    continue;
+                };
+                let result = publish_claimed_batch(
+                    session as *mut RuntimeSessionOpaque,
+                    &candidates,
+                );
+                let Ok(mut state) = publish_state.lock() else {
+                    return;
+                };
+                match result {
+                    Ok(published) => {
+                        if let Err(status) =
+                            state.complete_publish_claims(&candidates, &published)
+                        {
+                            eprintln!(
+                                "vexfs-nfs-gateway: deferred publish result mismatch: {status:?}"
+                            );
+                        }
+                    }
+                    Err(status) => {
+                        state.release_publish_claims(&candidates);
+                        eprintln!(
+                            "vexfs-nfs-gateway: deferred claimed publish failed: {status:?}"
+                        );
+                    }
+                }
+            }
+        });
         let listener = NFSTcpListener::bind(&bind_address, filesystem)
             .await
             .map_err(|error| error.to_string())?;
@@ -1426,5 +2167,127 @@ pub unsafe extern "C" fn vexfs_nfs_gateway_run(
             write_error(error_message, error_message_size, "NFS gateway panicked");
             1
         }
+    }
+}
+
+#[cfg(test)]
+#[export_name = "vexfs_mount_session_close"]
+extern "C" fn test_vexfs_mount_session_close(_session: *mut RuntimeSessionOpaque) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state_with_pending(entries: &[(u64, i64, i64, u64)]) -> RuntimeState {
+        let mut pending_writes = HashMap::new();
+        for (inode, updated_at_ms, first_dirty_at_ms, dirty_bytes) in entries {
+            pending_writes.insert(
+                *inode,
+                PendingWrite {
+                    handle: CString::new(format!("handle-{inode}")).unwrap(),
+                    generation: 1,
+                    logical_size: *dirty_bytes,
+                    updated_at_ms: *updated_at_ms,
+                    first_dirty_at_ms: *first_dirty_at_ms,
+                    dirty_bytes: *dirty_bytes,
+                    publishing_generation: None,
+                },
+            );
+        }
+        RuntimeState {
+            session: ptr::null_mut(),
+            postgresql_backend: true,
+            root_inode: 1,
+            uid: 0,
+            gid: 0,
+            strict_durability: false,
+            next_sidecar_inode: SIDECAR_INODE_START,
+            sidecars_by_key: HashMap::new(),
+            sidecars: HashMap::new(),
+            pending_writes,
+            paths: HashMap::new(),
+            inodes_by_path: HashMap::new(),
+            stats: HashMap::new(),
+            directory_entries: HashMap::new(),
+            metadata_cache_checked_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn foreground_write_burst_is_coalesced_until_globally_idle() {
+        let now = 10_000;
+        let mut state = state_with_pending(&[
+            (1, now - DEFERRED_PUBLISH_IDLE_MS, now - DEFERRED_PUBLISH_IDLE_MS, 4_096),
+            (2, now, now, 4_096),
+        ]);
+        let claimed = state.claim_deferred_publish_batch(now);
+        assert!(claimed.is_empty());
+        assert_eq!(
+            state.pending_writes.get(&1).unwrap().publishing_generation,
+            None
+        );
+        assert_eq!(
+            state.pending_writes.get(&2).unwrap().publishing_generation,
+            None
+        );
+
+        let claimed = state.claim_deferred_publish_batch(now + DEFERRED_PUBLISH_IDLE_MS);
+        assert_eq!(claimed.len(), 2);
+    }
+
+    #[test]
+    fn dirty_byte_threshold_flushes_before_idle_timeout() {
+        let now = 20_000;
+        let mut state = state_with_pending(&[(
+            7,
+            now,
+            now,
+            DEFERRED_PUBLISH_DIRTY_BYTES,
+        )]);
+        let claimed = state.claim_deferred_publish_batch(now);
+        assert!(claimed.is_empty());
+        let claimed =
+            state.claim_deferred_publish_batch(now + DEFERRED_PUBLISH_IDLE_MS);
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].inode, 7);
+    }
+
+    #[test]
+    fn oldest_dirty_write_has_a_bounded_publish_delay() {
+        let now = 30_000;
+        let mut state = state_with_pending(&[(
+            9,
+            now - DEFERRED_PUBLISH_IDLE_MS,
+            now - DEFERRED_PUBLISH_MAX_AGE_MS,
+            1,
+        )]);
+        let claimed = state.claim_deferred_publish_batch(now);
+        assert_eq!(claimed.len(), 1);
+        state.release_publish_claims(&claimed);
+        assert_eq!(
+            state.pending_writes.get(&9).unwrap().publishing_generation,
+            None
+        );
+    }
+
+    #[test]
+    fn file_count_threshold_bounds_a_continuous_small_file_burst() {
+        let now = 40_000;
+        let entries: Vec<_> = (0..DEFERRED_PUBLISH_FILE_THRESHOLD)
+            .map(|inode| {
+                let updated = if inode + 1 == DEFERRED_PUBLISH_FILE_THRESHOLD {
+                    now
+                } else {
+                    now - DEFERRED_PUBLISH_IDLE_MS
+                };
+                (inode as u64 + 1, updated, updated, 2)
+            })
+            .collect();
+        let mut state = state_with_pending(&entries);
+        let claimed = state.claim_deferred_publish_batch(now);
+        assert_eq!(claimed.len(), DEFERRED_PUBLISH_BATCH_SIZE as usize);
+        assert!(claimed.iter().all(|candidate| {
+            candidate.inode != DEFERRED_PUBLISH_FILE_THRESHOLD as u64
+        }));
     }
 }

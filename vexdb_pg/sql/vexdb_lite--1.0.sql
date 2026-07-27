@@ -603,7 +603,6 @@ CREATE TABLE _vexfs.handles (
     expected_version bigint NOT NULL CHECK (expected_version >= 0),
     dirty_generation bigint NOT NULL DEFAULT 0 CHECK (dirty_generation >= 0),
     published_generation bigint NOT NULL DEFAULT 0 CHECK (published_generation >= 0),
-    staging bytea NOT NULL DEFAULT ''::bytea,
     state text NOT NULL DEFAULT 'open' CHECK (state IN ('open', 'retained', 'closed')),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -614,6 +613,33 @@ CREATE INDEX vexfs_handles_workspace_state_idx
     ON _vexfs.handles(workspace_id, state, lease_until);
 CREATE INDEX vexfs_handles_inode_idx
     ON _vexfs.handles(workspace_id, inode_id);
+
+-- Writable handles keep only a reference to their published base plus the
+-- chunks changed since that base. A small positional write therefore stores at
+-- most the affected 64 KiB chunks instead of replacing one full-file bytea.
+CREATE TABLE _vexfs.handle_staging (
+    handle_id text PRIMARY KEY REFERENCES _vexfs.handles(handle_id) ON DELETE CASCADE,
+    generation bigint NOT NULL CHECK (generation >= 0),
+    base_manifest_id bigint REFERENCES _vexfs.manifests(manifest_id),
+    base_size bigint NOT NULL CHECK (base_size >= 0),
+    base_visible_size bigint NOT NULL CHECK (base_visible_size >= 0),
+    logical_size bigint NOT NULL CHECK (logical_size BETWEEN 0 AND 134217728),
+    dirty_bytes bigint NOT NULL DEFAULT 0 CHECK (dirty_bytes >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    CHECK (base_visible_size <= base_size)
+);
+
+CREATE INDEX vexfs_handle_staging_updated_idx
+    ON _vexfs.handle_staging(updated_at, handle_id);
+
+CREATE TABLE _vexfs.handle_staging_chunks (
+    handle_id text NOT NULL REFERENCES _vexfs.handles(handle_id) ON DELETE CASCADE,
+    chunk_no integer NOT NULL CHECK (chunk_no >= 0),
+    content bytea NOT NULL CHECK (
+        octet_length(content) BETWEEN 1 AND 65536),
+    PRIMARY KEY (handle_id, chunk_no)
+);
 
 CREATE TABLE _vexfs.request_replays (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -1343,6 +1369,168 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION _vexfs.read_staging_chunk(
+    p_handle text,
+    p_chunk_no integer,
+    p_target_size integer)
+RETURNS bytea
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_staging _vexfs.handle_staging%ROWTYPE;
+    v_workspace_id bigint;
+    v_inode_id bigint;
+    v_chunk_start bigint;
+    v_visible_size integer;
+    v_content bytea;
+    v_size integer;
+    v_checksum text;
+    v_chunk_workspace bigint;
+    v_chunk_inode bigint;
+BEGIN
+    IF p_chunk_no < 0 OR p_target_size < 0 OR p_target_size > 65536 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: invalid staging chunk range'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_target_size = 0 THEN
+        RETURN ''::bytea;
+    END IF;
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
+            USING ERRCODE = 'P0002';
+    END IF;
+    SELECT handle.workspace_id, handle.inode_id
+      INTO STRICT v_workspace_id, v_inode_id
+      FROM _vexfs.handles AS handle
+     WHERE handle.handle_id = p_handle;
+
+    SELECT dirty.content INTO v_content
+      FROM _vexfs.handle_staging_chunks AS dirty
+     WHERE dirty.handle_id = p_handle
+       AND dirty.chunk_no = p_chunk_no;
+    IF NOT FOUND THEN
+        v_content := ''::bytea;
+        v_chunk_start := p_chunk_no::bigint * 65536;
+        IF v_staging.base_manifest_id IS NOT NULL
+           AND v_chunk_start < v_staging.base_visible_size THEN
+            SELECT chunk.content,
+                   chunk.size_bytes,
+                   chunk.checksum,
+                   chunk.workspace_id,
+                   chunk.inode_id
+              INTO v_content,
+                   v_size,
+                   v_checksum,
+                   v_chunk_workspace,
+                   v_chunk_inode
+              FROM _vexfs.manifest_chunks AS entry
+              JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+             WHERE entry.manifest_id = v_staging.base_manifest_id
+               AND entry.chunk_no = p_chunk_no;
+            IF NOT FOUND
+               OR v_chunk_workspace <> v_workspace_id
+               OR v_chunk_inode IS DISTINCT FROM v_inode_id
+               OR v_size <> octet_length(v_content)
+               OR v_checksum <> encode(pg_catalog.sha256(v_content), 'hex') THEN
+                RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: staging base chunk is invalid'
+                    USING ERRCODE = 'XX001';
+            END IF;
+            v_visible_size := least(
+                v_size,
+                v_staging.base_visible_size - v_chunk_start)::integer;
+            v_content := substring(v_content FROM 1 FOR v_visible_size);
+        END IF;
+    END IF;
+
+    IF octet_length(v_content) > p_target_size THEN
+        v_content := substring(v_content FROM 1 FOR p_target_size);
+    ELSIF octet_length(v_content) < p_target_size THEN
+        v_content := v_content || decode(
+            repeat('00', p_target_size - octet_length(v_content)), 'hex');
+    END IF;
+    RETURN v_content;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.read_staging_range(
+    p_handle text,
+    p_offset bigint,
+    p_length bigint)
+RETURNS bytea
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_staging _vexfs.handle_staging%ROWTYPE;
+    v_end bigint;
+    v_first_chunk integer;
+    v_last_chunk integer;
+    v_chunk_no integer;
+    v_chunk_start bigint;
+    v_chunk_size integer;
+    v_copy_start integer;
+    v_copy_length integer;
+    v_chunk bytea;
+    v_content bytea := ''::bytea;
+BEGIN
+    IF p_offset < 0 OR p_length < 0
+       OR p_offset > 134217728 OR p_length > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: offset and length must be within 0..128 MiB'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
+            USING ERRCODE = 'P0002';
+    END IF;
+    IF p_length = 0 OR p_offset >= v_staging.logical_size THEN
+        RETURN ''::bytea;
+    END IF;
+
+    v_end := least(v_staging.logical_size, p_offset + p_length);
+    v_first_chunk := (p_offset / 65536)::integer;
+    v_last_chunk := ((v_end - 1) / 65536)::integer;
+    FOR v_chunk_no IN v_first_chunk..v_last_chunk LOOP
+        v_chunk_start := v_chunk_no::bigint * 65536;
+        v_chunk_size := least(
+            65536, v_staging.logical_size - v_chunk_start)::integer;
+        v_chunk := _vexfs.read_staging_chunk(
+            p_handle, v_chunk_no, v_chunk_size);
+        v_copy_start := (greatest(p_offset, v_chunk_start) - v_chunk_start)::integer;
+        v_copy_length := (
+            least(v_end, v_chunk_start + v_chunk_size)
+            - greatest(p_offset, v_chunk_start))::integer;
+        v_content := v_content || substring(
+            v_chunk FROM v_copy_start + 1 FOR v_copy_length);
+    END LOOP;
+    RETURN v_content;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.read_staging_content(p_handle text)
+RETURNS bytea
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+    SELECT _vexfs.read_staging_range(
+        p_handle, 0,
+        (SELECT staging.logical_size
+           FROM _vexfs.handle_staging AS staging
+          WHERE staging.handle_id = p_handle))
+$$;
+
 CREATE FUNCTION _vexfs.resolve_version_storage(
     p_workspace_id bigint,
     p_inode_id bigint,
@@ -1544,6 +1732,223 @@ BEGIN
 END;
 $$;
 
+-- Build a copy-on-write manifest for a positional write. Untouched chunks are
+-- linked into the new manifest in one statement; only overlapping chunks (and
+-- zero-filled hole chunks) are materialized again. The final file checksum is
+-- still SHA-256 over the complete byte stream, so range writes keep the same
+-- integrity contract as vexfs_write without rebuilding the complete file in a
+-- PL/pgSQL loop.
+CREATE FUNCTION _vexfs.store_manifest_range(
+    p_workspace_id bigint,
+    p_inode_id bigint,
+    p_previous_manifest bigint,
+    p_previous_size bigint,
+    p_offset bigint,
+    p_content bytea)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_manifest bigint;
+    v_previous_chunk_count integer;
+    v_previous_file_size bigint;
+    v_new_size bigint;
+    v_new_chunk_count integer;
+    v_write_end bigint;
+    v_chunk_no integer;
+    v_chunk_start bigint;
+    v_chunk_end bigint;
+    v_chunk_size integer;
+    v_chunk bytea;
+    v_previous_chunk_id bigint;
+    v_chunk_id bigint;
+    v_chunk_checksum text;
+    v_overlap_start bigint;
+    v_overlap_end bigint;
+    v_existing_count bigint;
+    v_existing_bytes bigint;
+    v_existing_valid boolean;
+    v_full_content bytea;
+    v_final_count bigint;
+    v_final_bytes bigint;
+    v_file_checksum text;
+BEGIN
+    IF p_content IS NULL THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_CONTENT: content cannot be null'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_previous_manifest IS NULL OR p_previous_size < 0
+       OR p_offset < 0 OR p_offset > 134217728
+       OR p_offset + octet_length(p_content) > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: range manifest input is invalid'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT manifest.file_size, manifest.chunk_count
+      INTO v_previous_file_size, v_previous_chunk_count
+      FROM _vexfs.manifests AS manifest
+     WHERE manifest.manifest_id = p_previous_manifest
+       AND manifest.workspace_id = p_workspace_id
+       AND manifest.inode_id = p_inode_id;
+    IF NOT FOUND OR v_previous_file_size <> p_previous_size THEN
+        RAISE EXCEPTION 'VEXFS_CORRUPT: previous range manifest is invalid'
+            USING ERRCODE = 'XX001';
+    END IF;
+
+    -- Validate every source chunk independently while keeping peak memory
+    -- bounded to one 64 KiB chunk. The complete-file checksum is recomputed for
+    -- the new manifest below.
+    SELECT count(*),
+           coalesce(sum(chunk.size_bytes), 0),
+           coalesce(bool_and(
+               entry.chunk_no >= 0
+               AND entry.chunk_no < v_previous_chunk_count
+               AND chunk.workspace_id = p_workspace_id
+               AND chunk.inode_id = p_inode_id
+               AND chunk.size_bytes = least(
+                   65536,
+                   p_previous_size - entry.chunk_no::bigint * 65536)::integer
+               AND octet_length(chunk.content) = chunk.size_bytes
+               AND chunk.checksum = encode(
+                   pg_catalog.sha256(chunk.content), 'hex')),
+               v_previous_chunk_count = 0)
+      INTO v_existing_count, v_existing_bytes, v_existing_valid
+      FROM _vexfs.manifest_chunks AS entry
+      JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+     WHERE entry.manifest_id = p_previous_manifest;
+    IF v_existing_count <> v_previous_chunk_count
+       OR v_existing_bytes <> p_previous_size
+       OR NOT v_existing_valid THEN
+        RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: previous manifest chunk is invalid'
+            USING ERRCODE = 'XX001';
+    END IF;
+
+    v_write_end := p_offset + octet_length(p_content);
+    v_new_size := greatest(p_previous_size, v_write_end);
+    v_new_chunk_count := ((v_new_size + 65535) / 65536)::integer;
+    INSERT INTO _vexfs.manifests(
+        workspace_id, inode_id, file_size, chunk_size, chunk_count, checksum)
+    VALUES (
+        p_workspace_id, p_inode_id, v_new_size, 65536,
+        v_new_chunk_count, repeat('0', 64))
+    RETURNING manifest_id INTO v_manifest;
+
+    -- Copy chunks whose byte range and final size are unchanged. This is the
+    -- common path for NFS writes and avoids one SQL round trip per old chunk.
+    INSERT INTO _vexfs.manifest_chunks(manifest_id, chunk_no, chunk_id)
+    SELECT v_manifest, entry.chunk_no, entry.chunk_id
+      FROM _vexfs.manifest_chunks AS entry
+      JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+     WHERE entry.manifest_id = p_previous_manifest
+       AND entry.chunk_no < v_new_chunk_count
+       AND chunk.size_bytes = least(
+           65536,
+           v_new_size - entry.chunk_no::bigint * 65536)::integer
+       AND (entry.chunk_no::bigint * 65536 + chunk.size_bytes <= p_offset
+            OR entry.chunk_no::bigint * 65536 >= v_write_end);
+
+    FOR v_chunk_no IN 0..v_new_chunk_count - 1 LOOP
+        IF EXISTS (
+            SELECT 1 FROM _vexfs.manifest_chunks AS entry
+             WHERE entry.manifest_id = v_manifest
+               AND entry.chunk_no = v_chunk_no) THEN
+            CONTINUE;
+        END IF;
+
+        v_chunk_start := v_chunk_no::bigint * 65536;
+        v_chunk_end := least(v_new_size, v_chunk_start + 65536);
+        v_chunk_size := (v_chunk_end - v_chunk_start)::integer;
+        v_previous_chunk_id := NULL;
+        v_chunk := ''::bytea;
+        SELECT chunk.chunk_id, chunk.content
+          INTO v_previous_chunk_id, v_chunk
+          FROM _vexfs.manifest_chunks AS entry
+          JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+         WHERE entry.manifest_id = p_previous_manifest
+           AND entry.chunk_no = v_chunk_no;
+        IF NOT FOUND THEN
+            v_chunk := ''::bytea;
+        END IF;
+        IF octet_length(v_chunk) > v_chunk_size THEN
+            v_chunk := substring(v_chunk FROM 1 FOR v_chunk_size);
+        ELSIF octet_length(v_chunk) < v_chunk_size THEN
+            v_chunk := v_chunk || decode(
+                repeat('00', v_chunk_size - octet_length(v_chunk)), 'hex');
+        END IF;
+
+        v_overlap_start := greatest(v_chunk_start, p_offset);
+        v_overlap_end := least(v_chunk_end, v_write_end);
+        IF v_overlap_end > v_overlap_start THEN
+            v_chunk := _vexfs.overlay_bytes(
+                v_chunk,
+                v_overlap_start - v_chunk_start,
+                substring(
+                    p_content
+                    FROM (v_overlap_start - p_offset + 1)::integer
+                    FOR (v_overlap_end - v_overlap_start)::integer));
+        END IF;
+        IF octet_length(v_chunk) <> v_chunk_size THEN
+            RAISE EXCEPTION 'VEXFS_CORRUPT: range chunk has invalid size'
+                USING ERRCODE = 'XX001';
+        END IF;
+
+        v_chunk_checksum := encode(pg_catalog.sha256(v_chunk), 'hex');
+        v_chunk_id := NULL;
+        IF v_previous_chunk_id IS NOT NULL THEN
+            SELECT chunk.chunk_id INTO v_chunk_id
+              FROM _vexfs.chunks AS chunk
+             WHERE chunk.chunk_id = v_previous_chunk_id
+               AND chunk.size_bytes = v_chunk_size
+               AND chunk.checksum = v_chunk_checksum
+               AND chunk.content = v_chunk;
+        END IF;
+        IF v_chunk_id IS NULL THEN
+            SELECT chunk.chunk_id INTO v_chunk_id
+              FROM _vexfs.manifest_chunks AS entry
+              JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+             WHERE entry.manifest_id = v_manifest
+               AND chunk.size_bytes = v_chunk_size
+               AND chunk.checksum = v_chunk_checksum
+               AND chunk.content = v_chunk
+             LIMIT 1;
+        END IF;
+        IF v_chunk_id IS NULL THEN
+            INSERT INTO _vexfs.chunks(
+                workspace_id, inode_id, content, size_bytes, checksum)
+            VALUES (
+                p_workspace_id, p_inode_id, v_chunk,
+                v_chunk_size, v_chunk_checksum)
+            RETURNING chunk_id INTO v_chunk_id;
+        END IF;
+        INSERT INTO _vexfs.manifest_chunks(manifest_id, chunk_no, chunk_id)
+        VALUES (v_manifest, v_chunk_no, v_chunk_id);
+    END LOOP;
+
+    SELECT coalesce(
+               pg_catalog.string_agg(
+                   chunk.content, ''::bytea ORDER BY entry.chunk_no),
+               ''::bytea),
+           count(*),
+           coalesce(sum(chunk.size_bytes), 0)
+      INTO v_full_content, v_final_count, v_final_bytes
+      FROM _vexfs.manifest_chunks AS entry
+      JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+     WHERE entry.manifest_id = v_manifest;
+    IF v_final_count <> v_new_chunk_count OR v_final_bytes <> v_new_size THEN
+        RAISE EXCEPTION 'VEXFS_CORRUPT: range manifest is incomplete'
+            USING ERRCODE = 'XX001';
+    END IF;
+    v_file_checksum := encode(pg_catalog.sha256(v_full_content), 'hex');
+    UPDATE _vexfs.manifests
+       SET checksum = v_file_checksum
+     WHERE manifest_id = v_manifest;
+    RETURN v_manifest;
+END;
+$$;
+
 CREATE FUNCTION _vexfs.read_version_content(
     p_workspace_id bigint,
     p_inode_id bigint,
@@ -1615,6 +2020,94 @@ BEGIN
        OR v_expected_chunk <> v_chunk_count
        OR encode(pg_catalog.sha256(v_content), 'hex') <> v_checksum THEN
         RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: file content does not match manifest'
+            USING ERRCODE = 'XX001';
+    END IF;
+    RETURN v_content;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.read_version_range(
+    p_workspace_id bigint,
+    p_inode_id bigint,
+    p_version bigint,
+    p_offset bigint,
+    p_length bigint)
+RETURNS bytea
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_manifest bigint;
+    v_size bigint;
+    v_first_chunk integer;
+    v_last_chunk integer;
+    v_end bigint;
+    v_expected_chunk integer;
+    v_chunk_offset bigint;
+    v_expected_size integer;
+    v_copy_start integer;
+    v_copy_length integer;
+    v_content bytea := ''::bytea;
+    v_row record;
+BEGIN
+    IF p_offset < 0 OR p_length < 0
+       OR p_offset > 134217728 OR p_length > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: offset and length must be within 0..128 MiB'
+            USING ERRCODE = '22023';
+    END IF;
+    SELECT storage.manifest_id, storage.size_bytes
+      INTO v_manifest, v_size
+      FROM _vexfs.resolve_version_storage(
+          p_workspace_id, p_inode_id, p_version) AS storage;
+    IF v_size > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_CORRUPT: file version exceeds 128 MiB'
+            USING ERRCODE = 'XX001';
+    END IF;
+    IF p_length = 0 OR p_offset >= v_size THEN
+        RETURN ''::bytea;
+    END IF;
+
+    v_end := least(v_size, p_offset + p_length);
+    v_first_chunk := (p_offset / 65536)::integer;
+    v_last_chunk := ((v_end - 1) / 65536)::integer;
+    v_expected_chunk := v_first_chunk;
+    FOR v_row IN
+        SELECT entry.chunk_no,
+               chunk.content,
+               chunk.size_bytes,
+               chunk.checksum,
+               chunk.workspace_id,
+               chunk.inode_id
+          FROM _vexfs.manifest_chunks AS entry
+          JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
+         WHERE entry.manifest_id = v_manifest
+           AND entry.chunk_no BETWEEN v_first_chunk AND v_last_chunk
+         ORDER BY entry.chunk_no
+    LOOP
+        v_chunk_offset := v_row.chunk_no::bigint * 65536;
+        v_expected_size := least(65536, v_size - v_chunk_offset)::integer;
+        IF v_row.chunk_no <> v_expected_chunk
+           OR v_expected_size <= 0
+           OR v_row.size_bytes <> v_expected_size
+           OR octet_length(v_row.content) <> v_expected_size
+           OR v_row.workspace_id <> p_workspace_id
+           OR v_row.inode_id <> p_inode_id
+           OR v_row.checksum <> encode(pg_catalog.sha256(v_row.content), 'hex') THEN
+            RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: file manifest range chunk is invalid'
+                USING ERRCODE = 'XX001';
+        END IF;
+        v_copy_start := (greatest(p_offset, v_chunk_offset) - v_chunk_offset)::integer;
+        v_copy_length := (least(v_end, v_chunk_offset + v_expected_size) -
+                          greatest(p_offset, v_chunk_offset))::integer;
+        v_content := v_content || substring(
+            v_row.content FROM v_copy_start + 1 FOR v_copy_length);
+        v_expected_chunk := v_expected_chunk + 1;
+    END LOOP;
+    IF v_expected_chunk <> v_last_chunk + 1
+       OR octet_length(v_content) <> v_end - p_offset THEN
+        RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: file manifest range is incomplete'
             USING ERRCODE = 'XX001';
     END IF;
     RETURN v_content;
@@ -2079,6 +2572,11 @@ BEGIN
         jsonb_build_object(
             'before_version', v_workspace.head_commit,
             'after_version', NULL));
+    -- Staging deliberately keeps its base manifest alive during normal GC.
+    -- On an explicit workspace drop, remove handles first so those references
+    -- disappear before the workspace cascade reaches manifests.
+    DELETE FROM _vexfs.handles
+     WHERE workspace_id = v_workspace.workspace_id;
     DELETE FROM _vexfs.workspaces WHERE workspace_id = v_workspace.workspace_id;
     RETURN 1;
 END;
@@ -2241,9 +2739,13 @@ BEGIN
           FROM _vexfs.file_versions AS f
          WHERE f.workspace_id = v_workspace.workspace_id
            AND f.inode_id = v_inode;
-        SELECT storage.manifest_id INTO v_previous_manifest
-          FROM _vexfs.resolve_version_storage(
-              v_workspace.workspace_id, v_inode, v_current_version) AS storage;
+        IF v_current_version > 0 THEN
+            SELECT storage.manifest_id INTO v_previous_manifest
+              FROM _vexfs.resolve_version_storage(
+                  v_workspace.workspace_id, v_inode, v_current_version) AS storage;
+        ELSE
+            v_previous_manifest := NULL;
+        END IF;
         UPDATE _vexfs.inodes
            SET current_version = v_version,
                size_bytes = octet_length(p_content),
@@ -2317,8 +2819,51 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_NOT_REGULAR_FILE: %', p_path
             USING ERRCODE = '42809';
     END IF;
+    IF v_version = 0 THEN
+        RETURN ''::bytea;
+    END IF;
     RETURN _vexfs.read_version_content(
         v_workspace.workspace_id, v_inode, v_version);
+END;
+$$;
+
+CREATE FUNCTION public.vexfs_read_range(
+    p_workspace text,
+    p_path text,
+    p_offset bigint,
+    p_length bigint)
+RETURNS bytea
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_inode bigint;
+    v_kind text;
+    v_version bigint;
+BEGIN
+    IF p_offset < 0 OR p_length < 0
+       OR p_offset > 134217728 OR p_length > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: offset and length must be within 0..128 MiB'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'read');
+    v_inode := _vexfs.resolve_path(v_workspace.workspace_id, p_path);
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_inode, 'read');
+    SELECT inode.kind, inode.current_version INTO v_kind, v_version
+      FROM _vexfs.inodes AS inode WHERE inode.inode_id = v_inode;
+    IF v_kind <> 'file' THEN
+        RAISE EXCEPTION 'VEXFS_NOT_REGULAR_FILE: %', p_path
+            USING ERRCODE = '42809';
+    END IF;
+    IF v_version = 0 THEN
+        RETURN ''::bytea;
+    END IF;
+    RETURN _vexfs.read_version_range(
+        v_workspace.workspace_id, v_inode, v_version, p_offset, p_length);
 END;
 $$;
 
@@ -3213,6 +3758,13 @@ BEGIN
        AND session_id = p_session_id
        AND owner_oid = v_actor
        AND state = 'open';
+    DELETE FROM _vexfs.handle_staging AS staging
+     USING _vexfs.handles AS handle
+     WHERE staging.handle_id = handle.handle_id
+       AND handle.workspace_id = v_workspace.workspace_id
+       AND handle.session_id = p_session_id
+       AND handle.owner_oid = v_actor
+       AND handle.state = 'closed';
     UPDATE _vexfs.file_locks
        SET lease_until = clock_timestamp() + interval '30 seconds'
      WHERE workspace_id = v_workspace.workspace_id
@@ -3280,7 +3832,8 @@ DECLARE
     v_inode bigint;
     v_kind text;
     v_version bigint;
-    v_content bytea;
+    v_size bigint := 0;
+    v_manifest bigint;
     v_handle text;
     v_hash text;
     v_cached text;
@@ -3327,7 +3880,8 @@ BEGIN
 
     BEGIN
         v_inode := _vexfs.resolve_path(v_workspace.workspace_id, p_path);
-        SELECT i.kind, i.current_version INTO STRICT v_kind, v_version
+        SELECT i.kind, i.current_version, i.size_bytes
+          INTO STRICT v_kind, v_version, v_size
           FROM _vexfs.inodes AS i
          WHERE i.workspace_id = v_workspace.workspace_id
            AND i.inode_id = v_inode AND i.live;
@@ -3338,8 +3892,11 @@ BEGIN
         PERFORM _vexfs.require_inode_permission(
             v_workspace.workspace_id, v_inode,
             CASE WHEN v_writable THEN 'write' ELSE 'read' END);
-        v_content := CASE WHEN v_truncate THEN ''::bytea ELSE
-            _vexfs.read_version_content(v_workspace.workspace_id, v_inode, v_version) END;
+        IF v_version > 0 THEN
+            SELECT storage.manifest_id INTO v_manifest
+              FROM _vexfs.resolve_version_storage(
+                  v_workspace.workspace_id, v_inode, v_version) AS storage;
+        END IF;
     EXCEPTION WHEN SQLSTATE 'P0002' THEN
         IF NOT v_create THEN
             RAISE;
@@ -3350,19 +3907,32 @@ BEGIN
             v_workspace.workspace_id, v_parent, 'write');
         v_inode := NULL;
         v_version := 0;
-        v_content := ''::bytea;
+        v_size := 0;
+        v_manifest := NULL;
     END;
     v_handle := _vexfs.random_token('handle');
     INSERT INTO _vexfs.handles(
         handle_id, workspace_id, inode_id, path, flags, create_mode,
         owner_oid, owner_role, session_id, expected_version,
-        dirty_generation, staging)
+        dirty_generation)
     VALUES (
         v_handle, v_workspace.workspace_id, v_inode, p_path, p_flags,
         CASE WHEN v_inode IS NULL THEN 420 ELSE NULL END,
         v_actor, session_user, p_session_id, v_version,
-        CASE WHEN v_truncate OR v_inode IS NULL THEN 1 ELSE 0 END,
-        v_content);
+        CASE WHEN v_truncate OR v_inode IS NULL THEN 1 ELSE 0 END);
+    IF v_writable THEN
+        INSERT INTO _vexfs.handle_staging(
+            handle_id, generation, base_manifest_id, base_size,
+            base_visible_size, logical_size, dirty_bytes)
+        VALUES (
+            v_handle,
+            CASE WHEN v_truncate OR v_inode IS NULL THEN 1 ELSE 0 END,
+            v_manifest,
+            v_size,
+            CASE WHEN v_truncate THEN 0 ELSE v_size END,
+            CASE WHEN v_truncate THEN 0 ELSE v_size END,
+            0);
+    END IF;
     PERFORM _vexfs.replay_put(
         v_workspace.workspace_id, p_request_id, 'handle_open', v_hash, v_handle);
     RETURN v_handle;
@@ -3430,13 +4000,165 @@ BEGIN
     INSERT INTO _vexfs.handles(
         handle_id, workspace_id, path, flags, create_mode,
         owner_oid, owner_role, session_id, expected_version,
-        dirty_generation, staging)
+        dirty_generation)
     VALUES (
         v_handle, v_workspace.workspace_id, p_path, 'rwct', p_mode,
-        v_actor, session_user, p_session_id, 0, 1, ''::bytea);
+        v_actor, session_user, p_session_id, 0, 1);
+    INSERT INTO _vexfs.handle_staging(
+        handle_id, generation, base_manifest_id, base_size,
+        base_visible_size, logical_size, dirty_bytes)
+    VALUES (v_handle, 1, NULL, 0, 0, 0, 0);
     PERFORM _vexfs.replay_put(
         v_workspace.workspace_id, p_request_id, 'handle_create', v_hash, v_handle);
     RETURN v_handle;
+END;
+$$;
+
+-- Filesystem gateways must return a usable inode from CREATE before the first
+-- WRITE arrives.  Keep the older five-argument handle API isolated until
+-- publish, but let this owned form expose a version-0 empty inode immediately.
+-- The first publish records version 1 and the workspace commit atomically.
+CREATE FUNCTION public.vexfs_handle_create(
+    p_workspace text,
+    p_path text,
+    p_mode integer,
+    p_uid bigint,
+    p_gid bigint,
+    p_request_id text,
+    p_session_id text)
+RETURNS text
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_actor oid;
+    v_parent bigint;
+    v_name text;
+    v_inode bigint;
+    v_handle text;
+    v_hash text;
+    v_cached text;
+BEGIN
+    IF p_mode < 0 OR p_mode > 4095 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_MODE: %', p_mode
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_uid < 0 OR p_uid > 4294967295
+       OR p_gid < 0 OR p_gid > 4294967295 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_OWNER: uid and gid must be within 0..4294967295'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_session_id IS NULL OR p_session_id = '' THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SESSION: session id is required'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.mount_sessions AS mounted
+         WHERE mounted.workspace_id = v_workspace.workspace_id
+           AND mounted.session_id = p_session_id
+           AND mounted.owner_oid = v_actor
+           AND mounted.lease_until > clock_timestamp()) THEN
+        RAISE EXCEPTION 'VEXFS_SESSION_STALE: mount session is not active'
+            USING ERRCODE = '55006';
+    END IF;
+
+    v_hash := _vexfs.request_digest(jsonb_build_object(
+        'workspace', p_workspace,
+        'path', p_path,
+        'mode', p_mode,
+        'uid', p_uid,
+        'gid', p_gid,
+        'session', p_session_id));
+    PERFORM _vexfs.lock_request(v_workspace.workspace_id, p_request_id);
+    v_cached := _vexfs.replay_get(
+        v_workspace.workspace_id, p_request_id, 'handle_create', v_hash);
+    IF v_cached IS NOT NULL THEN
+        RETURN v_cached;
+    END IF;
+
+    PERFORM 1 FROM _vexfs.workspaces
+     WHERE workspace_id = v_workspace.workspace_id FOR UPDATE;
+    SELECT parent.parent_inode, parent.entry_name INTO v_parent, v_name
+      FROM _vexfs.resolve_parent(v_workspace.workspace_id, p_path) AS parent;
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_parent, 'write');
+    IF EXISTS (
+        SELECT 1 FROM _vexfs.dentries AS dentry
+         WHERE dentry.workspace_id = v_workspace.workspace_id
+           AND dentry.parent_inode = v_parent
+           AND dentry.name = v_name) THEN
+        RAISE EXCEPTION 'VEXFS_ALREADY_EXISTS: %', p_path
+            USING ERRCODE = '23505';
+    END IF;
+    PERFORM _vexfs.enforce_quota(v_workspace.workspace_id, NULL, 0);
+
+    INSERT INTO _vexfs.inodes(
+        workspace_id, kind, mode, owner_oid, owner_role, owner_principal,
+        uid, gid, current_version, size_bytes)
+    VALUES (
+        v_workspace.workspace_id, 'file', p_mode,
+        v_actor, session_user, session_user,
+        p_uid, p_gid, 0, 0)
+    RETURNING inode_id INTO v_inode;
+    INSERT INTO _vexfs.dentries(workspace_id, parent_inode, name, inode_id)
+    VALUES (v_workspace.workspace_id, v_parent, v_name, v_inode);
+    PERFORM _vexfs.inherit_acl(v_workspace.workspace_id, v_parent, v_inode);
+    UPDATE _vexfs.inodes
+       SET modified_at = clock_timestamp(),
+           changed_at = clock_timestamp()
+     WHERE workspace_id = v_workspace.workspace_id
+       AND inode_id = v_parent;
+
+    v_handle := _vexfs.random_token('handle');
+    INSERT INTO _vexfs.handles(
+        handle_id, workspace_id, inode_id, path, flags, create_mode,
+        owner_oid, owner_role, session_id, expected_version,
+        dirty_generation)
+    VALUES (
+        v_handle, v_workspace.workspace_id, v_inode, p_path, 'rwct', p_mode,
+        v_actor, session_user, p_session_id, 0, 1);
+    INSERT INTO _vexfs.handle_staging(
+        handle_id, generation, base_manifest_id, base_size,
+        base_visible_size, logical_size, dirty_bytes)
+    VALUES (v_handle, 1, NULL, 0, 0, 0, 0);
+    PERFORM _vexfs.replay_put(
+        v_workspace.workspace_id, p_request_id, 'handle_create', v_hash, v_handle);
+    RETURN v_handle;
+END;
+$$;
+
+-- NFS CREATE needs both a writable handle and attributes before it can reply.
+-- Keeping these as two PL/pgSQL statements makes the STABLE stat query see the
+-- new inode, while the client pays for only one database round trip.
+CREATE FUNCTION public.vexfs_handle_create_stat(
+    p_workspace text,
+    p_path text,
+    p_mode integer,
+    p_uid bigint,
+    p_gid bigint,
+    p_request_id text,
+    p_session_id text)
+RETURNS TABLE(handle text, stat jsonb)
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_handle text;
+BEGIN
+    v_handle := public.vexfs_handle_create(
+        p_workspace, p_path, p_mode, p_uid, p_gid,
+        p_request_id, p_session_id);
+    RETURN QUERY
+    SELECT v_handle, public.vexfs_stat(p_workspace, p_path);
 END;
 $$;
 
@@ -3453,14 +4175,28 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_handle _vexfs.handles%ROWTYPE;
+    v_staging _vexfs.handle_staging%ROWTYPE;
     v_hash text;
     v_cached text;
     v_generation bigint;
-    v_staging bytea;
+    v_logical_size bigint;
+    v_patch_offset integer := 0;
+    v_absolute bigint;
+    v_chunk_no integer;
+    v_chunk_start bigint;
+    v_within integer;
+    v_write_size integer;
+    v_target_size integer;
+    v_chunk bytea;
 BEGIN
     IF p_content IS NULL THEN
         RAISE EXCEPTION 'VEXFS_INVALID_CONTENT: content cannot be null'
             USING ERRCODE = '22004';
+    END IF;
+    IF p_offset < 0 OR p_offset > 134217728
+       OR p_offset + octet_length(p_content) > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: staged write is outside 0..128 MiB'
+            USING ERRCODE = '22023';
     END IF;
     SELECT * INTO v_handle FROM _vexfs.require_handle(p_handle, 'write');
     IF position('w' IN v_handle.flags) = 0 THEN
@@ -3477,13 +4213,65 @@ BEGIN
     IF v_cached IS NOT NULL THEN
         RETURN v_cached::bigint;
     END IF;
-    v_staging := _vexfs.overlay_bytes(v_handle.staging, p_offset, p_content);
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
+            USING ERRCODE = 'P0002';
+    END IF;
+    IF octet_length(p_content) = 0 THEN
+        PERFORM _vexfs.replay_put(
+            v_handle.workspace_id, p_request_id, 'handle_stage_write',
+            v_hash, v_handle.dirty_generation::text);
+        RETURN v_handle.dirty_generation;
+    END IF;
+    v_logical_size := greatest(
+        v_staging.logical_size, p_offset + octet_length(p_content));
     PERFORM _vexfs.enforce_quota(
-        v_handle.workspace_id, v_handle.inode_id, octet_length(v_staging));
+        v_handle.workspace_id, v_handle.inode_id, v_logical_size);
+
+    WHILE v_patch_offset < octet_length(p_content) LOOP
+        v_absolute := p_offset + v_patch_offset;
+        v_chunk_no := (v_absolute / 65536)::integer;
+        v_chunk_start := v_chunk_no::bigint * 65536;
+        v_within := (v_absolute - v_chunk_start)::integer;
+        v_write_size := least(
+            octet_length(p_content) - v_patch_offset,
+            65536 - v_within);
+        v_target_size := least(
+            65536, v_logical_size - v_chunk_start)::integer;
+        IF v_within = 0 AND v_write_size = v_target_size THEN
+            v_chunk := substring(
+                p_content FROM v_patch_offset + 1 FOR v_write_size);
+        ELSE
+            v_chunk := _vexfs.read_staging_chunk(
+                p_handle, v_chunk_no, v_target_size);
+            v_chunk := _vexfs.overlay_bytes(
+                v_chunk,
+                v_within,
+                substring(p_content FROM v_patch_offset + 1 FOR v_write_size));
+        END IF;
+        INSERT INTO _vexfs.handle_staging_chunks(handle_id, chunk_no, content)
+        VALUES (p_handle, v_chunk_no, v_chunk)
+        ON CONFLICT (handle_id, chunk_no) DO UPDATE
+            SET content = excluded.content;
+        v_patch_offset := v_patch_offset + v_write_size;
+    END LOOP;
+
     v_generation := v_handle.dirty_generation + 1;
+    UPDATE _vexfs.handle_staging
+       SET generation = v_generation,
+           logical_size = v_logical_size,
+           dirty_bytes = (
+               SELECT coalesce(sum(octet_length(dirty.content)), 0)
+                 FROM _vexfs.handle_staging_chunks AS dirty
+                WHERE dirty.handle_id = p_handle),
+           updated_at = clock_timestamp()
+     WHERE handle_id = p_handle;
     UPDATE _vexfs.handles
-       SET staging = v_staging,
-           dirty_generation = v_generation,
+       SET dirty_generation = v_generation,
            lease_until = clock_timestamp() + interval '30 seconds',
            updated_at = clock_timestamp()
      WHERE handle_id = p_handle;
@@ -3506,11 +4294,14 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_handle _vexfs.handles%ROWTYPE;
+    v_staging _vexfs.handle_staging%ROWTYPE;
     v_hash text;
     v_cached text;
     v_generation bigint;
-    v_staging bytea;
-    v_current_size bigint;
+    v_remainder integer;
+    v_boundary_chunk integer;
+    v_current_chunk_size integer;
+    v_chunk bytea;
 BEGIN
     IF p_size < 0 OR p_size > 134217728 THEN
         RAISE EXCEPTION 'VEXFS_INVALID_SIZE: staged file must be 0..128 MiB'
@@ -3529,21 +4320,56 @@ BEGIN
     IF v_cached IS NOT NULL THEN
         RETURN v_cached::bigint;
     END IF;
-    v_current_size := octet_length(v_handle.staging);
-    IF p_size <= v_current_size THEN
-        v_staging := substring(v_handle.staging FROM 1 FOR p_size::integer);
-    ELSIF p_size = 0 THEN
-        v_staging := ''::bytea;
-    ELSE
-        v_staging := _vexfs.overlay_bytes(
-            v_handle.staging, p_size - 1, decode('00', 'hex'));
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
+            USING ERRCODE = 'P0002';
+    END IF;
+    IF p_size = v_staging.logical_size THEN
+        PERFORM _vexfs.replay_put(
+            v_handle.workspace_id, p_request_id, 'handle_truncate',
+            v_hash, v_handle.dirty_generation::text);
+        RETURN v_handle.dirty_generation;
     END IF;
     PERFORM _vexfs.enforce_quota(
         v_handle.workspace_id, v_handle.inode_id, p_size);
+
+    IF p_size < v_staging.logical_size THEN
+        v_remainder := (p_size % 65536)::integer;
+        v_boundary_chunk := (p_size / 65536)::integer;
+        IF v_remainder > 0 THEN
+            v_current_chunk_size := least(
+                65536,
+                v_staging.logical_size - v_boundary_chunk::bigint * 65536)::integer;
+            v_chunk := _vexfs.read_staging_chunk(
+                p_handle, v_boundary_chunk, v_current_chunk_size);
+            v_chunk := substring(v_chunk FROM 1 FOR v_remainder);
+            INSERT INTO _vexfs.handle_staging_chunks(handle_id, chunk_no, content)
+            VALUES (p_handle, v_boundary_chunk, v_chunk)
+            ON CONFLICT (handle_id, chunk_no) DO UPDATE
+                SET content = excluded.content;
+        END IF;
+        DELETE FROM _vexfs.handle_staging_chunks AS dirty
+         WHERE dirty.handle_id = p_handle
+           AND dirty.chunk_no >= ((p_size + 65535) / 65536)::integer;
+    END IF;
+
     v_generation := v_handle.dirty_generation + 1;
+    UPDATE _vexfs.handle_staging
+       SET generation = v_generation,
+           base_visible_size = least(base_visible_size, p_size),
+           logical_size = p_size,
+           dirty_bytes = (
+               SELECT coalesce(sum(octet_length(dirty.content)), 0)
+                 FROM _vexfs.handle_staging_chunks AS dirty
+                WHERE dirty.handle_id = p_handle),
+           updated_at = clock_timestamp()
+     WHERE handle_id = p_handle;
     UPDATE _vexfs.handles
-       SET staging = v_staging,
-           dirty_generation = v_generation,
+       SET dirty_generation = v_generation,
            lease_until = clock_timestamp() + interval '30 seconds',
            updated_at = clock_timestamp()
      WHERE handle_id = p_handle;
@@ -3566,7 +4392,6 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_handle _vexfs.handles%ROWTYPE;
-    v_content bytea;
     v_version bigint;
 BEGIN
     IF p_offset < 0 OR p_length < 0
@@ -3584,13 +4409,14 @@ BEGIN
           FROM _vexfs.inodes AS i
          WHERE i.workspace_id = v_handle.workspace_id
            AND i.inode_id = v_handle.inode_id;
-        v_content := CASE WHEN v_version = 0 THEN ''::bytea ELSE
-            _vexfs.read_version_content(
-                v_handle.workspace_id, v_handle.inode_id, v_version) END;
-    ELSE
-        v_content := v_handle.staging;
+        IF v_version = 0 THEN
+            RETURN ''::bytea;
+        END IF;
+        RETURN _vexfs.read_version_range(
+            v_handle.workspace_id, v_handle.inode_id, v_version,
+            p_offset, p_length);
     END IF;
-    RETURN substring(v_content FROM (p_offset + 1)::integer FOR p_length::integer);
+    RETURN _vexfs.read_staging_range(p_handle, p_offset, p_length);
 END;
 $$;
 
@@ -3607,6 +4433,7 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_handle _vexfs.handles%ROWTYPE;
+    v_staging _vexfs.handle_staging%ROWTYPE;
     v_hash text;
     v_cached text;
     v_current_version bigint;
@@ -3620,6 +4447,7 @@ DECLARE
     v_checksum text;
     v_commit bigint;
     v_principal_oid oid;
+    v_content bytea;
 BEGIN
     IF p_durability NOT IN ('none', 'data', 'full') THEN
         RAISE EXCEPTION 'VEXFS_INVALID_DURABILITY: use none, data, or full'
@@ -3651,6 +4479,22 @@ BEGIN
             v_handle.dirty_generation, p_generation
             USING ERRCODE = '40001';
     END IF;
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle
+     FOR UPDATE;
+    IF NOT FOUND OR v_staging.generation <> p_generation THEN
+        RAISE EXCEPTION 'VEXFS_STALE_GENERATION: staging generation does not match %',
+            p_generation USING ERRCODE = '40001';
+    END IF;
+    -- Assemble and validate the candidate before taking the workspace row lock.
+    -- The handle/staging row locks keep this generation stable while other
+    -- files in the same workspace continue to make progress.
+    v_content := _vexfs.read_staging_content(p_handle);
+    IF octet_length(v_content) <> v_staging.logical_size THEN
+        RAISE EXCEPTION 'VEXFS_CORRUPT: staged content size does not match metadata'
+            USING ERRCODE = 'XX001';
+    END IF;
     PERFORM pg_catalog.set_config(
         'synchronous_commit',
         CASE p_durability WHEN 'none' THEN 'off'
@@ -3675,7 +4519,7 @@ BEGIN
         v_version := public.vexfs_write(
             (SELECT w.name FROM _vexfs.workspaces AS w
               WHERE w.workspace_id = v_handle.workspace_id),
-            v_handle.path, v_handle.staging);
+            v_handle.path, v_content);
         v_inode := _vexfs.resolve_path(v_handle.workspace_id, v_handle.path);
         UPDATE _vexfs.inodes
            SET mode = coalesce(v_handle.create_mode, 420),
@@ -3697,33 +4541,37 @@ BEGIN
             v_version := public.vexfs_write(
                 (SELECT w.name FROM _vexfs.workspaces AS w
                   WHERE w.workspace_id = v_handle.workspace_id),
-                v_path, v_handle.staging);
+                v_path, v_content);
         ELSE
             -- POSIX keeps an unlinked file alive while an open descriptor still
             -- references its inode. Publish the new version without recreating
             -- a directory entry; the inode is reaped after the final handle closes.
             PERFORM _vexfs.enforce_quota(
                 v_handle.workspace_id, v_handle.inode_id,
-                octet_length(v_handle.staging));
+                v_staging.logical_size);
             SELECT coalesce(max(version.version_no), 0) + 1
               INTO v_version
               FROM _vexfs.file_versions AS version
              WHERE version.workspace_id = v_handle.workspace_id
                AND version.inode_id = v_handle.inode_id;
-            SELECT storage.manifest_id INTO v_previous_manifest
-              FROM _vexfs.resolve_version_storage(
-                  v_handle.workspace_id, v_handle.inode_id,
-                  v_current_version) AS storage;
+            IF v_current_version > 0 THEN
+                SELECT storage.manifest_id INTO v_previous_manifest
+                  FROM _vexfs.resolve_version_storage(
+                      v_handle.workspace_id, v_handle.inode_id,
+                      v_current_version) AS storage;
+            ELSE
+                v_previous_manifest := NULL;
+            END IF;
             UPDATE _vexfs.inodes
-               SET current_version = v_version,
-                   size_bytes = octet_length(v_handle.staging),
+                   SET current_version = v_version,
+                   size_bytes = v_staging.logical_size,
                    modified_at = clock_timestamp(),
                    changed_at = clock_timestamp()
              WHERE workspace_id = v_handle.workspace_id
                AND inode_id = v_handle.inode_id;
             v_manifest := _vexfs.store_manifest(
                 v_handle.workspace_id, v_handle.inode_id,
-                v_previous_manifest, v_handle.staging);
+                v_previous_manifest, v_content);
             SELECT manifest.checksum INTO STRICT v_checksum
               FROM _vexfs.manifests AS manifest
              WHERE manifest.manifest_id = v_manifest;
@@ -3742,10 +4590,15 @@ BEGIN
                 size_bytes, checksum, created_by_oid, created_by)
             VALUES (
                 v_handle.workspace_id, v_handle.inode_id, v_version,
-                v_commit, v_manifest, octet_length(v_handle.staging),
+                v_commit, v_manifest, v_staging.logical_size,
                 v_checksum, v_principal_oid, session_user);
         END IF;
         v_inode := v_handle.inode_id;
+    END IF;
+    IF v_manifest IS NULL THEN
+        SELECT storage.manifest_id INTO v_manifest
+          FROM _vexfs.resolve_version_storage(
+              v_handle.workspace_id, v_inode, v_version) AS storage;
     END IF;
     UPDATE _vexfs.handles
        SET inode_id = v_inode,
@@ -3754,6 +4607,17 @@ BEGIN
            published_generation = p_generation,
            lease_until = clock_timestamp() + interval '30 seconds',
            updated_at = clock_timestamp()
+     WHERE handle_id = p_handle;
+    UPDATE _vexfs.handle_staging
+       SET generation = p_generation,
+           base_manifest_id = v_manifest,
+           base_size = v_staging.logical_size,
+           base_visible_size = v_staging.logical_size,
+           logical_size = v_staging.logical_size,
+           dirty_bytes = 0,
+           updated_at = clock_timestamp()
+     WHERE handle_id = p_handle;
+    DELETE FROM _vexfs.handle_staging_chunks
      WHERE handle_id = p_handle;
     PERFORM _vexfs.replay_put(
         v_handle.workspace_id, p_request_id, 'handle_publish',
@@ -3774,10 +4638,12 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_handle _vexfs.handles%ROWTYPE;
+    v_staging _vexfs.handle_staging%ROWTYPE;
     v_hash text;
     v_cached text;
     v_current_version bigint;
-    v_current bytea;
+    v_current_size bigint;
+    v_manifest bigint;
     v_generation bigint;
     v_version bigint;
     v_publish_request text;
@@ -3801,16 +4667,23 @@ BEGIN
     IF v_cached IS NOT NULL THEN
         RETURN v_cached::bigint;
     END IF;
-    PERFORM 1 FROM _vexfs.workspaces
-     WHERE workspace_id = v_handle.workspace_id FOR UPDATE;
+    SELECT * INTO v_staging
+      FROM _vexfs.handle_staging AS staging
+     WHERE staging.handle_id = p_handle
+     FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
+            USING ERRCODE = 'P0002';
+    END IF;
     IF v_handle.inode_id IS NULL THEN
-        v_current := v_handle.staging;
+        v_current_size := v_staging.logical_size;
     ELSE
         IF v_handle.dirty_generation <> v_handle.published_generation THEN
             RAISE EXCEPTION 'VEXFS_DIRTY_HANDLE: append requires a clean handle'
                 USING ERRCODE = '55006';
         END IF;
-        SELECT i.current_version INTO v_current_version
+        SELECT i.current_version, i.size_bytes
+          INTO v_current_version, v_current_size
           FROM _vexfs.inodes AS i
          WHERE i.workspace_id = v_handle.workspace_id
            AND i.inode_id = v_handle.inode_id
@@ -3820,29 +4693,36 @@ BEGIN
             RAISE EXCEPTION 'VEXFS_VERSION_CONFLICT: open inode is unavailable'
                 USING ERRCODE = '40001';
         END IF;
-        v_current := _vexfs.read_version_content(
-            v_handle.workspace_id, v_handle.inode_id, v_current_version);
+        IF v_current_version > 0 THEN
+            SELECT storage.manifest_id INTO v_manifest
+              FROM _vexfs.resolve_version_storage(
+                  v_handle.workspace_id, v_handle.inode_id,
+                  v_current_version) AS storage;
+        ELSE
+            v_manifest := NULL;
+        END IF;
         UPDATE _vexfs.handles
            SET expected_version = v_current_version,
-               staging = v_current,
+               updated_at = clock_timestamp()
+         WHERE handle_id = p_handle;
+        DELETE FROM _vexfs.handle_staging_chunks
+         WHERE handle_id = p_handle;
+        UPDATE _vexfs.handle_staging
+           SET generation = v_handle.published_generation,
+               base_manifest_id = v_manifest,
+               base_size = v_current_size,
+               base_visible_size = v_current_size,
+               logical_size = v_current_size,
+               dirty_bytes = 0,
                updated_at = clock_timestamp()
          WHERE handle_id = p_handle;
     END IF;
-    IF octet_length(v_current) + octet_length(p_content) > 134217728 THEN
-        RAISE EXCEPTION 'VEXFS_FILE_TOO_LARGE: appended file exceeds 128 MiB'
-            USING ERRCODE = '54000';
-    END IF;
-    PERFORM _vexfs.enforce_quota(
-        v_handle.workspace_id, v_handle.inode_id,
-        octet_length(v_current) + octet_length(p_content));
-    v_generation := greatest(
-        v_handle.dirty_generation, v_handle.published_generation) + 1;
-    UPDATE _vexfs.handles
-       SET staging = v_current || p_content,
-           dirty_generation = v_generation,
-           lease_until = clock_timestamp() + interval '30 seconds',
-           updated_at = clock_timestamp()
-     WHERE handle_id = p_handle;
+    v_generation := public.vexfs_handle_stage_write(
+        p_handle,
+        v_current_size,
+        p_content,
+        'append-stage:' || coalesce(
+            nullif(p_request_id, ''), _vexfs.random_token('request')));
     v_publish_request := 'append-publish:' || coalesce(
         nullif(p_request_id, ''), _vexfs.random_token('request'));
     v_version := public.vexfs_handle_publish(
@@ -3893,10 +4773,346 @@ BEGIN
     UPDATE _vexfs.handles
        SET state = 'closed',
            lease_until = clock_timestamp(),
-           staging = ''::bytea,
            updated_at = clock_timestamp()
      WHERE handle_id = p_handle;
+    DELETE FROM _vexfs.handle_staging
+     WHERE handle_id = p_handle;
     PERFORM _vexfs.reap_orphan_inodes(v_handle.workspace_id);
+    RETURN v_version;
+END;
+$$;
+
+-- Publish every dirty handle owned by one mount session in a single database
+-- transaction.  The NFS idle flusher uses this to turn many small UNSTABLE
+-- writes into durable file versions without one libpq round trip per file.
+CREATE FUNCTION public.vexfs_mount_publish_close_all(
+    p_workspace text,
+    p_session_id text,
+    p_durability text DEFAULT 'none',
+    p_limit bigint DEFAULT 0)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_actor oid;
+    v_handle record;
+    v_count bigint := 0;
+BEGIN
+    IF p_durability NOT IN ('none', 'data', 'full') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_DURABILITY: use none, data, or full'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_session_id IS NULL OR p_session_id = '' THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SESSION: session id is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_limit < 0 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_LIMIT: limit must be zero or positive'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.mount_sessions AS mounted
+         WHERE mounted.workspace_id = v_workspace.workspace_id
+           AND mounted.session_id = p_session_id
+           AND mounted.owner_oid = v_actor
+           AND mounted.lease_until > clock_timestamp()) THEN
+        RAISE EXCEPTION 'VEXFS_SESSION_STALE: mount session is not active'
+            USING ERRCODE = '55006';
+    END IF;
+
+    FOR v_handle IN
+        SELECT handle.handle_id, handle.dirty_generation
+          FROM _vexfs.handles AS handle
+         WHERE handle.workspace_id = v_workspace.workspace_id
+           AND handle.owner_oid = v_actor
+           AND handle.session_id = p_session_id
+           AND handle.state = 'open'
+           AND handle.dirty_generation > handle.published_generation
+         ORDER BY handle.handle_id
+         LIMIT NULLIF(p_limit, 0)
+    LOOP
+        PERFORM public.vexfs_handle_publish_close(
+            v_handle.handle_id, v_handle.dirty_generation, p_durability);
+        v_count := v_count + 1;
+    END LOOP;
+    RETURN v_count;
+END;
+$$;
+
+-- Publish an exact generation snapshot selected by the gateway. This avoids a
+-- race where a newly opened handle sorts ahead of the gateway's local batch
+-- after RuntimeState has released its mutex. The whole bounded batch remains
+-- atomic, while generation checks prevent a later write from being cleared.
+CREATE FUNCTION public.vexfs_mount_publish_close_claimed(
+    p_workspace text,
+    p_session_id text,
+    p_durability text,
+    p_claims jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_actor oid;
+    v_claim jsonb;
+    v_handle text;
+    v_generation bigint;
+    v_version bigint;
+    v_owned _vexfs.handles%ROWTYPE;
+    v_seen text[] := ARRAY[]::text[];
+    v_result jsonb := '[]'::jsonb;
+BEGIN
+    IF p_durability NOT IN ('none', 'data', 'full') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_DURABILITY: use none, data, or full'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_session_id IS NULL OR p_session_id = '' THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SESSION: session id is required'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_claims IS NULL OR jsonb_typeof(p_claims) <> 'array'
+       OR jsonb_array_length(p_claims) < 1
+       OR jsonb_array_length(p_claims) > 64 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_BATCH: claims must contain 1..64 handles'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.mount_sessions AS mounted
+         WHERE mounted.workspace_id = v_workspace.workspace_id
+           AND mounted.session_id = p_session_id
+           AND mounted.owner_oid = v_actor
+           AND mounted.lease_until > clock_timestamp()) THEN
+        RAISE EXCEPTION 'VEXFS_SESSION_STALE: mount session is not active'
+            USING ERRCODE = '55006';
+    END IF;
+
+    FOR v_claim IN SELECT value FROM jsonb_array_elements(p_claims) LOOP
+        IF jsonb_typeof(v_claim) <> 'object'
+           OR NOT v_claim ? 'handle'
+           OR NOT v_claim ? 'generation' THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_BATCH: claim requires handle and generation'
+                USING ERRCODE = '22023';
+        END IF;
+        v_handle := v_claim->>'handle';
+        BEGIN
+            v_generation := (v_claim->>'generation')::bigint;
+        EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_BATCH: claim generation is invalid'
+                USING ERRCODE = '22023';
+        END;
+        IF v_handle IS NULL OR v_handle = '' OR v_generation < 0
+           OR v_handle = ANY(v_seen) THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_BATCH: claim is empty or duplicated'
+                USING ERRCODE = '22023';
+        END IF;
+        SELECT * INTO v_owned
+          FROM _vexfs.handles AS handle
+         WHERE handle.handle_id = v_handle
+           AND handle.workspace_id = v_workspace.workspace_id
+           AND handle.owner_oid = v_actor
+           AND handle.session_id = p_session_id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VEXFS_HANDLE_NOT_FOUND: claimed handle is unavailable'
+                USING ERRCODE = 'P0002';
+        END IF;
+        IF v_owned.state = 'closed'
+           AND v_generation <= v_owned.published_generation THEN
+            v_seen := array_append(v_seen, v_handle);
+            v_result := v_result || jsonb_build_array(jsonb_build_object(
+                'handle', v_handle,
+                'generation', v_generation,
+                'version', v_owned.expected_version));
+            CONTINUE;
+        END IF;
+        IF v_owned.state <> 'open'
+           OR v_owned.dirty_generation <> v_generation
+           OR v_owned.dirty_generation <= v_owned.published_generation THEN
+            RAISE EXCEPTION 'VEXFS_STALE_GENERATION: claimed handle changed before publish'
+                USING ERRCODE = '40001';
+        END IF;
+        v_seen := array_append(v_seen, v_handle);
+        v_version := public.vexfs_handle_publish_close(
+            v_handle, v_generation, p_durability);
+        v_result := v_result || jsonb_build_array(jsonb_build_object(
+            'handle', v_handle,
+            'generation', v_generation,
+            'version', v_version));
+    END LOOP;
+    RETURN v_result;
+END;
+$$;
+
+-- NFS FILE_SYNC writes must be durable before the RPC returns. Apply the range
+-- directly to the current manifest so the remote mount pays for one libpq
+-- round trip and PG only materializes the affected 64 KiB chunks.
+CREATE FUNCTION public.vexfs_write_range(
+    p_workspace text,
+    p_path text,
+    p_offset bigint,
+    p_content bytea,
+    p_request_id text,
+    p_session_id text,
+    p_durability text DEFAULT 'full')
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_actor oid;
+    v_hash text;
+    v_cached text;
+    v_inode bigint;
+    v_kind text;
+    v_current_version bigint;
+    v_version bigint;
+    v_previous_manifest bigint;
+    v_previous_size bigint;
+    v_manifest bigint;
+    v_checksum text;
+    v_new_size bigint;
+    v_commit bigint;
+    v_parent bigint;
+BEGIN
+    IF p_content IS NULL THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_CONTENT: content cannot be null'
+            USING ERRCODE = '22004';
+    END IF;
+    IF p_offset < 0 OR p_offset > 134217728
+       OR p_offset + octet_length(p_content) > 134217728 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RANGE: write exceeds 128 MiB'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_durability NOT IN ('none', 'data', 'full') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_DURABILITY: use none, data, or full'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+    IF p_session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM _vexfs.mount_sessions AS mounted
+         WHERE mounted.workspace_id = v_workspace.workspace_id
+           AND mounted.session_id = p_session_id
+           AND mounted.owner_oid = v_actor
+           AND mounted.lease_until > clock_timestamp()) THEN
+        RAISE EXCEPTION 'VEXFS_SESSION_STALE: mount session is not active'
+            USING ERRCODE = '55006';
+    END IF;
+    v_hash := _vexfs.request_digest(jsonb_build_object(
+        'path', p_path,
+        'offset', p_offset,
+        'content_size', octet_length(p_content),
+        'content_checksum', encode(pg_catalog.sha256(p_content), 'hex'),
+        'session', p_session_id,
+        'durability', p_durability));
+    PERFORM _vexfs.lock_request(v_workspace.workspace_id, p_request_id);
+    v_cached := _vexfs.replay_get(
+        v_workspace.workspace_id, p_request_id, 'write_range', v_hash);
+    IF v_cached IS NOT NULL THEN
+        RETURN v_cached::bigint;
+    END IF;
+
+    PERFORM pg_catalog.set_config(
+        'synchronous_commit',
+        CASE p_durability WHEN 'none' THEN 'off'
+                          WHEN 'data' THEN 'local'
+                          ELSE 'on' END,
+        true);
+    PERFORM 1 FROM _vexfs.workspaces
+     WHERE workspace_id = v_workspace.workspace_id FOR UPDATE;
+    v_inode := _vexfs.resolve_path(v_workspace.workspace_id, p_path);
+    SELECT inode.kind, inode.current_version
+      INTO STRICT v_kind, v_current_version
+      FROM _vexfs.inodes AS inode
+     WHERE inode.workspace_id = v_workspace.workspace_id
+       AND inode.inode_id = v_inode
+       AND inode.live
+     FOR UPDATE;
+    IF v_kind <> 'file' THEN
+        RAISE EXCEPTION 'VEXFS_NOT_REGULAR_FILE: %', p_path
+            USING ERRCODE = '42809';
+    END IF;
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_inode, 'write');
+    SELECT parent.parent_inode INTO v_parent
+      FROM _vexfs.resolve_parent(
+          v_workspace.workspace_id, p_path) AS parent;
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_parent, 'write');
+
+    -- POSIX zero-byte writes do not change file contents or create a version.
+    IF octet_length(p_content) = 0 THEN
+        PERFORM _vexfs.replay_put(
+            v_workspace.workspace_id, p_request_id, 'write_range', v_hash,
+            v_current_version::text);
+        RETURN v_current_version;
+    END IF;
+
+    SELECT storage.manifest_id, storage.size_bytes
+      INTO v_previous_manifest, v_previous_size
+      FROM _vexfs.resolve_version_storage(
+          v_workspace.workspace_id, v_inode, v_current_version) AS storage;
+    v_new_size := greatest(v_previous_size, p_offset + octet_length(p_content));
+    PERFORM _vexfs.enforce_quota(
+        v_workspace.workspace_id, v_inode, v_new_size);
+    SELECT coalesce(max(version.version_no), 0) + 1
+      INTO v_version
+      FROM _vexfs.file_versions AS version
+     WHERE version.workspace_id = v_workspace.workspace_id
+       AND version.inode_id = v_inode;
+    v_manifest := _vexfs.store_manifest_range(
+        v_workspace.workspace_id, v_inode, v_previous_manifest,
+        v_previous_size, p_offset, p_content);
+    SELECT manifest.checksum INTO STRICT v_checksum
+      FROM _vexfs.manifests AS manifest
+     WHERE manifest.manifest_id = v_manifest;
+    v_commit := _vexfs.record_commit(
+        v_workspace.workspace_id, 'write_range', p_path, v_inode,
+        jsonb_build_object(
+            'before_version', v_current_version,
+            'after_version', v_version,
+            'offset', p_offset,
+            'length', octet_length(p_content)));
+    INSERT INTO _vexfs.file_versions(
+        workspace_id, inode_id, version_no, commit_no, manifest_id,
+        size_bytes, checksum, created_by_oid, created_by)
+    VALUES (
+        v_workspace.workspace_id, v_inode, v_version, v_commit, v_manifest,
+        v_new_size, v_checksum, v_actor, session_user);
+    UPDATE _vexfs.inodes
+       SET current_version = v_version,
+           size_bytes = v_new_size,
+           modified_at = clock_timestamp(),
+           changed_at = clock_timestamp()
+     WHERE workspace_id = v_workspace.workspace_id
+       AND inode_id = v_inode;
+    UPDATE _vexfs.inodes
+       SET modified_at = clock_timestamp(),
+           changed_at = clock_timestamp()
+     WHERE workspace_id = v_workspace.workspace_id
+       AND inode_id = v_parent;
+    PERFORM _vexfs.replay_put(
+        v_workspace.workspace_id, p_request_id, 'write_range', v_hash,
+        v_version::text);
     RETURN v_version;
 END;
 $$;
@@ -3946,10 +5162,12 @@ BEGIN
            lease_until = CASE WHEN v_state = 'retained'
                THEN clock_timestamp() + interval '24 hours'
                ELSE clock_timestamp() END,
-           staging = CASE WHEN v_state = 'retained'
-               THEN staging ELSE ''::bytea END,
            updated_at = clock_timestamp()
      WHERE handle_id = p_handle;
+    IF v_state = 'closed' THEN
+        DELETE FROM _vexfs.handle_staging
+         WHERE handle_id = p_handle;
+    END IF;
     PERFORM _vexfs.reap_orphan_inodes(v_handle.workspace_id);
     PERFORM _vexfs.replay_put(
         v_handle.workspace_id, p_request_id, 'handle_close', v_hash, v_state);
@@ -4229,10 +5447,11 @@ BEGIN
     SELECT count(*) FILTER (
                WHERE handle.dirty_generation > handle.published_generation),
            count(*) FILTER (WHERE handle.state = 'retained'),
-           coalesce(sum(octet_length(handle.staging)) FILTER (
+           coalesce(sum(staging.dirty_bytes) FILTER (
                WHERE handle.state IN ('open', 'retained')), 0)
       INTO v_pending, v_retained, v_staging_bytes
       FROM _vexfs.handles AS handle
+      LEFT JOIN _vexfs.handle_staging AS staging USING (handle_id)
      WHERE handle.workspace_id = v_workspace.workspace_id;
     RETURN jsonb_build_object(
         'schema_version', public.vexfs_contract_version(),
@@ -6945,10 +8164,20 @@ BEGIN
        AND f.inode_id = i.inode_id
        AND f.version_no = i.current_version
      WHERE i.workspace_id = v_workspace.workspace_id
-       AND ((i.kind <> 'directory' AND (
-                i.current_version < 1
-                OR f.version_no IS NULL
-                OR i.size_bytes IS DISTINCT FROM f.size_bytes))
+       AND ((i.kind <> 'directory'
+             AND NOT (
+                 i.kind = 'file'
+                 AND i.current_version = 0
+                 AND i.size_bytes = 0
+                 AND EXISTS (
+                     SELECT 1 FROM _vexfs.handles AS pending
+                      WHERE pending.workspace_id = i.workspace_id
+                        AND pending.inode_id = i.inode_id
+                        AND pending.state IN ('open', 'retained')
+                        AND pending.dirty_generation > pending.published_generation))
+             AND (i.current_version < 1
+                  OR f.version_no IS NULL
+                  OR i.size_bytes IS DISTINCT FROM f.size_bytes))
             OR (i.kind = 'directory' AND i.current_version <> 0));
     IF v_bad <> 0 THEN
         v_issues := v_issues || jsonb_build_array(jsonb_build_object(
@@ -7065,6 +8294,51 @@ BEGIN
         v_issues := v_issues || jsonb_build_array(jsonb_build_object(
             'code', 'orphan_chunk', 'count', v_bad,
             'message', 'chunk is not referenced by a manifest'));
+    END IF;
+
+    -- Writable handles are mutable state, but their overlay still has strict
+    -- invariants.  Check them here so a damaged dirty chunk cannot remain
+    -- invisible until the next publish attempt.
+    SELECT count(*) INTO v_bad
+      FROM _vexfs.handles AS handle
+      LEFT JOIN _vexfs.handle_staging AS staging
+        ON staging.handle_id = handle.handle_id
+      LEFT JOIN _vexfs.manifests AS base
+        ON base.manifest_id = staging.base_manifest_id
+     WHERE handle.workspace_id = v_workspace.workspace_id
+       AND (
+           (handle.state IN ('open', 'retained')
+            AND position('w' IN handle.flags) > 0
+            AND staging.handle_id IS NULL)
+           OR (staging.handle_id IS NOT NULL
+               AND (handle.state = 'closed'
+                    OR position('w' IN handle.flags) = 0
+                    OR staging.generation <> handle.dirty_generation
+                    OR staging.dirty_bytes IS DISTINCT FROM (
+                        SELECT coalesce(sum(octet_length(dirty.content)), 0)
+                          FROM _vexfs.handle_staging_chunks AS dirty
+                         WHERE dirty.handle_id = staging.handle_id)
+                    OR (staging.base_manifest_id IS NULL
+                        AND staging.base_size <> 0)
+                    OR (staging.base_manifest_id IS NOT NULL
+                        AND (base.manifest_id IS NULL
+                             OR base.workspace_id <> handle.workspace_id
+                             OR base.inode_id IS DISTINCT FROM handle.inode_id
+                             OR base.file_size <> staging.base_size))
+                    OR EXISTS (
+                        SELECT 1
+                          FROM _vexfs.handle_staging_chunks AS dirty
+                         WHERE dirty.handle_id = staging.handle_id
+                           AND (dirty.chunk_no::bigint * 65536 >= staging.logical_size
+                                OR octet_length(dirty.content) <>
+                                   least(
+                                       65536::bigint,
+                                       staging.logical_size
+                                           - dirty.chunk_no::bigint * 65536))))));
+    IF v_bad <> 0 THEN
+        v_issues := v_issues || jsonb_build_array(jsonb_build_object(
+            'code', 'handle_staging', 'count', v_bad,
+            'message', 'writable handle staging metadata or dirty chunks are invalid'));
     END IF;
 
     SELECT count(*) INTO v_bad
