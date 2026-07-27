@@ -4,7 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 PYTHON="$ROOT/tests/eval/vexfs/python.sh"
 PG_CONTAINER="${VEXDB_PG_CONTAINER:-vexdb_pg19-test}"
-DSN="${VEXDB_PG_DSN:-postgresql://postgres@127.0.0.1:5433/test}"
+PG_DATABASE="${VEXDB_PG_DATABASE:-test}"
+DSN="${VEXDB_PG_DSN:-postgresql://postgres@127.0.0.1:5433/$PG_DATABASE}"
 MOUNT_CLI="${VEXFS_EVAL_MOUNT_CLI:-$HOME/.local/bin/vexdb}"
 BUILD_DIR="${VEXFS_MACOS_PG_BUILD_DIR:-$ROOT/vexdb_sqlite/build}"
 OUTPUT="${VEXFS_MACOS_PG_OUTPUT:-$BUILD_DIR/eval/vexfs-pg-macos-mount}"
@@ -19,7 +20,7 @@ cleanup_pg_workspaces() {
     for workspace in conformance timestamps append open-life read-life locks \
         force-unmount eval posix perf git-eval toolchains mount-scale opencode \
         pg-shared-local scale-read external-cache; do
-        docker exec "$PG_CONTAINER" psql -U postgres -d test -X -q \
+        docker exec "$PG_CONTAINER" psql -U postgres -d "$PG_DATABASE" -X -q \
             -v ON_ERROR_STOP=1 \
             -c "SELECT vexfs_workspace_drop('$workspace', true);" \
             >/dev/null 2>&1 || true

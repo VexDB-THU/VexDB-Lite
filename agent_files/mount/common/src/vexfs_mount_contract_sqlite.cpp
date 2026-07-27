@@ -2493,6 +2493,36 @@ extern "C" vexfs_mount_status vexfs_mount_handle_publish_close(
     });
 }
 
+extern "C" vexfs_mount_status vexfs_mount_handle_publish_close_background(
+    vexfs_mount_session *session, const char *handle, int64_t generation,
+    const char *durability, int64_t *version, vexfs_mount_error *error) {
+#if defined(VEXFS_HAVE_LIBPQ)
+    return GuardPublisher(session, error, [&] {
+        if (handle == nullptr || durability == nullptr || version == nullptr) {
+            throw CallError(kPgInvalidArgument,
+                            "handle, durability and version output are required",
+                            VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        Call call(session->publisher_pg,
+                  "SELECT vexfs_handle_publish_close(?1,?2,?3)");
+        call.Text(1, handle);
+        call.Int64(2, generation);
+        call.Text(3, durability);
+        call.Row();
+        *version = call.ResultInt64();
+    });
+#else
+    (void)session;
+    (void)handle;
+    (void)generation;
+    (void)durability;
+    (void)version;
+    return SetError(error, kUnsupportedBackend,
+                    "background publisher requires PostgreSQL",
+                    VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+#endif
+}
+
 extern "C" vexfs_mount_status vexfs_mount_handle_close(
     vexfs_mount_session *session, const char *handle, int retain_unpublished,
     const char *request_id, vexfs_mount_bytes *state, vexfs_mount_error *error) {

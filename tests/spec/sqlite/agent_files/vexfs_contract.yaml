@@ -206,9 +206,10 @@ steps:
 - query: SELECT json_array_length(json_extract(vexfs_snapshot_diff('default', 'spec-baseline', 'HEAD'), '$.changes'));
   expect:
   - - 0
-- query: SELECT json_extract(vexfs_stat('default', '/notes/hello.txt'), '$.checksum');
+- query: SELECT length(json_extract(vexfs_stat('default', '/notes/hello.txt'), '$.checksum')), json_extract(vexfs_stat('default', '/notes/hello.txt'), '$.checksum') <> '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824';
   expect:
-  - - 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+  - - 64
+    - 1
 - query: SELECT json_extract(vexfs_check('default', 1), '$.ok'), json_extract(vexfs_check('default', 1), '$.mode'), json_extract(vexfs_check('default', 1), '$.issue_count');
   expect:
   - - 1

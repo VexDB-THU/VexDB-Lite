@@ -1379,7 +1379,8 @@ SELECT id,chunk_no,size,checksum,length(content) FROM package.chunks
 WHERE source_manifest=?1 ORDER BY chunk_no
 )SQL");
         chunks.Int64(1, source_manifest);
-        vexfs::Sha256 file_hash;
+        std::vector<vexfs::ManifestChunkChecksum> manifest_chunks;
+        manifest_chunks.reserve(static_cast<size_t>(expected_chunks));
         sqlite3_int64 total = 0;
         sqlite3_int64 chunk_no = 0;
         while (chunks.Row()) {
@@ -1410,17 +1411,20 @@ WHERE source_manifest=?1 ORDER BY chunk_no
                     throw Error("cannot read archive chunk BLOB");
                 }
                 chunk_hash.Update(buffer.data(), static_cast<size_t>(amount));
-                file_hash.Update(buffer.data(), static_cast<size_t>(amount));
                 offset += amount;
             }
             if (vexfs::Hex(chunk_hash.Finish()) != chunk_checksum) {
                 throw Error("archive chunk checksum mismatch");
             }
+            manifest_chunks.push_back({
+                static_cast<uint64_t>(chunk_size), chunk_checksum});
             total += chunk_size;
             ++chunk_no;
         }
         if (total != expected_size || chunk_no != expected_chunks ||
-            vexfs::Hex(file_hash.Finish()) != expected_checksum) {
+            vexfs::ManifestChecksum(
+                static_cast<uint64_t>(expected_size), 65536, manifest_chunks) !=
+                expected_checksum) {
             throw Error("archive content checksum mismatch");
         }
         info.content_bytes += expected_size;

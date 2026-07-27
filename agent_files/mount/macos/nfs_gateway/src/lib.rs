@@ -252,6 +252,14 @@ extern "C" {
         version: *mut i64,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
+    fn vexfs_mount_handle_publish_close_background(
+        session: *mut RuntimeSessionOpaque,
+        handle: *const c_char,
+        generation: i64,
+        durability: *const c_char,
+        version: *mut i64,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
     fn vexfs_mount_handle_close(
         session: *mut RuntimeSessionOpaque,
         handle: *const c_char,
@@ -271,13 +279,6 @@ extern "C" {
         durability: *const c_char,
         max_count: i64,
         published: *mut i64,
-        error: *mut RuntimeError,
-    ) -> RuntimeStatus;
-    fn vexfs_mount_publish_close_claimed(
-        session: *mut RuntimeSessionOpaque,
-        durability: *const c_char,
-        claims_json: *const c_char,
-        result_json: *mut RuntimeBytes,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
     fn vexfs_mount_free(memory: *mut c_void);
@@ -367,6 +368,11 @@ struct PublishedClaim {
     generation: i64,
     #[allow(dead_code)]
     version: i64,
+}
+
+struct PublishBatchOutcome {
+    published: Vec<PublishedClaim>,
+    failure: Option<nfsstat3>,
 }
 
 struct RuntimeState {
@@ -470,40 +476,48 @@ fn runtime_result(status: RuntimeStatus) -> Result<(), nfsstat3> {
 fn publish_claimed_batch(
     session: *mut RuntimeSessionOpaque,
     candidates: &[PublishCandidate],
-) -> Result<Vec<PublishedClaim>, nfsstat3> {
-    let claims: Result<Vec<serde_json::Value>, nfsstat3> = candidates
-        .iter()
-        .map(|candidate| {
-            Ok(serde_json::json!({
-                "handle": candidate
-                    .handle
-                    .to_str()
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?,
-                "generation": candidate.generation,
-            }))
-        })
-        .collect();
-    let claims = CString::new(
-        serde_json::to_string(&claims?).map_err(|_| nfsstat3::NFS3ERR_IO)?,
-    )
-    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+) -> PublishBatchOutcome {
     let durability = CString::new("full").unwrap();
-    let mut result = RuntimeBytes {
-        data: ptr::null_mut(),
-        size: 0,
-    };
-    let mut error = empty_error();
-    let status = unsafe {
-        vexfs_mount_publish_close_claimed(
-            session,
-            durability.as_ptr(),
-            claims.as_ptr(),
-            &mut result,
-            &mut error,
-        )
-    };
-    runtime_result(status)?;
-    serde_json::from_str(&bytes_to_string(result)?).map_err(|_| nfsstat3::NFS3ERR_IO)
+    let mut published = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let Ok(handle) = candidate.handle.to_str() else {
+            return PublishBatchOutcome {
+                published,
+                failure: Some(nfsstat3::NFS3ERR_IO),
+            };
+        };
+        let mut version = 0;
+        let mut error = empty_error();
+        let status = unsafe {
+            vexfs_mount_handle_publish_close_background(
+                session,
+                candidate.handle.as_ptr(),
+                candidate.generation,
+                durability.as_ptr(),
+                &mut version,
+                &mut error,
+            )
+        };
+        // Each call is its own implicit PG transaction. If a later call fails,
+        // the gateway clears completed items and releases only the unreported
+        // remainder. An unknown commit result is still safe to retry because
+        // the exact generation returns its committed version idempotently.
+        if let Err(failure) = runtime_result(status) {
+            return PublishBatchOutcome {
+                published,
+                failure: Some(failure),
+            };
+        }
+        published.push(PublishedClaim {
+            handle: handle.to_owned(),
+            generation: candidate.generation,
+            version,
+        });
+    }
+    PublishBatchOutcome {
+        published,
+        failure: None,
+    }
 }
 
 fn now_ms() -> i64 {
@@ -1010,7 +1024,12 @@ impl RuntimeState {
             left_pending
                 .updated_at_ms
                 .cmp(&right_pending.updated_at_ms)
-                .then_with(|| left_pending.handle.as_bytes().cmp(right_pending.handle.as_bytes()))
+                .then_with(|| {
+                    left_pending
+                        .handle
+                        .as_bytes()
+                        .cmp(right_pending.handle.as_bytes())
+                })
         });
 
         let mut claimed = Vec::new();
@@ -1031,8 +1050,7 @@ impl RuntimeState {
             }
             let candidate_bytes = pending.dirty_bytes.max(1);
             if !claimed.is_empty()
-                && claimed_bytes.saturating_add(candidate_bytes)
-                    > DEFERRED_PUBLISH_BATCH_BYTES
+                && claimed_bytes.saturating_add(candidate_bytes) > DEFERRED_PUBLISH_BATCH_BYTES
             {
                 break;
             }
@@ -1069,41 +1087,43 @@ impl RuntimeState {
         candidates: &[PublishCandidate],
         published: &[PublishedClaim],
     ) -> Result<usize, nfsstat3> {
-        if published.len() != candidates.len() {
+        if published.len() > candidates.len()
+            || !candidates
+                .iter()
+                .zip(published.iter())
+                .all(|(candidate, item)| {
+                    candidate.handle.to_bytes() == item.handle.as_bytes()
+                        && candidate.generation == item.generation
+                })
+        {
             self.release_publish_claims(candidates);
             return Err(nfsstat3::NFS3ERR_IO);
         }
-        for candidate in candidates {
-            let handle = candidate
-                .handle
-                .to_str()
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            if !published
-                .iter()
-                .any(|item| item.handle == handle && item.generation == candidate.generation)
-            {
-                self.release_publish_claims(candidates);
-                return Err(nfsstat3::NFS3ERR_IO);
-            }
-        }
         let updated_at = now_ms();
         let mut completed = 0;
-        for candidate in candidates {
-            let matches = self.pending_writes.get(&candidate.inode).is_some_and(|pending| {
-                pending.handle.as_bytes() == candidate.handle.as_bytes()
-                    && pending.generation == candidate.generation
-                    && pending.publishing_generation == Some(candidate.generation)
-            });
+        for (index, candidate) in candidates.iter().enumerate() {
+            let matches = self
+                .pending_writes
+                .get(&candidate.inode)
+                .is_some_and(|pending| {
+                    pending.handle.as_bytes() == candidate.handle.as_bytes()
+                        && pending.generation == candidate.generation
+                        && pending.publishing_generation == Some(candidate.generation)
+                });
             if !matches {
                 continue;
             }
-            self.pending_writes.remove(&candidate.inode);
-            if let Some(stat) = self.stats.get_mut(&candidate.inode) {
-                stat.size = candidate.logical_size.min(i64::MAX as u64) as i64;
-                stat.updated_at = updated_at;
-                stat.changed_at = updated_at;
+            if index < published.len() {
+                self.pending_writes.remove(&candidate.inode);
+                if let Some(stat) = self.stats.get_mut(&candidate.inode) {
+                    stat.size = candidate.logical_size.min(i64::MAX as u64) as i64;
+                    stat.updated_at = updated_at;
+                    stat.changed_at = updated_at;
+                }
+                completed += 1;
+            } else if let Some(pending) = self.pending_writes.get_mut(&candidate.inode) {
+                pending.publishing_generation = None;
             }
-            completed += 1;
         }
         Ok(completed)
     }
@@ -1601,7 +1621,10 @@ impl NFSFileSystem for VexfsNfs {
             .get(&id)
             .is_some_and(|pending| pending.dirty_bytes >= DEFERRED_PUBLISH_DIRTY_BYTES);
         // Strict mode reports UNSTABLE unless this request was actually FULL.
-        Ok((attr, !state.strict_durability && !requires_foreground_commit))
+        Ok((
+            attr,
+            !state.strict_durability && !requires_foreground_commit,
+        ))
     }
 
     async fn create(
@@ -2055,8 +2078,8 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
                             .max()
                             .is_some_and(|updated_at_ms| updated_at_ms <= cutoff);
                         if idle {
-                            if let Err(status) = state
-                                .publish_pending_batch("full", DEFERRED_PUBLISH_BATCH_SIZE)
+                            if let Err(status) =
+                                state.publish_pending_batch("full", DEFERRED_PUBLISH_BATCH_SIZE)
                             {
                                 eprintln!(
                                     "vexfs-nfs-gateway: deferred batch publish failed: {status:?}"
@@ -2069,29 +2092,17 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
                 let Some((session, candidates)) = publish_job else {
                     continue;
                 };
-                let result = publish_claimed_batch(
-                    session as *mut RuntimeSessionOpaque,
-                    &candidates,
-                );
+                let outcome =
+                    publish_claimed_batch(session as *mut RuntimeSessionOpaque, &candidates);
                 let Ok(mut state) = publish_state.lock() else {
                     return;
                 };
-                match result {
-                    Ok(published) => {
-                        if let Err(status) =
-                            state.complete_publish_claims(&candidates, &published)
-                        {
-                            eprintln!(
-                                "vexfs-nfs-gateway: deferred publish result mismatch: {status:?}"
-                            );
-                        }
-                    }
-                    Err(status) => {
-                        state.release_publish_claims(&candidates);
-                        eprintln!(
-                            "vexfs-nfs-gateway: deferred claimed publish failed: {status:?}"
-                        );
-                    }
+                if let Err(status) = state.complete_publish_claims(&candidates, &outcome.published)
+                {
+                    eprintln!("vexfs-nfs-gateway: deferred publish result mismatch: {status:?}");
+                }
+                if let Some(status) = outcome.failure {
+                    eprintln!("vexfs-nfs-gateway: deferred claimed publish failed: {status:?}");
                 }
             }
         });
@@ -2217,7 +2228,12 @@ mod tests {
     fn foreground_write_burst_is_coalesced_until_globally_idle() {
         let now = 10_000;
         let mut state = state_with_pending(&[
-            (1, now - DEFERRED_PUBLISH_IDLE_MS, now - DEFERRED_PUBLISH_IDLE_MS, 4_096),
+            (
+                1,
+                now - DEFERRED_PUBLISH_IDLE_MS,
+                now - DEFERRED_PUBLISH_IDLE_MS,
+                4_096,
+            ),
             (2, now, now, 4_096),
         ]);
         let claimed = state.claim_deferred_publish_batch(now);
@@ -2238,16 +2254,10 @@ mod tests {
     #[test]
     fn dirty_byte_threshold_flushes_before_idle_timeout() {
         let now = 20_000;
-        let mut state = state_with_pending(&[(
-            7,
-            now,
-            now,
-            DEFERRED_PUBLISH_DIRTY_BYTES,
-        )]);
+        let mut state = state_with_pending(&[(7, now, now, DEFERRED_PUBLISH_DIRTY_BYTES)]);
         let claimed = state.claim_deferred_publish_batch(now);
         assert!(claimed.is_empty());
-        let claimed =
-            state.claim_deferred_publish_batch(now + DEFERRED_PUBLISH_IDLE_MS);
+        let claimed = state.claim_deferred_publish_batch(now + DEFERRED_PUBLISH_IDLE_MS);
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].inode, 7);
     }
@@ -2286,8 +2296,38 @@ mod tests {
         let mut state = state_with_pending(&entries);
         let claimed = state.claim_deferred_publish_batch(now);
         assert_eq!(claimed.len(), DEFERRED_PUBLISH_BATCH_SIZE as usize);
-        assert!(claimed.iter().all(|candidate| {
-            candidate.inode != DEFERRED_PUBLISH_FILE_THRESHOLD as u64
-        }));
+        assert!(claimed
+            .iter()
+            .all(|candidate| { candidate.inode != DEFERRED_PUBLISH_FILE_THRESHOLD as u64 }));
+    }
+
+    #[test]
+    fn partial_publish_clears_success_and_releases_remainder() {
+        let now = 50_000;
+        let mut state = state_with_pending(&[
+            (1, now - DEFERRED_PUBLISH_IDLE_MS, now - 1_000, 4_096),
+            (2, now - DEFERRED_PUBLISH_IDLE_MS, now - 1_000, 4_096),
+        ]);
+        let claimed = state.claim_deferred_publish_batch(now);
+        assert_eq!(claimed.len(), 2);
+        let first = &claimed[0];
+        let published = [PublishedClaim {
+            handle: first.handle.to_str().unwrap().to_owned(),
+            generation: first.generation,
+            version: 1,
+        }];
+        assert_eq!(
+            state.complete_publish_claims(&claimed, &published).unwrap(),
+            1
+        );
+        assert!(!state.pending_writes.contains_key(&first.inode));
+        assert_eq!(
+            state
+                .pending_writes
+                .get(&claimed[1].inode)
+                .unwrap()
+                .publishing_generation,
+            None
+        );
     }
 }

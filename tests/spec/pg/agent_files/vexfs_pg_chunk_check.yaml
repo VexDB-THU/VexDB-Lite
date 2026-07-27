@@ -12,10 +12,12 @@ steps:
 - query: SELECT vexfs_write('pg-a2', '/large.bin', convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8'));
   expect:
   - - 1
-- query: SELECT octet_length(vexfs_read('pg-a2', '/large.bin')), vexfs_stat('pg-a2', '/large.bin')->>'checksum';
+- query: SELECT octet_length(vexfs_read('pg-a2', '/large.bin')), length(vexfs_stat('pg-a2', '/large.bin')->>'checksum'), vexfs_stat('pg-a2', '/large.bin')->>'checksum' = _vexfs.compute_manifest_checksum((SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=1)), vexfs_stat('pg-a2', '/large.bin')->>'checksum' <> encode(sha256(vexfs_read('pg-a2', '/large.bin')), 'hex');
   expect:
   - - 131079
-    - 57ad989627081a0270bb309d3f9272ae22f302aedc2b907dfd1e676741bc535d
+    - 64
+    - true
+    - true
 - query: SELECT m.chunk_size, m.chunk_count, count(entry.chunk_id), count(DISTINCT entry.chunk_id) FROM _vexfs.file_versions AS f JOIN _vexfs.manifests AS m ON m.manifest_id=f.manifest_id LEFT JOIN _vexfs.manifest_chunks AS entry ON entry.manifest_id=m.manifest_id WHERE f.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND f.version_no=1 GROUP BY m.chunk_size,m.chunk_count;
   expect:
   - - 65536
@@ -40,11 +42,12 @@ steps:
 - query: SELECT vexfs_restore_version('pg-a2', '/large.bin', 1, 2);
   expect:
   - - 3
-- query: SELECT manifest_id IS NULL, source_version_no, checksum FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=3;
+- query: SELECT manifest_id IS NULL, source_version_no, length(checksum), checksum = (SELECT checksum FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=1) FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-a2') AND version_no=3;
   expect:
   - - true
     - 1
-    - 57ad989627081a0270bb309d3f9272ae22f302aedc2b907dfd1e676741bc535d
+    - 64
+    - true
 - query: SELECT vexfs_read('pg-a2', '/large.bin') = convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8');
   expect:
   - - true
@@ -82,7 +85,7 @@ steps:
   expect:
   - - true
     - quick
-    - chunked-v1
+    - chunked-manifest-v1
 - query: SELECT (vexfs_check('pg-a2', 1)->>'ok')::boolean, (vexfs_check('pg-a2', 1)->'checked'->>'canonical_versions')::bigint, (vexfs_check('pg-a2', 1)->>'issue_count')::integer;
   expect:
   - - true

@@ -72,6 +72,35 @@ bool PgCommand(PGconn *connection, const char *sql) {
     return ok;
 }
 
+std::string PgScalar(PGconn *connection, const char *sql) {
+    PGresult *result = PQexec(connection, sql);
+    const bool ok = result != nullptr && PQresultStatus(result) == PGRES_TUPLES_OK &&
+        PQntuples(result) == 1 && PQnfields(result) == 1 && !PQgetisnull(result, 0, 0);
+    std::string value;
+    if (ok) {
+        value.assign(PQgetvalue(result, 0, 0),
+                     static_cast<size_t>(PQgetlength(result, 0, 0)));
+    } else {
+        std::fprintf(stderr, "PostgreSQL scalar query failed: %s\n",
+                     result == nullptr ? PQerrorMessage(connection) :
+                                         PQresultErrorMessage(result));
+    }
+    if (result != nullptr) PQclear(result);
+    return value;
+}
+
+bool WaitForBackendIdle(PGconn *control, int backend_pid) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const std::string sql =
+        "SELECT coalesce((SELECT state='idle' FROM pg_stat_activity WHERE pid=" +
+        std::to_string(backend_pid) + "),false)";
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (PgScalar(control, sql.c_str()) == "t") return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return false;
+}
+
 bool ReconnectControl(PGconn *connection) {
     bool probe_ok = false;
     if (PQstatus(connection) == CONNECTION_OK) {
@@ -250,11 +279,12 @@ int main(int argc, char **argv) {
     std::atomic<bool> publisher_started{false};
     vexfs_mount_status publisher_status = VEXFS_MOUNT_DATABASE_ERROR;
     vexfs_mount_error publisher_error{};
-    vexfs_mount_bytes publisher_result{};
+    int64_t publisher_version = 0;
     std::thread publisher([&] {
         publisher_started.store(true);
-        publisher_status = vexfs_mount_publish_close_claimed(
-            session, "full", claims.c_str(), &publisher_result, &publisher_error);
+        publisher_status = vexfs_mount_handle_publish_close_background(
+            session, claimed_handle.c_str(), claimed_generation, "full",
+            &publisher_version, &publisher_error);
     });
     while (!publisher_started.load()) std::this_thread::yield();
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -270,10 +300,14 @@ int main(int argc, char **argv) {
         !Expect(foreground_elapsed < std::chrono::seconds(1),
                 "background publisher does not hold foreground runtime mutex") ||
         !Expect(unlocked, "unlock workspace after concurrency probe") ||
-        !CheckStatus("claimed publisher", publisher_status, publisher_error)) return 1;
-    const std::string claimed_result = Take(&publisher_result);
-    if (!Expect(claimed_result.find(claimed_handle) != std::string::npos,
-                "claimed publisher result") ||
+        !CheckStatus("single-file background publisher", publisher_status,
+                     publisher_error) ||
+        !Expect(publisher_version == 1, "background publisher version")) return 1;
+    if (!CheckStatus("background publisher replay",
+            vexfs_mount_handle_publish_close_background(
+                session, claimed_handle.c_str(), claimed_generation, "full",
+                &publisher_version, &error), error) ||
+        !Expect(publisher_version == 1, "background publisher replay version") ||
         !CheckStatus("claimed publisher replay", vexfs_mount_publish_close_claimed(
             session, "full", claims.c_str(), &bytes, &error), error) ||
         !Expect(Take(&bytes).find(claimed_handle) != std::string::npos,
@@ -281,6 +315,62 @@ int main(int argc, char **argv) {
         !CheckStatus("claimed content", vexfs_mount_read_file(
             session, "/project/claimed.txt", &bytes, &error), error) ||
         !Expect(Take(&bytes) == "claimed", "claimed content value")) return 1;
+
+    // Model the hard network case where PostgreSQL commits but the client never
+    // consumes the result. A second control connection observes the committed
+    // content before the first connection is discarded. Retrying the exact
+    // handle generation must return version 1 without creating a duplicate.
+    vexfs_mount_bytes unknown_handle_bytes{};
+    if (!CheckStatus("unknown-result create", vexfs_mount_handle_create_owned_durable(
+            session, "/project/unknown-result.txt", 0644, 501, 20,
+            "create-unknown-result", "none", &unknown_handle_bytes, &error), error)) return 1;
+    const std::string unknown_handle = Take(&unknown_handle_bytes);
+    int64_t unknown_generation = 0;
+    if (!CheckStatus("unknown-result stage", vexfs_mount_handle_stage_write_durable(
+            session, unknown_handle.c_str(), 0, "unknown", 7,
+            "stage-unknown-result", "none", &unknown_generation, &error), error)) return 1;
+    PGconn *unknown = PQconnectdb(dsn);
+    if (!Expect(unknown != nullptr && PQstatus(unknown) == CONNECTION_OK,
+                "unknown-result connection")) {
+        if (unknown != nullptr) PQfinish(unknown);
+        return 1;
+    }
+    const std::string generation_text = std::to_string(unknown_generation);
+    const char *unknown_values[] = {unknown_handle.c_str(), generation_text.c_str()};
+    if (!Expect(PQsendQueryParams(
+            unknown, "SELECT vexfs_handle_publish_close($1,$2::bigint,'full')", 2,
+            nullptr, unknown_values, nullptr, nullptr, 0) == 1,
+            "send publish without consuming result")) {
+        PQfinish(unknown);
+        return 1;
+    }
+    while (PQflush(unknown) == 1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!Expect(PQstatus(unknown) == CONNECTION_OK,
+                "unknown-result query sent") ||
+        !Expect(WaitForBackendIdle(control, PQbackendPID(unknown)),
+                "unknown-result server commit completed") ||
+        !Expect(PgScalar(control,
+            "SELECT convert_from(vexfs_read('pg-runtime-contract',"
+            "'/project/unknown-result.txt'),'UTF8')") == "unknown",
+            "unknown-result commit visible before response read")) {
+        PQfinish(unknown);
+        return 1;
+    }
+    PQfinish(unknown);
+    int64_t unknown_version = 0;
+    if (!CheckStatus("unknown-result generation retry",
+            vexfs_mount_handle_publish_close_background(
+                session, unknown_handle.c_str(), unknown_generation, "full",
+                &unknown_version, &error), error) ||
+        !Expect(unknown_version == 1, "unknown-result retry version") ||
+        !Expect(PgScalar(control,
+            "SELECT count(*) FROM _vexfs.file_versions AS version "
+            "WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces "
+            "WHERE name='pg-runtime-contract') AND version.inode_id="
+            "((vexfs_stat('pg-runtime-contract','/project/unknown-result.txt')->>"
+            "'inode')::bigint)") == "1", "unknown-result has one version")) return 1;
 
     if (!CheckStatus("write v1", vexfs_mount_write_file(
             session, "/project/main.txt", "alpha\n", 6, &version, &error), error) ||
@@ -347,7 +437,7 @@ int main(int argc, char **argv) {
     const std::string enabled_index = Take(&bytes);
     if (!Expect(enabled_index.find("\"enabled\":true") != std::string::npos &&
                 enabled_index.find("\"dirty\":false") != std::string::npos &&
-                enabled_index.find("\"indexed_files\":5") != std::string::npos,
+                enabled_index.find("\"indexed_files\":6") != std::string::npos,
                 "trigram index enabled") ||
         !CheckStatus("indexed grep", vexfs_mount_grep(
             session, "/project", "alpha", 0, 100, &bytes, &error), error)) return 1;

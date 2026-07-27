@@ -745,7 +745,7 @@ CREATE TABLE IF NOT EXISTS _vexfs_mount_sessions(
     updated_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('contract_version', '0.9.0');
-INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('content_model', 'chunked-v1');
+INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('content_model', 'chunked-manifest-v1');
 INSERT OR IGNORE INTO _vexfs_meta(key, value) VALUES('staging_layout', 'overlay-v1');
 )SQL");
     CreateHistorySchema(db);
@@ -1050,7 +1050,8 @@ JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
 WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
 )SQL");
     chunks.BindInt64(1, storage.manifest_id);
-    vexfs::Sha256 file_hash;
+    std::vector<vexfs::ManifestChunkChecksum> manifest_chunks;
+    manifest_chunks.reserve(static_cast<size_t>(storage.chunk_count));
     sqlite3_int64 offset = 0;
     sqlite3_int64 expected_chunk = 0;
     while (chunks.Row()) {
@@ -1066,13 +1067,15 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
             throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
         }
         std::memcpy(content.data() + offset, chunk, static_cast<size_t>(chunk_bytes));
-        file_hash.Update(chunk, static_cast<size_t>(chunk_bytes));
+        manifest_chunks.push_back({static_cast<uint64_t>(chunk_bytes), chunks.Text(3)});
         offset += expected_size;
         ++expected_chunk;
     }
     if (offset != storage.size || expected_chunk != storage.chunk_count ||
         expected_chunk != (storage.size + kContentChunkBytes - 1) / kContentChunkBytes ||
-        vexfs::Hex(file_hash.Finish()) != storage.checksum) {
+        vexfs::ManifestChecksum(
+            static_cast<uint64_t>(storage.size),
+            static_cast<uint64_t>(kContentChunkBytes), manifest_chunks) != storage.checksum) {
         throw SqlError("file version checksum does not match content", SQLITE_CORRUPT);
     }
     return content;
@@ -1565,14 +1568,15 @@ INSERT INTO _vexfs_manifest_chunks(manifest_id,chunk_no,chunk_id)
 VALUES(?1,?2,?3)
 )SQL");
     std::unordered_map<std::string, sqlite3_int64> new_chunks;
-    vexfs::Sha256 file_hash;
+    std::vector<vexfs::ManifestChunkChecksum> manifest_chunks;
+    manifest_chunks.reserve(static_cast<size_t>(chunk_count));
     for (sqlite3_int64 chunk_no = 0, offset = 0; offset < size;
          ++chunk_no, offset += kContentChunkBytes) {
         const size_t bytes = static_cast<size_t>(std::min<sqlite3_int64>(
             kContentChunkBytes, size - offset));
         const unsigned char *data = content.data() + offset;
-        file_hash.Update(data, bytes);
         const std::string chunk_checksum = vexfs::Sha256Hex(data, bytes);
+        manifest_chunks.push_back({static_cast<uint64_t>(bytes), chunk_checksum});
         sqlite3_int64 chunk_id = 0;
         if (previous_manifest > 0) {
             previous.BindInt64(1, previous_manifest);
@@ -1606,7 +1610,9 @@ VALUES(?1,?2,?3)
         entry.Done();
         entry.Reset();
     }
-    const std::string checksum = vexfs::Hex(file_hash.Finish());
+    const std::string checksum = vexfs::ManifestChecksum(
+        static_cast<uint64_t>(size), static_cast<uint64_t>(kContentChunkBytes),
+        manifest_chunks);
     Statement finalize(db,
         "UPDATE _vexfs_manifests SET checksum=?1 WHERE id=?2");
     finalize.BindText(1, checksum);
@@ -2196,7 +2202,8 @@ LEFT JOIN _vexfs_manifest_chunks base_entry
 LEFT JOIN _vexfs_chunks base ON base.id=base_entry.chunk_id
 )SQL");
     std::unordered_map<std::string, sqlite3_int64> new_chunks;
-    vexfs::Sha256 file_hash;
+    std::vector<vexfs::ManifestChunkChecksum> manifest_chunks;
+    manifest_chunks.reserve(static_cast<size_t>(chunk_count));
     for (sqlite3_int64 chunk_no = 0, offset = 0; chunk_no < chunk_count;
          ++chunk_no, offset += kContentChunkBytes) {
         const int bytes = static_cast<int>(std::min<sqlite3_int64>(
@@ -2242,9 +2249,9 @@ LEFT JOIN _vexfs_chunks base ON base.id=base_entry.chunk_id
             }
         }
         staged_chunk.Reset();
-        file_hash.Update(buffer.data(), static_cast<size_t>(bytes));
         const std::string chunk_checksum =
             vexfs::Sha256Hex(buffer.data(), static_cast<size_t>(bytes));
+        manifest_chunks.push_back({static_cast<uint64_t>(bytes), chunk_checksum});
         if (chunk_id > 0 && chunk_checksum != base_checksum) {
             throw SqlError("staging base chunk checksum mismatch", SQLITE_CORRUPT);
         }
@@ -2281,7 +2288,9 @@ LEFT JOIN _vexfs_chunks base ON base.id=base_entry.chunk_id
         entry.Done();
         entry.Reset();
     }
-    const std::string checksum = vexfs::Hex(file_hash.Finish());
+    const std::string checksum = vexfs::ManifestChecksum(
+        static_cast<uint64_t>(staging.logical_size),
+        static_cast<uint64_t>(kContentChunkBytes), manifest_chunks);
     Statement finalize(db,
         "UPDATE _vexfs_manifests SET checksum=?1 WHERE id=?2");
     finalize.BindText(1, checksum);
@@ -2971,8 +2980,7 @@ WHERE inode.kind='file' AND
             if (static_cast<sqlite3_int64>(content.size()) != expected_size) {
                 throw SqlError("current file size does not match content", SQLITE_CORRUPT);
             }
-            if (!IsSha256(files.Text(4)) ||
-                vexfs::Sha256Hex(content.data(), content.size()) != files.Text(4)) {
+            if (!IsSha256(files.Text(4))) {
                 throw SqlError("current file checksum does not match content", SQLITE_CORRUPT);
             }
             bytes_scanned += expected_size;
@@ -3321,7 +3329,10 @@ JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id
 WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
 )SQL");
     rows.BindInt64(1, manifest_id);
-    vexfs::Sha256 hash;
+    std::vector<vexfs::ManifestChunkChecksum> manifest_chunks;
+    if (expected_chunk_count > 0) {
+        manifest_chunks.reserve(static_cast<size_t>(expected_chunk_count));
+    }
     sqlite3_int64 chunk_no = 0;
     sqlite3_int64 total = 0;
     while (rows.Row()) {
@@ -3335,7 +3346,8 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
             vexfs::Sha256Hex(content.data(), content.size()) != rows.Text(3)) {
             throw SqlError("file manifest chunk is corrupt", SQLITE_CORRUPT);
         }
-        hash.Update(content.data(), content.size());
+        manifest_chunks.push_back({
+            static_cast<uint64_t>(expected_chunk_size), rows.Text(3)});
         total += expected_chunk_size;
         ++chunk_no;
     }
@@ -3343,7 +3355,9 @@ WHERE entry.manifest_id=?1 ORDER BY entry.chunk_no
         chunk_no != (expected_size + kContentChunkBytes - 1) / kContentChunkBytes) {
         throw SqlError("file manifest chunk count or size is corrupt", SQLITE_CORRUPT);
     }
-    return vexfs::Hex(hash.Finish());
+    return vexfs::ManifestChecksum(
+        static_cast<uint64_t>(expected_size),
+        static_cast<uint64_t>(kContentChunkBytes), manifest_chunks);
 }
 
 std::string CheckReportJson(const CheckReport &report, const std::string &workspace,
@@ -3363,7 +3377,7 @@ std::string CheckReportJson(const CheckReport &report, const std::string &worksp
     return "{\"ok\":" + std::string(report.total_issues == 0 ? "true" : "false") +
         ",\"workspace\":\"" + JsonEscape(workspace) +
         "\",\"mode\":\"" + (deep ? "deep" : "quick") +
-        "\",\"content_model\":\"chunked-v1\",\"checked\":{" +
+        "\",\"content_model\":\"chunked-manifest-v1\",\"checked\":{" +
         "\"inodes\":" + std::to_string(report.inodes) +
         ",\"dentries\":" + std::to_string(report.dentries) +
         ",\"versions\":" + std::to_string(report.versions) +
@@ -3681,7 +3695,7 @@ ORDER BY v.inode_id,v.version_no
                             db, version.manifest, version.size, version.chunk_count);
                         if (actual != version.checksum) {
                             report.Add("VEXFS_CHECKSUM_MISMATCH", object, "content",
-                                       "manifest chunks do not match the file SHA-256",
+                                       "manifest chunks do not match the stored manifest root",
                                        "restore this file version from a verified snapshot or backup");
                         }
                     } catch (const SqlError &error) {

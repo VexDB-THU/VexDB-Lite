@@ -86,6 +86,11 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_PERF_FILES=1000 \
   bash tests/eval/vexfs/run_pg_adapter_performance.sh
 
+# PG manifest 根哈希专项：16 MiB 文件每轮只改 4 KiB，发布不得拼完整文件；
+# 默认重复 5 次，容器 memory.max 必须不超过 1 GiB，并检查 oom_kill 未增长。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_DATABASE=test \
+  bash tests/eval/vexfs/run_pg_manifest_publish_performance.sh
+
 # libpq HostStore、CLI、handle、ACL、审计、多 gateway 和缓存失效
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
@@ -95,6 +100,12 @@ VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
   bash tests/eval/vexfs/run_pg_restart_recovery.sh
+
+# 断电等价 Gate：strict 写入并 fsync、SIGKILL gateway、PG immediate restart、
+# 重挂载读取与 deep check；只写一个小文件，容器 memory.max 必须不超过 1 GiB。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+VEXFS_EVAL_MOUNT_CLI=/absolute/path/to/current/vexdb \
+  bash tests/eval/vexfs/run_pg_strict_crash_recovery.sh
 
 # 完整数据库 pg_dump/pg_restore
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
@@ -128,6 +139,7 @@ VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
 
 # PG overlay/publisher 专项：真实挂载性能、1000 小文件后冷读、跨会话缓存失效
 VEXFS_MACOS_PG_CASES='mount.performance mount.scale-read-after-small-files mount.external-cache-invalidation' \
+VEXDB_PG_DATABASE=test \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
   bash tests/eval/vexfs/run_pg_macos_mount.sh
 
@@ -246,7 +258,7 @@ vexdb_sqlite/build/eval/vexfs-linux-mount/{root,uid-1000}/<run-id>/report.json
 - 恢复：进程中途退出、WAL 重开、integrity check、retained reclaim；
   Linux helper 被 `SIGKILL` 后，底层目录保持 `0500`、普通用户不能产生本地假文件；30 秒
   session/handle 租约到期后重挂载会自动发布保留的暂存写入，显式卸载恢复 `0700`。
-- 长期校验：版本 SHA-256、单文件恢复和 workspace 恢复别名、commit/snapshot/history/dentry
+- 长期校验：逐块 SHA-256 与有序 manifest 根、单文件恢复和 workspace 恢复别名、commit/snapshot/history/dentry
   引用、staging 缺失、同长度内容损坏注入、损坏读取拒绝、CLI 退出码 8；性能用例分别记录
   quick 元数据检查和 64 KiB 流式 deep hash 的吞吐与 RSS 增长。
 - 数据库版本：当前尚未发版，只支持当前 schema，不运行旧 schema 迁移测试。
@@ -255,7 +267,8 @@ vexdb_sqlite/build/eval/vexfs-linux-mount/{root,uid-1000}/<run-id>/report.json
 - PostgreSQL 备份性能：有界验证 `pg_dump/pg_restore`、`pg_basebackup` + `pg_verifybackup` +
   克隆启动、format v2 PG → SQLite；同时检查容器 1 GiB 内存上限、`oom_kill` 和 CLI 峰值 RSS。
 - PostgreSQL staging：基础 manifest + 64 KiB 脏块、范围读写、truncate 缩短后零填充、
-  未变化 chunk 复用、精确 generation claim、断线重试幂等、后台发布不持有前台 runtime 锁；
+  未变化 chunk 复用、精确 generation claim、逐文件后台事务、断线重试幂等、部分成功清理、
+  服务端已提交但客户端不读取结果后的同 generation 收敛、后台发布不持有前台 runtime 锁；
   调度器覆盖全局空闲、4 MiB 脏写、1024 文件、30 秒最长等待和活跃 handle 隔离。
 - 随机模型：真实数据库状态与 Python 参考文件树持续比对。
 - 性能：大量小文件、大文件顺序读写、分块 staging、随机 4 KiB 覆盖、备份吞吐；

@@ -156,6 +156,12 @@ vexfs_mount_status vexfs_mount_handle_publish_close(vexfs_mount_session *session
                                                     const char *durability,
                                                     int64_t *version,
                                                     vexfs_mount_error *error);
+// PostgreSQL-only single-file background path. It uses the dedicated publisher
+// connection, so one implicit transaction releases the workspace row lock
+// before the next claimed file begins publishing.
+vexfs_mount_status vexfs_mount_handle_publish_close_background(
+    vexfs_mount_session *session, const char *handle, int64_t generation,
+    const char *durability, int64_t *version, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_handle_close(vexfs_mount_session *session,
                                             const char *handle, int retain_unpublished,
                                             const char *request_id,

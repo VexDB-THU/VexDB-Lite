@@ -47,6 +47,11 @@ steps:
 - query: SELECT count(*) FROM _vexfs.manifest_chunks AS old_entry JOIN _vexfs.manifest_chunks AS new_entry ON new_entry.chunk_id=old_entry.chunk_id WHERE old_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version_no=1) AND new_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version_no=2);
   expect:
   - - 1
+- query: SELECT position('read_staging_content' in pg_get_functiondef('public.vexfs_handle_publish(text,bigint,text,text)'::regprocedure)) = 0, version.checksum = _vexfs.compute_manifest_checksum(version.manifest_id), version.checksum <> encode(sha256(vexfs_read('pg-overlay', '/large.bin')), 'hex') FROM _vexfs.file_versions AS version WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version.version_no=2;
+  expect:
+  - - true
+    - true
+    - true
 - query: SELECT vexfs_handle_truncate((SELECT handle FROM overlay_handle), 3, 'overlay-truncate-small');
   expect:
   - - 2
@@ -77,16 +82,33 @@ steps:
 - statement: CREATE TEMP TABLE claimed_handles(name text PRIMARY KEY, handle text NOT NULL, generation bigint);
 - statement: INSERT INTO claimed_handles(name, handle) VALUES ('a', vexfs_handle_create('pg-overlay', '/claimed-a.txt', 420, 501, 20, 'claimed-create-a', 'overlay-gateway')), ('b', vexfs_handle_create('pg-overlay', '/claimed-b.txt', 420, 501, 20, 'claimed-create-b', 'overlay-gateway'));
 - statement: UPDATE claimed_handles SET generation=vexfs_handle_stage_write(handle, 0, convert_to(name, 'UTF8'), 'claimed-stage-' || name);
-- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles)));
+- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
   expect:
   - - 2
 - query: SELECT convert_from(vexfs_read('pg-overlay', '/claimed-a.txt'), 'UTF8'), convert_from(vexfs_read('pg-overlay', '/claimed-b.txt'), 'UTF8');
   expect:
   - - a
     - b
-- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles)));
+- statement: INSERT INTO claimed_handles(name, handle) VALUES ('lazy', vexfs_handle_create('pg-overlay', '/lazy.txt', 420, 'lazy-create', 'overlay-gateway'));
+- statement: UPDATE claimed_handles SET generation=vexfs_handle_stage_write(handle, 0, convert_to('lazy', 'UTF8'), 'lazy-stage') WHERE name='lazy';
+- query: SELECT vexfs_handle_publish_close((SELECT handle FROM claimed_handles WHERE name='lazy'), (SELECT generation FROM claimed_handles WHERE name='lazy'), 'full');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-overlay', '/lazy.txt'), 'UTF8');
+  expect:
+  - - lazy
+- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
   expect:
   - - 2
+- statement: CREATE TEMP TABLE root_manifest AS SELECT version.manifest_id, version.checksum FROM _vexfs.file_versions AS version WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version.inode_id=_vexfs.resolve_path((SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay'), '/lazy.txt') AND version.version_no=1;
+- statement: UPDATE _vexfs.manifests SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- statement: UPDATE _vexfs.file_versions SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- query: SELECT (vexfs_check('pg-overlay', 0)->>'ok')::boolean, EXISTS (SELECT 1 FROM jsonb_array_elements(vexfs_check('pg-overlay', 0)->'issues') AS issue WHERE issue->>'code'='manifest_chunks');
+  expect:
+  - - false
+    - true
+- statement: UPDATE _vexfs.manifests SET checksum=(SELECT checksum FROM root_manifest) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- statement: UPDATE _vexfs.file_versions SET checksum=(SELECT checksum FROM root_manifest) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
 - query: SELECT (vexfs_check('pg-overlay', 1)->>'ok')::boolean;
   expect:
   - - true

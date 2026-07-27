@@ -301,11 +301,19 @@ class UnderlyingMountPointGuard {
 };
 
 void DisarmMountPointGuard(const std::string &path) {
-    std::error_code error;
-    if (!std::filesystem::is_directory(path, error)) return;
-    if (chmod(path.c_str(), 0700) != 0)
-        throw std::runtime_error("cannot restore mount point permissions: " +
-                                 std::string(std::strerror(errno)));
+    // After a forced NFS unmount, getmntinfo can stop reporting the mount a few
+    // seconds before the stale vnode at the path becomes usable. Calling chmod
+    // in this process can then block until the NFS dead timeout (60 seconds).
+    // Keep each probe bounded in a child process and retry while macOS finishes
+    // detaching the old vnode.
+    constexpr int kPermissionRestoreAttempts = 12;
+    for (int attempt = 0; attempt < kPermissionRestoreAttempts; ++attempt) {
+        const int result = RunProcess("/bin/chmod", {"0700", path}, 1'000);
+        if (result == 0) return;
+        if (attempt + 1 != kPermissionRestoreAttempts) usleep(250 * 1000);
+    }
+    throw std::runtime_error(
+        "cannot restore mount point permissions after NFS detach");
 }
 
 uint64_t StableHash(const std::string &value) {

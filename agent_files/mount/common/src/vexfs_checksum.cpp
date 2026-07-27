@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace vexfs {
@@ -151,6 +152,43 @@ std::string Hex(const std::array<unsigned char, 32> &digest) {
 std::string Sha256Hex(const void *data, size_t size) {
     Sha256 hash;
     hash.Update(data, size);
+    return Hex(hash.Finish());
+}
+
+std::string ManifestChecksum(
+    uint64_t file_size, uint64_t chunk_size,
+    const std::vector<ManifestChunkChecksum> &chunks) {
+    if (chunk_size == 0) throw std::invalid_argument("manifest chunk size is zero");
+    const uint64_t expected_chunks = file_size == 0
+        ? 0 : 1 + (file_size - 1) / chunk_size;
+    if (expected_chunks != chunks.size()) {
+        throw std::invalid_argument("manifest chunk count does not match file size");
+    }
+    uint64_t total = 0;
+    Sha256 hash;
+    const std::string header = "vexfs-manifest-v1:" + std::to_string(chunk_size) +
+        ":" + std::to_string(file_size) + ":" + std::to_string(chunks.size()) + "\n";
+    hash.Update(header.data(), header.size());
+    for (size_t index = 0; index < chunks.size(); ++index) {
+        const ManifestChunkChecksum &chunk = chunks[index];
+        const uint64_t expected_size = std::min(chunk_size, file_size - total);
+        const bool valid_checksum = chunk.checksum.size() == 64 &&
+            std::all_of(chunk.checksum.begin(), chunk.checksum.end(), [](unsigned char value) {
+                return (value >= '0' && value <= '9') || (value >= 'a' && value <= 'f');
+            });
+        if (chunk.size != expected_size || !valid_checksum ||
+            chunk.size > std::numeric_limits<uint64_t>::max() - total) {
+            throw std::invalid_argument("manifest chunk metadata is invalid");
+        }
+        if (index != 0) hash.Update("\n", 1);
+        const std::string entry = std::to_string(index) + ":" +
+            std::to_string(chunk.size) + ":" + chunk.checksum;
+        hash.Update(entry.data(), entry.size());
+        total += chunk.size;
+    }
+    if (total != file_size) {
+        throw std::invalid_argument("manifest chunks do not cover the file");
+    }
     return Hex(hash.Finish());
 }
 
