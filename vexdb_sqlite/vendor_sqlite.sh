@@ -24,16 +24,18 @@ SQLITE_AMALG_VERSION="${SQLITE_AMALG_VERSION:-$DEFAULT_SQLITE_AMALG_VERSION}"
 SQLITE3_C_SHA256="${SQLITE3_C_SHA256:-}"
 SQLITE3_H_SHA256="${SQLITE3_H_SHA256:-}"
 SQLITE3EXT_H_SHA256="${SQLITE3EXT_H_SHA256:-}"
+SQLITE_SHELL_C_SHA256="${SQLITE_SHELL_C_SHA256:-}"
 
 if [ "$SQLITE_YEAR:$SQLITE_AMALG_VERSION" = \
         "$DEFAULT_SQLITE_YEAR:$DEFAULT_SQLITE_AMALG_VERSION" ]; then
     SQLITE3_C_SHA256="${SQLITE3_C_SHA256:-9ca336fbcbff9f1d78b4f45b6a19583fcc097192310dd2f5f6cd43b9a33d7d69}"
     SQLITE3_H_SHA256="${SQLITE3_H_SHA256:-882ad3c0448d0324fb3a6b1a85333a9173d539ac669c9972ae1f03722ff86282}"
     SQLITE3EXT_H_SHA256="${SQLITE3EXT_H_SHA256:-b184dd1586d935133d37ad76fa353faf0a1021ff2fdedeedcc3498fff74bbb94}"
+    SQLITE_SHELL_C_SHA256="${SQLITE_SHELL_C_SHA256:-cfbc5b9bc4c94d8caeb3d55dc9e224038683f14a1faec5872407ba81f3b4f66a}"
 fi
 if [ -z "$SQLITE3_C_SHA256" ] || [ -z "$SQLITE3_H_SHA256" ] || \
-        [ -z "$SQLITE3EXT_H_SHA256" ]; then
-    echo "非默认 SQLite 版本必须提供 SQLITE3_C_SHA256、SQLITE3_H_SHA256 和 SQLITE3EXT_H_SHA256" >&2
+        [ -z "$SQLITE3EXT_H_SHA256" ] || [ -z "$SQLITE_SHELL_C_SHA256" ]; then
+    echo "非默认 SQLite 版本必须提供 sqlite3.c、sqlite3.h、sqlite3ext.h 和 shell.c 的 SHA-256" >&2
     exit 2
 fi
 
@@ -74,10 +76,11 @@ verify_dir() {
     verify_file "$dir/sqlite3.c" "$SQLITE3_C_SHA256"
     verify_file "$dir/sqlite3.h" "$SQLITE3_H_SHA256"
     verify_file "$dir/sqlite3ext.h" "$SQLITE3EXT_H_SHA256"
+    verify_file "$dir/shell.c" "$SQLITE_SHELL_C_SHA256"
 }
 
 if [ -f "$DIR/sqlite3.c" ] && [ -f "$DIR/sqlite3.h" ] && \
-        [ -f "$DIR/sqlite3ext.h" ]; then
+        [ -f "$DIR/sqlite3ext.h" ] && [ -f "$DIR/shell.c" ]; then
     verify_dir "$DIR"
     echo "[vendor] SQLite ${SQLITE_AMALG_VERSION} 已校验 -> $DIR"
     exit 0
@@ -101,7 +104,7 @@ echo "[vendor] 下载 $URL"
 curl --fail --location --silent --show-error --retry 2 --max-time 60 \
     --output "$ARCHIVE" "$URL"
 unzip -q -j "$ARCHIVE" \
-    '*/sqlite3.c' '*/sqlite3.h' '*/sqlite3ext.h' \
+    '*/sqlite3.c' '*/sqlite3.h' '*/sqlite3ext.h' '*/shell.c' \
     -d "$EXTRACTED"
 verify_dir "$EXTRACTED"
 
@@ -109,6 +112,7 @@ mkdir -p "$DIR"
 install -m 0644 "$EXTRACTED/sqlite3.c" "$DIR/sqlite3.c"
 install -m 0644 "$EXTRACTED/sqlite3.h" "$DIR/sqlite3.h"
 install -m 0644 "$EXTRACTED/sqlite3ext.h" "$DIR/sqlite3ext.h"
+install -m 0644 "$EXTRACTED/shell.c" "$DIR/shell.c"
 verify_dir "$DIR"
 
 echo "[vendor] SQLite ${SQLITE_AMALG_VERSION} 下载并校验完成 -> $DIR"

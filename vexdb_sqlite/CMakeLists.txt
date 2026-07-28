@@ -111,7 +111,10 @@ get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
 
 # vendored SQLite amalgamation：移动端静态形态必需 sqlite3.c；loadable 也用其头。
 set(SQLITE_AMALG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/sqlite")
-if(NOT EXISTS "${SQLITE_AMALG_DIR}/sqlite3ext.h")
+if(NOT EXISTS "${SQLITE_AMALG_DIR}/sqlite3.c" OR
+   NOT EXISTS "${SQLITE_AMALG_DIR}/sqlite3.h" OR
+   NOT EXISTS "${SQLITE_AMALG_DIR}/sqlite3ext.h" OR
+   NOT EXISTS "${SQLITE_AMALG_DIR}/shell.c")
     message(FATAL_ERROR
         "缺少 SQLite amalgamation。先运行:\n"
         "  bash ${CMAKE_CURRENT_SOURCE_DIR}/vendor_sqlite.sh")
