@@ -279,6 +279,9 @@ if fskit_mounts_active; then
     exit 1
 fi
 
+echo "=== 准备并校验 SQLite 官方源码 ==="
+bash "$SQLITE_DIR/vendor_sqlite.sh" --ensure
+
 echo "=== 构建 VexDB-Lite CLI 与 SQLite 扩展 ==="
 "$CMAKE_BIN" -S "$SQLITE_DIR" -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
