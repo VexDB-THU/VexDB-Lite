@@ -1,0 +1,140 @@
+name: pg__vexfs_staging_overlay
+tags: [vexfs, pg, handles, staging, overlay, performance]
+description: PostgreSQL handle staging 使用基础 manifest 和 64 KiB 脏块，范围写不复制整份文件
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-overlay') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-overlay', '/large.bin', convert_to(repeat('a', 65536) || repeat('b', 65536) || repeat('c', 7), 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_mount_session_start('pg-overlay', 'overlay-gateway');
+  expect:
+  - - 1
+- statement: CREATE TEMP TABLE overlay_handle(handle text PRIMARY KEY);
+- statement: INSERT INTO overlay_handle VALUES (vexfs_handle_open('pg-overlay', '/large.bin', 'rw', 'overlay-open', 'overlay-gateway'));
+- query: SELECT staging.base_manifest_id IS NOT NULL, staging.base_size, staging.base_visible_size, staging.logical_size, staging.dirty_bytes, count(dirty.chunk_no) FROM _vexfs.handle_staging AS staging LEFT JOIN _vexfs.handle_staging_chunks AS dirty USING(handle_id) WHERE staging.handle_id=(SELECT handle FROM overlay_handle) GROUP BY staging.base_manifest_id, staging.base_size, staging.base_visible_size, staging.logical_size, staging.dirty_bytes;
+  expect:
+  - - true
+    - 131079
+    - 131079
+    - 131079
+    - 0
+    - 0
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM overlay_handle), 65534, convert_to('RANGE', 'UTF8'), 'overlay-stage');
+  expect:
+  - - 1
+- query: SELECT staging.logical_size, staging.dirty_bytes, count(dirty.chunk_no), coalesce(sum(octet_length(dirty.content)), 0) FROM _vexfs.handle_staging AS staging LEFT JOIN _vexfs.handle_staging_chunks AS dirty USING(handle_id) WHERE staging.handle_id=(SELECT handle FROM overlay_handle) GROUP BY staging.logical_size, staging.dirty_bytes;
+  expect:
+  - - 131079
+    - 131072
+    - 2
+    - 131072
+- query: SELECT convert_from(vexfs_handle_read((SELECT handle FROM overlay_handle), 65530, 16), 'UTF8');
+  expect:
+  - - aaaaRANGEbbbbbbb
+- query: SELECT vexfs_handle_publish((SELECT handle FROM overlay_handle), 1, 'full', 'overlay-publish');
+  expect:
+  - - 2
+- query: SELECT staging.base_size, staging.base_visible_size, staging.logical_size, staging.dirty_bytes, count(dirty.chunk_no) FROM _vexfs.handle_staging AS staging LEFT JOIN _vexfs.handle_staging_chunks AS dirty USING(handle_id) WHERE staging.handle_id=(SELECT handle FROM overlay_handle) GROUP BY staging.base_size, staging.base_visible_size, staging.logical_size, staging.dirty_bytes;
+  expect:
+  - - 131079
+    - 131079
+    - 131079
+    - 0
+    - 0
+- query: SELECT count(*) FROM _vexfs.manifest_chunks AS old_entry JOIN _vexfs.manifest_chunks AS new_entry ON new_entry.chunk_id=old_entry.chunk_id WHERE old_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version_no=1) AND new_entry.manifest_id=(SELECT manifest_id FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version_no=2);
+  expect:
+  - - 1
+- query: SELECT position('read_staging_content' in pg_get_functiondef('public.vexfs_handle_publish(text,bigint,text,text)'::regprocedure)) = 0, version.checksum = _vexfs.compute_manifest_checksum(version.manifest_id), version.checksum <> encode(sha256(vexfs_read('pg-overlay', '/large.bin')), 'hex') FROM _vexfs.file_versions AS version WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version.version_no=2;
+  expect:
+  - - true
+    - true
+    - true
+- query: SELECT vexfs_handle_truncate((SELECT handle FROM overlay_handle), 3, 'overlay-truncate-small');
+  expect:
+  - - 2
+- query: SELECT vexfs_handle_truncate((SELECT handle FROM overlay_handle), 65540, 'overlay-truncate-grow');
+  expect:
+  - - 3
+- query: SELECT convert_from(vexfs_handle_read((SELECT handle FROM overlay_handle), 0, 3), 'UTF8'), vexfs_handle_read((SELECT handle FROM overlay_handle), 3, 65537) = decode(repeat('00', 65537), 'hex');
+  expect:
+  - - aaa
+    - true
+- query: SELECT staging.base_visible_size, staging.logical_size, staging.dirty_bytes, count(dirty.chunk_no) FROM _vexfs.handle_staging AS staging LEFT JOIN _vexfs.handle_staging_chunks AS dirty USING(handle_id) WHERE staging.handle_id=(SELECT handle FROM overlay_handle) GROUP BY staging.base_visible_size, staging.logical_size, staging.dirty_bytes;
+  expect:
+  - - 3
+    - 65540
+    - 3
+    - 1
+- query: SELECT vexfs_handle_publish_close((SELECT handle FROM overlay_handle), 3, 'full');
+  expect:
+  - - 3
+- query: SELECT octet_length(vexfs_read('pg-overlay', '/large.bin')), convert_from(vexfs_read_range('pg-overlay', '/large.bin', 0, 3), 'UTF8'), vexfs_read_range('pg-overlay', '/large.bin', 3, 65537) = decode(repeat('00', 65537), 'hex');
+  expect:
+  - - 65540
+    - aaa
+    - true
+- query: SELECT count(*) FROM _vexfs.handle_staging WHERE handle_id=(SELECT handle FROM overlay_handle);
+  expect:
+  - - 0
+- statement: CREATE TEMP TABLE claimed_handles(name text PRIMARY KEY, handle text NOT NULL, generation bigint);
+- statement: INSERT INTO claimed_handles(name, handle) VALUES ('a', vexfs_handle_create('pg-overlay', '/claimed-a.txt', 420, 501, 20, 'claimed-create-a', 'overlay-gateway')), ('b', vexfs_handle_create('pg-overlay', '/claimed-b.txt', 420, 501, 20, 'claimed-create-b', 'overlay-gateway'));
+- statement: UPDATE claimed_handles SET generation=vexfs_handle_stage_write(handle, 0, convert_to(name, 'UTF8'), 'claimed-stage-' || name);
+- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
+  expect:
+  - - 2
+- query: SELECT commit.operation, count(change.ordinal), min(change.ordinal), max(change.ordinal) FROM _vexfs.commits AS commit JOIN _vexfs.commit_changes AS change USING(workspace_id, commit_no) WHERE commit.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND commit.commit_no=(SELECT head_commit FROM _vexfs.workspaces WHERE name='pg-overlay') GROUP BY commit.operation;
+  expect:
+  - - publish_batch
+    - 2
+    - 1
+    - 2
+- query: SELECT convert_from(vexfs_read('pg-overlay', '/claimed-a.txt'), 'UTF8'), convert_from(vexfs_read('pg-overlay', '/claimed-b.txt'), 'UTF8');
+  expect:
+  - - a
+    - b
+- statement: INSERT INTO claimed_handles(name, handle) VALUES ('lazy', vexfs_handle_create('pg-overlay', '/lazy.txt', 420, 'lazy-create', 'overlay-gateway'));
+- statement: UPDATE claimed_handles SET generation=vexfs_handle_stage_write(handle, 0, convert_to('lazy', 'UTF8'), 'lazy-stage') WHERE name='lazy';
+- query: SELECT vexfs_handle_publish_close((SELECT handle FROM claimed_handles WHERE name='lazy'), (SELECT generation FROM claimed_handles WHERE name='lazy'), 'full');
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-overlay', '/lazy.txt'), 'UTF8');
+  expect:
+  - - lazy
+- statement: CREATE TEMP TABLE claimed_publish_head AS SELECT head_commit FROM _vexfs.workspaces WHERE name='pg-overlay';
+- query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
+  expect:
+  - - 2
+- query: SELECT workspace.head_commit = published.head_commit FROM _vexfs.workspaces AS workspace CROSS JOIN claimed_publish_head AS published WHERE workspace.name='pg-overlay';
+  expect:
+  - - true
+- statement: CREATE TEMP TABLE root_manifest AS SELECT version.manifest_id, version.checksum FROM _vexfs.file_versions AS version WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version.inode_id=_vexfs.resolve_path((SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay'), '/lazy.txt') AND version.version_no=1;
+- statement: UPDATE _vexfs.manifests SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- statement: UPDATE _vexfs.file_versions SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- query: SELECT (vexfs_check('pg-overlay', 0)->>'ok')::boolean, EXISTS (SELECT 1 FROM jsonb_array_elements(vexfs_check('pg-overlay', 0)->'issues') AS issue WHERE issue->>'code'='manifest_chunks');
+  expect:
+  - - false
+    - true
+- statement: UPDATE _vexfs.manifests SET checksum=(SELECT checksum FROM root_manifest) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- statement: UPDATE _vexfs.file_versions SET checksum=(SELECT checksum FROM root_manifest) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
+- query: SELECT (vexfs_check('pg-overlay', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- statement: INSERT INTO claimed_handles(name, handle, generation) VALUES ('check', vexfs_handle_create('pg-overlay', '/check.txt', 420, 501, 20, 'check-create', 'overlay-gateway'), 1);
+- statement: UPDATE _vexfs.handle_staging SET dirty_bytes=1 WHERE handle_id=(SELECT handle FROM claimed_handles WHERE name='check');
+- query: SELECT (vexfs_check('pg-overlay', 0)->>'ok')::boolean, (vexfs_check('pg-overlay', 0)->'issues'->0->>'code');
+  expect:
+  - - false
+    - handle_staging
+- statement: UPDATE _vexfs.handle_staging SET dirty_bytes=0 WHERE handle_id=(SELECT handle FROM claimed_handles WHERE name='check');
+- query: SELECT (vexfs_check('pg-overlay', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_workspace_drop('pg-overlay', false);
+  expect:
+  - - 1
+- query: SELECT count(*) FROM _vexfs.workspaces WHERE name='pg-overlay';
+  expect:
+  - - 0

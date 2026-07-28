@@ -14,6 +14,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(VEXDB_SQLITE_BUILD_TESTS "Build M0 smoke tests" ON)
+set(VEXDB_LITE_VERSION "0.1.0-dev" CACHE STRING "VexDB-Lite product version")
 
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
@@ -22,6 +23,65 @@ if(CCACHE_PROGRAM)
 endif()
 
 find_package(Threads REQUIRED)
+
+# Desktop CLI/mount runtime can connect to the PostgreSQL VexFS adapter through
+# normal libpq.  Embedded/mobile SQLite builds stay independent of libpq.
+option(VEXFS_ENABLE_POSTGRESQL "Build PostgreSQL VexFS client support when libpq is available" ON)
+option(VEXFS_REQUIRE_POSTGRESQL "Fail configuration when PostgreSQL client support is unavailable" OFF)
+option(VEXFS_BUNDLE_POSTGRESQL_RUNTIME "Use package-relative libpq runpaths" OFF)
+if(VEXFS_ENABLE_POSTGRESQL AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
+    find_package(PostgreSQL QUIET)
+    if(NOT PostgreSQL_FOUND)
+        find_program(VEXFS_PG_CONFIG pg_config
+            HINTS /opt/homebrew/opt/libpq/bin /usr/local/opt/libpq/bin /opt/anaconda3/bin)
+        if(VEXFS_PG_CONFIG)
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --includedir
+                OUTPUT_VARIABLE _VEXFS_PG_INCLUDEDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --libdir
+                OUTPUT_VARIABLE _VEXFS_PG_LIBDIR OUTPUT_STRIP_TRAILING_WHITESPACE)
+        endif()
+        find_path(VEXFS_LIBPQ_INCLUDE_DIR libpq-fe.h
+            HINTS "${_VEXFS_PG_INCLUDEDIR}" /opt/homebrew/opt/libpq/include
+                  /usr/local/opt/libpq/include /opt/anaconda3/include)
+        find_library(VEXFS_LIBPQ_LIBRARY NAMES pq libpq
+            HINTS "${_VEXFS_PG_LIBDIR}" /opt/homebrew/opt/libpq/lib
+                  /usr/local/opt/libpq/lib /opt/anaconda3/lib)
+        if(VEXFS_LIBPQ_INCLUDE_DIR AND VEXFS_LIBPQ_LIBRARY)
+            set(PostgreSQL_FOUND TRUE)
+            set(PostgreSQL_INCLUDE_DIRS "${VEXFS_LIBPQ_INCLUDE_DIR}")
+            set(PostgreSQL_LIBRARIES "${VEXFS_LIBPQ_LIBRARY}")
+            execute_process(COMMAND "${VEXFS_PG_CONFIG}" --version
+                OUTPUT_VARIABLE PostgreSQL_VERSION_STRING OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET)
+        endif()
+    endif()
+    if(PostgreSQL_FOUND)
+        message(STATUS "PostgreSQL VexFS client: ${PostgreSQL_VERSION_STRING}")
+        set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "")
+        foreach(_VEXFS_POSTGRESQL_LIBRARY IN LISTS PostgreSQL_LIBRARIES)
+            if(EXISTS "${_VEXFS_POSTGRESQL_LIBRARY}")
+                set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "${_VEXFS_POSTGRESQL_LIBRARY}")
+                break()
+            endif()
+        endforeach()
+        if(NOT _VEXFS_POSTGRESQL_CLIENT_LIBRARY AND
+           DEFINED VEXFS_LIBPQ_LIBRARY AND EXISTS "${VEXFS_LIBPQ_LIBRARY}")
+            set(_VEXFS_POSTGRESQL_CLIENT_LIBRARY "${VEXFS_LIBPQ_LIBRARY}")
+        endif()
+        set(VEXFS_POSTGRESQL_CLIENT_LIBRARY "${_VEXFS_POSTGRESQL_CLIENT_LIBRARY}"
+            CACHE FILEPATH "Resolved libpq runtime used by VexFS" FORCE)
+        if(APPLE AND VEXFS_POSTGRESQL_CLIENT_LIBRARY)
+            file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/pg-client/lib")
+            configure_file("${VEXFS_POSTGRESQL_CLIENT_LIBRARY}"
+                "${CMAKE_BINARY_DIR}/pg-client/lib/libpq.dylib" COPYONLY)
+        endif()
+    else()
+        message(STATUS "PostgreSQL VexFS client disabled: libpq development files not found")
+    endif()
+endif()
+if(VEXFS_REQUIRE_POSTGRESQL AND NOT PostgreSQL_FOUND)
+    message(FATAL_ERROR "PostgreSQL VexFS client support requires libpq development files")
+endif()
 
 # macOS：默认对齐真实硬件架构。两个坑：① anaconda clang 默认 target 是 x86_64；
 # ② 在 Rosetta(x86_64) 进程里 `uname -m` 会谎报 x86_64。都会编出与系统 arm64
@@ -38,6 +98,13 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_TOOLCHAIN_FILE
         set(CMAKE_OSX_ARCHITECTURES "${_HOST_ARCH}" CACHE STRING "" FORCE)
     endif()
     message(STATUS "macOS arch 对齐真实硬件: ${CMAKE_OSX_ARCHITECTURES}")
+endif()
+if(APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET AND NOT CMAKE_TOOLCHAIN_FILE
+   AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    # 默认 NFS 路径不依赖 FSKit。FSKit App 保持自己的 macOS 26 target，
+    # CLI、SQLite extension 和 NFS gateway 保持对更低版本 macOS 的兼容。
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "13.0" CACHE STRING "" FORCE)
+    message(STATUS "macOS NFS core deployment target: ${CMAKE_OSX_DEPLOYMENT_TARGET}")
 endif()
 
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.." ABSOLUTE)
@@ -101,6 +168,8 @@ endif()
 
 set(VEXDB_SQLITE_SRCS
     src/vexdb_sqlite_init.cpp
+    src/agent_files/vexfs_sqlite.cpp
+    ${REPO_ROOT}/agent_files/mount/common/src/vexfs_checksum.cpp
     src/vtab/graph_index_vtab.cpp
     src/functions/distance_functions.cpp
     src/functions/vector_codec.cpp
@@ -111,6 +180,7 @@ set(VEXDB_SQLITE_SRCS
 )
 
 set(VEXDB_SQLITE_INCLUDES
+    ${REPO_ROOT}/agent_files/mount/common/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include/store
     ${SQLITE_AMALG_DIR}
@@ -122,15 +192,20 @@ set(VEXDB_SQLITE_INCLUDES
     ${VEXDB_BOOST_INC}
 )
 
-# 版本信息注入（vexdb_version() 输出；对齐 duck 端做法）
-execute_process(COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE VEXDB_SQLITE_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# 版本信息注入（vexdb_version() 输出；对齐 duck 端做法）。远程发行构建不带
+# .git，允许发布脚本把本机提交号显式传进来，避免产物显示 unknown。
+set(VEXDB_SQLITE_GIT_HASH "" CACHE STRING "VexDB-Lite source revision")
+if(NOT VEXDB_SQLITE_GIT_HASH)
+    execute_process(COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE VEXDB_SQLITE_GIT_HASH OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
 if(NOT VEXDB_SQLITE_GIT_HASH)
     set(VEXDB_SQLITE_GIT_HASH "unknown")
 endif()
 string(TIMESTAMP VEXDB_SQLITE_BUILD_TIME "%Y-%m-%d %H:%M")
 add_compile_definitions(
+    VEXDB_LITE_VERSION="${VEXDB_LITE_VERSION}"
     VEXDB_SQLITE_GIT_HASH="${VEXDB_SQLITE_GIT_HASH}"
     VEXDB_SQLITE_BUILD_TIME="${VEXDB_SQLITE_BUILD_TIME}")
 
@@ -207,13 +282,190 @@ target_include_directories(vexdb_lite_static PRIVATE ${VEXDB_SQLITE_INCLUDES})
 target_compile_definitions(vexdb_lite_static PRIVATE VEXDB_SQLITE_CORE=1)
 set_target_properties(vexdb_lite_static PROPERTIES OUTPUT_NAME "vexdb_lite_static")
 
-if(VEXDB_SQLITE_BUILD_TESTS)
-    # 把 amalgamation 编成静态库供 smoke test 链接（模拟移动端宿主自带 sqlite3）。
+# 平台和 CLI 共用的 runtime。平台只能包含 runtime_io，CLI 额外包含
+# runtime_admin；SQLite 只是当前 backend adapter。
+add_library(vexfs_runtime STATIC
+    ${REPO_ROOT}/agent_files/mount/common/src/vexfs_mount_contract_sqlite.cpp)
+target_include_directories(vexfs_runtime PUBLIC
+    ${REPO_ROOT}/agent_files/mount/common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${SQLITE_AMALG_DIR})
+target_compile_definitions(vexfs_runtime PRIVATE VEXDB_SQLITE_CORE=1)
+target_link_libraries(vexfs_runtime PUBLIC vexdb_lite_static)
+if(PostgreSQL_FOUND)
+    target_compile_definitions(vexfs_runtime PRIVATE VEXFS_HAVE_LIBPQ=1)
+    target_include_directories(vexfs_runtime PRIVATE ${PostgreSQL_INCLUDE_DIRS})
+    target_link_libraries(vexfs_runtime PUBLIC ${PostgreSQL_LIBRARIES})
+endif()
+set_target_properties(vexfs_runtime PROPERTIES OUTPUT_NAME "vexfs_runtime")
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT ANDROID)
+    set(VEXDB_SQLITE_DESKTOP ON)
+endif()
+
+if(VEXDB_SQLITE_BUILD_TESTS OR VEXDB_SQLITE_DESKTOP)
+    # 自带 SQLite 的 shell 和 smoke test 共用同一份锁定版本 amalgamation。
     add_library(sqlite3_amalg STATIC ${SQLITE_AMALG_DIR}/sqlite3.c)
     target_include_directories(sqlite3_amalg PUBLIC ${SQLITE_AMALG_DIR})
-    target_compile_definitions(sqlite3_amalg PRIVATE SQLITE_ENABLE_LOAD_EXTENSION=1)
+    target_compile_definitions(sqlite3_amalg PRIVATE
+        SQLITE_ENABLE_LOAD_EXTENSION=1 SQLITE_ENABLE_FTS5=1)
+endif()
 
-    foreach(smoke m0_static_smoke m1_distance_smoke m2_vtab_smoke m3_hnsw_smoke)
+if(VEXDB_SQLITE_DESKTOP)
+    if(APPLE)
+        find_program(VEXFS_CARGO cargo)
+        if(NOT VEXFS_CARGO)
+            message(FATAL_ERROR
+                "macOS 默认 NFS gateway 需要 Rust cargo；请安装 Rust toolchain")
+        endif()
+        set(VEXFS_NFS_GATEWAY_DIR
+            "${REPO_ROOT}/agent_files/mount/macos/nfs_gateway")
+        set(VEXFS_NFS_CARGO_TARGET_DIR
+            "${CMAKE_BINARY_DIR}/nfs-gateway-cargo")
+        if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+            set(VEXFS_NFS_RUST_TARGET "aarch64-apple-darwin")
+        elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+            set(VEXFS_NFS_RUST_TARGET "x86_64-apple-darwin")
+        else()
+            message(FATAL_ERROR
+                "macOS NFS gateway 当前要求单架构构建（arm64 或 x86_64）；"
+                "通用包由发布脚本合并两个独立构建")
+        endif()
+        set(VEXFS_NFS_RUST_LIBRARY
+            "${VEXFS_NFS_CARGO_TARGET_DIR}/${VEXFS_NFS_RUST_TARGET}/release/libvexfs_nfs_gateway.a")
+        file(GLOB_RECURSE VEXFS_NFS_RUST_SOURCES CONFIGURE_DEPENDS
+            "${VEXFS_NFS_GATEWAY_DIR}/src/*.rs"
+            "${VEXFS_NFS_GATEWAY_DIR}/vendor/nfsserve/src/*.rs")
+        add_custom_command(
+            OUTPUT "${VEXFS_NFS_RUST_LIBRARY}"
+            COMMAND "${CMAKE_COMMAND}" -E env
+                "CARGO_TARGET_DIR=${VEXFS_NFS_CARGO_TARGET_DIR}"
+                "MACOSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}"
+                "${VEXFS_CARGO}" build --release --locked
+                    --target "${VEXFS_NFS_RUST_TARGET}"
+                    --manifest-path "${VEXFS_NFS_GATEWAY_DIR}/Cargo.toml"
+            DEPENDS
+                "${VEXFS_NFS_GATEWAY_DIR}/Cargo.toml"
+                "${VEXFS_NFS_GATEWAY_DIR}/Cargo.lock"
+                "${VEXFS_NFS_GATEWAY_DIR}/vendor/nfsserve/Cargo.toml"
+                ${VEXFS_NFS_RUST_SOURCES}
+            COMMENT "Build macOS VexFS NFS protocol adapter"
+            VERBATIM)
+        add_custom_target(vexfs_nfs_gateway_rust_build
+            DEPENDS "${VEXFS_NFS_RUST_LIBRARY}")
+        add_library(vexfs_nfs_gateway_rust STATIC IMPORTED GLOBAL)
+        set_target_properties(vexfs_nfs_gateway_rust PROPERTIES
+            IMPORTED_LOCATION "${VEXFS_NFS_RUST_LIBRARY}")
+        add_dependencies(vexfs_nfs_gateway_rust vexfs_nfs_gateway_rust_build)
+
+        add_executable(vexfs_nfs_gateway
+            ${VEXFS_NFS_GATEWAY_DIR}/vexfs_nfs_gateway_main.cpp)
+        target_include_directories(vexfs_nfs_gateway PRIVATE
+            ${VEXFS_NFS_GATEWAY_DIR}/include
+            ${REPO_ROOT}/agent_files/mount/common/include)
+        target_link_libraries(vexfs_nfs_gateway PRIVATE
+            vexfs_nfs_gateway_rust vexfs_runtime sqlite3_amalg
+            Threads::Threads ${CMAKE_DL_LIBS})
+        if(PostgreSQL_FOUND)
+            target_link_libraries(vexfs_nfs_gateway PRIVATE ${PostgreSQL_LIBRARIES})
+        endif()
+        set_target_properties(vexfs_nfs_gateway PROPERTIES
+            OUTPUT_NAME "vexfs-nfs-gateway" LINKER_LANGUAGE CXX)
+        if(VEXFS_BUNDLE_POSTGRESQL_RUNTIME)
+            set_target_properties(vexfs_nfs_gateway PROPERTIES
+                BUILD_WITH_INSTALL_RPATH ON
+                INSTALL_RPATH "@executable_path/../lib/runtime;@executable_path/../lib/vexdb-lite/runtime")
+        endif()
+    endif()
+
+    set_source_files_properties(${SQLITE_AMALG_DIR}/shell.c PROPERTIES
+        COMPILE_DEFINITIONS "main=vexdb_sqlite_shell_main;SQLITE_SHELL_INIT_PROC=vexdb_shell_init")
+    set(VEXDB_CLI_SOURCES
+        ${REPO_ROOT}/agent_files/cli/vexdb_main.cpp
+        ${REPO_ROOT}/agent_files/cli/vexdb_shell_init.c
+        ${REPO_ROOT}/agent_files/cli/vexfs_main.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_archive.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_platform_registry.cpp
+        ${SQLITE_AMALG_DIR}/shell.c)
+    set(VEXDB_CLI_PLATFORM_LIBS)
+    if(APPLE)
+        enable_language(OBJCXX)
+        find_library(VEXFS_FOUNDATION Foundation REQUIRED)
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_macos.cpp
+            ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm)
+        set_source_files_properties(
+            ${REPO_ROOT}/agent_files/cli/vexfs_fskit_state.mm
+            PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+        list(APPEND VEXDB_CLI_PLATFORM_LIBS ${VEXFS_FOUNDATION})
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_linux.cpp)
+    else()
+        list(APPEND VEXDB_CLI_SOURCES
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_stub.cpp)
+    endif()
+    add_executable(vexdb_cli ${VEXDB_CLI_SOURCES})
+    target_include_directories(vexdb_cli PRIVATE
+        ${REPO_ROOT}/agent_files/mount/common/include
+        ${REPO_ROOT}/agent_files/cli
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${SQLITE_AMALG_DIR})
+    target_compile_definitions(vexdb_cli PRIVATE VEXFS_EMBEDDED_MAIN=1 VEXDB_SQLITE_CORE=1)
+    target_link_libraries(vexdb_cli PRIVATE vexfs_runtime sqlite3_amalg
+        ${VEXDB_CLI_PLATFORM_LIBS} Threads::Threads ${CMAKE_DL_LIBS})
+    if(PostgreSQL_FOUND)
+        target_compile_definitions(vexdb_cli PRIVATE VEXFS_HAVE_LIBPQ=1)
+        target_include_directories(vexdb_cli PRIVATE ${PostgreSQL_INCLUDE_DIRS})
+        target_link_libraries(vexdb_cli PRIVATE ${PostgreSQL_LIBRARIES})
+    endif()
+    set_target_properties(vexdb_cli PROPERTIES OUTPUT_NAME "vexdb" LINKER_LANGUAGE CXX)
+    if(APPLE AND VEXFS_BUNDLE_POSTGRESQL_RUNTIME)
+        set_target_properties(vexdb_cli PROPERTIES
+            BUILD_WITH_INSTALL_RPATH ON
+            INSTALL_RPATH "@executable_path/../lib/runtime;@executable_path/../lib/vexdb-lite/runtime")
+    endif()
+    if(WIN32)
+        add_custom_command(TARGET vexdb_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:vexdb_cli>
+                $<TARGET_FILE_DIR:vexdb_cli>/vexfs${CMAKE_EXECUTABLE_SUFFIX}
+            COMMENT "Create vexfs compatibility entry")
+    else()
+        add_custom_command(TARGET vexdb_cli POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E remove -f $<TARGET_FILE_DIR:vexdb_cli>/vexfs
+            COMMAND ${CMAKE_COMMAND} -E create_symlink
+                $<TARGET_FILE_NAME:vexdb_cli> $<TARGET_FILE_DIR:vexdb_cli>/vexfs
+            COMMENT "Create vexfs compatibility entry")
+    endif()
+    add_custom_target(vexfs_cli DEPENDS vexdb_cli)
+    if(APPLE)
+        add_dependencies(vexfs_cli vexfs_nfs_gateway)
+    endif()
+
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_package(PkgConfig QUIET)
+        if(PkgConfig_FOUND)
+            pkg_check_modules(FUSE3 QUIET IMPORTED_TARGET fuse3)
+        endif()
+        if(TARGET PkgConfig::FUSE3)
+            add_executable(vexfs_fuse
+                ${REPO_ROOT}/agent_files/mount/linux/vexfs_fuse.cpp)
+            target_include_directories(vexfs_fuse PRIVATE
+                ${REPO_ROOT}/agent_files/mount/common/include)
+            target_link_libraries(vexfs_fuse PRIVATE vexfs_runtime sqlite3_amalg
+                PkgConfig::FUSE3 Threads::Threads ${CMAKE_DL_LIBS})
+            set_target_properties(vexfs_fuse PROPERTIES OUTPUT_NAME "vexfs-fuse")
+            add_dependencies(vexfs_cli vexfs_fuse)
+        else()
+            message(WARNING
+                "libfuse3 development files were not found; vexfs-fuse will not be built")
+        endif()
+    endif()
+endif()
+
+if(VEXDB_SQLITE_BUILD_TESTS)
+    foreach(smoke m0_static_smoke m1_distance_smoke m2_vtab_smoke m3_hnsw_smoke vexfs_static_smoke)
         add_executable(${smoke} test/${smoke}.c)
         target_include_directories(${smoke} PRIVATE ${VEXDB_SQLITE_INCLUDES})
         # 宿主侧静态注册形态：直接用真实 sqlite3 符号（非 ext 间接表）。
@@ -228,4 +480,39 @@ if(VEXDB_SQLITE_BUILD_TESTS)
     target_compile_definitions(m3p_parallel_smoke PRIVATE VEXDB_SQLITE_CORE=1)
     target_link_libraries(m3p_parallel_smoke PRIVATE
         vexdb_lite_static sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    add_executable(vexfs_runtime_smoke
+        ${REPO_ROOT}/agent_files/mount/common/test/vexfs_mount_contract_smoke.cpp)
+    target_include_directories(vexfs_runtime_smoke PRIVATE
+        ${REPO_ROOT}/agent_files/mount/common/include ${SQLITE_AMALG_DIR})
+    target_link_libraries(vexfs_runtime_smoke PRIVATE
+        vexfs_runtime sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    if(PostgreSQL_FOUND)
+        add_executable(vexfs_pg_runtime_smoke
+            ${REPO_ROOT}/agent_files/mount/common/test/vexfs_pg_runtime_smoke.cpp)
+        target_include_directories(vexfs_pg_runtime_smoke PRIVATE
+            ${REPO_ROOT}/agent_files/mount/common/include ${PostgreSQL_INCLUDE_DIRS})
+        target_link_libraries(vexfs_pg_runtime_smoke PRIVATE
+            vexfs_runtime sqlite3_amalg ${PostgreSQL_LIBRARIES}
+            Threads::Threads ${CMAKE_DL_LIBS})
+    endif()
+
+    add_executable(vexfs_platform_registry_smoke
+        ${REPO_ROOT}/agent_files/cli/test/vexfs_platform_registry_smoke.cpp
+        ${REPO_ROOT}/agent_files/cli/vexfs_platform_registry.cpp)
+    target_include_directories(vexfs_platform_registry_smoke PRIVATE
+        ${REPO_ROOT}/agent_files/cli)
+
+    foreach(platform linux windows)
+        add_executable(vexfs_platform_${platform}_smoke
+            ${REPO_ROOT}/agent_files/cli/test/vexfs_platform_stub_smoke.cpp
+            ${REPO_ROOT}/agent_files/cli/vexfs_platform_stub.cpp)
+        target_include_directories(vexfs_platform_${platform}_smoke PRIVATE
+            ${REPO_ROOT}/agent_files/cli)
+        string(TOUPPER "${platform}" platform_upper)
+        target_compile_definitions(vexfs_platform_${platform}_smoke PRIVATE
+            VEXFS_PLATFORM_STUB_${platform_upper}=1
+            VEXFS_PLATFORM_EXPECT_${platform_upper}=1)
+    endforeach()
 endif()

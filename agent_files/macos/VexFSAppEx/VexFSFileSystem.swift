@@ -1,0 +1,148 @@
+import Foundation
+import FSKit
+import OSLog
+import CryptoKit
+
+extension Logger {
+    static let vexfs = Logger(subsystem: "io.vexdb.vexfs", category: "filesystem")
+}
+
+enum VexFSIdentity {
+    static func uuid(backend: String, connection: String, workspace: String) -> UUID {
+        let digest = SHA256.hash(
+            data: Data("\(backend)\u{0}\(connection)\u{0}\(workspace)".utf8))
+        var bytes = Array(digest.prefix(16))
+        bytes[6] = (bytes[6] & 0x0f) | 0x50
+        bytes[8] = (bytes[8] & 0x3f) | 0x80
+        return UUID(uuid: (bytes[0], bytes[1], bytes[2], bytes[3],
+                           bytes[4], bytes[5], bytes[6], bytes[7],
+                           bytes[8], bytes[9], bytes[10], bytes[11],
+                           bytes[12], bytes[13], bytes[14], bytes[15]))
+    }
+}
+
+@objc
+@available(macOS 26.0, *)
+final class VexFSFileSystem: FSUnaryFileSystem & FSUnaryFileSystemOperations {
+    private static let descriptorName = ".vexfs-volume.json"
+    private var resource: FSPathURLResource?
+    private var volume: VexFSVolume?
+
+    private struct Configuration {
+        let descriptor: VexFSDescriptor
+        let connection: String
+    }
+
+    private func configuration(for resource: FSPathURLResource) throws
+        -> Configuration {
+        let root = resource.url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+              isDirectory.boolValue else {
+            throw POSIXError(.ENOTDIR)
+        }
+        let descriptorURL = root.appendingPathComponent(Self.descriptorName, isDirectory: false)
+        let descriptor = try JSONDecoder().decode(
+            VexFSDescriptor.self, from: Data(contentsOf: descriptorURL))
+        guard descriptor.version == 3,
+              descriptor.backend == "sqlite" || descriptor.backend == "postgresql",
+              !descriptor.connection.isEmpty,
+              !descriptor.workspace.isEmpty else {
+            throw POSIXError(.EINVAL)
+        }
+        if descriptor.backend == "sqlite" {
+            guard descriptor.connection != ".", descriptor.connection != "..",
+                  URL(fileURLWithPath: descriptor.connection).lastPathComponent ==
+                    descriptor.connection else {
+                throw POSIXError(.EINVAL)
+            }
+            let databaseURL = root.appendingPathComponent(
+                descriptor.connection, isDirectory: false).standardizedFileURL
+            guard databaseURL.deletingLastPathComponent() == root else {
+                throw POSIXError(.EACCES)
+            }
+            return Configuration(descriptor: descriptor, connection: databaseURL.path)
+        }
+        return Configuration(descriptor: descriptor, connection: descriptor.connection)
+    }
+
+    func probeResource(resource: FSResource,
+                       replyHandler: @escaping (FSProbeResult?, (any Error)?) -> Void) {
+        guard let pathResource = resource as? FSPathURLResource else {
+            return replyHandler(nil, POSIXError(.ENODEV))
+        }
+        do {
+            let configuration = try configuration(for: pathResource)
+            let descriptor = configuration.descriptor
+            let identifier = FSContainerIdentifier(uuid:
+                VexFSIdentity.uuid(backend: descriptor.backend,
+                                   connection: configuration.connection,
+                                   workspace: descriptor.workspace))
+            replyHandler(.usable(name: "VexFS \(descriptor.workspace)", containerID: identifier), nil)
+        } catch {
+            Logger.vexfs.debug("probe rejected resource: \(error.localizedDescription)")
+            replyHandler(.notRecognized, nil)
+        }
+    }
+
+    func loadResource(resource: FSResource, options: FSTaskOptions,
+                      replyHandler: @escaping (FSVolume?, (any Error)?) -> Void) {
+        guard let pathResource = resource as? FSPathURLResource else {
+            return replyHandler(nil, POSIXError(.EINVAL))
+        }
+        for option in options.taskOptions where option.contains("-f") {
+            return replyHandler(nil, POSIXError(.ENOTSUP))
+        }
+        guard pathResource.url.startAccessingSecurityScopedResource() else {
+            return replyHandler(nil, POSIXError(.EACCES))
+        }
+        do {
+            let configuration = try configuration(for: pathResource)
+            let descriptor = configuration.descriptor
+            let backend = try VexFSBackend(backend: descriptor.backend,
+                                           connection: configuration.connection,
+                                           workspace: descriptor.workspace)
+            let identity = VexFSIdentity.uuid(backend: descriptor.backend,
+                                              connection: configuration.connection,
+                                              workspace: descriptor.workspace)
+            let loadedVolume = try VexFSVolume(backend: backend, workspace: descriptor.workspace,
+                                               volumeID: identity)
+            containerStatus = .ready
+            self.resource = pathResource
+            self.volume = loadedVolume
+            replyHandler(loadedVolume, nil)
+        } catch {
+            // This contains the runtime error text, never the connection string or
+            // passfile contents. Keep it public so headless install/eval failures
+            // can be diagnosed from unified logs without enabling private logging.
+            Logger.vexfs.error(
+                "load rejected resource: \(error.localizedDescription, privacy: .public)")
+            pathResource.url.stopAccessingSecurityScopedResource()
+            replyHandler(nil, error)
+        }
+    }
+
+    func unloadResource(resource: FSResource, options: FSTaskOptions,
+                        replyHandler: @escaping ((any Error)?) -> Void) {
+        guard resource is FSPathURLResource else {
+            return replyHandler(POSIXError(.EINVAL))
+        }
+        // FSUnaryFileSystem has exactly one loaded resource. FSKit may give the
+        // unload callback a new FSPathURLResource object whose URL spelling is
+        // not byte-for-byte identical to the load callback (for example
+        // /tmp versus /private/tmp). Comparing URL objects here rejected a real
+        // unmount and left the database mount lease alive until its 30s expiry.
+        guard let loadedResource = self.resource else {
+            return replyHandler(nil)
+        }
+        Logger.vexfs.info("unloading VexFS resource")
+        do { try volume?.synchronizeNow() } catch {
+            Logger.vexfs.error("unload synchronize failed: \(error.localizedDescription)")
+        }
+        volume?.closeBackend()
+        self.volume = nil
+        self.resource = nil
+        loadedResource.url.stopAccessingSecurityScopedResource()
+        replyHandler(nil)
+    }
+}

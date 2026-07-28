@@ -1,0 +1,308 @@
+name: sqlite__vexfs_contract
+tags: [vexfs, sqlite, transaction]
+description: VexFS 文件目录、事务、句柄写入、幂等请求和并发冲突合同
+steps:
+- query: SELECT vexfs_contract_version();
+  expect:
+  - - 0.9.0
+- query: SELECT vexfs_init();
+  expect:
+  - - 1
+- query: SELECT vexfs_workspace_create('default');
+  expect:
+  - - 1
+- query: SELECT vexfs_mkdir('default', '/notes/2026');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('default', '/notes/2026/hello.txt', X'68656C6C6F');
+  expect:
+  - - 1
+- query: SELECT CAST(vexfs_read('default', '/notes/2026/hello.txt') AS TEXT);
+  expect:
+  - - hello
+- query: SELECT CAST(vexfs_read_range('default', '/notes/2026/hello.txt', 1, 3) AS TEXT), length(vexfs_read_range('default', '/notes/2026/hello.txt', 5, 9));
+  expect:
+  - - ell
+    - 0
+- query: SELECT vexfs_create('default', '/notes/run.sh', 'file', 488);
+  expect:
+  - - 5
+- query: SELECT json_extract(vexfs_stat('default', '/notes/run.sh'), '$.mode');
+  expect:
+  - - 488
+- query: SELECT vexfs_chown('default', 5, 123, 456);
+  expect:
+  - - 123
+- query: SELECT json_extract(vexfs_stat('default', '/notes/run.sh'), '$.uid'), json_extract(vexfs_stat('default', '/notes/run.sh'), '$.gid');
+  expect:
+  - - 123
+    - 456
+- query: SELECT vexfs_acl_set('default', 5, '[{"principal":"alice","effect":"allow","permissions":"read,write","inherit":1}]');
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_acl_get('default', 5), '$[0].principal'), json_extract(vexfs_acl_get('default', 5), '$[0].permissions');
+  expect:
+  - - alice
+    - read,write
+- query: SELECT vexfs_set_mode('default', 5, 448);
+  expect:
+  - - 448
+- query: SELECT vexfs_symlink('default', '/notes/run-link', X'72756E2E7368');
+  expect:
+  - - 6
+- query: SELECT CAST(vexfs_readlink('default', 6) AS TEXT);
+  expect:
+  - - run.sh
+- query: SELECT json_extract(vexfs_stat('default', '/notes/run-link'), '$.kind'), json_extract(vexfs_stat('default', '/notes/run-link'), '$.mode');
+  expect:
+  - - symlink
+    - 511
+- statement: BEGIN;
+- query: SELECT vexfs_write('default', '/notes/2026/hello.txt', 'rolled back');
+  expect:
+  - - 2
+- statement: ROLLBACK;
+- query: SELECT CAST(vexfs_read('default', '/notes/2026/hello.txt') AS TEXT);
+  expect:
+  - - hello
+- query: SELECT length(vexfs_handle_open('default', '/notes/2026/hello.txt', 'rw', 'open-spec'));
+  expect:
+  - - 32
+- query: SELECT vexfs_handle_stage_write((SELECT result_text FROM _vexfs_requests WHERE request_id='open-spec'), 5, ' world', 'write-spec');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_stage_write((SELECT result_text FROM _vexfs_requests WHERE request_id='open-spec'), 5, ' world', 'write-spec');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_publish((SELECT result_text FROM _vexfs_requests WHERE request_id='open-spec'), 1, 'data', 'publish-spec');
+  expect:
+  - - 2
+- query: SELECT vexfs_handle_close((SELECT result_text FROM _vexfs_requests WHERE request_id='open-spec'), 1, 'close-spec');
+  expect:
+  - - closed
+- query: SELECT CAST(vexfs_read('default', '/notes/2026/hello.txt') AS TEXT);
+  expect:
+  - - hello world
+- query: SELECT length(vexfs_handle_open('default', '/notes/2026/hello.txt', 'rw', 'open-a'));
+  expect:
+  - - 32
+- query: SELECT length(vexfs_handle_open('default', '/notes/2026/hello.txt', 'rw', 'open-b'));
+  expect:
+  - - 32
+- query: SELECT vexfs_handle_stage_write((SELECT result_text FROM _vexfs_requests WHERE request_id='open-a'), 0, 'A', 'write-a');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_stage_write((SELECT result_text FROM _vexfs_requests WHERE request_id='open-b'), 0, 'B', 'write-b');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_publish((SELECT result_text FROM _vexfs_requests WHERE request_id='open-a'), 1, 'data', 'publish-a');
+  expect:
+  - - 3
+- query: SELECT vexfs_handle_publish((SELECT result_text FROM _vexfs_requests WHERE request_id='open-b'), 1, 'data', 'publish-b');
+  expect_error: write conflict
+- query: SELECT vexfs_handle_close((SELECT result_text FROM _vexfs_requests WHERE request_id='open-a'), 0, 'close-a');
+  expect:
+  - - closed
+- query: SELECT vexfs_handle_close((SELECT result_text FROM _vexfs_requests WHERE request_id='open-b'), 0, 'close-b');
+  expect:
+  - - closed
+- query: SELECT CAST(vexfs_read('default', '/notes/2026/hello.txt') AS TEXT);
+  expect:
+  - - Aello world
+- query: SELECT json_extract(value, '$.version'), json_extract(value, '$.current') FROM json_each(vexfs_history('default', '/notes/2026/hello.txt'));
+  expect:
+  - - 3
+    - 1
+  - - 2
+    - 0
+  - - 1
+    - 0
+- query: SELECT json_extract(vexfs_history('default', '/notes/2026/hello.txt', 1, 0), '$.entries[0].version'), json_extract(vexfs_history('default', '/notes/2026/hello.txt', 1, 0), '$.next_before');
+  expect:
+  - - 3
+    - 3
+- query: SELECT CAST(vexfs_read_version('default', '/notes/2026/hello.txt', 1) AS TEXT);
+  expect:
+  - - hello
+- query: SELECT json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.changed'), json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.from_size'), json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3), '$.to_size');
+  expect:
+  - - 1
+    - 5
+    - 11
+- query: SELECT json_extract(vexfs_compare_versions('default', '/notes/2026/hello.txt', 3, 3), '$.changed');
+  expect:
+  - - 0
+- statement: UPDATE _vexfs_manifests SET chunk_count=2049 WHERE id=(SELECT manifest_id FROM _vexfs_file_versions WHERE inode_id=4 AND version_no=1);
+- query: SELECT vexfs_compare_versions('default', '/notes/2026/hello.txt', 1, 3);
+  expect_error: file version content reference is corrupt
+- statement: UPDATE _vexfs_manifests SET chunk_count=1 WHERE id=(SELECT manifest_id FROM _vexfs_file_versions WHERE inode_id=4 AND version_no=1);
+- query: SELECT vexfs_restore_version('default', '/notes/2026/hello.txt', 1, 3);
+  expect:
+  - - 4
+- query: SELECT CAST(vexfs_read('default', '/notes/2026/hello.txt') AS TEXT);
+  expect:
+  - - hello
+- query: SELECT source_version_no FROM _vexfs_file_versions WHERE version_no=4;
+  expect:
+  - - 1
+- query: SELECT vexfs_move('default', '/notes/2026/hello.txt', '/notes/hello.txt');
+  expect:
+  - - 1
+- query: SELECT vexfs_remove('default', '/notes/2026', 0);
+  expect:
+  - - 1
+- query: SELECT json_extract(value, '$.name'), json_extract(value, '$.inode'), json_extract(value, '$.kind'), json_extract(value, '$.size'), json_extract(value, '$.version') FROM json_each(vexfs_list('default', '/notes'));
+  expect:
+  - - hello.txt
+    - 4
+    - file
+    - 5
+    - 4
+  - - run-link
+    - 6
+    - symlink
+    - 6
+    - 1
+  - - run.sh
+    - 5
+    - file
+    - 0
+    - 1
+- query: SELECT vexfs_xattr_set('default', 5, 'user.spec', 'old', 0);
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('default', 'spec-baseline') = (SELECT head_commit FROM _vexfs_workspaces WHERE name='default');
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_snapshot_show('default', 'spec-baseline'), '$.name');
+  expect:
+  - - spec-baseline
+- query: SELECT vexfs_write('default', '/notes/hello.txt', 'changed');
+  expect:
+  - - 5
+- query: SELECT vexfs_set_mode('default', 5, 384);
+  expect:
+  - - 384
+- query: SELECT vexfs_xattr_set('default', 5, 'user.spec', 'new', 0);
+  expect:
+  - - 1
+- query: SELECT vexfs_chown('default', 5, 789, 987);
+  expect:
+  - - 789
+- query: SELECT vexfs_acl_set('default', 5, '[]');
+  expect:
+  - - 0
+- query: SELECT vexfs_remove('default', '/notes/run-link', 0);
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/notes/extra.txt', 'extra');
+  expect:
+  - - 1
+- query: SELECT json_array_length(json_extract(vexfs_snapshot_diff('default', 'spec-baseline', 'HEAD'), '$.changes')) > 0;
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_restore('default', 'spec-baseline', (SELECT head_commit FROM _vexfs_workspaces WHERE name='default')) > 0;
+  expect:
+  - - 1
+- query: SELECT CAST(vexfs_read('default', '/notes/hello.txt') AS TEXT), json_extract(vexfs_stat('default', '/notes/run.sh'), '$.mode'), json_extract(vexfs_stat('default', '/notes/run.sh'), '$.uid'), json_extract(vexfs_stat('default', '/notes/run.sh'), '$.gid'), json_extract(vexfs_acl_get('default', 5), '$[0].principal'), CAST(vexfs_readlink('default', 6) AS TEXT), CAST(vexfs_xattr_get('default', 5, 'user.spec') AS TEXT);
+  expect:
+  - - hello
+    - 448
+    - 123
+    - 456
+    - alice
+    - run.sh
+    - old
+- query: SELECT vexfs_stat('default', '/notes/extra.txt');
+  expect_error: path not found
+- query: SELECT json_array_length(json_extract(vexfs_snapshot_diff('default', 'spec-baseline', 'HEAD'), '$.changes'));
+  expect:
+  - - 0
+- query: SELECT length(json_extract(vexfs_stat('default', '/notes/hello.txt'), '$.checksum')), json_extract(vexfs_stat('default', '/notes/hello.txt'), '$.checksum') <> '2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824';
+  expect:
+  - - 64
+    - 1
+- query: SELECT json_extract(vexfs_check('default', 1), '$.ok'), json_extract(vexfs_check('default', 1), '$.mode'), json_extract(vexfs_check('default', 1), '$.issue_count');
+  expect:
+  - - 1
+    - deep
+    - 0
+- query: SELECT json_extract(vexfs_check('default', 0), '$.ok'), json_extract(vexfs_check('default', 0), '$.mode');
+  expect:
+  - - 1
+    - quick
+- query: SELECT vexfs_snapshot_restore('default', 'spec-baseline', (SELECT head_commit FROM _vexfs_workspaces WHERE name='default'));
+  expect_error: already matches
+- query: SELECT vexfs_snapshot_drop('default', 'spec-baseline');
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_quota_get('default'), '$.max_bytes'), json_extract(vexfs_quota_get('default'), '$.over_quota');
+  expect:
+  - - null
+    - 0
+- query: SELECT json_extract(vexfs_quota_set('default', NULL, NULL, 5), '$.max_file_bytes');
+  expect:
+  - - 5
+- query: SELECT vexfs_write('default', '/notes/hello.txt', '123456');
+  expect_error: maximum file size quota exceeded
+- query: SELECT CAST(vexfs_read('default', '/notes/hello.txt') AS TEXT), count(*) FROM _vexfs_file_versions WHERE inode_id=4;
+  expect:
+  - - hello
+    - 6
+- query: SELECT json_extract(vexfs_quota_set('default', NULL, NULL, NULL), '$.over_quota');
+  expect:
+  - - 0
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'one');
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'two');
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('default', 'gc-protected') > 0;
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'three');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('default', '/notes/gc.txt', 'four');
+  expect:
+  - - 4
+- query: SELECT json_extract(vexfs_retention_set('default', 1, 0), '$.reclaimable_versions') >= 2;
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_gc_pause('default', 1), '$.gc_paused');
+  expect:
+  - - 1
+- query: SELECT vexfs_gc('default', 10000);
+  expect_error: GC is paused
+- query: SELECT json_extract(vexfs_gc_pause('default', 0), '$.gc_paused');
+  expect:
+  - - 0
+- query: SELECT json_extract(vexfs_gc('default', 10000), '$.deleted_versions') > 0;
+  expect:
+  - - 1
+- query: SELECT json_extract(vexfs_gc('default', 10000), '$.remaining_reclaimable_versions');
+  expect:
+  - - 0
+- query: SELECT CAST(vexfs_read_version('default', '/notes/gc.txt', 2) AS TEXT), CAST(vexfs_read('default', '/notes/gc.txt') AS TEXT);
+  expect:
+  - - two
+    - four
+- query: SELECT json_extract(vexfs_check('default', 1), '$.ok'), json_extract(vexfs_check('default', 1), '$.issue_count');
+  expect:
+  - - 1
+    - 0
+- query: SELECT vexfs_snapshot_drop('default', 'gc-protected');
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/multi.bin', zeroblob(65537));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('default', '/multi.bin', zeroblob(131073));
+  expect:
+  - - 2
+- query: SELECT json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.changed'), json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.from_size'), json_extract(vexfs_compare_versions('default', '/multi.bin', 1, 2), '$.to_size');
+  expect:
+  - - 1
+    - 65537
+    - 131073

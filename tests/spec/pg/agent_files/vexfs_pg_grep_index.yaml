@@ -1,0 +1,99 @@
+name: pg__vexfs_grep_index
+tags: [vexfs, pg, grep, index, pg_trgm]
+description: PostgreSQL VexFS 可选 trigram 子串索引、回退扫描和快照恢复维护
+steps:
+- statement: CREATE EXTENSION IF NOT EXISTS pg_trgm;
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_grep_index('status')->>'backend', (vexfs_grep_index('status')->>'available')::boolean;
+  expect:
+  - - pg-trgm
+    - true
+- query: SELECT vexfs_grep_index('enable');
+  expect_error: VEXFS_WORKSPACE_REQUIRED
+- query: SELECT vexfs_workspace_create('pg-grep') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_mkdir('pg-grep', '/src') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-grep', '/src/a.txt', convert_to('Alpha needle 100% foo_bar C:\tmp' || E'\n' || 'second needle', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-grep', '/src/b.txt', convert_to('ordinary content', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-grep', '/src/bin.dat', decode('ff00fe', 'hex'));
+  expect:
+  - - 1
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'match_count')::integer, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'binary_files_skipped')::integer;
+  expect:
+  - - false
+    - 2
+    - 1
+- query: SELECT (vexfs_grep_index('pg-grep', 'enable')->>'enabled')::boolean, (vexfs_grep_index('pg-grep', 'status')->>'dirty')::boolean, (vexfs_grep_index('pg-grep', 'status')->>'indexed_files')::integer;
+  expect:
+  - - true
+    - false
+    - 2
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'match_count')::integer, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'files_scanned')::integer;
+  expect:
+  - - true
+    - 2
+    - 1
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'alpha', 1, 100)->>'match_count')::integer, (vexfs_grep('pg-grep', '/src', '100%', 0, 100)->>'match_count')::integer, (vexfs_grep('pg-grep', '/src', 'foo_bar', 0, 100)->>'match_count')::integer, (vexfs_grep('pg-grep', '/src', 'C:\tmp', 0, 100)->>'match_count')::integer;
+  expect:
+  - - 1
+    - 1
+    - 1
+    - 1
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'ne', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'ne', 0, 100)->>'match_count')::integer;
+  expect:
+  - - false
+    - 2
+- query: SELECT vexfs_snapshot_create('pg-grep', 'baseline');
+  expect:
+  - - 5
+- query: SELECT vexfs_write('pg-grep', '/src/a.txt', convert_to('replacement haystack', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT vexfs_write('pg-grep', '/src/new.txt', convert_to('new needle file', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'match_count')::integer, vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->'matches'->0->>'path';
+  expect:
+  - - 1
+    - /src/new.txt
+- query: SELECT vexfs_snapshot_restore('pg-grep', 'baseline', 7);
+  expect:
+  - - 8
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'match_count')::integer, vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->'matches'->0->>'path';
+  expect:
+  - - true
+    - 2
+    - /src/a.txt
+- statement: UPDATE _vexfs.workspaces SET grep_index_dirty=true WHERE name='pg-grep';
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'index_used')::boolean, (vexfs_grep_index('pg-grep', 'status')->>'dirty')::boolean;
+  expect:
+  - - false
+    - true
+- query: SELECT (vexfs_grep_index('pg-grep', 'rebuild')->>'dirty')::boolean, (vexfs_grep_index('pg-grep', 'status')->>'indexed_files')::integer;
+  expect:
+  - - false
+    - 2
+- query: SELECT vexfs_remove('pg-grep', '/src/a.txt', false);
+  expect:
+  - - 1
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'needle', 0, 100)->>'match_count')::integer, (vexfs_grep_index('pg-grep', 'status')->>'indexed_files')::integer;
+  expect:
+  - - true
+    - 0
+    - 1
+- query: SELECT (vexfs_grep_index('pg-grep', 'disable')->>'enabled')::boolean;
+  expect:
+  - - false
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'ordinary', 0, 100)->>'index_used')::boolean;
+  expect:
+  - - false
+- query: SELECT vexfs_workspace_drop('pg-grep');
+  expect:
+  - - 1

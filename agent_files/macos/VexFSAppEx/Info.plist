@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>VexDB Lite 需要连接局域网中的 PostgreSQL，挂载共享的 VexFS 工作区。</string>
+    <key>EXAppExtensionAttributes</key>
+    <dict>
+        <key>EXExtensionPointIdentifier</key>
+        <string>com.apple.fskit.fsmodule</string>
+        <key>FSActivateOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>u:g:m:o:</string>
+        </dict>
+        <key>FSCheckOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>nqy</string>
+        </dict>
+        <key>FSFormatOptionSyntax</key>
+        <dict>
+            <key>shortOptions</key>
+            <string>v</string>
+        </dict>
+        <key>FSMediaTypes</key>
+        <dict/>
+        <key>FSPersonalities</key>
+        <dict>
+            <key>VexFS</key>
+            <dict>
+                <key>FSfileObjectsAreCaseSensitive</key>
+                <true/>
+                <key>FSName</key>
+                <string>VexFS</string>
+            </dict>
+        </dict>
+        <key>FSRequiresSecurityScopedPathURLResources</key>
+        <true/>
+        <key>FSShortName</key>
+        <string>vexfs</string>
+        <key>FSSupportsBlockResources</key>
+        <false/>
+        <key>FSSupportsPathURLs</key>
+        <true/>
+    </dict>
+</dict>
+</plist>

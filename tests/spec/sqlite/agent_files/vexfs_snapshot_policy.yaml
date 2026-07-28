@@ -1,0 +1,71 @@
+name: sqlite__vexfs_snapshot_policy
+tags: [vexfs, sqlite, snapshot, policy, prune]
+description: SQLite 快照分类、保留策略、dry-run 和 GC 边界
+steps:
+- query: SELECT vexfs_init();
+  expect:
+  - - 1
+- query: SELECT vexfs_workspace_create('snapshot-policy');
+  expect:
+  - - 1
+- query: SELECT vexfs_mkdir('snapshot-policy', '/src');
+  expect:
+  - - 2
+- query: SELECT vexfs_write('snapshot-policy', '/src/main.txt', 'v1');
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'agent-old', NULL, 'consistent', 'agent');
+  expect:
+  - - 3
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'safety-old', NULL, 'consistent', 'safety');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('snapshot-policy', '/src/main.txt', 'v2');
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'manual-current', NULL, 'consistent', 'manual');
+  expect:
+  - - 4
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'agent-new', NULL, 'consistent', 'agent');
+  expect:
+  - - 4
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'safety-new', NULL, 'consistent', 'safety');
+  expect:
+  - - 4
+- query: SELECT json_extract(vexfs_snapshot_policy_get('snapshot-policy'), '$.agent_keep'), json_extract(vexfs_snapshot_policy_get('snapshot-policy'), '$.safety_keep'), json_extract(vexfs_snapshot_policy_get('snapshot-policy'), '$.keep_days');
+  expect:
+  - - 20
+    - 10
+    - 30
+- query: SELECT json_extract(vexfs_snapshot_policy_set('snapshot-policy', 1, 1, 0), '$.expired.total');
+  expect:
+  - - 2
+- query: SELECT json_extract(vexfs_snapshot_prune('snapshot-policy', 1), '$.candidate_count'), json_extract(vexfs_snapshot_prune('snapshot-policy', 1), '$.deleted'), (SELECT count(*) FROM _vexfs_snapshots WHERE workspace_id=(SELECT id FROM _vexfs_workspaces WHERE name='snapshot-policy'));
+  expect:
+  - - 2
+    - 0
+    - 5
+- query: SELECT json_extract(vexfs_snapshot_prune('snapshot-policy', 0), '$.deleted');
+  expect:
+  - - 2
+- query: SELECT json_extract(value, '$.name'), json_extract(value, '$.type') FROM json_each(vexfs_snapshot_list('snapshot-policy')) ORDER BY 1;
+  expect:
+  - - agent-new
+    - agent
+  - - manual-current
+    - manual
+  - - safety-new
+    - safety
+- query: SELECT json_extract(vexfs_retention_set('snapshot-policy', 1, 0), '$.reclaimable_versions') >= 1;
+  expect:
+  - - 1
+- statement: UPDATE _vexfs_snapshots SET created_at=CAST(unixepoch('subsec')*1000 AS INTEGER)-31*86400000 WHERE workspace_id=(SELECT id FROM _vexfs_workspaces WHERE name='snapshot-policy') AND name='agent-new';
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'agent-recent', NULL, 'consistent', 'agent');
+  expect:
+  - - 4
+- query: SELECT json_extract(vexfs_snapshot_policy_set('snapshot-policy', 0, 1, 30), '$.expired.agent'), json_extract(vexfs_snapshot_prune('snapshot-policy', 1), '$.candidate_count');
+  expect:
+  - - 1
+    - 1
+- query: SELECT vexfs_snapshot_create('snapshot-policy', 'bad-type', NULL, 'consistent', 'other');
+  expect_error: snapshot type must be manual, agent or safety

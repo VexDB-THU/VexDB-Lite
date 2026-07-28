@@ -76,6 +76,7 @@ m4/lt~obsolete.m4
 build/
 build-release/
 build-release-vex/
+/.cache/
 duckdb_benchmark_data/
 #*.m4
 *.o
@@ -380,6 +381,9 @@ __pycache__/
 *.egg-info/
 *.whl
 
+# Rust build artifacts
+agent_files/mount/macos/nfs_gateway/target/
+
 # DuckDB runtime / built extensions
 *.duckdb
 *.duckdb.wal
@@ -406,8 +410,17 @@ vexdb_duckdb/test/sql/vex/
 scripts/env.local.sh
 scripts/*.local.sh
 
-# 内部文档目录（本地保留，不入仓库）
-docs/
+# 本地分析和生成报告不入仓库；当前 VexFS 产品基线必须随代码版本管理。
+docs/*
+!docs/specs/
+docs/specs/*
+!docs/specs/2026-07-16_vexfs-product-spec.md
+!docs/plans/
+docs/plans/*
+!docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md
+!docs/design/
+docs/design/*
+!docs/design/2026-07-16_agent-files-universal-filesystem.md
 CHANGELOG.md
 
 # SIFT benchmark data (large, generated from hdf5; not in repo)

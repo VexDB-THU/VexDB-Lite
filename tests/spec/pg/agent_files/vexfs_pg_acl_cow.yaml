@@ -1,0 +1,75 @@
+name: pg__vexfs_acl_cow
+tags: [vexfs, pg, acl, cow, snapshot, scale]
+description: PostgreSQL VexFS 复用不可变 ACL 集合，修改时只切换单个 inode 引用
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-acl-cow') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_acl_set('pg-acl-cow', (vexfs_workspace_stat('pg-acl-cow')->>'root_inode')::bigint, '[{"principal":"public","effect":"allow","permissions":"read","inherit":1},{"principal":"local-admin","effect":"allow","permissions":"admin","inherit":0}]');
+  expect:
+  - - 2
+- query: SELECT jsonb_array_length(vexfs_create_batch('pg-acl-cow', '/', (SELECT jsonb_agg(jsonb_build_object('name', 'file-' || value || '.txt') ORDER BY value) FROM generate_series(1,1000) AS value))->'created');
+  expect:
+  - - 1000
+- query: SELECT count(DISTINCT inode.acl_set_id), count(*) FILTER (WHERE inode.acl_set_id IS NULL), (SELECT count(*) FROM _vexfs.acl_sets WHERE workspace_id=workspace.workspace_id), (SELECT count(*) FROM _vexfs.acl_set_entries AS entry JOIN _vexfs.acl_sets AS acl_set USING (acl_set_id) WHERE acl_set.workspace_id=workspace.workspace_id) FROM _vexfs.workspaces AS workspace JOIN _vexfs.inodes AS inode ON inode.workspace_id=workspace.workspace_id JOIN _vexfs.dentries AS dentry ON dentry.workspace_id=workspace.workspace_id AND dentry.inode_id=inode.inode_id WHERE workspace.name='pg-acl-cow' AND dentry.parent_inode=workspace.root_inode GROUP BY workspace.workspace_id;
+  expect:
+  - - 1
+    - 0
+    - 2
+    - 3
+- query: SELECT count(*) FROM _vexfs.acl_entries AS acl JOIN _vexfs.dentries AS dentry ON dentry.workspace_id=acl.workspace_id AND dentry.inode_id=acl.inode_id WHERE acl.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-acl-cow') AND dentry.parent_inode=(SELECT root_inode FROM _vexfs.workspaces WHERE name='pg-acl-cow');
+  expect:
+  - - 1000
+- query: SELECT vexfs_snapshot_create('pg-acl-cow', 'baseline') > 0;
+  expect:
+  - - true
+- query: SELECT count(DISTINCT inode.acl_set_id), (SELECT count(*) FROM _vexfs.snapshot_acl_entries AS acl WHERE acl.snapshot_id=snapshot.snapshot_id), (SELECT count(*) FROM _vexfs.acl_set_entries AS entry JOIN _vexfs.acl_sets AS acl_set USING (acl_set_id) WHERE acl_set.workspace_id=snapshot.workspace_id) FROM _vexfs.snapshots AS snapshot JOIN _vexfs.snapshot_inodes AS inode USING (snapshot_id) WHERE snapshot.name='baseline' GROUP BY snapshot.snapshot_id, snapshot.workspace_id;
+  expect:
+  - - 2
+    - 1002
+    - 3
+- query: SELECT vexfs_acl_grant('pg-acl-cow', (vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint, 'agent-writer', 'write', 'allow', 0);
+  expect:
+  - - 1
+- query: SELECT first.acl_set_id <> sibling.acl_set_id, sibling.acl_set_id = snapshot_inode.acl_set_id, (SELECT count(*) FROM _vexfs.acl_sets WHERE workspace_id=workspace.workspace_id), (SELECT count(*) FROM _vexfs.acl_set_entries AS entry JOIN _vexfs.acl_sets AS acl_set USING (acl_set_id) WHERE acl_set.workspace_id=workspace.workspace_id) FROM _vexfs.workspaces AS workspace JOIN _vexfs.inodes AS first ON first.inode_id=(vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint JOIN _vexfs.inodes AS sibling ON sibling.inode_id=(vexfs_stat('pg-acl-cow', '/file-2.txt')->>'inode')::bigint JOIN _vexfs.snapshots AS snapshot ON snapshot.workspace_id=workspace.workspace_id AND snapshot.name='baseline' JOIN _vexfs.snapshot_inodes AS snapshot_inode ON snapshot_inode.snapshot_id=snapshot.snapshot_id AND snapshot_inode.inode_id=first.inode_id WHERE workspace.name='pg-acl-cow';
+  expect:
+  - - true
+    - true
+    - 3
+    - 5
+- query: SELECT details ? 'before_acl_set', details ? 'after_acl_set', (details->>'before_acl_set')::bigint <> (details->>'after_acl_set')::bigint FROM _vexfs.commit_changes WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-acl-cow') AND operation='grant_acl' ORDER BY commit_no DESC LIMIT 1;
+  expect:
+  - - true
+    - true
+    - true
+- query: SELECT vexfs_acl_grant('pg-acl-cow', (vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint, 'agent-writer', 'write', 'allow', 0);
+  expect:
+  - - 1
+- query: SELECT (vexfs_workspace_stat('pg-acl-cow')->>'head_commit')::bigint;
+  expect:
+  - - 4
+- query: SELECT vexfs_acl_revoke('pg-acl-cow', (vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint, 'agent-writer', 'allow');
+  expect:
+  - - 1
+- query: SELECT first.acl_set_id = sibling.acl_set_id, (SELECT count(*) FROM _vexfs.acl_sets WHERE workspace_id=workspace.workspace_id), (vexfs_workspace_stat('pg-acl-cow')->>'head_commit')::bigint FROM _vexfs.workspaces AS workspace JOIN _vexfs.inodes AS first ON first.inode_id=(vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint JOIN _vexfs.inodes AS sibling ON sibling.inode_id=(vexfs_stat('pg-acl-cow', '/file-2.txt')->>'inode')::bigint WHERE workspace.name='pg-acl-cow';
+  expect:
+  - - true
+    - 3
+    - 5
+- query: SELECT vexfs_acl_set('pg-acl-cow', (vexfs_stat('pg-acl-cow', '/file-1.txt')->>'inode')::bigint, '[{"principal":"dup","effect":"allow","permissions":"read"},{"principal":"dup","effect":"allow","permissions":"write"}]');
+  expect_error: VEXFS_INVALID_ACL
+- query: SELECT (vexfs_workspace_stat('pg-acl-cow')->>'head_commit')::bigint, (vexfs_check('pg-acl-cow', 1)->>'ok')::boolean;
+  expect:
+  - - 5
+    - true
+- query: SELECT vexfs_snapshot_restore('pg-acl-cow', 'baseline', 5) > 0;
+  expect:
+  - - true
+- query: SELECT count(DISTINCT inode.acl_set_id), (vexfs_check('pg-acl-cow', 1)->>'ok')::boolean FROM _vexfs.inodes AS inode WHERE inode.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-acl-cow') AND inode.live GROUP BY inode.workspace_id;
+  expect:
+  - - 2
+    - true
+- query: SELECT vexfs_workspace_drop('pg-acl-cow');
+  expect:
+  - - 1

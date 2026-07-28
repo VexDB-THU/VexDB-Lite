@@ -311,6 +311,7 @@ def emit_pg(spec: dict, dialect: dict) -> tuple[str, str]:
     sql_lines = [
         f"-- spec: {spec['name']}",
         "-- 抑制 NOTICE/WARNING (扩展输出噪声), 让 expected 纯净",
+        r"\set VERBOSITY terse",
         "SET client_min_messages = ERROR;",
         "",
     ]

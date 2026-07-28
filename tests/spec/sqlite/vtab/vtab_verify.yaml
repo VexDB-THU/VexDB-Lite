@@ -2,7 +2,7 @@ name: sqlite__vtab_verify
 tags: [vex, sqlite]
 description: 扩展自省——版本函数可调、全部函数已注册、shadow 表三件套与 vtab 共存于 sqlite_master（对照 duck graph_index_verify 行为面）
 steps:
-- query: SELECT vexdb_version() LIKE 'vexdb_lite sqlite extension%';
+- query: SELECT vexdb_version() LIKE 'vexdb-lite % sqlite extension%';
   expect:
   - - 1
 # 六个标量函数全部注册（任一缺失会直接报 no such function）

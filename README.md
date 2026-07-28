@@ -2,7 +2,7 @@
 
 **English** | **[中文](README.zh.md)**
 
-`VexDB-Lite` is a vector similarity search engine for PostgreSQL (`vexdb_lite` extension) and DuckDB (`vexdb_lite` extension). Both backends share the same graph index algorithm, SIMD distance dispatch, and quantization kernel.
+`VexDB-Lite` extends PostgreSQL, DuckDB, and SQLite with a shared graph index, SIMD distance dispatch, and quantization kernel. The SQLite edition also includes VexFS, so one database can hold regular tables, vector indexes, and database-managed files.
 
 > See [vexdb_duckdb/README.md](vexdb_duckdb/README.md) for the DuckDB extension docs.  
 > This root README is a project-level overview and build guide.
@@ -45,6 +45,32 @@ Current functionality:
 - Optimizer rewrite into `VEXDB_INDEX_SCAN`
 - Vector buffer cache and parallel index build
 - Runtime settings: `vexdb_ef_search`, `vexdb_brute_force_threshold`, `vexdb_pq_search_mode`, `vexdb_pq_refine_k_factor`
+
+### 1.3 SQLite: unified VexDB-Lite
+
+The unified macOS package installs:
+
+- `vexdb`, with SQLite 3.45.3 and automatic extension registration;
+- `GRAPH_INDEX` and vector distance functions;
+- VexFS files, directories, history, restore, SHA-256, and read-only integrity checks;
+- `vexdb fs ...`, including database-batched `grep` and an optional FTS5 trigram index, with `vexfs ...` kept as a compatible shortcut;
+- a VexFS FSKit extension for native `ls`, `cat`, `grep`, `cp`, and `mv` after enablement.
+
+```bash
+vexdb agent.db
+vexdb agent.db "SELECT vexdb_l2_distance('[1,2]', '[4,6]');"
+vexdb fs --db agent.db write /notes/hello.txt
+vexdb fs --db agent.db grep -n hello /notes
+vexdb fs --db agent.db check
+vexdb fs --db agent.db index enable
+vexdb fs --db agent.db mount ~/VexDB
+```
+
+The text index is disabled by default, so ordinary writes have no index overhead. Without the
+index, or when the SQLite host has no FTS5 support, `grep` falls back to a single-connection
+database scan.
+
+Build the unified macOS preview with `bash agent_files/macos/package_preview.sh`.
 
 ---
 

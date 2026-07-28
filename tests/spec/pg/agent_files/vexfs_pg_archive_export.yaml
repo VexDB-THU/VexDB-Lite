@@ -1,0 +1,103 @@
+name: pg__vexfs_archive_export
+tags: [vexfs, pg, archive, format-v2]
+description: PostgreSQL 通过公开合同在单一事务快照中生成 format v2 逻辑记录
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-archive') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_mkdir('pg-archive', '/tree', true) > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-archive', '/tree/value.txt', convert_to('before', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_link('pg-archive', '/tree/value.txt', '/tree/value-hard.txt') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_symlink('pg-archive', '/tree/current', convert_to('value.txt', 'UTF8')) > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_xattr_set('pg-archive', (vexfs_stat('pg-archive', '/tree/value.txt')->>'inode')::bigint, 'user.archive', convert_to('portable', 'UTF8'), 1);
+  expect:
+  - - 1
+- query: SELECT vexfs_acl_grant('pg-archive', (vexfs_stat('pg-archive', '/tree/value.txt')->>'inode')::bigint, 'public', 'read', 'allow', 0);
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('pg-archive', 'baseline');
+  expect:
+  - - 7
+- query: SELECT vexfs_write('pg-archive', '/tree/value.txt', convert_to('after', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT vexfs_remove('pg-archive', '/tree/value-hard.txt', false);
+  expect:
+  - - 1
+- query: SELECT vexfs_xattr_set('pg-archive', (vexfs_stat('pg-archive', '/tree/value.txt')->>'inode')::bigint, 'user.archive', NULL, 3);
+  expect:
+  - - 1
+- query: SELECT vexfs_acl_revoke('pg-archive', (vexfs_stat('pg-archive', '/tree/value.txt')->>'inode')::bigint, 'public', 'allow');
+  expect:
+  - - 1
+- statement: CREATE TEMP TABLE pg_archive_head AS SELECT * FROM vexfs_archive_export_records('pg-archive', NULL);
+- query: SELECT record_json->>'source_engine', (record_json->>'format_version')::integer, (record_json->>'source_commit')::bigint FROM pg_archive_head WHERE record_type='manifest';
+  expect:
+  - - postgresql
+    - 2
+    - 11
+- query: SELECT record_type, count(*) FROM pg_archive_head GROUP BY record_type ORDER BY record_type COLLATE "C";
+  expect:
+  - - acl_states
+    - 2
+  - - chunks
+    - 3
+  - - commit_changes
+    - 11
+  - - commits
+    - 11
+  - - dentries
+    - 3
+  - - dentry_states
+    - 8
+  - - file_versions
+    - 3
+  - - inode_states
+    - 8
+  - - inodes
+    - 4
+  - - manifest
+    - 1
+  - - manifests
+    - 3
+  - - principals
+    - 2
+  - - snapshots
+    - 1
+  - - xattr_states
+    - 2
+- query: SELECT count(*) FROM pg_archive_head WHERE record_type='chunks' AND encode(sha256(content),'hex') = record_json->>'checksum';
+  expect:
+  - - 3
+- query: SELECT count(*) FROM pg_archive_head WHERE record_type='dentry_states' AND (record_json->>'deleted')::integer=1 AND record_json->>'name'='value-hard.txt';
+  expect:
+  - - 1
+- query: SELECT count(*) FROM pg_archive_head WHERE record_type='xattr_states' AND (record_json->>'deleted')::integer=1;
+  expect:
+  - - 1
+- query: SELECT count(*) FROM pg_archive_head WHERE record_type='acl_states' AND (record_json->>'deleted')::integer=1;
+  expect:
+  - - 1
+- statement: CREATE TEMP TABLE pg_archive_baseline AS SELECT * FROM vexfs_archive_export_records('pg-archive', 'baseline');
+- query: SELECT (record_json->>'source_commit')::bigint, record_json->>'source_snapshot' FROM pg_archive_baseline WHERE record_type='manifest';
+  expect:
+  - - 7
+    - baseline
+- query: SELECT count(*) FROM pg_archive_baseline WHERE record_type='dentries' AND record_json->>'name'='value-hard.txt';
+  expect:
+  - - 1
+- query: SELECT count(*) FROM pg_archive_baseline WHERE record_type='file_versions';
+  expect:
+  - - 2
+- query: SELECT (vexfs_check('pg-archive', 1)->>'ok')::boolean;
+  expect:
+  - - true

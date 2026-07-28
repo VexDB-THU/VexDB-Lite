@@ -2,7 +2,7 @@
 
 **[English](README.md)** | **中文**
 
-`VexDB-Lite` 是一个高性能向量检索系统，提供 PostgreSQL（`vexdb_lite` 扩展）和 DuckDB（`vexdb_lite` 扩展）两种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和量化器内核。
+`VexDB-Lite` 是一个数据库能力扩展，提供 PostgreSQL、DuckDB 和 SQLite 三种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和量化器内核。SQLite 版还内置 VexFS 文件能力，让同一个数据库同时保存普通表、向量索引和文件。
 
 > DuckDB 扩展详见 [vexdb_duckdb/README.md](vexdb_duckdb/README.md)。  
 > 本根 README 只做项目级综述与构建总览。
@@ -44,6 +44,31 @@
 - 优化器生成 `VEXDB_INDEX_SCAN`
 - 向量缓存、并行建索引
 - 运行参数：`vexdb_ef_search`、`vexdb_brute_force_threshold`、`vexdb_pq_search_mode`、`vexdb_pq_refine_k_factor`
+
+### 1.3 SQLite：统一的 VexDB-Lite
+
+macOS 统一包一次安装即可获得：
+
+- `vexdb`：自带 SQLite 3.45.3，无需手动 `.load`；
+- `GRAPH_INDEX` 和向量距离函数；
+- VexFS 文件、目录、历史版本、恢复、SHA-256 和只读完整性检查；
+- `vexdb fs ...` 文件命令，含数据库批量 `grep` 和可选 FTS5 trigram 索引，兼容入口为 `vexfs ...`；
+- VexFS FSKit extension，启用后可用原生 `ls`、`cat`、`grep`、`cp`、`mv`。
+
+```bash
+vexdb agent.db
+vexdb agent.db "SELECT vexdb_l2_distance('[1,2]', '[4,6]');"
+vexdb fs --db agent.db write /notes/hello.txt
+vexdb fs --db agent.db grep -n hello /notes
+vexdb fs --db agent.db check
+vexdb fs --db agent.db index enable
+vexdb fs --db agent.db mount ~/VexDB
+```
+
+文本索引默认关闭，不增加普通写入开销；未开启索引或宿主没有 FTS5 时，`grep` 自动使用
+单连接数据库扫描。
+
+统一 macOS 技术预览包通过 `bash agent_files/macos/package_preview.sh` 构建。
 
 ---
 
