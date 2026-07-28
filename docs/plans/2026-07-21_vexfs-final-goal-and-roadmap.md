@@ -2,9 +2,9 @@
 
 - 文档类型：唯一有效的目标和开发顺序基线
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
-- 日期：2026-07-28
+- 日期：2026-07-29
 - 分支：`feature/agent_files`
-- 文档版本：3.8
+- 文档版本：3.9
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
 - 当前阶段：Phase 2 PostgreSQL 数据库合同、本机默认 NFS 和 SQLite commit 级恢复闭环已完成。
   最新 SQLite spec 33/33、libpq runtime 151 项、SQLite 真挂载 68 项、PG Agent 真挂载 21 项通过。
@@ -13,11 +13,11 @@
   逐文件 version，同时复用空 manifest 和不可变 ACL 集合；10 万文件有界性能 Gate 通过。
   历史 FSKit 两 Mac、
   macOS↔Linux、PG 16–19、备份、
-  format v2 和真实 OpenCode 证据继续有效。当前源码的 Developer ID 候选包已经通过文档、
-  安装和解压签名检查，但正式 preview.38 仍需从干净提交生成并提交 Apple 公证；第二台 Mac
-  NFS 复验也没有完成。快照分类、自动保留、Agent checkpoint、SQLite 历史 commit 固定、
-  分页 show/diff 和 `--at` 均已实现；下一步做历史查询性能 Gate 和发行 Gate。DuckDB adapter 已交由其他方向
-  负责，不在本路线继续开发。
+  format v2 和真实 OpenCode 证据继续有效。preview.38 已从干净提交生成，并通过 Developer ID、
+  Apple 公证、staple、Gatekeeper、102 项文档 smoke 和 19 项安装 eval；第二台 Mac NFS 复验
+  仍未完成。快照分类、自动保留、Agent checkpoint、SQLite 历史 commit 固定、分页 show/diff、
+  `--at` 和历史查询性能 Gate 均已完成；下一步完成额外真机发行 Gate。DuckDB adapter 已交由
+  其他方向负责，不在本路线继续开发。
 
 ## 0. 2026-07-24 路线调整
 
@@ -440,12 +440,13 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
    删除 29 个快照后的元数据压实 426 ms。
 5. **已完成：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，
    给出脱敏恢复命令；最新 SQLite 真挂载运行前 checkpoint 为 42 ms，PG 为 110 ms。
-6. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
-   sleep/wake、跨机器锁和长时间 Agent 工作区。
+6. **发行 Gate（公证包已完成，真机矩阵继续）：**preview.38 已从干净提交生成并通过 Apple
+   公证、staple、Gatekeeper 和包内安装 Gate；下一步在干净 Mac 和第二台 Mac 上按默认 NFS
+   复跑，并补 sleep/wake、跨机器锁和长时间 Agent 工作区。
 7. **已完成：**SQLite commit 固定快照、分页 show/diff 和按时间选择均已进入 SQL、C ABI、CLI 和 eval。
 8. **已完成：**SQLite 历史大树 1 万/10 万文件 Gate 通过；10 万文件 show/diff 深页约
    518/513 ms，按时间建快照 786 ms，RSS 159.5 MB。
-9. **当前任务：**执行发行 Gate，再做 Windows WinFsp。
+9. **当前任务：**完成 preview.38 的额外真机发行 Gate，再做 Windows WinFsp。
 
 DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入当前队列。PG 逐 commit PITR
 必须先由真实快照规模数据证明需要，不能提前增加长期写放大。
@@ -465,11 +466,11 @@ DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入�
    restore；CLI 正常卸载、恢复并原位重挂载；FSKit 在 `unmount()` / `deactivate()` 关闭
    session，在 `activate()` 重开并清理旧缓存。M1 实测 lease 约 2.832 ms 释放，恢复后内容
    正确且无残留挂载。
-5. **P0（候选包已完成，正式公证待做）：** preview.22 已从干净提交签名、公证并
-   通过真实 Gate；当前源码的 `preview.38-candidate` 已通过 Developer ID 签名、102 项文档 smoke、
-   19 项统一安装 eval、解压签名链和 CLI smoke。正式 preview.38 必须先形成干净提交，再使用
-   `vexdb-lite-notary` profile 生成，并再次要求 Apple `Accepted`、staple、Gatekeeper、安装后
-   doctor 和快照恢复真机回归全部通过。
+5. **P0（正式公证包已完成）：** preview.38 已从干净提交 `51079ee01e` 生成，通过 Developer ID
+   签名、102 项文档 smoke、19 项统一安装 eval、解压签名链、Apple `Accepted`、staple 和
+   Gatekeeper。最终 ZIP SHA-256 为
+   `55ec400e9f9531fb941e336feebd2be5c98485c1d7d81826076548335b27e60d`；安装后 doctor、快照恢复和
+   第二台 Mac 复验仍归发行真机矩阵。
 6. **P0（已完成）：把本次真实挂载快照恢复脚本变成正式 eval。** 覆盖活动 mount 直接
    restore 被拒、一键卸载/恢复/重挂载、lease 立即释放、旧缓存清理、失败回滚、多 workspace
    定位和最终无残留挂载，避免以后只靠 `/tmp` 手工脚本发现回归。
@@ -480,9 +481,8 @@ DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入�
 9. **P1（已完成 PG Alpha 规模和 Agent 验证）：** PostgreSQL 已完成有界性能、1 千文件、
    真实工具链和双 Mac 串行 OpenCode 完整闭环：第一台创建、第二台继承修改、第一台回看，
    两个 workspace 快照和一键恢复均通过。所有大测试继续保留 RSS 上限和低并发。
-10. **发行遗留动作：** 把已经通过自动测试、本机真挂载、长循环 crash、真实
-    TCP 断线和候选包 Gate 的工作树形成干净提交，生成并公证 `preview.38`，安装后再跑双机安装
-    Gate。实际 sleep/wake 仍需交互式管理员授权；局域网直连另需第二台 Mac 在线并允许 VexDB Lite
+10. **发行遗留动作：** 干净提交和 `preview.38` 公证已经完成；安装后双机 Gate 仍待第二台 Mac
+    在线。实际 sleep/wake 仍需交互式管理员授权；局域网直连另需第二台 Mac 允许 VexDB Lite
     使用“本地网络”。
 
 ### 7.1 发行 Gate 后的 workspace 恢复顺序
