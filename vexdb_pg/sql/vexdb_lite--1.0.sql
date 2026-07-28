@@ -362,6 +362,9 @@ CREATE TABLE _vexfs.inodes (
     changed_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+CREATE INDEX vexfs_inodes_workspace_idx
+    ON _vexfs.inodes(workspace_id, inode_id);
+
 CREATE TABLE _vexfs.dentries (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
     parent_inode bigint NOT NULL REFERENCES _vexfs.inodes(inode_id) ON DELETE CASCADE,
@@ -372,6 +375,10 @@ CREATE TABLE _vexfs.dentries (
 
 CREATE INDEX vexfs_dentries_inode_idx
     ON _vexfs.dentries(workspace_id, inode_id);
+CREATE INDEX vexfs_dentries_inode_fk_idx
+    ON _vexfs.dentries(inode_id);
+CREATE INDEX vexfs_dentries_parent_fk_idx
+    ON _vexfs.dentries(parent_inode);
 
 CREATE TABLE _vexfs.commits (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -384,10 +391,57 @@ CREATE TABLE _vexfs.commits (
     PRIMARY KEY (workspace_id, commit_no)
 );
 
+-- One workspace commit may describe many filesystem changes.  Keeping the
+-- header separate from these path-level rows avoids advancing workspace HEAD,
+-- auditing and notifying once per file while preserving exact history.
+CREATE TABLE _vexfs.commit_changes (
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
+    commit_no bigint NOT NULL,
+    ordinal integer NOT NULL CHECK (ordinal > 0),
+    operation text NOT NULL,
+    path text NOT NULL CHECK (path <> '' AND octet_length(path) <= 4096),
+    inode_id bigint,
+    before_version bigint CHECK (before_version IS NULL OR before_version >= 0),
+    after_version bigint CHECK (after_version IS NULL OR after_version >= 0),
+    details jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (workspace_id, commit_no, ordinal),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.commits(workspace_id, commit_no) ON DELETE CASCADE
+);
+
+CREATE INDEX vexfs_commit_changes_inode_idx
+    ON _vexfs.commit_changes(workspace_id, inode_id, commit_no DESC);
+-- A legal VexFS path may be 4096 bytes, larger than one PostgreSQL btree item.
+-- Index its stable digest so long paths never make history insertion fail.
+CREATE INDEX vexfs_commit_changes_path_idx
+    ON _vexfs.commit_changes(
+        workspace_id,
+        (pg_catalog.md5(path)),
+        commit_no DESC);
+-- Private, transaction-scoped state used while one SQL call publishes many
+-- files.  It is disposable coordination data, not workspace history, so it is
+-- intentionally excluded from pg_extension_config_dump and archives.
+CREATE TABLE _vexfs.commit_batch_contexts (
+    backend_pid integer NOT NULL,
+    transaction_id xid8 NOT NULL,
+    workspace_id bigint NOT NULL,
+    commit_no bigint,
+    next_ordinal integer NOT NULL DEFAULT 0 CHECK (next_ordinal >= 0),
+    operation text NOT NULL,
+    path text,
+    inode_id bigint,
+    details jsonb NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (backend_pid, transaction_id),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.commits(workspace_id, commit_no) ON DELETE CASCADE
+);
+
+CREATE INDEX vexfs_commit_batch_context_commit_idx
+    ON _vexfs.commit_batch_contexts(workspace_id, commit_no);
+
 CREATE TABLE _vexfs.manifests (
     manifest_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
-    inode_id bigint NOT NULL REFERENCES _vexfs.inodes(inode_id) ON DELETE CASCADE,
     file_size bigint NOT NULL CHECK (file_size >= 0),
     chunk_size integer NOT NULL CHECK (chunk_size = 65536),
     chunk_count integer NOT NULL CHECK (chunk_count >= 0),
@@ -395,16 +449,23 @@ CREATE TABLE _vexfs.manifests (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- All empty files in a workspace share one immutable content root.
+CREATE UNIQUE INDEX vexfs_manifests_empty_workspace_idx
+    ON _vexfs.manifests(workspace_id)
+    WHERE file_size = 0 AND chunk_count = 0;
+
 CREATE TABLE _vexfs.chunks (
     chunk_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
-    inode_id bigint NOT NULL REFERENCES _vexfs.inodes(inode_id) ON DELETE CASCADE,
     content bytea NOT NULL,
     size_bytes integer NOT NULL CHECK (size_bytes BETWEEN 1 AND 65536),
     checksum text NOT NULL CHECK (checksum ~ '^[0-9a-f]{64}$'),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     CHECK (octet_length(content) = size_bytes)
 );
+
+CREATE INDEX vexfs_chunks_workspace_idx
+    ON _vexfs.chunks(workspace_id, chunk_id);
 
 CREATE TABLE _vexfs.manifest_chunks (
     manifest_id bigint NOT NULL REFERENCES _vexfs.manifests(manifest_id) ON DELETE CASCADE,
@@ -425,6 +486,9 @@ CREATE TABLE _vexfs.xattrs (
     PRIMARY KEY (workspace_id, inode_id, name)
 );
 
+CREATE INDEX vexfs_xattrs_inode_fk_idx
+    ON _vexfs.xattrs(inode_id);
+
 CREATE TABLE _vexfs.acl_entries (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
     inode_id bigint NOT NULL REFERENCES _vexfs.inodes(inode_id) ON DELETE CASCADE,
@@ -439,6 +503,8 @@ CREATE TABLE _vexfs.acl_entries (
 
 CREATE INDEX vexfs_acl_entries_principal_idx
     ON _vexfs.acl_entries(workspace_id, principal, inode_id);
+CREATE INDEX vexfs_acl_entries_inode_fk_idx
+    ON _vexfs.acl_entries(inode_id);
 
 CREATE TABLE _vexfs.file_versions (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -458,6 +524,13 @@ CREATE TABLE _vexfs.file_versions (
     FOREIGN KEY (workspace_id, commit_no)
         REFERENCES _vexfs.commits(workspace_id, commit_no) ON DELETE CASCADE
 );
+
+CREATE INDEX vexfs_file_versions_inode_fk_idx
+    ON _vexfs.file_versions(inode_id);
+CREATE INDEX vexfs_file_versions_manifest_fk_idx
+    ON _vexfs.file_versions(manifest_id);
+CREATE INDEX vexfs_file_versions_commit_fk_idx
+    ON _vexfs.file_versions(workspace_id, commit_no);
 
 -- Optional, derived search state. This table is deliberately not registered
 -- with pg_extension_config_dump: authoritative file versions are restored
@@ -485,6 +558,9 @@ CREATE TABLE _vexfs.snapshots (
     FOREIGN KEY (workspace_id, head_commit)
         REFERENCES _vexfs.commits(workspace_id, commit_no)
 );
+
+CREATE INDEX vexfs_snapshots_commit_fk_idx
+    ON _vexfs.snapshots(workspace_id, head_commit);
 
 CREATE TABLE _vexfs.snapshot_inodes (
     snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
@@ -613,6 +689,8 @@ CREATE INDEX vexfs_handles_workspace_state_idx
     ON _vexfs.handles(workspace_id, state, lease_until);
 CREATE INDEX vexfs_handles_inode_idx
     ON _vexfs.handles(workspace_id, inode_id);
+CREATE INDEX vexfs_handles_inode_fk_idx
+    ON _vexfs.handles(inode_id);
 
 -- Writable handles keep only a reference to their published base plus the
 -- chunks changed since that base. A small positional write therefore stores at
@@ -632,6 +710,8 @@ CREATE TABLE _vexfs.handle_staging (
 
 CREATE INDEX vexfs_handle_staging_updated_idx
     ON _vexfs.handle_staging(updated_at, handle_id);
+CREATE INDEX vexfs_handle_staging_base_manifest_idx
+    ON _vexfs.handle_staging(base_manifest_id);
 
 CREATE TABLE _vexfs.handle_staging_chunks (
     handle_id text NOT NULL REFERENCES _vexfs.handles(handle_id) ON DELETE CASCADE,
@@ -668,6 +748,8 @@ CREATE TABLE _vexfs.file_locks (
 
 CREATE INDEX vexfs_file_locks_lease_idx
     ON _vexfs.file_locks(workspace_id, inode_id, lease_until);
+CREATE INDEX vexfs_file_locks_inode_fk_idx
+    ON _vexfs.file_locks(inode_id);
 
 -- PostgreSQL excludes extension-owned table data from pg_dump unless every
 -- authoritative relation is registered as extension configuration data.
@@ -680,6 +762,7 @@ SELECT pg_catalog.pg_extension_config_dump('_vexfs.workspaces', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.inodes', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.dentries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.commits', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.commit_changes', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.manifests', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.chunks', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.manifest_chunks', '');
@@ -719,45 +802,99 @@ CREATE TRIGGER vexfs_workspace_reset_live_usage
 BEFORE INSERT ON _vexfs.workspaces
 FOR EACH ROW EXECUTE FUNCTION _vexfs.reset_live_usage_on_workspace_insert();
 
-CREATE FUNCTION _vexfs.update_live_usage()
+CREATE FUNCTION _vexfs.update_live_usage_after_insert()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, _vexfs
 AS $$
 BEGIN
-    IF TG_OP IN ('UPDATE', 'DELETE')
-       AND OLD.kind <> 'directory' AND OLD.live THEN
-        UPDATE _vexfs.workspaces
-           SET live_files = live_files - 1,
-               live_bytes = live_bytes - OLD.size_bytes
-         WHERE workspace_id = OLD.workspace_id;
-    END IF;
-    IF TG_OP IN ('INSERT', 'UPDATE')
-       AND NEW.kind <> 'directory' AND NEW.live THEN
-        UPDATE _vexfs.workspaces
-           SET live_files = live_files + 1,
-               live_bytes = live_bytes + NEW.size_bytes
-         WHERE workspace_id = NEW.workspace_id;
-    END IF;
-    IF TG_OP = 'DELETE' THEN
-        RETURN OLD;
-    END IF;
-    RETURN NEW;
+    UPDATE _vexfs.workspaces AS workspace
+       SET live_files = workspace.live_files + delta.files,
+           live_bytes = workspace.live_bytes + delta.bytes
+      FROM (
+          SELECT inserted.workspace_id,
+                 count(*) AS files,
+                 coalesce(sum(inserted.size_bytes), 0) AS bytes
+            FROM inserted_inodes AS inserted
+           WHERE inserted.kind <> 'directory' AND inserted.live
+           GROUP BY inserted.workspace_id) AS delta
+     WHERE workspace.workspace_id = delta.workspace_id;
+    RETURN NULL;
 END;
 $$;
 
 CREATE TRIGGER vexfs_inode_live_usage_insert
 AFTER INSERT ON _vexfs.inodes
-FOR EACH ROW EXECUTE FUNCTION _vexfs.update_live_usage();
+REFERENCING NEW TABLE AS inserted_inodes
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.update_live_usage_after_insert();
 
-CREATE TRIGGER vexfs_inode_live_usage_update
-AFTER UPDATE OF workspace_id, kind, size_bytes, live ON _vexfs.inodes
-FOR EACH ROW EXECUTE FUNCTION _vexfs.update_live_usage();
+CREATE FUNCTION _vexfs.update_live_usage_after_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+BEGIN
+    UPDATE _vexfs.workspaces AS workspace
+       SET live_files = workspace.live_files - delta.files,
+           live_bytes = workspace.live_bytes - delta.bytes
+      FROM (
+          SELECT removed.workspace_id,
+                 count(*) AS files,
+                 coalesce(sum(removed.size_bytes), 0) AS bytes
+            FROM removed_inodes AS removed
+           WHERE removed.kind <> 'directory' AND removed.live
+           GROUP BY removed.workspace_id) AS delta
+     WHERE workspace.workspace_id = delta.workspace_id;
+    RETURN NULL;
+END;
+$$;
 
 CREATE TRIGGER vexfs_inode_live_usage_delete
 AFTER DELETE ON _vexfs.inodes
-FOR EACH ROW EXECUTE FUNCTION _vexfs.update_live_usage();
+REFERENCING OLD TABLE AS removed_inodes
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.update_live_usage_after_delete();
+
+CREATE FUNCTION _vexfs.update_live_usage_after_update()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+BEGIN
+    UPDATE _vexfs.workspaces AS workspace
+       SET live_files = workspace.live_files + delta.files,
+           live_bytes = workspace.live_bytes + delta.bytes
+      FROM (
+          SELECT workspace_id,
+                 sum(files)::bigint AS files,
+                 sum(bytes)::bigint AS bytes
+            FROM (
+                SELECT old_row.workspace_id,
+                       -count(*) AS files,
+                       -coalesce(sum(old_row.size_bytes), 0) AS bytes
+                  FROM previous_inodes AS old_row
+                 WHERE old_row.kind <> 'directory' AND old_row.live
+                 GROUP BY old_row.workspace_id
+                UNION ALL
+                SELECT new_row.workspace_id,
+                       count(*) AS files,
+                       coalesce(sum(new_row.size_bytes), 0) AS bytes
+                  FROM updated_inodes AS new_row
+                 WHERE new_row.kind <> 'directory' AND new_row.live
+                 GROUP BY new_row.workspace_id) AS changes
+           GROUP BY workspace_id
+          HAVING sum(files) <> 0 OR sum(bytes) <> 0) AS delta
+     WHERE workspace.workspace_id = delta.workspace_id;
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER vexfs_inode_live_usage_update
+AFTER UPDATE ON _vexfs.inodes
+REFERENCING OLD TABLE AS previous_inodes NEW TABLE AS updated_inodes
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.update_live_usage_after_update();
 
 CREATE FUNCTION _vexfs.path_parts(p_path text)
 RETURNS text[]
@@ -1026,7 +1163,7 @@ AS $$
      LIMIT 1
 $$;
 
-CREATE FUNCTION _vexfs.record_commit(
+CREATE FUNCTION _vexfs.record_commit_header(
     p_workspace_id bigint,
     p_operation text,
     p_path text DEFAULT NULL,
@@ -1076,6 +1213,124 @@ BEGIN
             'head_commit', v_commit,
             'operation', p_operation)::text);
     RETURN v_commit;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.record_commit(
+    p_workspace_id bigint,
+    p_operation text,
+    p_path text DEFAULT NULL,
+    p_inode_id bigint DEFAULT NULL,
+    p_details jsonb DEFAULT '{}'::jsonb)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_commit bigint;
+    v_ordinal integer;
+    v_batch _vexfs.commit_batch_contexts%ROWTYPE;
+BEGIN
+    SELECT * INTO v_batch
+      FROM _vexfs.commit_batch_contexts AS context
+     WHERE context.backend_pid = pg_catalog.pg_backend_pid()
+       AND context.transaction_id = pg_catalog.pg_current_xact_id()
+       AND context.workspace_id = p_workspace_id
+     FOR UPDATE;
+    IF FOUND THEN
+        IF v_batch.commit_no IS NULL THEN
+            v_commit := _vexfs.record_commit_header(
+                p_workspace_id, v_batch.operation, v_batch.path,
+                v_batch.inode_id, v_batch.details);
+            v_ordinal := 1;
+            UPDATE _vexfs.commit_batch_contexts AS context
+               SET commit_no = v_commit,
+                   next_ordinal = v_ordinal
+             WHERE context.backend_pid = pg_catalog.pg_backend_pid()
+               AND context.transaction_id = pg_catalog.pg_current_xact_id();
+        ELSE
+            UPDATE _vexfs.commit_batch_contexts AS context
+               SET next_ordinal = context.next_ordinal + 1
+             WHERE context.backend_pid = pg_catalog.pg_backend_pid()
+               AND context.transaction_id = pg_catalog.pg_current_xact_id()
+            RETURNING context.commit_no, context.next_ordinal
+                 INTO v_commit, v_ordinal;
+        END IF;
+    ELSE
+        v_commit := _vexfs.record_commit_header(
+            p_workspace_id, p_operation, p_path, p_inode_id, p_details);
+        v_ordinal := 1;
+    END IF;
+    INSERT INTO _vexfs.commit_changes(
+        workspace_id, commit_no, ordinal, operation, path, inode_id,
+        before_version, after_version, details)
+    VALUES (
+        p_workspace_id, v_commit, v_ordinal, p_operation, coalesce(p_path, '/'), p_inode_id,
+        nullif(p_details->>'before_version', '')::bigint,
+        nullif(p_details->>'after_version', '')::bigint,
+        coalesce(p_details, '{}'::jsonb));
+    RETURN v_commit;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.begin_commit_batch(
+    p_workspace_id bigint,
+    p_operation text,
+    p_path text DEFAULT NULL,
+    p_inode_id bigint DEFAULT NULL,
+    p_details jsonb DEFAULT '{}'::jsonb)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_existing xid8;
+BEGIN
+    SELECT context.transaction_id INTO v_existing
+      FROM _vexfs.commit_batch_contexts AS context
+     WHERE context.backend_pid = pg_catalog.pg_backend_pid()
+       AND context.transaction_id = pg_catalog.pg_current_xact_id();
+    IF FOUND THEN
+        RAISE EXCEPTION 'VEXFS_INTERNAL: nested commit batch is not supported'
+            USING ERRCODE = 'XX000';
+    END IF;
+    DELETE FROM _vexfs.commit_batch_contexts AS context
+     WHERE context.backend_pid = pg_catalog.pg_backend_pid();
+    INSERT INTO _vexfs.commit_batch_contexts(
+        backend_pid, transaction_id, workspace_id,
+        operation, path, inode_id, details)
+    VALUES (
+        pg_catalog.pg_backend_pid(), pg_catalog.pg_current_xact_id(),
+        p_workspace_id, p_operation, p_path, p_inode_id,
+        coalesce(p_details, '{}'::jsonb));
+    RETURN 0;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.end_commit_batch(p_workspace_id bigint)
+RETURNS integer
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_removed integer;
+BEGIN
+    DELETE FROM _vexfs.commit_batch_contexts AS context
+     WHERE context.backend_pid = pg_catalog.pg_backend_pid()
+       AND context.transaction_id = pg_catalog.pg_current_xact_id()
+       AND context.workspace_id = p_workspace_id;
+    GET DIAGNOSTICS v_removed = ROW_COUNT;
+    IF v_removed <> 1 THEN
+        RAISE EXCEPTION 'VEXFS_INTERNAL: commit batch context is missing'
+            USING ERRCODE = 'XX000';
+    END IF;
+    RETURN v_removed;
 END;
 $$;
 
@@ -1382,14 +1637,12 @@ AS $$
 DECLARE
     v_staging _vexfs.handle_staging%ROWTYPE;
     v_workspace_id bigint;
-    v_inode_id bigint;
     v_chunk_start bigint;
     v_visible_size integer;
     v_content bytea;
     v_size integer;
     v_checksum text;
     v_chunk_workspace bigint;
-    v_chunk_inode bigint;
 BEGIN
     IF p_chunk_no < 0 OR p_target_size < 0 OR p_target_size > 65536 THEN
         RAISE EXCEPTION 'VEXFS_INVALID_RANGE: invalid staging chunk range'
@@ -1405,8 +1658,8 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_STAGING_NOT_FOUND: %', p_handle
             USING ERRCODE = 'P0002';
     END IF;
-    SELECT handle.workspace_id, handle.inode_id
-      INTO STRICT v_workspace_id, v_inode_id
+    SELECT handle.workspace_id
+      INTO STRICT v_workspace_id
       FROM _vexfs.handles AS handle
      WHERE handle.handle_id = p_handle;
 
@@ -1422,20 +1675,17 @@ BEGIN
             SELECT chunk.content,
                    chunk.size_bytes,
                    chunk.checksum,
-                   chunk.workspace_id,
-                   chunk.inode_id
+                   chunk.workspace_id
               INTO v_content,
                    v_size,
                    v_checksum,
-                   v_chunk_workspace,
-                   v_chunk_inode
+                   v_chunk_workspace
               FROM _vexfs.manifest_chunks AS entry
               JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
              WHERE entry.manifest_id = v_staging.base_manifest_id
                AND entry.chunk_no = p_chunk_no;
             IF NOT FOUND
                OR v_chunk_workspace <> v_workspace_id
-               OR v_chunk_inode IS DISTINCT FROM v_inode_id
                OR v_size <> octet_length(v_content)
                OR v_checksum <> encode(pg_catalog.sha256(v_content), 'hex') THEN
                 RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: staging base chunk is invalid'
@@ -1554,7 +1804,6 @@ DECLARE
     v_source_size bigint;
     v_source_checksum text;
     v_manifest_workspace bigint;
-    v_manifest_inode bigint;
     v_manifest_size bigint;
     v_manifest_chunk_size integer;
     v_manifest_checksum text;
@@ -1607,13 +1856,11 @@ BEGIN
     END IF;
 
     SELECT m.workspace_id,
-           m.inode_id,
            m.file_size,
            m.chunk_size,
            m.chunk_count,
            m.checksum
       INTO v_manifest_workspace,
-           v_manifest_inode,
            v_manifest_size,
            v_manifest_chunk_size,
            chunk_count,
@@ -1622,7 +1869,6 @@ BEGIN
      WHERE m.manifest_id = v_resolved_manifest;
     IF NOT FOUND
        OR v_manifest_workspace <> p_workspace_id
-       OR v_manifest_inode <> p_inode_id
        OR v_manifest_size <> size_bytes
        OR v_manifest_chunk_size <> 65536
        OR chunk_count <> ((size_bytes + 65535) / 65536)::integer
@@ -1720,6 +1966,7 @@ DECLARE
     v_chunk_size integer;
     v_chunk_checksum text;
     v_chunk_id bigint;
+    v_empty_checksum text;
 BEGIN
     IF p_content IS NULL THEN
         RAISE EXCEPTION 'VEXFS_INVALID_CONTENT: content cannot be null'
@@ -1732,11 +1979,36 @@ BEGIN
     END IF;
     v_chunk_count := ((v_file_size + 65535) / 65536)::integer;
 
+    IF v_file_size = 0 THEN
+        v_empty_checksum := encode(pg_catalog.sha256(pg_catalog.convert_to(
+            pg_catalog.format('vexfs-manifest-v1:%s:%s:%s', 65536, 0, 0)
+            || E'\n', 'UTF8')), 'hex');
+        INSERT INTO _vexfs.manifests(
+            workspace_id, file_size, chunk_size, chunk_count, checksum)
+        VALUES (p_workspace_id, 0, 65536, 0, v_empty_checksum)
+        ON CONFLICT (workspace_id)
+            WHERE file_size = 0 AND chunk_count = 0
+            DO NOTHING
+        RETURNING manifest_id INTO v_manifest;
+        IF v_manifest IS NULL THEN
+            SELECT manifest.manifest_id, manifest.checksum
+              INTO STRICT v_manifest, v_chunk_checksum
+              FROM _vexfs.manifests AS manifest
+             WHERE manifest.workspace_id = p_workspace_id
+               AND manifest.file_size = 0
+               AND manifest.chunk_count = 0;
+            IF v_chunk_checksum IS DISTINCT FROM v_empty_checksum THEN
+                RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: canonical empty manifest is invalid'
+                    USING ERRCODE = 'XX001';
+            END IF;
+        END IF;
+        RETURN v_manifest;
+    END IF;
+
     INSERT INTO _vexfs.manifests(
-        workspace_id, inode_id, file_size, chunk_size, chunk_count, checksum)
+        workspace_id, file_size, chunk_size, chunk_count, checksum)
     VALUES (
-        p_workspace_id, p_inode_id, v_file_size, 65536,
-        v_chunk_count, repeat('0', 64))
+        p_workspace_id, v_file_size, 65536, v_chunk_count, repeat('0', 64))
     RETURNING manifest_id INTO v_manifest;
 
     WHILE v_offset < v_file_size LOOP
@@ -1755,9 +2027,7 @@ BEGIN
              WHERE entry.manifest_id = p_previous_manifest
                AND entry.chunk_no = v_chunk_no
                AND previous.workspace_id = p_workspace_id
-               AND previous.inode_id = p_inode_id
                AND c.workspace_id = p_workspace_id
-               AND c.inode_id = p_inode_id
                AND c.size_bytes = v_chunk_size
                AND c.checksum = v_chunk_checksum
                AND c.content = v_chunk;
@@ -1769,7 +2039,6 @@ BEGIN
               JOIN _vexfs.chunks AS c ON c.chunk_id = entry.chunk_id
              WHERE entry.manifest_id = v_manifest
                AND c.workspace_id = p_workspace_id
-               AND c.inode_id = p_inode_id
                AND c.size_bytes = v_chunk_size
                AND c.checksum = v_chunk_checksum
                AND c.content = v_chunk
@@ -1778,10 +2047,9 @@ BEGIN
 
         IF v_chunk_id IS NULL THEN
             INSERT INTO _vexfs.chunks(
-                workspace_id, inode_id, content, size_bytes, checksum)
+                workspace_id, content, size_bytes, checksum)
             VALUES (
-                p_workspace_id, p_inode_id, v_chunk,
-                v_chunk_size, v_chunk_checksum)
+                p_workspace_id, v_chunk, v_chunk_size, v_chunk_checksum)
             RETURNING chunk_id INTO v_chunk_id;
         END IF;
 
@@ -1850,10 +2118,9 @@ BEGIN
 
     SELECT manifest.file_size, manifest.chunk_count
       INTO v_previous_file_size, v_previous_chunk_count
-      FROM _vexfs.manifests AS manifest
+     FROM _vexfs.manifests AS manifest
      WHERE manifest.manifest_id = p_previous_manifest
-       AND manifest.workspace_id = p_workspace_id
-       AND manifest.inode_id = p_inode_id;
+       AND manifest.workspace_id = p_workspace_id;
     IF NOT FOUND OR v_previous_file_size <> p_previous_size THEN
         RAISE EXCEPTION 'VEXFS_CORRUPT: previous range manifest is invalid'
             USING ERRCODE = 'XX001';
@@ -1867,7 +2134,6 @@ BEGIN
                entry.chunk_no >= 0
                AND entry.chunk_no < v_previous_chunk_count
                AND chunk.workspace_id = p_workspace_id
-               AND chunk.inode_id = p_inode_id
                AND chunk.size_bytes = least(
                    65536,
                    p_previous_size - entry.chunk_no::bigint * 65536)::integer
@@ -1886,12 +2152,15 @@ BEGIN
 
     v_write_end := p_offset + octet_length(p_content);
     v_new_size := greatest(p_previous_size, v_write_end);
+    IF v_new_size = 0 THEN
+        RETURN _vexfs.store_manifest(
+            p_workspace_id, p_inode_id, p_previous_manifest, ''::bytea);
+    END IF;
     v_new_chunk_count := ((v_new_size + 65535) / 65536)::integer;
     INSERT INTO _vexfs.manifests(
-        workspace_id, inode_id, file_size, chunk_size, chunk_count, checksum)
+        workspace_id, file_size, chunk_size, chunk_count, checksum)
     VALUES (
-        p_workspace_id, p_inode_id, v_new_size, 65536,
-        v_new_chunk_count, repeat('0', 64))
+        p_workspace_id, v_new_size, 65536, v_new_chunk_count, repeat('0', 64))
     RETURNING manifest_id INTO v_manifest;
 
     -- Copy chunks whose byte range and final size are unchanged. This is the
@@ -1984,10 +2253,9 @@ BEGIN
         END IF;
         IF v_chunk_id IS NULL THEN
             INSERT INTO _vexfs.chunks(
-                workspace_id, inode_id, content, size_bytes, checksum)
+                workspace_id, content, size_bytes, checksum)
             VALUES (
-                p_workspace_id, p_inode_id, v_chunk,
-                v_chunk_size, v_chunk_checksum)
+                p_workspace_id, v_chunk, v_chunk_size, v_chunk_checksum)
             RETURNING chunk_id INTO v_chunk_id;
         END IF;
         INSERT INTO _vexfs.manifest_chunks(manifest_id, chunk_no, chunk_id)
@@ -2028,7 +2296,6 @@ DECLARE
     v_handle_inode bigint;
     v_staging _vexfs.handle_staging%ROWTYPE;
     v_base_workspace bigint;
-    v_base_inode bigint;
     v_base_size bigint;
     v_manifest bigint;
     v_chunk_count integer;
@@ -2074,13 +2341,12 @@ BEGIN
                 USING ERRCODE = 'XX001';
         END IF;
     ELSE
-        SELECT base.workspace_id, base.inode_id, base.file_size
-          INTO v_base_workspace, v_base_inode, v_base_size
+        SELECT base.workspace_id, base.file_size
+          INTO v_base_workspace, v_base_size
           FROM _vexfs.manifests AS base
          WHERE base.manifest_id = v_staging.base_manifest_id;
         IF NOT FOUND
            OR v_base_workspace <> v_workspace_id
-           OR v_base_inode <> p_inode_id
            OR v_base_size <> v_staging.base_size
            OR v_staging.base_visible_size > v_base_size THEN
             RAISE EXCEPTION 'VEXFS_CORRUPT: staging base manifest is invalid'
@@ -2089,11 +2355,15 @@ BEGIN
     END IF;
 
     v_chunk_count := ((v_staging.logical_size + 65535) / 65536)::integer;
+    IF v_staging.logical_size = 0 THEN
+        RETURN _vexfs.store_manifest(
+            v_workspace_id, p_inode_id, v_staging.base_manifest_id, ''::bytea);
+    END IF;
     INSERT INTO _vexfs.manifests(
-        workspace_id, inode_id, file_size, chunk_size, chunk_count, checksum)
+        workspace_id, file_size, chunk_size, chunk_count, checksum)
     VALUES (
-        v_workspace_id, p_inode_id, v_staging.logical_size,
-        65536, v_chunk_count, repeat('0', 64))
+        v_workspace_id, v_staging.logical_size, 65536,
+        v_chunk_count, repeat('0', 64))
     RETURNING manifest_id INTO v_manifest;
 
     -- Reuse unchanged chunks without loading their payload. A partially visible
@@ -2111,7 +2381,6 @@ BEGIN
                 WHERE dirty.handle_id = p_handle
                   AND dirty.chunk_no = entry.chunk_no)
            AND chunk.workspace_id = v_workspace_id
-           AND chunk.inode_id = p_inode_id
            AND chunk.size_bytes = least(
                65536,
                v_staging.logical_size
@@ -2149,10 +2418,9 @@ BEGIN
             END IF;
             IF v_base_chunk_id IS NOT NULL THEN
                 SELECT chunk.chunk_id INTO v_chunk_id
-                  FROM _vexfs.chunks AS chunk
+                 FROM _vexfs.chunks AS chunk
                  WHERE chunk.chunk_id = v_base_chunk_id
                    AND chunk.workspace_id = v_workspace_id
-                   AND chunk.inode_id = p_inode_id
                    AND chunk.size_bytes = v_chunk_size
                    AND chunk.checksum = v_chunk_checksum
                    AND chunk.content = v_chunk;
@@ -2169,10 +2437,9 @@ BEGIN
             END IF;
             IF v_chunk_id IS NULL THEN
                 INSERT INTO _vexfs.chunks(
-                    workspace_id, inode_id, content, size_bytes, checksum)
+                    workspace_id, content, size_bytes, checksum)
                 VALUES (
-                    v_workspace_id, p_inode_id, v_chunk,
-                    v_chunk_size, v_chunk_checksum)
+                    v_workspace_id, v_chunk, v_chunk_size, v_chunk_checksum)
                 RETURNING chunk_id INTO v_chunk_id;
             END IF;
             INSERT INTO _vexfs.manifest_chunks(manifest_id, chunk_no, chunk_id)
@@ -2241,8 +2508,7 @@ BEGIN
                c.content,
                c.size_bytes,
                c.checksum,
-               c.workspace_id,
-               c.inode_id
+               c.workspace_id
           FROM _vexfs.manifest_chunks AS entry
           JOIN _vexfs.chunks AS c ON c.chunk_id = entry.chunk_id
          WHERE entry.manifest_id = v_manifest
@@ -2254,7 +2520,6 @@ BEGIN
            OR v_row.size_bytes <> v_expected_size
            OR octet_length(v_row.content) <> v_expected_size
            OR v_row.workspace_id <> p_workspace_id
-           OR v_row.inode_id <> p_inode_id
            OR v_row.checksum <> encode(pg_catalog.sha256(v_row.content), 'hex') THEN
             RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: file manifest chunk is invalid'
                 USING ERRCODE = 'XX001';
@@ -2326,8 +2591,7 @@ BEGIN
                chunk.content,
                chunk.size_bytes,
                chunk.checksum,
-               chunk.workspace_id,
-               chunk.inode_id
+               chunk.workspace_id
           FROM _vexfs.manifest_chunks AS entry
           JOIN _vexfs.chunks AS chunk ON chunk.chunk_id = entry.chunk_id
          WHERE entry.manifest_id = v_manifest
@@ -2341,7 +2605,6 @@ BEGIN
            OR v_row.size_bytes <> v_expected_size
            OR octet_length(v_row.content) <> v_expected_size
            OR v_row.workspace_id <> p_workspace_id
-           OR v_row.inode_id <> p_inode_id
            OR v_row.checksum <> encode(pg_catalog.sha256(v_row.content), 'hex') THEN
             RAISE EXCEPTION 'VEXFS_CHECKSUM_MISMATCH: file manifest range chunk is invalid'
                 USING ERRCODE = 'XX001';
@@ -3515,41 +3778,94 @@ EXCEPTION WHEN OTHERS THEN
 END;
 $$;
 
-CREATE FUNCTION _vexfs.refresh_grep_document_from_inode()
+CREATE FUNCTION _vexfs.refresh_grep_documents_after_inode_insert()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, _vexfs
 AS $$
+DECLARE
+    v_inode record;
 BEGIN
-    PERFORM _vexfs.refresh_grep_document(NEW.workspace_id, NEW.inode_id);
-    RETURN NEW;
+    FOR v_inode IN
+        SELECT inserted.workspace_id, inserted.inode_id
+          FROM inserted_inodes AS inserted
+          JOIN _vexfs.workspaces AS workspace
+            ON workspace.workspace_id = inserted.workspace_id
+           AND workspace.grep_index_enabled
+    LOOP
+        PERFORM _vexfs.refresh_grep_document(
+            v_inode.workspace_id, v_inode.inode_id);
+    END LOOP;
+    RETURN NULL;
 END;
 $$;
 
 CREATE TRIGGER vexfs_grep_document_inode_insert
 AFTER INSERT ON _vexfs.inodes
-FOR EACH ROW EXECUTE FUNCTION _vexfs.refresh_grep_document_from_inode();
+REFERENCING NEW TABLE AS inserted_inodes
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.refresh_grep_documents_after_inode_insert();
 
-CREATE TRIGGER vexfs_grep_document_inode_update
-AFTER UPDATE OF current_version, live, kind ON _vexfs.inodes
-FOR EACH ROW EXECUTE FUNCTION _vexfs.refresh_grep_document_from_inode();
-
-CREATE FUNCTION _vexfs.refresh_grep_document_from_version()
+CREATE FUNCTION _vexfs.refresh_grep_documents_after_inode_update()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = pg_catalog, _vexfs
 AS $$
+DECLARE
+    v_inode record;
 BEGIN
-    PERFORM _vexfs.refresh_grep_document(NEW.workspace_id, NEW.inode_id);
-    RETURN NEW;
+    FOR v_inode IN
+        SELECT updated.workspace_id, updated.inode_id
+          FROM updated_inodes AS updated
+          JOIN previous_inodes AS previous USING (inode_id)
+          JOIN _vexfs.workspaces AS workspace
+            ON workspace.workspace_id = updated.workspace_id
+           AND workspace.grep_index_enabled
+         WHERE updated.workspace_id IS DISTINCT FROM previous.workspace_id
+            OR updated.current_version IS DISTINCT FROM previous.current_version
+            OR updated.live IS DISTINCT FROM previous.live
+            OR updated.kind IS DISTINCT FROM previous.kind
+    LOOP
+        PERFORM _vexfs.refresh_grep_document(
+            v_inode.workspace_id, v_inode.inode_id);
+    END LOOP;
+    RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER vexfs_grep_document_inode_update
+AFTER UPDATE ON _vexfs.inodes
+REFERENCING OLD TABLE AS previous_inodes NEW TABLE AS updated_inodes
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.refresh_grep_documents_after_inode_update();
+
+CREATE FUNCTION _vexfs.refresh_grep_documents_after_version_insert()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_inode record;
+BEGIN
+    FOR v_inode IN
+        SELECT DISTINCT inserted.workspace_id, inserted.inode_id
+          FROM inserted_versions AS inserted
+          JOIN _vexfs.workspaces AS workspace
+            ON workspace.workspace_id = inserted.workspace_id
+           AND workspace.grep_index_enabled
+    LOOP
+        PERFORM _vexfs.refresh_grep_document(
+            v_inode.workspace_id, v_inode.inode_id);
+    END LOOP;
+    RETURN NULL;
 END;
 $$;
 
 CREATE TRIGGER vexfs_grep_document_version_insert
 AFTER INSERT ON _vexfs.file_versions
-FOR EACH ROW EXECUTE FUNCTION _vexfs.refresh_grep_document_from_version();
+REFERENCING NEW TABLE AS inserted_versions
+FOR EACH STATEMENT EXECUTE FUNCTION _vexfs.refresh_grep_documents_after_version_insert();
 
 CREATE FUNCTION _vexfs.rebuild_grep_index(p_workspace_id bigint)
 RETURNS bigint
@@ -5262,6 +5578,7 @@ DECLARE
     v_actor oid;
     v_handle record;
     v_count bigint := 0;
+    v_pending bigint;
 BEGIN
     IF p_durability NOT IN ('none', 'data', 'full') THEN
         RAISE EXCEPTION 'VEXFS_INVALID_DURABILITY: use none, data, or full'
@@ -5289,6 +5606,32 @@ BEGIN
             USING ERRCODE = '55006';
     END IF;
 
+    SELECT count(*) INTO v_pending
+      FROM (
+          SELECT 1
+            FROM _vexfs.handles AS handle
+           WHERE handle.workspace_id = v_workspace.workspace_id
+             AND handle.owner_oid = v_actor
+             AND handle.session_id = p_session_id
+             AND handle.state = 'open'
+             AND handle.dirty_generation > handle.published_generation
+           ORDER BY handle.handle_id
+           LIMIT NULLIF(p_limit, 0)) AS pending;
+    IF v_pending = 0 THEN
+        RETURN 0;
+    END IF;
+    PERFORM _vexfs.begin_commit_batch(
+        v_workspace.workspace_id,
+        'publish_batch',
+        '/',
+        v_workspace.root_inode,
+        jsonb_build_object(
+            'before_version', NULL,
+            'after_version', NULL,
+            'item_count', v_pending,
+            'session', p_session_id,
+            'durability', p_durability));
+
     FOR v_handle IN
         SELECT handle.handle_id, handle.dirty_generation
           FROM _vexfs.handles AS handle
@@ -5304,6 +5647,7 @@ BEGIN
             v_handle.handle_id, v_handle.dirty_generation, p_durability);
         v_count := v_count + 1;
     END LOOP;
+    PERFORM _vexfs.end_commit_batch(v_workspace.workspace_id);
     RETURN v_count;
 END;
 $$;
@@ -5332,6 +5676,12 @@ DECLARE
     v_version bigint;
     v_owned _vexfs.handles%ROWTYPE;
     v_seen text[] := ARRAY[]::text[];
+    v_handles text[] := ARRAY[]::text[];
+    v_generations bigint[] := ARRAY[]::bigint[];
+    v_versions bigint[] := ARRAY[]::bigint[];
+    v_dirty boolean[] := ARRAY[]::boolean[];
+    v_dirty_count integer := 0;
+    v_index integer;
     v_result jsonb := '[]'::jsonb;
 BEGIN
     IF p_durability NOT IN ('none', 'data', 'full') THEN
@@ -5394,10 +5744,10 @@ BEGIN
         IF v_owned.state = 'closed'
            AND v_generation <= v_owned.published_generation THEN
             v_seen := array_append(v_seen, v_handle);
-            v_result := v_result || jsonb_build_array(jsonb_build_object(
-                'handle', v_handle,
-                'generation', v_generation,
-                'version', v_owned.expected_version));
+            v_handles := array_append(v_handles, v_handle);
+            v_generations := array_append(v_generations, v_generation);
+            v_versions := array_append(v_versions, v_owned.expected_version);
+            v_dirty := array_append(v_dirty, false);
             CONTINUE;
         END IF;
         IF v_owned.state <> 'open'
@@ -5407,13 +5757,39 @@ BEGIN
                 USING ERRCODE = '40001';
         END IF;
         v_seen := array_append(v_seen, v_handle);
-        v_version := public.vexfs_handle_publish_close(
-            v_handle, v_generation, p_durability);
-        v_result := v_result || jsonb_build_array(jsonb_build_object(
-            'handle', v_handle,
-            'generation', v_generation,
-            'version', v_version));
+        v_handles := array_append(v_handles, v_handle);
+        v_generations := array_append(v_generations, v_generation);
+        v_versions := array_append(v_versions, NULL::bigint);
+        v_dirty := array_append(v_dirty, true);
+        v_dirty_count := v_dirty_count + 1;
     END LOOP;
+
+    IF v_dirty_count > 0 THEN
+        PERFORM _vexfs.begin_commit_batch(
+            v_workspace.workspace_id,
+            'publish_batch',
+            '/',
+            v_workspace.root_inode,
+            jsonb_build_object(
+                'before_version', NULL,
+                'after_version', NULL,
+                'item_count', v_dirty_count,
+                'session', p_session_id,
+                'durability', p_durability));
+    END IF;
+    FOR v_index IN 1..coalesce(array_length(v_handles, 1), 0) LOOP
+        IF v_dirty[v_index] THEN
+            v_versions[v_index] := public.vexfs_handle_publish_close(
+                v_handles[v_index], v_generations[v_index], p_durability);
+        END IF;
+        v_result := v_result || jsonb_build_array(jsonb_build_object(
+            'handle', v_handles[v_index],
+            'generation', v_generations[v_index],
+            'version', v_versions[v_index]));
+    END LOOP;
+    IF v_dirty_count > 0 THEN
+        PERFORM _vexfs.end_commit_batch(v_workspace.workspace_id);
+    END IF;
     RETURN v_result;
 END;
 $$;
@@ -6933,6 +7309,269 @@ BEGIN
             v_manifest, 0, v_checksum, v_principal_oid, session_user);
     END IF;
     RETURN v_inode;
+END;
+$$;
+
+-- Create many direct children of one directory with one workspace commit.
+-- Per-file versions and change rows are retained, but workspace HEAD, audit,
+-- notification, quota counters and the parent timestamp advance once.
+CREATE FUNCTION public.vexfs_create_batch(
+    p_workspace text,
+    p_parent text,
+    p_entries jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_parent bigint;
+    v_parent_kind text;
+    v_parent_path text;
+    v_actor oid;
+    v_entry jsonb;
+    v_name text;
+    v_kind text;
+    v_mode integer;
+    v_names text[] := ARRAY[]::text[];
+    v_kinds text[] := ARRAY[]::text[];
+    v_modes integer[] := ARRAY[]::integer[];
+    v_inodes bigint[] := ARRAY[]::bigint[];
+    v_count integer;
+    v_file_count integer;
+    v_index integer;
+    v_conflict text;
+    v_manifest bigint;
+    v_checksum text;
+    v_commit bigint;
+    v_created jsonb;
+BEGIN
+    IF p_entries IS NULL OR jsonb_typeof(p_entries) <> 'array' THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_BATCH: entries must be a JSON array'
+            USING ERRCODE = '22023';
+    END IF;
+    IF octet_length(p_entries::text) > 1048576 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_BATCH: entries exceed 1 MiB'
+            USING ERRCODE = '54000';
+    END IF;
+    v_count := jsonb_array_length(p_entries);
+    IF v_count < 1 OR v_count > 1000 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_BATCH: entries must contain 1..1000 items'
+            USING ERRCODE = '22023';
+    END IF;
+
+    FOR v_entry IN SELECT value FROM jsonb_array_elements(p_entries) LOOP
+        IF jsonb_typeof(v_entry) <> 'object'
+           OR jsonb_typeof(v_entry->'name') <> 'string'
+           OR (v_entry ? 'kind' AND jsonb_typeof(v_entry->'kind') <> 'string')
+           OR (v_entry ? 'mode' AND (
+               jsonb_typeof(v_entry->'mode') <> 'number'
+               OR v_entry->>'mode' !~ '^[0-9]+$'))
+           OR EXISTS (
+               SELECT 1 FROM jsonb_object_keys(v_entry) AS key
+                WHERE key NOT IN ('name', 'kind', 'mode')) THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_BATCH: each item requires name and optional kind/mode'
+                USING ERRCODE = '22023';
+        END IF;
+        v_name := v_entry->>'name';
+        v_kind := coalesce(v_entry->>'kind', 'file');
+        IF v_name IS NULL OR v_name = '' OR v_name IN ('.', '..')
+           OR octet_length(v_name) > 255 OR position('/' IN v_name) > 0 THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_NAME: %', coalesce(v_name, '<null>')
+                USING ERRCODE = '22023';
+        END IF;
+        IF v_kind NOT IN ('file', 'directory') THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_KIND: %', v_kind
+                USING ERRCODE = '22023';
+        END IF;
+        BEGIN
+            v_mode := CASE WHEN v_entry ? 'mode'
+                THEN (v_entry->>'mode')::integer
+                WHEN v_kind = 'directory' THEN 493
+                ELSE 420 END;
+        EXCEPTION WHEN invalid_text_representation OR numeric_value_out_of_range THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_MODE: batch mode is not an integer'
+                USING ERRCODE = '22023';
+        END;
+        IF v_mode < 0 OR v_mode > 4095 THEN
+            RAISE EXCEPTION 'VEXFS_INVALID_MODE: %', v_mode
+                USING ERRCODE = '22023';
+        END IF;
+        v_names := array_append(v_names, v_name);
+        v_kinds := array_append(v_kinds, v_kind);
+        v_modes := array_append(v_modes, v_mode);
+    END LOOP;
+    IF EXISTS (
+        SELECT 1 FROM unnest(v_names) AS item(name)
+         GROUP BY item.name HAVING count(*) > 1) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_BATCH: entry names must be unique'
+            USING ERRCODE = '22023';
+    END IF;
+
+    v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT * INTO STRICT v_workspace
+      FROM _vexfs.workspaces AS workspace
+     WHERE workspace.workspace_id = v_workspace.workspace_id
+     FOR UPDATE;
+    v_parent := _vexfs.resolve_path(v_workspace.workspace_id, p_parent);
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_parent, 'write');
+    SELECT inode.kind INTO STRICT v_parent_kind
+      FROM _vexfs.inodes AS inode
+     WHERE inode.workspace_id = v_workspace.workspace_id
+       AND inode.inode_id = v_parent
+       AND inode.live;
+    IF v_parent_kind <> 'directory' THEN
+        RAISE EXCEPTION 'VEXFS_NOT_DIRECTORY: %', p_parent
+            USING ERRCODE = '42809';
+    END IF;
+    v_parent_path := _vexfs.path_for_inode(v_workspace.workspace_id, v_parent);
+    IF v_parent_path IS NULL THEN
+        RAISE EXCEPTION 'VEXFS_CORRUPT: batch parent is not reachable'
+            USING ERRCODE = 'XX001';
+    END IF;
+    IF EXISTS (
+        SELECT 1 FROM unnest(v_names) AS item(name)
+         WHERE octet_length(v_parent_path) + octet_length(item.name)
+               + CASE WHEN v_parent_path = '/' THEN 0 ELSE 1 END > 4096) THEN
+        RAISE EXCEPTION 'VEXFS_PATH_TOO_LONG: batch child path exceeds 4096 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT dentry.name INTO v_conflict
+      FROM _vexfs.dentries AS dentry
+      JOIN unnest(v_names) AS item(name) ON item.name = dentry.name
+     WHERE dentry.workspace_id = v_workspace.workspace_id
+       AND dentry.parent_inode = v_parent
+     LIMIT 1;
+    IF v_conflict IS NOT NULL THEN
+        RAISE EXCEPTION 'VEXFS_ALREADY_EXISTS: %',
+            CASE WHEN v_parent_path = '/' THEN '/' || v_conflict
+                 ELSE v_parent_path || '/' || v_conflict END
+            USING ERRCODE = '23505';
+    END IF;
+
+    SELECT count(*) INTO v_file_count
+      FROM unnest(v_kinds) AS item(kind)
+     WHERE item.kind = 'file';
+    IF v_workspace.quota_max_files IS NOT NULL
+       AND v_workspace.live_files + v_file_count > v_workspace.quota_max_files THEN
+        RAISE EXCEPTION 'VEXFS_QUOTA_FILES: workspace file quota exceeded'
+            USING ERRCODE = '53100';
+    END IF;
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+
+    FOR v_index IN 1..v_count LOOP
+        v_inodes := array_append(
+            v_inodes,
+            nextval(pg_get_serial_sequence('_vexfs.inodes', 'inode_id')));
+    END LOOP;
+    INSERT INTO _vexfs.inodes(
+        inode_id, workspace_id, kind, mode, owner_oid, owner_role,
+        owner_principal, current_version, size_bytes)
+    OVERRIDING SYSTEM VALUE
+    SELECT item.inode_id,
+           v_workspace.workspace_id,
+           item.kind,
+           item.mode,
+           v_actor,
+           session_user,
+           session_user,
+           CASE WHEN item.kind = 'file' THEN 1 ELSE 0 END,
+           0
+      FROM unnest(v_inodes, v_kinds, v_modes)
+           AS item(inode_id, kind, mode);
+    INSERT INTO _vexfs.dentries(workspace_id, parent_inode, name, inode_id)
+    SELECT v_workspace.workspace_id, v_parent, item.name, item.inode_id
+      FROM unnest(v_names, v_inodes) AS item(name, inode_id);
+    INSERT INTO _vexfs.acl_entries(
+        workspace_id, inode_id, principal, effect,
+        permissions, inherit_flags, created_at, updated_at)
+    SELECT v_workspace.workspace_id,
+           child.inode_id,
+           acl.principal,
+           acl.effect,
+           acl.permissions,
+           acl.inherit_flags,
+           clock_timestamp(),
+           clock_timestamp()
+      FROM unnest(v_inodes) AS child(inode_id)
+      JOIN _vexfs.acl_entries AS acl
+        ON acl.workspace_id = v_workspace.workspace_id
+       AND acl.inode_id = v_parent
+       AND acl.inherit_flags <> 0;
+
+    IF v_file_count > 0 THEN
+        v_manifest := _vexfs.store_manifest(
+            v_workspace.workspace_id, v_parent, NULL, ''::bytea);
+        SELECT manifest.checksum INTO STRICT v_checksum
+          FROM _vexfs.manifests AS manifest
+         WHERE manifest.manifest_id = v_manifest;
+    END IF;
+    v_commit := _vexfs.record_commit_header(
+        v_workspace.workspace_id,
+        'create_batch',
+        v_parent_path,
+        v_parent,
+        jsonb_build_object(
+            'before_version', NULL,
+            'after_version', NULL,
+            'item_count', v_count,
+            'file_count', v_file_count));
+    INSERT INTO _vexfs.file_versions(
+        workspace_id, inode_id, version_no, commit_no, manifest_id,
+        size_bytes, checksum, created_by_oid, created_by)
+    SELECT v_workspace.workspace_id,
+           item.inode_id,
+           1,
+           v_commit,
+           v_manifest,
+           0,
+           v_checksum,
+           v_actor,
+           session_user
+      FROM unnest(v_inodes, v_kinds) AS item(inode_id, kind)
+     WHERE item.kind = 'file';
+    INSERT INTO _vexfs.commit_changes(
+        workspace_id, commit_no, ordinal, operation, path, inode_id,
+        before_version, after_version, details)
+    SELECT v_workspace.workspace_id,
+           v_commit,
+           item.ordinal::integer,
+           'create',
+           CASE WHEN v_parent_path = '/' THEN '/' || item.name
+                ELSE v_parent_path || '/' || item.name END,
+           item.inode_id,
+           NULL,
+           CASE WHEN item.kind = 'file' THEN 1 ELSE 0 END,
+           jsonb_build_object('kind', item.kind, 'mode', item.mode)
+      FROM unnest(v_names, v_kinds, v_modes, v_inodes) WITH ORDINALITY
+           AS item(name, kind, mode, inode_id, ordinal);
+    UPDATE _vexfs.inodes
+       SET modified_at = clock_timestamp(),
+           changed_at = clock_timestamp()
+     WHERE workspace_id = v_workspace.workspace_id
+       AND inode_id = v_parent;
+
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'path', CASE WHEN v_parent_path = '/' THEN '/' || item.name
+                            ELSE v_parent_path || '/' || item.name END,
+               'inode', item.inode_id,
+               'kind', item.kind,
+               'version', CASE WHEN item.kind = 'file' THEN 1 ELSE 0 END)
+               ORDER BY item.ordinal), '[]'::jsonb)
+      INTO v_created
+      FROM unnest(v_names, v_kinds, v_inodes) WITH ORDINALITY
+           AS item(name, kind, inode_id, ordinal);
+    RETURN jsonb_build_object(
+        'workspace', p_workspace,
+        'parent', v_parent_path,
+        'commit', v_commit,
+        'created', v_created);
 END;
 $$;
 
@@ -8507,6 +9146,7 @@ DECLARE
     v_manifest_count bigint;
     v_chunk_count bigint;
     v_commit_count bigint;
+    v_change_count bigint;
     v_request_count bigint;
     v_acl_count bigint;
     v_xattr_count bigint;
@@ -8542,6 +9182,9 @@ BEGIN
     SELECT count(*) INTO v_commit_count
       FROM _vexfs.commits AS c
      WHERE c.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_change_count
+      FROM _vexfs.commit_changes AS change
+     WHERE change.workspace_id = v_workspace.workspace_id;
     SELECT count(*) INTO v_request_count
       FROM _vexfs.request_replays AS request
      WHERE request.workspace_id = v_workspace.workspace_id;
@@ -8674,6 +9317,27 @@ BEGIN
     END IF;
 
     SELECT count(*) INTO v_bad
+      FROM (
+          SELECT commit.commit_no,
+                 count(change.ordinal) AS change_count,
+                 min(change.ordinal) AS first_ordinal,
+                 max(change.ordinal) AS last_ordinal
+            FROM _vexfs.commits AS commit
+            LEFT JOIN _vexfs.commit_changes AS change
+              ON change.workspace_id = commit.workspace_id
+             AND change.commit_no = commit.commit_no
+           WHERE commit.workspace_id = v_workspace.workspace_id
+           GROUP BY commit.commit_no) AS summary
+     WHERE summary.change_count = 0
+        OR summary.first_ordinal <> 1
+        OR summary.last_ordinal <> summary.change_count;
+    IF v_bad <> 0 THEN
+        v_issues := v_issues || jsonb_build_array(jsonb_build_object(
+            'code', 'commit_changes', 'count', v_bad,
+            'message', 'commit change ordinals are missing or discontinuous'));
+    END IF;
+
+    SELECT count(*) INTO v_bad
       FROM _vexfs.inodes AS i
       LEFT JOIN _vexfs.file_versions AS f
         ON f.workspace_id = i.workspace_id
@@ -8748,7 +9412,6 @@ BEGIN
        AND f.manifest_id IS NOT NULL
        AND (m.manifest_id IS NULL
             OR m.workspace_id <> f.workspace_id
-            OR m.inode_id <> f.inode_id
             OR m.file_size <> f.size_bytes
             OR m.checksum IS DISTINCT FROM f.checksum
             OR m.chunk_size <> 65536
@@ -8772,7 +9435,6 @@ BEGIN
                 WHERE entry.manifest_id = m.manifest_id
                   AND (entry.chunk_no >= m.chunk_count
                        OR c.workspace_id <> m.workspace_id
-                       OR c.inode_id <> m.inode_id
                        OR c.size_bytes <> CASE
                            WHEN entry.chunk_no < m.chunk_count - 1 THEN 65536
                            ELSE (m.file_size - entry.chunk_no::bigint * 65536)::integer
@@ -8853,7 +9515,6 @@ BEGIN
                     OR (staging.base_manifest_id IS NOT NULL
                         AND (base.manifest_id IS NULL
                              OR base.workspace_id <> handle.workspace_id
-                             OR base.inode_id IS DISTINCT FROM handle.inode_id
                              OR base.file_size <> staging.base_size))
                     OR EXISTS (
                         SELECT 1
@@ -8976,6 +9637,7 @@ BEGIN
             'manifests', v_manifest_count,
             'chunks', v_chunk_count,
             'commits', v_commit_count,
+            'commit_changes', v_change_count,
             'requests', v_request_count,
             'acl_entries', v_acl_count,
             'xattrs', v_xattr_count,
@@ -9246,6 +9908,25 @@ BEGIN
      WHERE c.workspace_id = v_workspace.workspace_id
        AND c.commit_no <= v_source_commit
      ORDER BY c.commit_no;
+
+    RETURN QUERY
+    SELECT 'commit_changes'::text,
+           lpad(change.commit_no::text, 20, '0') || ':' ||
+               lpad(change.ordinal::text, 10, '0'),
+           jsonb_build_object(
+               'source_commit', change.commit_no,
+               'ordinal', change.ordinal,
+               'operation', change.operation,
+               'path', change.path,
+               'source_inode', change.inode_id,
+               'before_version', change.before_version,
+               'after_version', change.after_version,
+               'details', change.details),
+           NULL::bytea
+      FROM _vexfs.commit_changes AS change
+     WHERE change.workspace_id = v_workspace.workspace_id
+       AND change.commit_no <= v_source_commit
+     ORDER BY change.commit_no, change.ordinal;
 
     RETURN QUERY
     WITH latest AS (
@@ -9703,7 +10384,7 @@ BEGIN
             USING ERRCODE = 'P0002';
     END IF;
     IF p_record_type NOT IN (
-        'commits', 'inodes', 'dentries', 'file_versions', 'manifests', 'chunks',
+        'commits', 'commit_changes', 'inodes', 'dentries', 'file_versions', 'manifests', 'chunks',
         'inode_states', 'dentry_states', 'xattr_states', 'acl_states', 'snapshots',
         'xattrs', 'acl_entries', 'principals')
        OR p_record_key IS NULL OR p_record_key = '' OR octet_length(p_record_key) > 1024
@@ -9781,6 +10462,7 @@ DECLARE
     v_check jsonb;
     v_versions bigint;
     v_content_bytes bigint;
+    v_empty_manifest bigint;
 BEGIN
     SELECT r.oid INTO STRICT v_actor
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
@@ -9838,7 +10520,7 @@ BEGIN
         local_id bigint UNIQUE NOT NULL) ON COMMIT DROP;
     CREATE TEMP TABLE vexfs_import_manifest_map(
         source_id bigint PRIMARY KEY,
-        local_id bigint UNIQUE NOT NULL) ON COMMIT DROP;
+        local_id bigint NOT NULL) ON COMMIT DROP;
     CREATE TEMP TABLE vexfs_import_chunk_map(
         source_manifest bigint NOT NULL,
         chunk_no integer NOT NULL,
@@ -9940,35 +10622,101 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
 
+    INSERT INTO _vexfs.commit_changes(
+        workspace_id, commit_no, ordinal, operation, path, inode_id,
+        before_version, after_version, details)
+    SELECT v_workspace_id,
+           commit_map.local_id,
+           (record.record_json->>'ordinal')::integer,
+           record.record_json->>'operation',
+           record.record_json->>'path',
+           inode_map.local_id,
+           (record.record_json->>'before_version')::bigint,
+           (record.record_json->>'after_version')::bigint,
+           coalesce(record.record_json->'details', '{}'::jsonb)
+      FROM _vexfs.archive_import_records AS record
+      JOIN pg_temp.vexfs_import_commit_map AS commit_map
+        ON commit_map.source_id = (record.record_json->>'source_commit')::bigint
+      LEFT JOIN pg_temp.vexfs_import_inode_map AS inode_map
+        ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
+     WHERE record.job_id = p_job
+       AND record.record_type = 'commit_changes'
+     ORDER BY commit_map.local_id, (record.record_json->>'ordinal')::integer;
+
+    -- SQLite archives created before path-level change records still carry a
+    -- complete commit chain. Preserve that history with one explicit marker
+    -- per commit so the imported workspace passes the same integrity rules.
+    IF NOT EXISTS (
+        SELECT 1
+          FROM _vexfs.archive_import_records AS record
+         WHERE record.job_id = p_job
+           AND record.record_type = 'commit_changes') THEN
+        INSERT INTO _vexfs.commit_changes(
+            workspace_id, commit_no, ordinal, operation, path, inode_id,
+            before_version, after_version, details)
+        SELECT v_workspace_id,
+               commit_map.local_id,
+               1,
+               record.record_json->>'message',
+               '/',
+               v_root,
+               NULL,
+               NULL,
+               jsonb_build_object('imported_without_change_detail', true)
+          FROM _vexfs.archive_import_records AS record
+          JOIN pg_temp.vexfs_import_commit_map AS commit_map
+            ON commit_map.source_id = (record.record_json->>'source_id')::bigint
+         WHERE record.job_id = p_job
+           AND record.record_type = 'commits'
+         ORDER BY commit_map.local_id;
+    END IF;
+
     INSERT INTO pg_temp.vexfs_import_manifest_map(source_id, local_id)
     SELECT (record.record_json->>'source_id')::bigint,
            nextval(pg_get_serial_sequence('_vexfs.manifests', 'manifest_id'))
       FROM _vexfs.archive_import_records AS record
-     WHERE record.job_id = p_job AND record.record_type = 'manifests'
+     WHERE record.job_id = p_job
+       AND record.record_type = 'manifests'
+       AND ((record.record_json->>'file_size')::bigint <> 0
+            OR (record.record_json->>'chunk_count')::integer <> 0)
      ORDER BY (record.record_json->>'source_id')::bigint;
+    IF EXISTS (
+        SELECT 1
+          FROM _vexfs.archive_import_records AS record
+         WHERE record.job_id = p_job
+           AND record.record_type = 'manifests'
+           AND (record.record_json->>'file_size')::bigint = 0
+           AND (record.record_json->>'chunk_count')::integer = 0) THEN
+        v_empty_manifest := nextval(
+            pg_get_serial_sequence('_vexfs.manifests', 'manifest_id'));
+        INSERT INTO pg_temp.vexfs_import_manifest_map(source_id, local_id)
+        SELECT (record.record_json->>'source_id')::bigint,
+               v_empty_manifest
+          FROM _vexfs.archive_import_records AS record
+         WHERE record.job_id = p_job
+           AND record.record_type = 'manifests'
+           AND (record.record_json->>'file_size')::bigint = 0
+           AND (record.record_json->>'chunk_count')::integer = 0
+         ORDER BY (record.record_json->>'source_id')::bigint;
+    END IF;
     INSERT INTO _vexfs.manifests(
-        manifest_id, workspace_id, inode_id, file_size, chunk_size,
+        manifest_id, workspace_id, file_size, chunk_size,
         chunk_count, checksum, created_at)
     OVERRIDING SYSTEM VALUE
-    SELECT manifest_map.local_id,
+    SELECT DISTINCT ON (manifest_map.local_id)
+           manifest_map.local_id,
            v_workspace_id,
-           inode_map.local_id,
            (manifest.record_json->>'file_size')::bigint,
            (manifest.record_json->>'chunk_size')::integer,
            (manifest.record_json->>'chunk_count')::integer,
            manifest.record_json->>'checksum',
            to_timestamp((manifest.record_json->>'created_at')::bigint / 1000.0)
       FROM _vexfs.archive_import_records AS manifest
-      JOIN pg_temp.vexfs_import_manifest_map AS manifest_map
+     JOIN pg_temp.vexfs_import_manifest_map AS manifest_map
         ON manifest_map.source_id = (manifest.record_json->>'source_id')::bigint
-      JOIN _vexfs.archive_import_records AS version
-        ON version.job_id = p_job AND version.record_type = 'file_versions'
-       AND (version.record_json->>'source_manifest')::bigint = manifest_map.source_id
-       AND (version.record_json->>'source_version_no') IS NULL
-      JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = (version.record_json->>'source_inode')::bigint
      WHERE manifest.job_id = p_job AND manifest.record_type = 'manifests'
-     ORDER BY manifest_map.source_id;
+     ORDER BY manifest_map.local_id,
+              (manifest.record_json->>'source_id')::bigint;
 
     INSERT INTO pg_temp.vexfs_import_chunk_map(
         source_manifest, chunk_no, local_id)
@@ -9980,11 +10728,10 @@ BEGIN
      ORDER BY (record.record_json->>'source_manifest')::bigint,
               (record.record_json->>'chunk_no')::integer;
     INSERT INTO _vexfs.chunks(
-        chunk_id, workspace_id, inode_id, content, size_bytes, checksum)
+        chunk_id, workspace_id, content, size_bytes, checksum)
     OVERRIDING SYSTEM VALUE
     SELECT chunk_map.local_id,
            v_workspace_id,
-           inode_map.local_id,
            record.content,
            (record.record_json->>'size')::integer,
            record.record_json->>'checksum'
@@ -9992,12 +10739,6 @@ BEGIN
       JOIN pg_temp.vexfs_import_chunk_map AS chunk_map
         ON chunk_map.source_manifest = (record.record_json->>'source_manifest')::bigint
        AND chunk_map.chunk_no = (record.record_json->>'chunk_no')::integer
-      JOIN _vexfs.archive_import_records AS version
-        ON version.job_id = p_job AND version.record_type = 'file_versions'
-       AND (version.record_json->>'source_manifest')::bigint = chunk_map.source_manifest
-       AND (version.record_json->>'source_version_no') IS NULL
-      JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = (version.record_json->>'source_inode')::bigint
      WHERE record.job_id = p_job AND record.record_type = 'chunks'
      ORDER BY chunk_map.source_manifest, chunk_map.chunk_no;
     INSERT INTO _vexfs.manifest_chunks(manifest_id, chunk_no, chunk_id)
@@ -10283,5 +11024,7 @@ COMMENT ON FUNCTION public.vexfs_workspace_create(text) IS
     'Creates a PostgreSQL-managed VexFS workspace owned by the authenticated session role';
 COMMENT ON FUNCTION public.vexfs_write(text, text, bytea) IS
     'Writes a complete file version in the caller transaction';
+COMMENT ON FUNCTION public.vexfs_create_batch(text, text, jsonb) IS
+    'Creates 1 to 1000 direct children with one commit and path-level change records';
 COMMENT ON FUNCTION public.vexfs_read(text, text) IS
     'Reads the current file version from PostgreSQL-managed VexFS storage';

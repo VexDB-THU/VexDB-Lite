@@ -85,6 +85,12 @@ steps:
 - query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
   expect:
   - - 2
+- query: SELECT commit.operation, count(change.ordinal), min(change.ordinal), max(change.ordinal) FROM _vexfs.commits AS commit JOIN _vexfs.commit_changes AS change USING(workspace_id, commit_no) WHERE commit.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND commit.commit_no=(SELECT head_commit FROM _vexfs.workspaces WHERE name='pg-overlay') GROUP BY commit.operation;
+  expect:
+  - - publish_batch
+    - 2
+    - 1
+    - 2
 - query: SELECT convert_from(vexfs_read('pg-overlay', '/claimed-a.txt'), 'UTF8'), convert_from(vexfs_read('pg-overlay', '/claimed-b.txt'), 'UTF8');
   expect:
   - - a
@@ -97,9 +103,13 @@ steps:
 - query: SELECT convert_from(vexfs_read('pg-overlay', '/lazy.txt'), 'UTF8');
   expect:
   - - lazy
+- statement: CREATE TEMP TABLE claimed_publish_head AS SELECT head_commit FROM _vexfs.workspaces WHERE name='pg-overlay';
 - query: SELECT jsonb_array_length(vexfs_mount_publish_close_claimed('pg-overlay', 'overlay-gateway', 'full', (SELECT jsonb_agg(jsonb_build_object('handle', handle, 'generation', generation) ORDER BY name) FROM claimed_handles WHERE name IN ('a', 'b'))));
   expect:
   - - 2
+- query: SELECT workspace.head_commit = published.head_commit FROM _vexfs.workspaces AS workspace CROSS JOIN claimed_publish_head AS published WHERE workspace.name='pg-overlay';
+  expect:
+  - - true
 - statement: CREATE TEMP TABLE root_manifest AS SELECT version.manifest_id, version.checksum FROM _vexfs.file_versions AS version WHERE version.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay') AND version.inode_id=_vexfs.resolve_path((SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-overlay'), '/lazy.txt') AND version.version_no=1;
 - statement: UPDATE _vexfs.manifests SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);
 - statement: UPDATE _vexfs.file_versions SET checksum=repeat('0', 64) WHERE manifest_id=(SELECT manifest_id FROM root_manifest);

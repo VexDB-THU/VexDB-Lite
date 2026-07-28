@@ -86,6 +86,13 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_PERF_FILES=1000 \
   bash tests/eval/vexfs/run_pg_adapter_performance.sh
 
+# PG 批量历史写入：先用旧单文件接口建立 1000 文件控制组，再验证
+# 1k/10k/100k 批量创建。每批最多 1000 个文件、单连接串行执行，容器
+# 内存硬限制默认 1 GiB；同时检查一个批次一个 commit、逐路径 change、
+# 逐文件 version、共享空 manifest、deep/quick check 和至少 2x 加速。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+  bash tests/eval/vexfs/run_pg_create_batch_performance.sh
+
 # PG manifest 根哈希专项：16 MiB 文件每轮只改 4 KiB，发布不得拼完整文件；
 # 默认重复 5 次，容器 memory.max 必须不超过 1 GiB，并检查 oom_kill 未增长。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_DATABASE=test \
@@ -285,6 +292,9 @@ vexdb_sqlite/build/eval/vexfs-linux-mount/{root,uid-1000}/<run-id>/report.json
   未变化 chunk 复用、精确 generation claim、逐文件后台事务、断线重试幂等、部分成功清理、
   服务端已提交但客户端不读取结果后的同 generation 收敛、后台发布不持有前台 runtime 锁；
   调度器覆盖全局空闲、4 MiB 脏写、1024 文件、30 秒最长等待和活跃 handle 隔离。
+- PostgreSQL 批量历史：`vexfs_create_batch` 用一个 commit/audit/notify 表示一个批次，
+  `commit_changes` 继续保留逐路径变化，空文件共享一个不可变 manifest；1 千/1 万/10 万
+  文件 eval 与旧逐文件接口对照，并限制 `work_mem`、临时文件和容器总内存。
 - 随机模型：真实数据库状态与 Python 参考文件树持续比对。
 - 性能：大量小文件、大文件顺序读写、分块 staging、随机 4 KiB 覆盖、备份吞吐；
   `performance.mount-contract-small-files` 额外模拟原子创建、macOS provenance xattr、

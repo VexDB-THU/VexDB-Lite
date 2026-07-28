@@ -51,6 +51,8 @@ steps:
     - 2
   - - chunks
     - 3
+  - - commit_changes
+    - 11
   - - commits
     - 11
   - - dentries

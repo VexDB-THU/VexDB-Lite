@@ -64,6 +64,8 @@ PG_IMPORT=("$CLI" fs --backend pg --dsn "$DSN" --workspace sqlite-to-pg)
 "${SQLITE[@]}" setup >/dev/null
 "${SQLITE[@]}" mkdir /tree >/dev/null
 printf 'sqlite-v1' | "${SQLITE[@]}" write /tree/value.txt >/dev/null
+: | "${SQLITE[@]}" write /tree/empty-a.txt >/dev/null
+: | "${SQLITE[@]}" write /tree/empty-b.txt >/dev/null
 "${SQLITE[@]}" ln /tree/value.txt /tree/value-hard.txt >/dev/null
 printf '[{"principal":"agent-portable","effect":"allow","permissions":"read","inherit":0}]' | \
     "${SQLITE[@]}" setfacl /tree/value.txt >/dev/null
@@ -100,9 +102,14 @@ PG_IMPORTED="$(docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t
             vexfs_acl_get(
               'sqlite-to-pg',(vexfs_stat('sqlite-to-pg','/tree/value.txt')->>'inode')::bigint)
               @> '[{\"principal\":\"agent-portable\",\"effect\":\"allow\",\"permissions\":\"read\"}]'::jsonb,
+            octet_length(vexfs_read('sqlite-to-pg','/tree/empty-a.txt'))=0,
+            (SELECT count(*) FROM _vexfs.manifests AS manifest
+              WHERE manifest.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces
+                                             WHERE name='sqlite-to-pg')
+                AND manifest.file_size=0 AND manifest.chunk_count=0)=1,
             (vexfs_check('sqlite-to-pg',1)->>'ok')::boolean;")"
 assert_equal "$PG_IMPORTED" \
-    "sqlite-v2|sqlite-v1|1|t|value.txt|sqlite-metadata|t|t" \
+    "sqlite-v2|sqlite-v1|1|t|value.txt|sqlite-metadata|t|t|t|t" \
     "SQLite 到 PostgreSQL format v2 往返错误"
 
 # 目标 workspace 已存在时必须拒绝，且不能改动已导入内容。
@@ -117,6 +124,8 @@ docker exec -i "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q \
     -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
 SELECT vexfs_workspace_create('pg-to-sqlite');
 SELECT vexfs_mkdir('pg-to-sqlite','/tree',true);
+SELECT vexfs_create_batch(
+  'pg-to-sqlite','/tree','[{"name":"empty-a.txt"},{"name":"empty-b.txt"}]'::jsonb);
 SELECT vexfs_write('pg-to-sqlite','/tree/value.txt',convert_to('pg-v1','UTF8'));
 SELECT vexfs_link('pg-to-sqlite','/tree/value.txt','/tree/value-hard.txt');
 SELECT vexfs_symlink('pg-to-sqlite','/tree/value-link.txt',convert_to('value.txt','UTF8'));
@@ -157,9 +166,10 @@ SQLITE_IMPORTED="$("$CLI" "$SQLITE_TARGET" \
                 'pg-imported',json_extract(vexfs_stat('pg-imported','/tree/value.txt'),'$.inode')))
                WHERE json_extract(value,'$.principal')='agent-portable'
                  AND json_extract(value,'$.permissions')='read'),
+            length(vexfs_read('pg-imported','/tree/empty-a.txt'))=0,
             json_extract(vexfs_check('pg-imported',1),'$.ok');")"
 assert_equal "$SQLITE_IMPORTED" \
-    "pg-v2|pg-v1|1|1|value.txt|pg-metadata|1|1" \
+    "pg-v2|pg-v1|1|1|value.txt|pg-metadata|1|1|1" \
     "PostgreSQL 到 SQLite format v2 往返错误"
 
 cp "$SQLITE_PACKAGE" "$CORRUPT_PACKAGE"

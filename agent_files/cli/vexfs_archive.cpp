@@ -246,8 +246,8 @@ FROM package.manifest
         hash.Update("\n", 1);
         if (manifest.Row()) throw Error("archive has more than one manifest row");
     }
-    constexpr std::array<const char *, 14> tables = {
-        "commits", "inodes", "dentries", "file_versions", "manifests", "chunks", "inode_states",
+    constexpr std::array<const char *, 15> tables = {
+        "commits", "commit_changes", "inodes", "dentries", "file_versions", "manifests", "chunks", "inode_states",
         "dentry_states", "xattr_states", "acl_states", "snapshots", "xattrs",
         "acl_entries", "principals"
     };
@@ -281,6 +281,11 @@ CREATE TABLE package.manifest(
 CREATE TABLE package.commits(
  record_key TEXT PRIMARY KEY,source_id INTEGER UNIQUE NOT NULL,parent_source_id INTEGER,
  message TEXT NOT NULL,created_at INTEGER NOT NULL,record_checksum TEXT NOT NULL);
+CREATE TABLE package.commit_changes(
+ record_key TEXT PRIMARY KEY,source_commit INTEGER NOT NULL,ordinal INTEGER NOT NULL,
+ operation TEXT NOT NULL,path TEXT NOT NULL,source_inode INTEGER,before_version INTEGER,
+ after_version INTEGER,details TEXT NOT NULL CHECK(json_valid(details)),
+ record_checksum TEXT NOT NULL,UNIQUE(source_commit,ordinal));
 CREATE TABLE package.inodes(
  record_key TEXT PRIMARY KEY,source_id INTEGER UNIQUE NOT NULL,kind TEXT NOT NULL,mode INTEGER NOT NULL,
  owner_principal TEXT NOT NULL,uid INTEGER NOT NULL,gid INTEGER NOT NULL,size INTEGER NOT NULL,
@@ -647,6 +652,16 @@ SELECT record_key,json_extract(record_json,'$.source_id'),
        json_extract(record_json,'$.created_at'),''
 FROM incoming WHERE record_type='commits';
 
+INSERT INTO package.commit_changes(
+ record_key,source_commit,ordinal,operation,path,source_inode,before_version,
+ after_version,details,record_checksum)
+SELECT record_key,json_extract(record_json,'$.source_commit'),
+       json_extract(record_json,'$.ordinal'),json_extract(record_json,'$.operation'),
+       json_extract(record_json,'$.path'),json_extract(record_json,'$.source_inode'),
+       json_extract(record_json,'$.before_version'),json_extract(record_json,'$.after_version'),
+       json(json_extract(record_json,'$.details')),''
+FROM incoming WHERE record_type='commit_changes';
+
 INSERT INTO package.inodes(
  record_key,source_id,kind,mode,owner_principal,uid,gid,size,current_version,
  created_at,accessed_at,updated_at,changed_at,deleted_at,record_checksum)
@@ -746,6 +761,9 @@ FROM incoming WHERE record_type='principals';
 
 UPDATE package.commits SET record_checksum=
  vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,created_at) AS BLOB));
+UPDATE package.commit_changes SET record_checksum=
+ vexfs_archive_sha256(CAST(json_array(source_commit,ordinal,operation,path,source_inode,
+  before_version,after_version,json(details)) AS BLOB));
 UPDATE package.inodes SET record_checksum=
  vexfs_archive_sha256(CAST(json_array(source_id,kind,mode,owner_principal,uid,gid,size,
   current_version,created_at,accessed_at,updated_at,changed_at,deleted_at) AS BLOB));
@@ -1167,14 +1185,14 @@ ArchiveInfo VerifyAttachedArchive(sqlite3 *db) {
     RequireZero(db, R"SQL(
 SELECT count(*) FROM package.sqlite_master
 WHERE type IN ('view','trigger') OR (type='table' AND name NOT IN (
- 'manifest','commits','inodes','dentries','file_versions','manifests','chunks','inode_states',
+ 'manifest','commits','commit_changes','inodes','dentries','file_versions','manifests','chunks','inode_states',
  'dentry_states','xattr_states','acl_states','snapshots','xattrs','acl_entries','principals'))
 )SQL", "archive has an unexpected schema object");
     if (ScalarInt64(db, R"SQL(
 SELECT count(*) FROM package.sqlite_master WHERE type='table' AND name IN (
- 'manifest','commits','inodes','dentries','file_versions','manifests','chunks','inode_states',
+ 'manifest','commits','commit_changes','inodes','dentries','file_versions','manifests','chunks','inode_states',
  'dentry_states','xattr_states','acl_states','snapshots','xattrs','acl_entries','principals')
-)SQL") != 15) {
+)SQL") != 16) {
         throw Error("archive schema is incomplete");
     }
 
@@ -1202,6 +1220,9 @@ FROM package.manifest
 SELECT sum(bad) FROM (
  SELECT count(*) bad FROM package.commits WHERE record_checksum<>
   vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,created_at) AS BLOB))
+ UNION ALL SELECT count(*) FROM package.commit_changes WHERE record_checksum<>
+  vexfs_archive_sha256(CAST(json_array(source_commit,ordinal,operation,path,source_inode,
+   before_version,after_version,json(details)) AS BLOB))
  UNION ALL SELECT count(*) FROM package.inodes WHERE record_checksum<>
   vexfs_archive_sha256(CAST(json_array(source_id,kind,mode,owner_principal,uid,gid,size,
    current_version,created_at,accessed_at,updated_at,changed_at,deleted_at) AS BLOB)))
@@ -1254,6 +1275,10 @@ SELECT sum(bad) FROM (
  SELECT count(*) bad FROM package.commits child
  WHERE child.parent_source_id IS NOT NULL AND NOT EXISTS(
   SELECT 1 FROM package.commits parent WHERE parent.source_id=child.parent_source_id)
+ UNION ALL SELECT count(*) FROM package.commit_changes change
+ WHERE NOT EXISTS(SELECT 1 FROM package.commits commit_row
+                  WHERE commit_row.source_id=change.source_commit)
+    OR change.ordinal<1 OR change.operation='' OR change.path=''
  UNION ALL SELECT count(*) FROM package.dentries entry
  WHERE NOT EXISTS(SELECT 1 FROM package.inodes inode
                   WHERE inode.source_id=entry.parent_source_inode AND inode.kind='directory'
@@ -1276,7 +1301,7 @@ SELECT sum(bad) FROM (
     OR manifest.chunk_count<>(manifest.file_size+65535)/65536
     OR (SELECT count(*) FROM package.file_versions version
         WHERE version.source_manifest=manifest.source_id
-          AND version.source_version_no IS NULL)<>1
+          AND version.source_version_no IS NULL)<1
  UNION ALL SELECT count(*) FROM package.chunks chunk
  WHERE NOT EXISTS(SELECT 1 FROM package.manifests manifest
                   WHERE manifest.source_id=chunk.source_manifest)
@@ -1476,6 +1501,12 @@ SELECT record_key,json_object(
  'source_id',source_id,'parent_source_id',parent_source_id,
  'message',message,'created_at',created_at),NULL
 FROM package.commits ORDER BY record_key)SQL", false},
+            {"commit_changes", R"SQL(
+SELECT record_key,json_object(
+ 'source_commit',source_commit,'ordinal',ordinal,'operation',operation,'path',path,
+ 'source_inode',source_inode,'before_version',before_version,
+ 'after_version',after_version,'details',json(details)),NULL
+FROM package.commit_changes ORDER BY record_key)SQL", false},
             {"inodes", R"SQL(
 SELECT record_key,json_object(
  'source_id',source_id,'kind',kind,'mode',mode,'owner_principal',owner_principal,
@@ -1815,8 +1846,12 @@ VALUES(?1,?2,?3,?4,?5,?6)
             Statement rows(db.get(), R"SQL(
 SELECT chunk.source_manifest,chunk.chunk_no,chunk.size,chunk.checksum,inode.local_id
 FROM package.chunks chunk
-JOIN package.file_versions version
-  ON version.source_manifest=chunk.source_manifest AND version.source_version_no IS NULL
+JOIN (
+ SELECT source_manifest,min(source_inode) AS source_inode
+ FROM package.file_versions
+ WHERE source_manifest IS NOT NULL AND source_version_no IS NULL
+ GROUP BY source_manifest) version
+  ON version.source_manifest=chunk.source_manifest
 JOIN import_inode_map inode ON inode.source_id=version.source_inode
 ORDER BY chunk.source_manifest,chunk.chunk_no
 )SQL");
