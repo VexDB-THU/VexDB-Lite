@@ -800,8 +800,12 @@ int PrereadVectors(GraphIndexVtab &vt, sqlite3_int64 limit, std::vector<float> &
 }
 
 int DefaultBuildThreads() {
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    return 1;
+#else
     unsigned hw = std::thread::hardware_concurrency();
     return int(hw > 1 ? (hw > 8 ? 8 : hw) : 1);  // 端侧保守上限 8
+#endif
 }
 
 // 从 %_vectors 全量重建（全内存）。两段式：先串行预读再 BuildBulk 多线程建图

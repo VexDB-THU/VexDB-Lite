@@ -778,7 +778,12 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         size_t rest = n - 1;
         int workers = n_threads;
         if (workers > int(rest)) workers = int(rest);
-        // Phase B：单线程回退
+        // Phase B：单线程回退。浏览器默认没有 SharedArrayBuffer/跨域隔离，
+        // 非 pthread WASM 构建固定走这里，避免产物要求额外响应头。
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+        for (size_t i = 1; i < n; i++) insert_one(i);
+        return 0;
+#else
         if (workers <= 1) {
             for (size_t i = 1; i < n; i++) insert_one(i);
             return 0;
@@ -816,6 +821,7 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         im.store.parallel_build_active_.store(false, std::memory_order_release);
         if (first_error) std::rethrow_exception(first_error);
         return 0;
+#endif
     });
     im.train_quantizer(im.store);
     im.release_raw_vectors(im.store);

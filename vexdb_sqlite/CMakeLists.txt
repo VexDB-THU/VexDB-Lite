@@ -21,7 +21,9 @@ if(CCACHE_PROGRAM)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 endif()
 
-find_package(Threads REQUIRED)
+if(NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+endif()
 
 # macOS：默认对齐真实硬件架构。两个坑：① anaconda clang 默认 target 是 x86_64；
 # ② 在 Rosetta(x86_64) 进程里 `uname -m` 会谎报 x86_64。都会编出与系统 arm64
@@ -200,7 +202,7 @@ endif()
 # ---- 形态 1：loadable 扩展（.so/.dylib），不链 sqlite3，运行时用宿主 API ----
 # iOS 禁运行时加载（系统 libsqlite3 关 load_extension + App Store 动态代码限制），
 # 不产此形态；Android 保留（requery 等自带 SQLite 的宿主支持 load_extension）。
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT EMSCRIPTEN)
     add_library(vexdb_lite_loadable SHARED ${VEXDB_SQLITE_SRCS})
     target_include_directories(vexdb_lite_loadable PRIVATE ${VEXDB_SQLITE_INCLUDES})
     set_target_properties(vexdb_lite_loadable PROPERTIES OUTPUT_NAME "vexdb_lite" PREFIX "")
