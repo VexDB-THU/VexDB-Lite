@@ -3189,6 +3189,208 @@ AS $$
       JOIN _vexfs.inodes AS inode ON inode.inode_id = item.inode
 $$;
 
+CREATE FUNCTION _vexfs.glob_regex(p_pattern text)
+RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+PARALLEL SAFE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_index integer;
+    v_character text;
+    v_regex text := '^';
+BEGIN
+    FOR v_index IN 1..char_length(p_pattern) LOOP
+        v_character := substr(p_pattern, v_index, 1);
+        IF v_character = '*' THEN
+            v_regex := v_regex || '.*';
+        ELSIF v_character = '?' THEN
+            v_regex := v_regex || '.';
+        ELSIF strpos('.+()[]{}^$|', v_character) > 0 OR v_character = chr(92) THEN
+            v_regex := v_regex || chr(92) || v_character;
+        ELSE
+            v_regex := v_regex || v_character;
+        END IF;
+    END LOOP;
+    RETURN v_regex || '$';
+END;
+$$;
+
+CREATE FUNCTION public.vexfs_find(
+    p_workspace text,
+    p_path text,
+    p_name_pattern text,
+    p_kind text,
+    p_min_size bigint,
+    p_max_size bigint,
+    p_modified_after_ms bigint,
+    p_modified_before_ms bigint,
+    p_after_path text,
+    p_limit integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_root bigint;
+    v_parts text[];
+    v_root_name text;
+    v_name_regex text;
+    v_actor_oid oid;
+    v_superuser boolean;
+    v_unrestricted boolean;
+    v_entries jsonb;
+    v_next_cursor text;
+BEGIN
+    IF p_name_pattern IS NOT NULL AND
+       (p_name_pattern = '' OR octet_length(p_name_pattern) > 255) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: name pattern must be 1..255 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_kind IS NOT NULL AND p_kind NOT IN ('file', 'directory', 'symlink') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: kind must be file, directory or symlink'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_limit NOT BETWEEN 1 AND 1000 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: limit must be between 1 and 1000'
+            USING ERRCODE = '22023';
+    END IF;
+    IF coalesce(p_min_size, 0) < 0 OR coalesce(p_max_size, 0) < 0 OR
+       coalesce(p_modified_after_ms, 0) < 0 OR
+       coalesce(p_modified_before_ms, 0) < 0 OR
+       coalesce(p_modified_after_ms, 0) > 253402300799999 OR
+       coalesce(p_modified_before_ms, 0) > 253402300799999 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: numeric filters are outside the supported range'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_min_size IS NOT NULL AND p_max_size IS NOT NULL AND
+       p_min_size > p_max_size THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: minimum size exceeds maximum size'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_modified_after_ms IS NOT NULL AND p_modified_before_ms IS NOT NULL AND
+       p_modified_after_ms > p_modified_before_ms THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_FIND: modified-after exceeds modified-before'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'read');
+    v_parts := _vexfs.path_parts(p_path);
+    v_root := _vexfs.resolve_path(v_workspace.workspace_id, p_path);
+    PERFORM _vexfs.require_inode_permission(
+        v_workspace.workspace_id, v_root, 'read');
+    SELECT role.oid, role.rolsuper
+      INTO STRICT v_actor_oid, v_superuser
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
+    v_unrestricted := v_superuser OR v_workspace.owner_oid = v_actor_oid;
+    IF p_after_path IS NOT NULL THEN
+        PERFORM _vexfs.path_parts(p_after_path);
+    END IF;
+    v_root_name := CASE WHEN cardinality(v_parts) = 0 THEN '/'
+                        ELSE v_parts[cardinality(v_parts)] END;
+    IF p_name_pattern IS NOT NULL THEN
+        v_name_regex := _vexfs.glob_regex(p_name_pattern);
+    END IF;
+
+    WITH RECURSIVE directories(path, inode_id) AS (
+        SELECT p_path, inode.inode_id
+          FROM _vexfs.inodes AS inode
+         WHERE inode.workspace_id = v_workspace.workspace_id
+           AND inode.inode_id = v_root
+           AND inode.kind = 'directory'
+        UNION ALL
+        SELECT CASE WHEN directories.path = '/' THEN '/' || dentry.name
+                    ELSE directories.path || '/' || dentry.name END,
+               inode.inode_id
+          FROM directories
+          JOIN _vexfs.dentries AS dentry
+            ON dentry.workspace_id = v_workspace.workspace_id
+           AND dentry.parent_inode = directories.inode_id
+          JOIN _vexfs.inodes AS inode
+            ON inode.workspace_id = v_workspace.workspace_id
+           AND inode.inode_id = dentry.inode_id
+           AND inode.live
+         WHERE inode.kind = 'directory'
+           AND (v_unrestricted OR _vexfs.has_acl_permission(
+                   v_workspace.workspace_id, inode.inode_id, 'read'))),
+    tree(path, name, inode_id, kind, size_bytes, version_no, modified_at) AS (
+        SELECT p_path,
+               v_root_name,
+               inode.inode_id,
+               inode.kind,
+               inode.size_bytes,
+               inode.current_version,
+               inode.modified_at
+          FROM _vexfs.inodes AS inode
+         WHERE inode.workspace_id = v_workspace.workspace_id
+           AND inode.inode_id = v_root
+        UNION ALL
+        SELECT CASE WHEN directories.path = '/' THEN '/' || dentry.name
+                    ELSE directories.path || '/' || dentry.name END,
+               dentry.name,
+               inode.inode_id,
+               inode.kind,
+               inode.size_bytes,
+               inode.current_version,
+               inode.modified_at
+          FROM directories
+          JOIN _vexfs.dentries AS dentry
+            ON dentry.workspace_id = v_workspace.workspace_id
+           AND dentry.parent_inode = directories.inode_id
+          JOIN _vexfs.inodes AS inode
+            ON inode.workspace_id = v_workspace.workspace_id
+           AND inode.inode_id = dentry.inode_id
+           AND inode.live
+         WHERE v_unrestricted OR _vexfs.has_acl_permission(
+                   v_workspace.workspace_id, inode.inode_id, 'read')),
+    limited AS MATERIALIZED (
+        SELECT tree.*
+          FROM tree
+         WHERE (p_after_path IS NULL OR
+                tree.path COLLATE "C" > p_after_path COLLATE "C")
+           AND (v_name_regex IS NULL OR tree.name ~ v_name_regex)
+           AND (p_kind IS NULL OR tree.kind = p_kind)
+           AND (p_min_size IS NULL OR tree.size_bytes >= p_min_size)
+           AND (p_max_size IS NULL OR tree.size_bytes <= p_max_size)
+           AND (p_modified_after_ms IS NULL OR
+                tree.modified_at >= pg_catalog.to_timestamp(p_modified_after_ms / 1000.0))
+           AND (p_modified_before_ms IS NULL OR
+                tree.modified_at <= pg_catalog.to_timestamp(p_modified_before_ms / 1000.0))
+         ORDER BY tree.path COLLATE "C"
+         LIMIT p_limit + 1),
+    numbered AS (
+        SELECT limited.*,
+               row_number() OVER (ORDER BY limited.path COLLATE "C") AS row_no,
+               count(*) OVER () AS total
+          FROM limited)
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'path', numbered.path,
+               'name', numbered.name,
+               'inode', numbered.inode_id,
+               'kind', numbered.kind,
+               'size', numbered.size_bytes,
+               'version', numbered.version_no,
+               'modified_at',
+                   (extract(epoch FROM numbered.modified_at) * 1000)::bigint)
+               ORDER BY numbered.path COLLATE "C")
+               FILTER (WHERE numbered.row_no <= p_limit), '[]'::jsonb),
+           CASE WHEN coalesce(max(numbered.total), 0) > p_limit THEN
+               max(numbered.path) FILTER (WHERE numbered.row_no = p_limit)
+           END
+      INTO v_entries, v_next_cursor
+      FROM numbered;
+    RETURN jsonb_build_object(
+        'root', p_path,
+        'entries', v_entries,
+        'next_cursor', v_next_cursor);
+END;
+$$;
+
 CREATE FUNCTION _vexfs.try_utf8(p_content bytea)
 RETURNS text
 LANGUAGE plpgsql
@@ -3915,6 +4117,12 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    -- Serialize session registration with workspace restore. A new gateway may
+    -- start after a restore commits, but it cannot appear between the restore
+    -- lease check and the tree replacement.
+    PERFORM 1 FROM _vexfs.workspaces AS workspace
+     WHERE workspace.workspace_id = v_workspace.workspace_id
+     FOR UPDATE;
     SELECT r.oid INTO STRICT v_actor
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
 
@@ -3987,6 +4195,11 @@ DECLARE
     v_actor oid;
 BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    -- Do not let an expired gateway revive while restore is using the same
+    -- workspace lock as its global write fence.
+    PERFORM 1 FROM _vexfs.workspaces AS workspace
+     WHERE workspace.workspace_id = v_workspace.workspace_id
+     FOR UPDATE;
     SELECT r.oid INTO STRICT v_actor
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
     UPDATE _vexfs.mount_sessions
@@ -3994,7 +4207,8 @@ BEGIN
            heartbeat_at = clock_timestamp()
      WHERE workspace_id = v_workspace.workspace_id
        AND session_id = p_session_id
-       AND owner_oid = v_actor;
+       AND owner_oid = v_actor
+       AND lease_until > clock_timestamp();
     IF NOT FOUND THEN
         RAISE EXCEPTION 'VEXFS_SESSION_STALE: mount session is not active'
             USING ERRCODE = '55006';
@@ -7761,7 +7975,11 @@ END;
 $$;
 
 CREATE FUNCTION public.vexfs_snapshot_restore(
-    p_workspace text, p_name text, p_expected_head bigint)
+    p_workspace text,
+    p_name text,
+    p_expected_head bigint,
+    p_safety_name text DEFAULT NULL,
+    p_caller_session_id text DEFAULT NULL)
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -7774,8 +7992,21 @@ DECLARE
     v_snapshot_head bigint;
     v_commit bigint;
     v_same boolean;
+    v_actor oid;
+    v_active_mounts bigint;
 BEGIN
+    IF p_safety_name IS NOT NULL AND
+       (btrim(p_safety_name) = '' OR
+        p_safety_name <> btrim(p_safety_name) OR
+        octet_length(p_safety_name) > 128 OR
+        p_safety_name = 'HEAD') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SNAPSHOT: invalid safety snapshot name'
+            USING ERRCODE = '22023';
+    END IF;
     v_workspace := _vexfs.require_workspace(p_workspace, 'write');
+    SELECT role.oid INTO STRICT v_actor
+      FROM pg_catalog.pg_roles AS role
+     WHERE role.rolname = session_user;
     SELECT w.head_commit INTO v_current_head
       FROM _vexfs.workspaces AS w
      WHERE w.workspace_id = v_workspace.workspace_id
@@ -7784,6 +8015,37 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_HEAD_CONFLICT: expected %, actual %',
             p_expected_head, v_current_head
             USING ERRCODE = '40001';
+    END IF;
+    IF p_caller_session_id IS NOT NULL AND NOT EXISTS (
+        SELECT 1
+          FROM _vexfs.mount_sessions AS caller
+         WHERE caller.workspace_id = v_workspace.workspace_id
+           AND caller.session_id = p_caller_session_id
+           AND caller.owner_oid = v_actor
+           AND caller.lease_until > clock_timestamp()) THEN
+        RAISE EXCEPTION 'VEXFS_SESSION_STALE: restore caller session is not active'
+            USING ERRCODE = '55006';
+    END IF;
+    SELECT count(*) INTO v_active_mounts
+      FROM _vexfs.mount_sessions AS mounted
+     WHERE mounted.workspace_id = v_workspace.workspace_id
+       AND mounted.lease_until > clock_timestamp()
+       AND (p_caller_session_id IS NULL OR
+            mounted.session_id <> p_caller_session_id);
+    IF v_active_mounts > 0 THEN
+        RAISE EXCEPTION
+            'VEXFS_MOUNT_BUSY: workspace has % other active mount session(s); unmount all machines before snapshot restore',
+            v_active_mounts
+            USING ERRCODE = '55006';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM _vexfs.handles AS handle
+         WHERE handle.workspace_id = v_workspace.workspace_id
+           AND handle.state IN ('open', 'retained')) THEN
+        RAISE EXCEPTION
+            'VEXFS_OPEN_HANDLES: close or recover all file handles before snapshot restore'
+            USING ERRCODE = '55006';
     END IF;
     SELECT s.snapshot_id, s.head_commit INTO v_snapshot_id, v_snapshot_head
       FROM _vexfs.snapshots AS s
@@ -7904,13 +8166,20 @@ BEGIN
 
     PERFORM _vexfs.enforce_snapshot_quota(
         v_workspace.workspace_id, v_snapshot_id);
+    IF p_safety_name IS NOT NULL THEN
+        -- This call reuses the same row lock and transaction. If any later
+        -- restore step fails, PostgreSQL rolls the safety snapshot back too.
+        PERFORM public.vexfs_snapshot_create(
+            p_workspace, p_safety_name, v_current_head, 'consistent');
+    END IF;
     v_commit := _vexfs.record_commit(
         v_workspace.workspace_id, 'snapshot_restore', '/', v_workspace.root_inode,
         jsonb_build_object(
             'before_version', v_current_head,
             'after_version', v_current_head + 1,
             'snapshot', p_name,
-            'snapshot_version', v_snapshot_head));
+            'snapshot_version', v_snapshot_head,
+            'safety_snapshot', p_safety_name));
     DELETE FROM _vexfs.dentries
      WHERE workspace_id = v_workspace.workspace_id;
     INSERT INTO _vexfs.dentries(workspace_id, parent_inode, name, inode_id)

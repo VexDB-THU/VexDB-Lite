@@ -2416,6 +2416,31 @@ def cli_command_surface(ctx: Context) -> dict[str, Any]:
                   b"3", "CLI restore 新版本")
         ctx.equal(run_process(prefix + ["cat", "/cli/a/version.txt"]).stdout,
                   b"one\n", "CLI restore 内容")
+        find_page_one = json.loads(run_process(
+            prefix + ["--json", "find", "/cli/a", "--type", "file",
+                      "--limit", "1"]).stdout)
+        ctx.equal([entry["path"] for entry in find_page_one["entries"]],
+                  ["/cli/a/payload.bin"], "CLI find 首屏二进制路径排序")
+        ctx.equal(find_page_one["next_cursor"], "/cli/a/payload.bin",
+                  "CLI find 游标")
+        find_page_two = json.loads(run_process(
+            prefix + ["--json", "find", "/cli/a", "--type", "f", "--limit", "1",
+                      "--after", find_page_one["next_cursor"]]).stdout)
+        ctx.equal([entry["path"] for entry in find_page_two["entries"]],
+                  ["/cli/a/version.txt"], "CLI find 下一页")
+        ctx.equal(find_page_two["next_cursor"], None, "CLI find 末页无游标")
+        named_find = json.loads(run_process(
+            prefix + ["--json", "find", "/cli", "--name", "*.txt",
+                      "--max-size", "4", "--modified-before",
+                      str(int(time.time() * 1000) + 1000)]).stdout)
+        ctx.equal([entry["path"] for entry in named_find["entries"]],
+                  ["/cli/a/version.txt"], "CLI find 名称、大小和时间过滤")
+        ctx.equal(run_process(
+            prefix + ["find", "/cli", "--name", "*.txt"]).stdout,
+            b"/cli/a/version.txt\n", "CLI find 文本输出")
+        invalid_find = run_process(
+            prefix + ["find", "/cli", "--limit", "1001"], check=False)
+        ctx.equal(invalid_find.returncode, 2, "CLI find 拒绝无界分页")
         grep_json = json.loads(run_process(
             prefix + ["--json", "grep", "ONE", "/cli/a", "-i", "-n"]).stdout)
         ctx.equal(grep_json["match_count"], 1, "CLI 数据库 grep 命中数")
@@ -2468,6 +2493,9 @@ def cli_command_surface(ctx: Context) -> dict[str, Any]:
             prefix + ["--json", "snapshot", "restore", "cli-stable"]).stdout)
         ctx.check(restored_snapshot["commit"] > restored_snapshot["previous_head"],
                   "CLI workspace restore 新 commit")
+        safety_snapshot = restored_snapshot["safety_snapshot"]
+        ctx.check(safety_snapshot.startswith("vexfs-safety-"),
+                  "CLI workspace restore 自动安全快照")
         ctx.equal(run_process(prefix + ["cat", "/cli/a/payload.bin"]).stdout,
                   payload, "CLI workspace restore 文件树")
         restored_grep = json.loads(run_process(
@@ -2479,10 +2507,27 @@ def cli_command_surface(ctx: Context) -> dict[str, Any]:
             0, "CLI workspace restore 后无差异")
         snapshot_list = json.loads(run_process(
             prefix + ["--json", "snapshot", "list"]).stdout)
-        ctx.equal(snapshot_list[0]["name"], "cli-stable", "CLI snapshot list")
+        snapshot_names = {entry["name"] for entry in snapshot_list}
+        ctx.check({"cli-stable", safety_snapshot}.issubset(snapshot_names),
+                  "CLI snapshot list 包含目标和安全快照")
         shown_snapshot = json.loads(run_process(
             prefix + ["snapshot", "show", "cli-stable"]).stdout)
         ctx.equal(shown_snapshot["commit"], snapshot["commit"], "CLI snapshot show")
+        undo_restore = json.loads(run_process(
+            prefix + ["--json", "snapshot", "restore", safety_snapshot]).stdout)
+        ctx.check(undo_restore["commit"] > restored_snapshot["commit"],
+                  "CLI 安全快照撤销恢复")
+        ctx.equal(run_process(prefix + ["cat", "/cli/b/moved.bin"]).stdout,
+                  payload, "CLI 安全快照恢复原修改树")
+        ctx.equal(run_process(prefix + ["stat", "/cli/a/version.txt"],
+                              check=False).returncode,
+                  3, "CLI 安全快照恢复原删除状态")
+        redo_restore = json.loads(run_process(
+            prefix + ["--json", "snapshot", "restore", "cli-stable"]).stdout)
+        ctx.check(redo_restore["commit"] > undo_restore["commit"],
+                  "CLI 撤销后可再次恢复目标快照")
+        ctx.equal(run_process(prefix + ["cat", "/cli/a/payload.bin"]).stdout,
+                  payload, "CLI 再次恢复目标文件树")
         run_process(prefix + ["snapshot", "drop", "cli-stable"])
         run_process(prefix + ["rm", "/cli/a/newline.txt"])
         run_process(prefix + ["rm", "/cli/a/version.txt"])
@@ -2656,6 +2701,41 @@ def performance_mount_contract_small_files(ctx: Context) -> dict[str, Any]:
     ctx.budget("mount_contract_create_seconds", metrics["create_seconds"],
                {"quick": 30.0, "full": 300.0, "stress": 3_000.0}[ctx.mode.name])
     ctx.budget("mount_contract_sync_seconds", metrics["sync_seconds"], 5.0)
+    find_budget = {"quick": 1.0, "full": 5.0, "stress": 20.0}[ctx.mode.name]
+    ctx.budget("find_first_page_seconds", metrics["find_first_page_seconds"], find_budget)
+    ctx.budget("find_second_page_seconds", metrics["find_second_page_seconds"], find_budget)
+    ctx.budget("find_selective_seconds", metrics["find_selective_seconds"], find_budget)
+    metrics["child_max_rss_before_bytes"] = rss_before
+    metrics["child_max_rss_after_bytes"] = rss_after
+    return metrics
+
+
+@case("performance.database-find", "performance",
+      "1 千/1 万/10 万文件上的数据库 find 首屏、下一页和选择性名称查询")
+def performance_database_find(ctx: Context) -> dict[str, Any]:
+    executable = ctx.build_dir / "vexfs_runtime_smoke"
+    if not executable.exists():
+        raise EvalSkip(f"缺少 find benchmark: {executable}")
+    file_count = {"quick": 1_000, "full": 10_000, "stress": 100_000}[
+        ctx.mode.name]
+    timeout = {"quick": 60, "full": 300, "stress": 1_200}[ctx.mode.name]
+    rss_before = child_max_rss_bytes()
+    result = run_process(
+        [str(executable), "--find-benchmark", str(file_count)], timeout=timeout)
+    metrics = json.loads(result.stdout)
+    rss_after = child_max_rss_bytes()
+    ctx.equal(metrics["files"], file_count, "find benchmark 文件数")
+    ctx.check(rss_after < 512 * MIB, "find benchmark 峰值内存低于 512 MiB")
+    query_budget = {"quick": 1.0, "full": 5.0, "stress": 30.0}[
+        ctx.mode.name]
+    ctx.budget("find_first_page_seconds", metrics["find_first_page_seconds"],
+               query_budget)
+    ctx.budget("find_second_page_seconds", metrics["find_second_page_seconds"],
+               query_budget)
+    ctx.budget("find_selective_seconds", metrics["find_selective_seconds"],
+               query_budget)
+    ctx.budget("find_seed_seconds", metrics["seed_seconds"],
+               {"quick": 30.0, "full": 180.0, "stress": 900.0}[ctx.mode.name])
     metrics["child_max_rss_before_bytes"] = rss_before
     metrics["child_max_rss_after_bytes"] = rss_after
     return metrics

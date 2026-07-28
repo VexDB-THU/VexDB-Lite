@@ -157,7 +157,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 
 | 范围 | 当前事实 | 主要缺口 |
 |---|---|---|
-| 统一合同 | SQLite 合同 `0.9.0`，runtime ABI 1；SQL、C ABI、CLI、mount runtime 已连通；PostgreSQL `0.4.0-alpha.1` 已实现同一文件合同、format v2、ACL、审计、libpq HostStore 和远程 mount | DuckDB 尚未实现 VexFS adapter |
+| 统一合同 | SQLite 合同 `0.9.0`，runtime ABI 1；SQL、C ABI、CLI、mount runtime 已连通；PostgreSQL `0.4.0-alpha.1` 已实现同一文件合同、format v2、ACL、审计、libpq HostStore 和远程 mount；两端数据库批量 `find` 已完成 | DuckDB 尚未实现 VexFS adapter |
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试；PG 已执行 ACL 和继承 | SQLite 尚未执行完整 ACL 授权；特殊文件不支持 |
 | 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、原生备份、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 自动维护、history/staging/index/total quota 和 DuckDB 导入端未完成 |
 | 长期校验 | `chunked-manifest-v1` 使用不可变 manifest、64 KiB 块、逐块 SHA-256 和有序块根哈希；deep check 逐块校验真实正文，publish 不再拼整文件 | 自动 repair、跨文件通用去重和按需标准整文件 SHA-256 命令不在当前范围 |
@@ -165,7 +165,7 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | Linux | libfuse3 真实挂载已通过 root 和 uid 1000 各 9 组；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；异常撤销后底层目录保持 0500，显式卸载恢复 0700；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
 | 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项和故障恢复 25 项；当前默认 NFS 又完成本机双 gateway 15 项和当前源码真实 TCP 中途断线连续 4/4 轮、每轮 21 项，PG `pg_trgm` 索引已实现 | 当前默认 NFS 源码对应的公证包和第二台 Mac NFS 复验尚未完成；同时覆盖同一文件只报告版本冲突，不自动合并 |
-| 性能规模 | SQLite 直连已完成 10 万文件；PG 16 MiB 文件修改 4 KiB 的组合发布从 589.357 ms 降到中位 10.289 ms，publish-only 两次正式复跑中位 4.020/9.828 ms；逐文件后台事务后的 PG NFS 两轮 8 MiB 写 46.430～46.516 MiB/s、随机覆盖 386.139～482.743 ops/s；strict fsync → gateway SIGKILL → PG immediate restart 历史连续 20/20，当前修复源码 2/2；真实 TCP 黑洞重连最长约 5.02 秒有界返回并连续 4/4 轮恢复；服务端已提交但客户端不读结果的 generation 重试通过；1 GiB 容器 `oom_kill=0` | 仍需补远程 ARM 同版基准、1 万文件、长 Agent、冷读和长时间运行 |
+| 性能规模 | SQLite 直连已完成 10 万文件；最新数据库 `find` 在 SQLite 1 万文件首/次页约 19.8/18.2 ms，10 万约 205.3/200.1 ms，RSS 约 93.8 MB；PG 1 万约 22.1/22.0 ms，10 万约 78.7/83.9 ms；PG 16 MiB 文件修改 4 KiB 的组合发布从 589.357 ms 降到中位 10.289 ms，publish-only 两次正式复跑中位 4.020/9.828 ms；逐文件后台事务后的 PG NFS 两轮 8 MiB 写 46.430～46.516 MiB/s、随机覆盖 386.139～482.743 ops/s；strict fsync → gateway SIGKILL → PG immediate restart 历史连续 20/20，当前修复源码 2/2；真实 TCP 黑洞重连最长约 5.02 秒有界返回并连续 4/4 轮恢复；服务端已提交但客户端不读结果的 generation 重试通过；1 GiB 容器 `oom_kill=0` | 仍需补远程 ARM 同版基准、长 Agent、冷读和长时间运行；PG 逐文件批量创建路径仍需优化 |
 
 “合同中已保存”不等于“所有平台已经完整执行”。例如 owner/group 和便携 ACL 已经可以保存、读取和恢复，但身份认证、权限判断和各系统的原生 ACL 映射仍属于后续阶段。
 
@@ -456,6 +456,20 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
     Gate。实际 sleep/wake 仍需交互式管理员授权；局域网直连另需第二台 Mac 在线并允许 VexDB Lite
     使用“本地网络”。
 
+### 7.1 发行 Gate 后的 workspace 恢复顺序
+
+发行 Gate 收口后，workspace 版本恢复按
+`docs/plans/2026-07-28_vexfs-workspace-pitr-roadmap.md` 推进。固定顺序是：
+
+1. PG 多机恢复屏障；
+2. 恢复前自动安全快照；
+3. 统一恢复正确性 Gate；
+4. workspace log、快照自动保留和 Agent 运行前 checkpoint；
+5. SQLite 从任意保留 commit 创建快照；
+6. 用真实规模数据决定是否投入 PG 逐 commit PITR。
+
+PG 逐 commit PITR 不是默认下一项，不能为了统一宣传提前引入长期写放大。
+
 PostgreSQL Phase 2 的 format v2、ACL、审计、libpq HostStore、远程 mount、备份和故障恢复
 已经完成。当前不再继续扩展 PG 代码；先关闭两台 Mac 对最终签名版本的系统授权验收点。DuckDB
 adapter 已明确不由本路线处理，后续平台开发只保留 Windows WinFsp。SQLite 的 10 万文件和小文件性能
@@ -674,3 +688,5 @@ macOS 完成 Apple 公证、干净机器安装和 extension 启用流程；Linux
 - Workspace 场景分析：`docs/analysis/2026-07-20_vexfs-claude-code-workspace-scenario.md`
 - POSIX 与快照边界：`docs/analysis/2026-07-20_vexfs-remaining-posix-snapshot-feasibility.md`
 - Eval 说明：`agent_files/eval/README.md`
+- Workspace PITR 后续顺序：`docs/plans/2026-07-28_vexfs-workspace-pitr-roadmap.md`
+- PITR 批次 A 实现报告：`docs/reports/2026-07-28_vexfs-pitr-batch-a.md`

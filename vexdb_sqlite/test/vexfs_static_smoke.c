@@ -236,6 +236,28 @@ int main(void) {
     text = scalar_text(db, "SELECT vexfs_list('default','/notes/2026')");
     if (text == NULL || strstr(text, "hello.txt") == NULL) return fail(db, "list");
     free(text);
+    text = scalar_text(db,
+        "SELECT vexfs_find('default','/notes','*.txt','file',5,20,NULL,NULL,NULL,10)");
+    if (text == NULL || strstr(text, "\"path\":\"/notes/2026/hello.txt\"") == NULL ||
+        strstr(text, "\"next_cursor\":null") == NULL) return fail(db, "find");
+    free(text);
+    if (!exec_ok(db,
+        "SELECT vexfs_write('default','/notes/你.md','unicode');"))
+        return fail(db, "find unicode seed");
+    text = scalar_text(db,
+        "SELECT vexfs_find('default','/notes','?.md','file',NULL,NULL,NULL,NULL,NULL,10)");
+    if (text == NULL || strstr(text, "\"path\":\"/notes/你.md\"") == NULL)
+        return fail(db, "find unicode question wildcard");
+    free(text);
+    if (!exec_fails_with(db,
+        "SELECT vexfs_find('default','/notes',NULL,NULL,NULL,NULL,NULL,NULL,NULL,1001)",
+        "limit must be at most 1000")) return fail(db, "find bounded limit");
+    if (!exec_fails_with(db,
+        "SELECT vexfs_find('default','/notes','',NULL,NULL,NULL,NULL,NULL,NULL,10)",
+        "name pattern must be 1..255 bytes")) return fail(db, "find empty name pattern");
+    if (!exec_fails_with(db,
+        "SELECT vexfs_find('default','/notes',NULL,NULL,NULL,NULL,253402300800000,NULL,NULL,10)",
+        "modified time is outside")) return fail(db, "find bounded timestamp");
 
     text = scalar_text(db, "SELECT vexfs_history('default','/notes/2026/hello.txt')");
     if (text == NULL || strstr(text, "\"version\":2") == NULL ||

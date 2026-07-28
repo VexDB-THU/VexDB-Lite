@@ -413,6 +413,23 @@ int main(int argc, char **argv) {
     if (!Expect(listing.find("\"name\":\"main.txt\"") != std::string::npos &&
                 listing.find("\"name\":\"current\"") != std::string::npos,
                 "directory listing")) return 1;
+    if (!CheckStatus("find first page", vexfs_mount_find(
+            session, "/project", "*.txt", "file", 11, 11, -1,
+            1700000200000LL, "", 1, &bytes, &error), error)) return 1;
+    const std::string find_first_page = Take(&bytes);
+    if (!Expect(find_first_page.find("/project/main-link.txt") != std::string::npos &&
+                find_first_page.find("\"next_cursor\":\"/project/main-link.txt\"") !=
+                    std::string::npos &&
+                find_first_page.find("/project/main.txt") == std::string::npos,
+                "find first page content")) return 1;
+    if (!CheckStatus("find second page", vexfs_mount_find(
+            session, "/project", "*.txt", "file", 11, 11, -1,
+            1700000200000LL, "/project/main-link.txt", 1, &bytes, &error), error))
+        return 1;
+    const std::string find_second_page = Take(&bytes);
+    if (!Expect(find_second_page.find("/project/main.txt") != std::string::npos &&
+                find_second_page.find("\"next_cursor\":null") != std::string::npos,
+                "find second page content")) return 1;
 
     if (!CheckStatus("grep", vexfs_mount_grep(
             session, "/project", "alpha", 0, 100, &bytes, &error), error)) return 1;
@@ -525,11 +542,40 @@ int main(int argc, char **argv) {
     if (!CheckStatus("workspace head", vexfs_mount_workspace_head(
             session, &head, &error), error)) return 1;
     int64_t restore_commit = 0;
-    if (!CheckStatus("snapshot restore", vexfs_mount_snapshot_restore(
-            session, "baseline", head, &restore_commit, &error), error) ||
+    if (vexfs_mount_snapshot_restore_safe(
+            session, "baseline", head, "must-not-exist-while-peer-mounted",
+            &restore_commit, &error) != VEXFS_MOUNT_BUSY ||
+        std::strstr(error.message, "active mount session") == nullptr)
+        return Fail("peer mount must block snapshot restore", &error);
+    ++checks;
+    vexfs_mount_session_close(peer);
+    peer = nullptr;
+    if (!CheckStatus("snapshot restore", vexfs_mount_snapshot_restore_safe(
+            session, "baseline", head, "safety-before-baseline-restore",
+            &restore_commit, &error), error) ||
         !CheckStatus("restored read", vexfs_mount_read_file(
             session, "/project/main.txt", &bytes, &error), error) ||
         !Expect(Take(&bytes) == "beta alpha\n", "snapshot restored content")) return 1;
+    if (!CheckStatus("head after baseline restore", vexfs_mount_workspace_head(
+            session, &head, &error), error) ||
+        !CheckStatus("restore safety snapshot", vexfs_mount_snapshot_restore_safe(
+            session, "safety-before-baseline-restore", head,
+            "safety-before-undo", &restore_commit, &error), error) ||
+        !CheckStatus("safety restored read", vexfs_mount_read_file(
+            session, "/project/main.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "changed\n", "safety snapshot restores pre-restore tree"))
+        return 1;
+    if (!CheckStatus("head after safety restore", vexfs_mount_workspace_head(
+            session, &head, &error), error) ||
+        !CheckStatus("restore baseline again", vexfs_mount_snapshot_restore_safe(
+            session, "baseline", head, "safety-before-final-baseline",
+            &restore_commit, &error), error) ||
+        !CheckStatus("final baseline read", vexfs_mount_read_file(
+            session, "/project/main.txt", &bytes, &error), error) ||
+        !Expect(Take(&bytes) == "beta alpha\n", "final baseline content")) return 1;
+
+    if (!CheckStatus("peer reopen", vexfs_mount_session_open(
+            &peer_config, &peer, &error), error)) return 1;
 
     if (!CheckStatus("deep check", vexfs_mount_check(session, 0, &bytes, &error), error) ||
         !Expect(Take(&bytes).find("\"ok\":true") != std::string::npos,

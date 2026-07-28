@@ -1827,6 +1827,38 @@ extern "C" vexfs_mount_status vexfs_mount_grep(vexfs_mount_session *session,
     });
 }
 
+extern "C" vexfs_mount_status vexfs_mount_find(
+        vexfs_mount_session *session, const char *path, const char *name_pattern,
+        const char *kind, int64_t min_size, int64_t max_size,
+        int64_t modified_after_ms, int64_t modified_before_ms,
+        const char *after_path, uint32_t limit, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (path == nullptr || name_pattern == nullptr || kind == nullptr ||
+            after_path == nullptr || json == nullptr) {
+            throw CallError(SQLITE_MISUSE, "find inputs and output are required");
+        }
+        if (limit == 0 || limit > 1000 || min_size < -1 || max_size < -1 ||
+            modified_after_ms < -1 || modified_before_ms < -1) {
+            throw CallError(SQLITE_RANGE, "find limits are outside the supported range");
+        }
+        Call call(session, "SELECT vexfs_find(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
+        call.Text(1, session->workspace.c_str());
+        call.Text(2, path);
+        if (*name_pattern == '\0') call.Null(3); else call.Text(3, name_pattern);
+        if (*kind == '\0') call.Null(4); else call.Text(4, kind);
+        if (min_size < 0) call.Null(5); else call.Int64(5, min_size);
+        if (max_size < 0) call.Null(6); else call.Int64(6, max_size);
+        if (modified_after_ms < 0) call.Null(7); else call.Int64(7, modified_after_ms);
+        if (modified_before_ms < 0) call.Null(8); else call.Int64(8, modified_before_ms);
+        if (*after_path == '\0') call.Null(9); else call.Text(9, after_path);
+        call.Int64(10, limit);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
 extern "C" vexfs_mount_status vexfs_mount_check(vexfs_mount_session *session,
                                                    uint32_t flags,
                                                    vexfs_mount_bytes *json,
@@ -2357,11 +2389,9 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_drop(vexfs_mount_session *ses
     });
 }
 
-extern "C" vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *session,
-                                                                 const char *name,
-                                                                 int64_t expected_head,
-                                                                 int64_t *new_commit,
-                                                                 vexfs_mount_error *error) {
+vexfs_mount_status SnapshotRestore(vexfs_mount_session *session, const char *name,
+                                   int64_t expected_head, const char *safety_name,
+                                   int64_t *new_commit, vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
         UseFullDurability(session);
@@ -2369,13 +2399,40 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *
             throw CallError(SQLITE_MISUSE,
                             "snapshot name, positive expected head and commit output are required");
         }
-        Call call(session, "SELECT vexfs_snapshot_restore(?1,?2,?3)");
+        Call call(session, session->postgresql
+            ? "SELECT vexfs_snapshot_restore(?1,?2,?3,?4,?5)"
+            : "SELECT vexfs_snapshot_restore(?1,?2,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
         call.Int64(3, expected_head);
+        if (safety_name == nullptr) call.Null(4); else call.Text(4, safety_name);
+        if (session->postgresql) {
+            if (session->session_started) call.Text(5, session->session_id.c_str());
+            else call.Null(5);
+        }
         call.Row();
         *new_commit = call.ResultInt64();
     });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *session,
+                                                                 const char *name,
+                                                                 int64_t expected_head,
+                                                                 int64_t *new_commit,
+                                                                 vexfs_mount_error *error) {
+    return SnapshotRestore(session, name, expected_head, nullptr, new_commit, error);
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_restore_safe(
+        vexfs_mount_session *session, const char *name, int64_t expected_head,
+        const char *safety_name, int64_t *new_commit, vexfs_mount_error *error) {
+    if (safety_name == nullptr || *safety_name == '\0') {
+        return SetError(error, SQLITE_MISUSE, "safety snapshot name is required",
+                        session != nullptr && session->postgresql
+                            ? VEXFS_RUNTIME_BACKEND_POSTGRESQL
+                            : VEXFS_RUNTIME_BACKEND_SQLITE);
+    }
+    return SnapshotRestore(session, name, expected_head, safety_name, new_commit, error);
 }
 
 extern "C" vexfs_mount_status vexfs_mount_quota_get(

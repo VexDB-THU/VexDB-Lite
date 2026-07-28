@@ -1,5 +1,7 @@
 #include "vexfs_runtime_admin.h"
 #include "sqlite3.h"
+#define VEXDB_SQLITE_CORE
+#include "vexdb_sqlite.h"
 
 #include <algorithm>
 #include <chrono>
@@ -39,6 +41,30 @@ int64_t JsonInteger(const vexfs_mount_bytes &bytes, const char *key) {
     return std::strtoll(value.c_str() + start + marker.size(), nullptr, 10);
 }
 
+std::string JsonString(const vexfs_mount_bytes &bytes, const char *key) {
+    const std::string value(static_cast<const char *>(bytes.data),
+                            static_cast<size_t>(bytes.size));
+    const std::string marker = std::string("\"") + key + "\":\"";
+    const size_t start = value.find(marker);
+    if (start == std::string::npos) return {};
+    const size_t value_start = start + marker.size();
+    const size_t end = value.find('"', value_start);
+    return end == std::string::npos ? std::string() :
+        value.substr(value_start, end - value_start);
+}
+
+int Count(const vexfs_mount_bytes &bytes, const char *needle) {
+    const std::string value(static_cast<const char *>(bytes.data),
+                            static_cast<size_t>(bytes.size));
+    int count = 0;
+    size_t position = 0;
+    while ((position = value.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += std::strlen(needle);
+    }
+    return count;
+}
+
 int64_t Scalar(const char *path, const char *sql) {
     sqlite3 *db = nullptr;
     if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
@@ -65,6 +91,140 @@ bool Execute(const char *path, const char *sql) {
     const int rc = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
     sqlite3_close(db);
     return rc == SQLITE_OK;
+}
+
+int RunFindBenchmark(int file_count) {
+    if (file_count <= 0 || file_count > 100000) {
+        std::fprintf(stderr, "find benchmark file count must be 1..100000\n");
+        return 2;
+    }
+    char path[] = "/tmp/vexfs-find-benchmark-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) return 1;
+    close(fd);
+    unlink(path);
+
+    sqlite3 *db = nullptr;
+    if (sqlite3_open(path, &db) != SQLITE_OK || vexdb_sqlite_register(db) != SQLITE_OK) {
+        if (db != nullptr) sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    const auto seed_started = std::chrono::steady_clock::now();
+    if (sqlite3_exec(db,
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;"
+            "PRAGMA temp_store=FILE; PRAGMA cache_size=-65536;"
+            "SELECT vexfs_init();"
+            "SELECT vexfs_workspace_create('find-benchmark');"
+            "SELECT vexfs_mkdir('find-benchmark','/files');"
+            "BEGIN IMMEDIATE;",
+            nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::fprintf(stderr, "find benchmark setup: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    sqlite3_stmt *create = nullptr;
+    if (sqlite3_prepare_v2(db,
+            "SELECT vexfs_create('find-benchmark',?1,'file',420)",
+            -1, &create, nullptr) != SQLITE_OK) {
+        std::fprintf(stderr, "find benchmark prepare: %s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    bool seed_ok = true;
+    for (int index = 0; index < file_count; ++index) {
+        char file_path[64];
+        std::snprintf(file_path, sizeof(file_path), "/files/f%06d.txt", index);
+        sqlite3_bind_text(create, 1, file_path, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(create) != SQLITE_ROW) {
+            std::fprintf(stderr, "find benchmark create %d: %s\n", index,
+                         sqlite3_errmsg(db));
+            seed_ok = false;
+            break;
+        }
+        sqlite3_reset(create);
+        sqlite3_clear_bindings(create);
+    }
+    sqlite3_finalize(create);
+    if (!seed_ok || sqlite3_exec(db, seed_ok ? "COMMIT" : "ROLLBACK",
+                                 nullptr, nullptr, nullptr) != SQLITE_OK) {
+        std::fprintf(stderr, "find benchmark commit: %s\n", sqlite3_errmsg(db));
+        sqlite3_close(db);
+        unlink(path);
+        return 1;
+    }
+    const double seed_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - seed_started).count();
+    sqlite3_close(db);
+
+    vexfs_mount_config config{};
+    config.abi_version = VEXFS_RUNTIME_ABI_VERSION;
+    config.backend = VEXFS_RUNTIME_BACKEND_SQLITE;
+    config.connection = path;
+    config.workspace = "find-benchmark";
+    config.principal = "local";
+    config.operation_timeout_ms = 30000;
+    config.flags = VEXFS_RUNTIME_OPEN_NO_CREATE;
+    vexfs_mount_error error{};
+    vexfs_mount_session *session = nullptr;
+    if (vexfs_mount_session_open(&config, &session, &error) != VEXFS_MOUNT_OK)
+        return Fail("find benchmark open", error);
+
+    vexfs_mount_bytes page{};
+    auto query_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", "*.txt", "file", 0, 0, -1, -1,
+                         "", 100, &page, &error) != VEXFS_MOUNT_OK ||
+        Count(page, "\"path\":") != 100) {
+        return Fail("find benchmark first page", error);
+    }
+    const double first_page_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - query_started).count();
+    const std::string cursor = JsonString(page, "next_cursor");
+    vexfs_mount_free(page.data);
+    if (cursor.empty()) return Fail("find benchmark cursor", error);
+
+    page = {};
+    query_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", "*.txt", "file", 0, 0, -1, -1,
+                         cursor.c_str(), 100, &page, &error) != VEXFS_MOUNT_OK ||
+        Count(page, "\"path\":") != 100) {
+        return Fail("find benchmark second page", error);
+    }
+    const double second_page_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - query_started).count();
+    vexfs_mount_free(page.data);
+
+    char last_name[32];
+    std::snprintf(last_name, sizeof(last_name), "f%06d.txt", file_count - 1);
+    page = {};
+    query_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", last_name, "file", 0, 0, -1, -1,
+                         "", 10, &page, &error) != VEXFS_MOUNT_OK ||
+        Count(page, "\"path\":") != 1 || !Contains(page, last_name)) {
+        return Fail("find benchmark selective", error);
+    }
+    const double selective_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - query_started).count();
+    vexfs_mount_free(page.data);
+    vexfs_mount_session_close(session);
+
+    struct stat info {};
+    const int64_t database_bytes = stat(path, &info) == 0 ? info.st_size : -1;
+    std::printf(
+        "{\"files\":%d,\"seed_seconds\":%.6f,"
+        "\"find_first_page_seconds\":%.6f,\"find_second_page_seconds\":%.6f,"
+        "\"find_selective_seconds\":%.6f,\"database_bytes\":%lld}\n",
+        file_count, seed_seconds, first_page_seconds, second_page_seconds,
+        selective_seconds, static_cast<long long>(database_bytes));
+    unlink(path);
+    const std::string wal = std::string(path) + "-wal";
+    const std::string shm = std::string(path) + "-shm";
+    unlink(wal.c_str());
+    unlink(shm.c_str());
+    return 0;
 }
 
 int RunBenchmark(int file_count) {
@@ -156,6 +316,42 @@ int RunBenchmark(int file_count) {
     }
     publish_call_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - publish_started).count();
+    vexfs_mount_bytes find_page{};
+    auto find_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", "*.txt", "file",
+                         sizeof(payload) - 1, sizeof(payload) - 1, -1, -1,
+                         "", 100, &find_page, &error) != VEXFS_MOUNT_OK ||
+        Count(find_page, "\"path\":") != 100) {
+        return Fail("benchmark find first page", error);
+    }
+    const double find_first_page_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - find_started).count();
+    const std::string find_cursor = JsonString(find_page, "next_cursor");
+    vexfs_mount_free(find_page.data);
+    if (find_cursor.empty()) return Fail("benchmark find cursor", error);
+    find_page = {};
+    find_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", "*.txt", "file",
+                         sizeof(payload) - 1, sizeof(payload) - 1, -1, -1,
+                         find_cursor.c_str(), 100, &find_page, &error) != VEXFS_MOUNT_OK ||
+        Count(find_page, "\"path\":") != 100) {
+        return Fail("benchmark find second page", error);
+    }
+    const double find_second_page_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - find_started).count();
+    vexfs_mount_free(find_page.data);
+    char last_name[32];
+    std::snprintf(last_name, sizeof(last_name), "f%06d.txt", file_count - 1);
+    find_page = {};
+    find_started = std::chrono::steady_clock::now();
+    if (vexfs_mount_find(session, "/files", last_name, "file", -1, -1, -1, -1,
+                         "", 10, &find_page, &error) != VEXFS_MOUNT_OK ||
+        Count(find_page, "\"path\":") != 1 || !Contains(find_page, last_name)) {
+        return Fail("benchmark find selective", error);
+    }
+    const double find_selective_seconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - find_started).count();
+    vexfs_mount_free(find_page.data);
     const double create_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
     const int64_t commits = Scalar(path, "SELECT count(*) FROM _vexfs_commits") - commits_before;
@@ -188,6 +384,8 @@ int RunBenchmark(int file_count) {
         "\"create_call_seconds\":%.6f,\"stat_call_seconds\":%.6f,"
         "\"xattr_call_seconds\":%.6f,\"stage_call_seconds\":%.6f,"
         "\"publish_call_seconds\":%.6f,"
+        "\"find_first_page_seconds\":%.6f,\"find_second_page_seconds\":%.6f,"
+        "\"find_selective_seconds\":%.6f,"
         "\"ordinary_mutation_calls\":%lld,\"full_boundary_calls\":%lld,"
         "\"durability_barriers\":%lld,\"database_bytes\":%lld}\n",
         file_count, create_seconds, file_count / std::max(create_seconds, 1e-9),
@@ -197,6 +395,7 @@ int RunBenchmark(int file_count) {
         static_cast<double>(requests) / file_count,
         create_call_seconds, stat_call_seconds, xattr_call_seconds,
         stage_call_seconds, publish_call_seconds,
+        find_first_page_seconds, find_second_page_seconds, find_selective_seconds,
         static_cast<long long>(ordinary_calls), static_cast<long long>(full_calls),
         static_cast<long long>(barriers), static_cast<long long>(database_bytes));
     unlink(path);
@@ -211,6 +410,9 @@ int RunBenchmark(int file_count) {
 }  // namespace
 
 int main(int argc, char **argv) {
+    if (argc == 3 && std::strcmp(argv[1], "--find-benchmark") == 0) {
+        return RunFindBenchmark(std::atoi(argv[2]));
+    }
     if (argc == 3 && std::strcmp(argv[1], "--benchmark") == 0) {
         return RunBenchmark(std::atoi(argv[2]));
     }
@@ -355,6 +557,31 @@ int main(int argc, char **argv) {
     target = {};
     if (vexfs_mount_readlink(session, task_inode, &target, &error) !=
         VEXFS_MOUNT_INVALID_ARGUMENT) return Fail("readlink regular file", error);
+    vexfs_mount_bytes found{};
+    if (vexfs_mount_find(session, "/agent", "*.txt", "file", 4, 5, -1, -1,
+                         "", 1, &found, &error) != VEXFS_MOUNT_OK ||
+        !Contains(found, "\"path\":\"/agent/external.txt\"") ||
+        !Contains(found, "\"next_cursor\":\"/agent/external.txt\"") ||
+        Contains(found, "/agent/task.txt"))
+        return Fail("find first page", error);
+    vexfs_mount_free(found.data);
+    found = {};
+    if (vexfs_mount_find(session, "/agent", "*.txt", "file", 4, 5, -1, -1,
+                         "/agent/external.txt", 1, &found, &error) != VEXFS_MOUNT_OK ||
+        !Contains(found, "\"path\":\"/agent/task.txt\"") ||
+        !Contains(found, "\"next_cursor\":null"))
+        return Fail("find next page", error);
+    vexfs_mount_free(found.data);
+    found = {};
+    if (vexfs_mount_find(session, "/agent", "*.txt", "file", -1, -1, -1,
+                         1700000200000LL, "", 10, &found, &error) != VEXFS_MOUNT_OK ||
+        !Contains(found, "/agent/task.txt") || Contains(found, "/agent/external.txt"))
+        return Fail("find modified time", error);
+    vexfs_mount_free(found.data);
+    found = {};
+    if (vexfs_mount_find(session, "/agent", "", "socket", -1, -1, -1, -1,
+                         "", 10, &found, &error) != VEXFS_MOUNT_INVALID_ARGUMENT)
+        return Fail("find invalid kind", error);
     if (vexfs_mount_xattr_set(session, task_inode, "com.vexfs.test", "alpha", 5,
                               VEXFS_MOUNT_XATTR_MUST_CREATE, &error) != VEXFS_MOUNT_OK)
         return Fail("xattr create", error);
@@ -443,9 +670,15 @@ int main(int argc, char **argv) {
         std::strstr(error.message, "active mount session") == nullptr)
         return Fail("mounted snapshot restore must be busy", error);
     vexfs_mount_session_close(mounted_session);
-    if (vexfs_mount_snapshot_restore(session, "before-change", head_commit,
-                                     &restored_commit, &error) != VEXFS_MOUNT_OK ||
+    if (vexfs_mount_snapshot_restore_safe(
+            session, "before-change", head_commit, "safety-before-change-restore",
+            &restored_commit, &error) != VEXFS_MOUNT_OK ||
         restored_commit <= head_commit) return Fail("snapshot restore", error);
+    snapshots = {};
+    if (vexfs_mount_snapshot_list(session, &snapshots, &error) != VEXFS_MOUNT_OK ||
+        !Contains(snapshots, "safety-before-change-restore"))
+        return Fail("snapshot restore safety point", error);
+    vexfs_mount_free(snapshots.data);
     vexfs_mount_bytes snapshot_content{};
     if (vexfs_mount_read_file(session, "/agent/task.txt", &snapshot_content, &error) !=
             VEXFS_MOUNT_OK || !Equals(snapshot_content, "draft"))

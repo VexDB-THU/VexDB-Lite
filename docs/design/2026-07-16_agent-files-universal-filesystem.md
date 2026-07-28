@@ -5,7 +5,8 @@
 - 文档版本：1.7
 - 状态：macOS FSKit 与 Linux libfuse3 已复用同一 runtime；PostgreSQL `0.4.0-alpha.1`
   已完成数据库合同、format v2、role/ACL/审计、libpq HostStore、macOS/Linux 真实 mount、
-  跨机器 OpenCode 和逻辑/物理备份；第二台 Mac 的局域网直连只差一次系统授权确认
+  跨机器 OpenCode 和逻辑/物理备份；SQLite/PG 数据库批量 `find`、CLI、C ABI、ACL 隔离及
+  10 万文件性能 Gate 已完成；第二台 Mac 的局域网直连只差一次系统授权确认
 - 产品名：暂定 `VexFS`
 - 产品规格：`docs/specs/2026-07-16_vexfs-product-spec.md`
 - 最终目标和阶段顺序：`docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md`
@@ -265,6 +266,12 @@ vexfs truncate -s 0 /logs/run.log
 - 运维：`check`、`gc`、`export`、`import`。
 
 普通终端使用 `vexfs ls`，避免覆盖系统命令。正常 macOS 安装优先使用真实 mount；直接命令用于脚本、诊断和不能挂载的环境。
+
+`vexdb fs find` 不逐项调用 `ls/stat`，而是一次进入数据库查询目录树元数据。第一版参数固定为
+名称 glob、文件类型、最小/最大大小、修改时间范围、路径游标和页大小；结果按二进制路径稳定
+排序，游标为排他下界，单页最多 1000 项。SQLite 递归队列只保存目录，避免平铺 10 万文件时
+反复递归全部文件；PostgreSQL 对 workspace owner/superuser 使用快速路径，其他 role 在递归和
+结果阶段执行 ACL 读取检查，不进入无权目录。文件正文不参与 `find`。
 
 #### 模式三：任意命令 worktree（受限环境回退）
 

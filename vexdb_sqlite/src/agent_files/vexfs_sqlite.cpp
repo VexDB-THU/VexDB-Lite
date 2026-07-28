@@ -4064,6 +4064,198 @@ void ListFunction(sqlite3_context *context, int, sqlite3_value **values) {
     });
 }
 
+size_t Utf8CodePointBytes(const std::string &text, size_t index) {
+    const unsigned char lead = static_cast<unsigned char>(text[index]);
+    size_t length = 1;
+    if ((lead & 0xe0) == 0xc0) length = 2;
+    else if ((lead & 0xf0) == 0xe0) length = 3;
+    else if ((lead & 0xf8) == 0xf0) length = 4;
+    if (index + length > text.size()) return 1;
+    for (size_t offset = 1; offset < length; ++offset) {
+        if ((static_cast<unsigned char>(text[index + offset]) & 0xc0) != 0x80) return 1;
+    }
+    return length;
+}
+
+bool FindGlobMatches(const std::string &pattern, const std::string &value) {
+    size_t pattern_index = 0;
+    size_t value_index = 0;
+    size_t star_index = std::string::npos;
+    size_t star_value_index = 0;
+    while (value_index < value.size()) {
+        if (pattern_index < pattern.size() && pattern[pattern_index] == '?') {
+            ++pattern_index;
+            value_index += Utf8CodePointBytes(value, value_index);
+        } else if (pattern_index < pattern.size() && pattern[pattern_index] != '*') {
+            const size_t pattern_bytes = Utf8CodePointBytes(pattern, pattern_index);
+            const size_t value_bytes = Utf8CodePointBytes(value, value_index);
+            if (pattern_bytes != value_bytes ||
+                pattern.compare(pattern_index, pattern_bytes,
+                                value, value_index, value_bytes) != 0) {
+                if (star_index == std::string::npos) return false;
+                pattern_index = star_index + 1;
+                star_value_index += Utf8CodePointBytes(value, star_value_index);
+                value_index = star_value_index;
+                continue;
+            }
+            pattern_index += pattern_bytes;
+            value_index += value_bytes;
+        } else if (pattern_index < pattern.size() && pattern[pattern_index] == '*') {
+            star_index = pattern_index++;
+            star_value_index = value_index;
+        } else if (star_index != std::string::npos) {
+            pattern_index = star_index + 1;
+            star_value_index += Utf8CodePointBytes(value, star_value_index);
+            value_index = star_value_index;
+        } else {
+            return false;
+        }
+    }
+    while (pattern_index < pattern.size() && pattern[pattern_index] == '*') ++pattern_index;
+    return pattern_index == pattern.size();
+}
+
+void FindFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::vector<std::string> root_parts =
+            PathParts(RequiredText(values[1], "path"));
+        const std::string root_path = CanonicalPath(root_parts);
+        const Node root = Resolve(db, workspace, root_parts);
+        const std::string root_name = root_parts.empty() ? "/" : root_parts.back();
+        const bool has_name_pattern = sqlite3_value_type(values[2]) != SQLITE_NULL;
+        const bool has_kind = sqlite3_value_type(values[3]) != SQLITE_NULL;
+        const bool has_after_path = sqlite3_value_type(values[8]) != SQLITE_NULL;
+        const std::string name_pattern = !has_name_pattern
+            ? std::string() : RequiredText(values[2], "name pattern");
+        const std::string kind = !has_kind
+            ? std::string() : RequiredText(values[3], "kind");
+        const auto optional_number = [&](int index, const char *name) {
+            return sqlite3_value_type(values[index]) == SQLITE_NULL
+                ? static_cast<sqlite3_int64>(-1)
+                : RequiredNonnegativeInteger(values[index], name);
+        };
+        const sqlite3_int64 min_size = optional_number(4, "minimum size");
+        const sqlite3_int64 max_size = optional_number(5, "maximum size");
+        const sqlite3_int64 modified_after = optional_number(6, "modified after");
+        const sqlite3_int64 modified_before = optional_number(7, "modified before");
+        const std::string after_path = !has_after_path
+            ? std::string() : RequiredText(values[8], "cursor");
+        const sqlite3_int64 limit = RequiredPositiveInteger(values[9], "limit");
+        if (has_name_pattern && (name_pattern.empty() || name_pattern.size() > 255)) {
+            throw SqlError("name pattern must be 1..255 bytes", SQLITE_RANGE);
+        }
+        if (has_kind && kind != "file" && kind != "directory" && kind != "symlink") {
+            throw SqlError("kind must be file, directory or symlink", SQLITE_MISMATCH);
+        }
+        if (has_after_path && after_path.empty()) {
+            throw SqlError("cursor must be an absolute path", SQLITE_MISMATCH);
+        }
+        if (limit > 1000) throw SqlError("limit must be at most 1000", SQLITE_RANGE);
+        if (min_size >= 0 && max_size >= 0 && min_size > max_size) {
+            throw SqlError("minimum size must not exceed maximum size", SQLITE_RANGE);
+        }
+        if (modified_after >= 0 && modified_before >= 0 &&
+            modified_after > modified_before) {
+            throw SqlError("modified after must not exceed modified before", SQLITE_RANGE);
+        }
+        constexpr sqlite3_int64 kMaximumTimestampMilliseconds = 253402300799999LL;
+        if (modified_after > kMaximumTimestampMilliseconds ||
+            modified_before > kMaximumTimestampMilliseconds) {
+            throw SqlError("modified time is outside the supported range", SQLITE_RANGE);
+        }
+        if (!after_path.empty()) {
+            const std::vector<std::string> cursor_parts = PathParts(after_path);
+            if (CanonicalPath(cursor_parts) != after_path) {
+                throw SqlError("cursor must be a canonical absolute path", SQLITE_MISMATCH);
+            }
+        }
+
+        Statement statement(db, R"SQL(
+WITH RECURSIVE directories(path,inode_id) AS (
+  SELECT ?2,inode.id FROM _vexfs_inodes inode
+  WHERE inode.id=?4 AND inode.workspace_id=?1 AND inode.kind='directory'
+  UNION ALL
+  SELECT CASE WHEN directories.path='/' THEN '/'||dentry.name
+              ELSE directories.path||'/'||dentry.name END,
+         inode.id
+  FROM directories
+  JOIN _vexfs_dentries dentry
+    ON dentry.workspace_id=?1 AND dentry.parent_inode=directories.inode_id
+  JOIN _vexfs_inodes inode
+    ON inode.id=dentry.inode_id AND inode.workspace_id=?1
+  WHERE inode.kind='directory' AND inode.deleted_at IS NULL
+),
+tree(path,name,inode_id,kind,size,version,modified_at) AS (
+  SELECT ?2,?3,inode.id,inode.kind,inode.size,inode.current_version,inode.updated_at
+  FROM _vexfs_inodes inode WHERE inode.id=?4 AND inode.workspace_id=?1
+  UNION ALL
+  SELECT CASE WHEN directories.path='/' THEN '/'||dentry.name
+              ELSE directories.path||'/'||dentry.name END,
+         dentry.name,inode.id,inode.kind,inode.size,inode.current_version,inode.updated_at
+  FROM directories
+  JOIN _vexfs_dentries dentry
+    ON dentry.workspace_id=?1 AND dentry.parent_inode=directories.inode_id
+  JOIN _vexfs_inodes inode
+    ON inode.id=dentry.inode_id AND inode.workspace_id=?1
+  WHERE inode.deleted_at IS NULL
+)
+SELECT path,name,inode_id,kind,size,version,modified_at
+FROM tree
+WHERE path COLLATE BINARY > ?5 COLLATE BINARY
+  AND (?6='' OR kind=?6)
+  AND (?7<0 OR size>=?7)
+  AND (?8<0 OR size<=?8)
+  AND (?9<0 OR modified_at>=?9)
+  AND (?10<0 OR modified_at<=?10)
+ORDER BY path COLLATE BINARY
+)SQL");
+        statement.BindInt64(1, workspace.id);
+        statement.BindText(2, root_path);
+        statement.BindText(3, root_name);
+        statement.BindInt64(4, root.id);
+        statement.BindText(5, after_path);
+        statement.BindText(6, kind);
+        statement.BindInt64(7, min_size);
+        statement.BindInt64(8, max_size);
+        statement.BindInt64(9, modified_after);
+        statement.BindInt64(10, modified_before);
+
+        std::vector<std::pair<std::string, std::string>> matches;
+        while (statement.Row()) {
+            const std::string name = statement.Text(1);
+            if (!name_pattern.empty() && !FindGlobMatches(name_pattern, name)) continue;
+            const std::string path = statement.Text(0);
+            std::string entry = "{\"path\":\"" + JsonEscape(path) +
+                "\",\"name\":\"" + JsonEscape(name) + "\",\"inode\":" +
+                std::to_string(statement.Int64(2)) + ",\"kind\":\"" +
+                JsonEscape(statement.Text(3)) + "\",\"size\":" +
+                std::to_string(statement.Int64(4)) + ",\"version\":" +
+                std::to_string(statement.Int64(5)) + ",\"modified_at\":" +
+                std::to_string(statement.Int64(6)) + "}";
+            matches.emplace_back(path, std::move(entry));
+            if (matches.size() > static_cast<size_t>(limit)) break;
+        }
+        const bool has_more = matches.size() > static_cast<size_t>(limit);
+        if (has_more) matches.resize(static_cast<size_t>(limit));
+        std::string json = "{\"root\":\"" + JsonEscape(root_path) + "\",\"entries\":[";
+        for (size_t index = 0; index < matches.size(); ++index) {
+            if (index > 0) json.push_back(',');
+            json += matches[index].second;
+        }
+        json += "],\"next_cursor\":";
+        if (has_more && !matches.empty()) {
+            json += "\"" + JsonEscape(matches.back().first) + "\"";
+        } else {
+            json += "null";
+        }
+        json += "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
 void RequireWorkspaceInode(sqlite3 *db, const Workspace &workspace, sqlite3_int64 inode) {
     Statement statement(db,
         "SELECT 1 FROM _vexfs_inodes WHERE id=?1 AND workspace_id=?2 LIMIT 1");
@@ -5765,13 +5957,23 @@ WHERE inode.workspace_id=?1 AND inode.deleted_at IS NULL
     insert.Done();
 }
 
-void SnapshotRestoreFunction(sqlite3_context *context, int, sqlite3_value **values) {
+void SnapshotRestoreFunction(sqlite3_context *context, int argument_count,
+                             sqlite3_value **values) {
     Guard(context, [&] {
         sqlite3 *db = sqlite3_context_db_handle(context);
         EnsureSchema(db);
         Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         const std::string name = RequiredText(values[1], "snapshot name");
         const sqlite3_int64 expected_head = RequiredPositiveInteger(values[2], "expected head");
+        const bool create_safety_snapshot = argument_count >= 4 &&
+            sqlite3_value_type(values[3]) != SQLITE_NULL;
+        const std::string safety_name = create_safety_snapshot
+            ? RequiredText(values[3], "safety snapshot name") : std::string();
+        if (create_safety_snapshot &&
+            (safety_name.empty() || safety_name.size() > 128 || safety_name == "HEAD")) {
+            throw SqlError("safety snapshot name must be 1..128 bytes and not HEAD",
+                           SQLITE_MISMATCH);
+        }
         Savepoint savepoint(db, "vexfs_snapshot_restore");
         AcquireWriteLock(db);
         workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
@@ -5803,6 +6005,14 @@ void SnapshotRestoreFunction(sqlite3_context *context, int, sqlite3_value **valu
             throw SqlError("snapshot already matches current workspace", SQLITE_MISMATCH);
         }
         CheckQuotaForSnapshotRestore(db, workspace, current, target);
+        if (create_safety_snapshot) {
+            Statement safety(db,
+                "INSERT INTO _vexfs_snapshots(workspace_id,name,commit_id) VALUES(?1,?2,?3)");
+            safety.BindInt64(1, workspace.id);
+            safety.BindText(2, safety_name);
+            safety.BindInt64(3, workspace.head_commit);
+            safety.Done();
+        }
         RestoreWorkspaceTree(db, workspace, snapshot.commit);
         PrepareRestoredVersionAliases(db, workspace, snapshot.commit);
         const sqlite3_int64 commit = CreateCommit(db, workspace, "restore snapshot " + name);
@@ -6616,6 +6826,7 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_check", 2, CheckFunction, SQLITE_UTF8},
         {"vexfs_path", 2, PathFunction, SQLITE_UTF8},
         {"vexfs_list", 2, ListFunction, SQLITE_UTF8},
+        {"vexfs_find", 10, FindFunction, SQLITE_UTF8},
         {"vexfs_readlink", 2, ReadlinkFunction, SQLITE_UTF8},
         {"vexfs_set_mode", 3, SetModeFunction, SQLITE_UTF8},
         {"vexfs_set_times", 5, SetTimesFunction, SQLITE_UTF8},
@@ -6640,6 +6851,7 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_snapshot_diff", 3, SnapshotDiffFunction, SQLITE_UTF8},
         {"vexfs_snapshot_drop", 2, SnapshotDropFunction, SQLITE_UTF8},
         {"vexfs_snapshot_restore", 3, SnapshotRestoreFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_restore", 4, SnapshotRestoreFunction, SQLITE_UTF8},
         {"vexfs_quota_get", 1, QuotaGetFunction, SQLITE_UTF8},
         {"vexfs_quota_set", 4, QuotaSetFunction, SQLITE_UTF8},
         {"vexfs_retention_get", 1, RetentionGetFunction, SQLITE_UTF8},

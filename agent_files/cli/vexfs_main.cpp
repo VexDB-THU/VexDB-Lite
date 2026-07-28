@@ -47,6 +47,10 @@ void Usage(std::ostream &output) {
         "  write PATH [LOCAL_FILE]      Write a local file or stdin\n"
         "  cat PATH                     Print a file\n"
         "  ls [PATH] [--json]           List a directory\n"
+        "  find [PATH] [--name GLOB] [--type KIND] [--min-size BYTES]\n"
+        "       [--max-size BYTES] [--modified-after EPOCH_MS]\n"
+        "       [--modified-before EPOCH_MS] [--limit N] [--after PATH]\n"
+        "                               Query names and metadata without file bodies\n"
         "  grep [-i] [-l] [-n] [--max-results N] PATTERN [PATH]\n"
         "                               Search current text files in the workspace\n"
         "  index status|enable|rebuild|disable\n"
@@ -271,6 +275,24 @@ void PrintNames(const std::string &json) {
     size_t position = 0;
     while ((position = json.find(marker, position)) != std::string::npos) {
         position += marker.size();
+        std::cout << JsonUnescape(json, &position) << '\n';
+    }
+}
+
+void PrintFindPaths(const std::string &json) {
+    const std::string marker = "\"path\"";
+    size_t position = 0;
+    while ((position = json.find(marker, position)) != std::string::npos) {
+        position += marker.size();
+        position = json.find(':', position);
+        if (position == std::string::npos) throw std::runtime_error("invalid find JSON");
+        ++position;
+        while (position < json.size() && std::isspace(
+                   static_cast<unsigned char>(json[position]))) ++position;
+        if (position >= json.size() || json[position] != '"') {
+            throw std::runtime_error("invalid find JSON");
+        }
+        ++position;
         std::cout << JsonUnescape(json, &position) << '\n';
     }
 }
@@ -767,20 +789,42 @@ void RemountWorkspace(const Options &options, const std::string &mount_point) {
     throw std::runtime_error(last_error);
 }
 
+std::string SafetySnapshotName(const std::string &workspace, int64_t head) {
+    std::string safe_workspace;
+    safe_workspace.reserve(std::min<std::size_t>(workspace.size(), 32));
+    for (const unsigned char byte : workspace) {
+        if (safe_workspace.size() >= 32) break;
+        safe_workspace.push_back(
+            std::isalnum(byte) || byte == '-' || byte == '_' ?
+                static_cast<char>(byte) : '_');
+    }
+    if (safe_workspace.empty()) safe_workspace = "workspace";
+    const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto monotonic = std::chrono::steady_clock::now().time_since_epoch().count();
+    return "vexfs-safety-" + safe_workspace + "-h" + std::to_string(head) + "-" +
+           std::to_string(wall) + "-" +
+           std::to_string(static_cast<unsigned long long>(monotonic));
+}
+
 int64_t RestoreSnapshotAfterUnmount(Session &session, const std::string &name,
-                                    int64_t head, bool wait_for_mount_shutdown,
+                                    int64_t head, const std::string &safety_name,
+                                    bool wait_for_mount_shutdown,
                                     std::chrono::seconds shutdown_timeout =
                                         std::chrono::seconds(35)) {
     const auto deadline = std::chrono::steady_clock::now() + shutdown_timeout;
     while (true) {
         int64_t commit = 0;
         vexfs_mount_error error{};
-        const vexfs_mount_status status = vexfs_mount_snapshot_restore(
-            session.get(), name.c_str(), head, &commit, &error);
+        const vexfs_mount_status status = vexfs_mount_snapshot_restore_safe(
+            session.get(), name.c_str(), head, safety_name.c_str(), &commit, &error);
         if (status == VEXFS_MOUNT_OK) return commit;
         const std::string message = ErrorMessage(error);
+        const bool mount_state_is_draining =
+            message.find("active mount session") != std::string::npos ||
+            message.find("file handle") != std::string::npos;
         if (!wait_for_mount_shutdown || status != VEXFS_MOUNT_BUSY ||
-            message.find("active mount session") == std::string::npos ||
+            !mount_state_is_draining ||
             std::chrono::steady_clock::now() >= deadline) {
             Check(status, error);
         }
@@ -955,6 +999,63 @@ int Run(const Options &options) {
         Check(vexfs_mount_list(session.get(), path.c_str(), &json, &error), error);
         const std::string value = BytesToString(&json);
         if (options.json) std::cout << value << '\n'; else PrintNames(value);
+    } else if (command == "find") {
+        const ParsedCommand parsed = ParseCommand(
+            options.arguments,
+            {"--name", "--type", "--min-size", "--max-size", "--modified-after",
+             "--modified-before", "--limit", "--after"}, {});
+        if (parsed.positional.size() > 1) {
+            throw std::runtime_error("find accepts one optional PATH");
+        }
+        const std::string path = parsed.positional.empty() ? "/" : parsed.positional[0];
+        const std::string name_pattern = parsed.Value("--name", false);
+        std::string kind = parsed.Value("--type", false);
+        if (kind == "f") kind = "file";
+        if (kind == "d") kind = "directory";
+        if (kind == "l") kind = "symlink";
+        if (!kind.empty() && kind != "file" && kind != "directory" && kind != "symlink") {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                           "type must be file, directory, symlink, f, d or l");
+        }
+        const std::string min_value = parsed.Value("--min-size", false);
+        const std::string max_value = parsed.Value("--max-size", false);
+        const std::string after_time_value = parsed.Value("--modified-after", false);
+        const std::string before_time_value = parsed.Value("--modified-before", false);
+        const std::string limit_value = parsed.Value("--limit", false);
+        const std::string after_path = parsed.Value("--after", false);
+        const int64_t min_size = min_value.empty() ? -1 :
+            NonnegativeInteger(min_value, "min-size");
+        const int64_t max_size = max_value.empty() ? -1 :
+            NonnegativeInteger(max_value, "max-size");
+        const int64_t modified_after = after_time_value.empty() ? -1 :
+            NonnegativeInteger(after_time_value, "modified-after");
+        const int64_t modified_before = before_time_value.empty() ? -1 :
+            NonnegativeInteger(before_time_value, "modified-before");
+        const int64_t limit = limit_value.empty() ? 100 :
+            PositiveInteger(limit_value, "limit");
+        if (limit > 1000) {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, "limit must be at most 1000");
+        }
+        if (min_size >= 0 && max_size >= 0 && min_size > max_size) {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                           "min-size must not exceed max-size");
+        }
+        if (modified_after >= 0 && modified_before >= 0 &&
+            modified_after > modified_before) {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                           "modified-after must not exceed modified-before");
+        }
+        if (!after_path.empty() && after_path.front() != '/') {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                           "after cursor must be an absolute path");
+        }
+        vexfs_mount_bytes json{};
+        Check(vexfs_mount_find(
+            session.get(), path.c_str(), name_pattern.c_str(), kind.c_str(),
+            min_size, max_size, modified_after, modified_before, after_path.c_str(),
+            static_cast<uint32_t>(limit), &json, &error), error);
+        const std::string value = BytesToString(&json);
+        if (options.json) std::cout << value << '\n'; else PrintFindPaths(value);
     } else if (command == "grep") {
         const ParsedCommand parsed = ParseCommand(
             options.arguments, {"--max-results"}, {"-i", "-l", "-n"});
@@ -1215,10 +1316,11 @@ int Run(const Options &options) {
                 // is gone, otherwise our own close path causes a false conflict.
                 int64_t head = 0;
                 Check(vexfs_mount_workspace_head(session.get(), &head, &error), error);
+                const std::string safety_name = SafetySnapshotName(options.workspace, head);
                 int64_t commit = 0;
                 try {
                     commit = RestoreSnapshotAfterUnmount(
-                        session, name, head, !mount_point.empty(),
+                        session, name, head, safety_name, !mount_point.empty(),
                         std::chrono::seconds(35));
                 } catch (const std::exception &restore_error) {
                     const std::string restore_message = restore_error.what();
@@ -1239,6 +1341,7 @@ int Run(const Options &options) {
                     } catch (const std::exception &remount_error) {
                         throw std::runtime_error(
                             "snapshot was restored at commit " + std::to_string(commit) +
+                            "; safety snapshot is " + safety_name +
                             " but workspace remount failed: " + remount_error.what() +
                             "; mount it again at " + mount_point);
                     }
@@ -1247,6 +1350,8 @@ int Run(const Options &options) {
                     std::cout << "{\"name\":\"" << JsonEscape(name)
                               << "\",\"previous_head\":" << head
                               << ",\"commit\":" << commit
+                              << ",\"safety_snapshot\":\""
+                              << JsonEscape(safety_name) << "\""
                               << ",\"remounted\":"
                               << (mount_point.empty() ? "false" : "true");
                     if (!mount_point.empty())

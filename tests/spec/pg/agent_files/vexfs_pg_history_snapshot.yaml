@@ -72,14 +72,25 @@ steps:
 - query: SELECT vexfs_remove('pg-a1', '/empty.txt', false);
   expect:
   - - 1
+- query: SELECT vexfs_mount_session_start('pg-a1', 'blocking-restore');
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_restore('pg-a1', 'baseline', 10);
+  expect_error: VEXFS_MOUNT_BUSY
+- query: SELECT vexfs_mount_session_end('pg-a1', 'blocking-restore');
+  expect:
+  - - 1
 - query: SELECT vexfs_snapshot_restore('pg-a1', 'baseline', 9);
   expect_error: VEXFS_HEAD_CONFLICT
 - query: SELECT (vexfs_workspace_stat('pg-a1')->>'head_commit')::bigint;
   expect:
   - - 10
-- query: SELECT vexfs_snapshot_restore('pg-a1', 'baseline', 10);
+- query: SELECT vexfs_snapshot_restore('pg-a1', 'baseline', 10, 'safety-before-baseline');
   expect:
   - - 11
+- query: SELECT count(*) FROM jsonb_array_elements(vexfs_snapshot_show('pg-a1', 'safety-before-baseline')->'entries') AS entry WHERE entry->>'path' = '/tree/new.txt';
+  expect:
+  - - 1
 - query: SELECT convert_from(vexfs_read('pg-a1', '/tree/file.txt'), 'UTF8'), (vexfs_stat('pg-a1', '/tree/file.txt')->>'version')::bigint, octet_length(vexfs_read('pg-a1', '/empty.txt'));
   expect:
   - - one
@@ -96,6 +107,8 @@ steps:
   expect_error: VEXFS_ALREADY_MATCHES
 - query: SELECT name, head_commit FROM vexfs_snapshot_list('pg-a1');
   expect:
+  - - safety-before-baseline
+    - 10
   - - baseline
     - 7
 - query: SELECT vexfs_remove('pg-a1', '/tree', false);
@@ -136,6 +149,9 @@ steps:
   - - remove
   - - snapshot_restore
 - query: SELECT vexfs_snapshot_drop('pg-a1', 'baseline');
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_drop('pg-a1', 'safety-before-baseline');
   expect:
   - - 1
 - statement: DROP TABLE vexfs_a1_business;

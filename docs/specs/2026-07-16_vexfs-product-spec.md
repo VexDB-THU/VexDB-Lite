@@ -8,7 +8,8 @@
 - 文档版本：2.0
 - 状态：SQLite `0.9.0`、macOS 默认 NFS、可选 FSKit、Linux libfuse3 和 arm64 真机交付已实现；
 PostgreSQL `0.4.0-alpha.1` 的数据库合同、format v2、ACL、审计、libpq HostStore、
-  macOS/Linux 真实 mount、双 Mac 串行 Agent 工作区和备份恢复已实现
+  macOS/Linux 真实 mount、双 Mac 串行 Agent 工作区和备份恢复已实现；SQLite 与 PostgreSQL
+  已提供数据库批量 `vexfs_find`，并通过 CLI、C ABI、ACL 和 10 万文件性能 Gate
 - 适用范围：VexFS 完整产品定义；开发顺序以 `docs/plans/2026-07-21_vexfs-final-goal-and-roadmap.md` 为准
 
 ## 0. 阅读结论
@@ -882,6 +883,11 @@ VexFS 使用四层数据保护：
 - `vexfs ls` 等直接命令用于脚本、诊断和不能挂载的环境，不覆盖系统命令；
 - `vexfs shell` 是不能挂载时的 worktree 回退入口；
 - 直接 `grep/rg` 是普通文本查找，不是语义搜索；
+- `vexdb fs find` 是数据库批量元数据查询，不依赖先挂载目录；第一版支持名称 glob、类型、
+  大小、修改时间、稳定路径游标和分页，单页最多 1000 项；
+- 名称 glob 的 `*` 匹配任意数量字符，`?` 匹配一个 Unicode 字符；SQLite 与 PostgreSQL
+  必须保持一致；
+- PostgreSQL `find` 不能进入调用者无读取权限的目录，也不能返回无读取权限的对象；
 - 二进制文件默认不作为文本输出，除非用户显式指定；
 - 直接命令的路径表示 VexFS workspace 路径；
 - mount point 内的路径表示数据库 workspace 的实时视图；
@@ -892,7 +898,8 @@ VexFS 使用四层数据保护：
 
 | CLI | SQL 合同 |
 |---|---|
-| ls/tree/find | vexfs_list / vexfs_walk |
+| ls/tree | vexfs_list / vexfs_walk |
+| find | vexfs_find |
 | cat/head/tail/get | vexfs_read / vexfs_read_range |
 | grep/rg | vexfs_grep |
 | stat/file/du/wc | vexfs_stat / vexfs_usage |

@@ -97,6 +97,18 @@ equals "$(vexfs show /project/src/main.txt --version 1)" "$(cat "$TMP_DIR/v1.txt
 
 vexfs ln /project/src/main.txt /project/src/hardlink.txt
 equals "$(vexfs cat /project/src/hardlink.txt)" "$(cat "$TMP_DIR/v2.txt")" "hardlink content"
+MODIFIED_BEFORE_MS="$(( $(date +%s) * 1000 + 2000 ))"
+vexfs --json find /project --name '*.txt' --type file --modified-before \
+    "$MODIFIED_BEFORE_MS" --limit 1 >"$TMP_DIR/find-page-one.json"
+contains "$TMP_DIR/find-page-one.json" '"path":"/project/src/hardlink.txt"' \
+    "PG find first page"
+FIND_CURSOR="$(sed -n 's/.*"next_cursor":[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$TMP_DIR/find-page-one.json")"
+equals "$FIND_CURSOR" "/project/src/hardlink.txt" "PG find cursor"
+vexfs --json find /project --name '*.txt' --type f --limit 1 --after "$FIND_CURSOR" \
+    >"$TMP_DIR/find-page-two.json"
+contains "$TMP_DIR/find-page-two.json" '"path":"/project/src/main.txt"' \
+    "PG find second page"
 vexfs chown 501:20 /project/src/main.txt
 vexfs stat /project/src/main.txt >"$TMP_DIR/chown.json"
 contains "$TMP_DIR/chown.json" '"uid":501' "stored uid"
@@ -137,8 +149,22 @@ diff_status=$?
 set -e
 equals "$diff_status" "1" "snapshot diff changed status"
 contains "$TMP_DIR/snapshot-diff.json" '"path":"/project/src/main.txt"' "snapshot diff"
-vexfs snapshot restore baseline >/dev/null
+vexfs --json snapshot restore baseline >"$TMP_DIR/snapshot-restore.json"
+contains "$TMP_DIR/snapshot-restore.json" '"safety_snapshot":"vexfs-safety-pg-runtime-eval-h' \
+    "snapshot restore safety point"
+SAFETY_SNAPSHOT="$(sed -n 's/.*"safety_snapshot":"\([^"]*\)".*/\1/p' \
+    "$TMP_DIR/snapshot-restore.json")"
+[ -n "$SAFETY_SNAPSHOT" ] || { echo "恢复输出缺少 safety_snapshot" >&2; exit 1; }
 equals "$(vexfs cat /project/src/main.txt)" "$(cat "$TMP_DIR/v2.txt")" "snapshot restore"
+vexfs snapshot list >"$TMP_DIR/snapshot-list-after-restore.out"
+contains "$TMP_DIR/snapshot-list-after-restore.out" "$SAFETY_SNAPSHOT" \
+    "safety snapshot listed"
+vexfs snapshot restore "$SAFETY_SNAPSHOT" >/dev/null
+equals "$(vexfs cat /project/src/main.txt)" "$(cat "$TMP_DIR/after.txt")" \
+    "safety snapshot returns to pre-restore state"
+vexfs snapshot restore baseline >/dev/null
+equals "$(vexfs cat /project/src/main.txt)" "$(cat "$TMP_DIR/v2.txt")" \
+    "baseline can be restored again"
 vexfs --json grep alpha /project >"$TMP_DIR/restored-indexed-grep.json"
 contains "$TMP_DIR/restored-indexed-grep.json" '"index_used":true' \
     "snapshot restore keeps PG trigram index current"

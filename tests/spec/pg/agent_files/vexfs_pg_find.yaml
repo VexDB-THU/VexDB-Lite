@@ -1,0 +1,90 @@
+name: pg__vexfs_find
+tags: [vexfs, pg, find, pagination, performance]
+description: PostgreSQL VexFS 数据库批量 find 的名称、类型、大小、时间和游标合同
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- statement: DROP ROLE IF EXISTS vexfs_pg_find_owner;
+- statement: DROP ROLE IF EXISTS vexfs_pg_find_reader;
+- statement: CREATE ROLE vexfs_pg_find_owner NOLOGIN;
+- statement: CREATE ROLE vexfs_pg_find_reader NOLOGIN;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_find_owner;
+- query: SELECT vexfs_workspace_create('pg-find') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_acl_set('pg-find', (vexfs_workspace_stat('pg-find')->>'root_inode')::bigint, '[{"principal":"vexfs_pg_find_reader","effect":"allow","permissions":"read","inherit":1}]');
+  expect:
+  - - 1
+- query: SELECT vexfs_mkdir('pg-find', '/src/sub') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-find', '/src/a.txt', convert_to('a', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-find', '/src/b.bin', convert_to('bbbb', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-find', '/src/sub/c.txt', convert_to('ccc', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-find', '/src/你.md', convert_to('unicode', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_mkdir('pg-find', '/private') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-find', '/private/secret.txt', convert_to('secret', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_acl_set('pg-find', (vexfs_stat('pg-find', '/private')->>'inode')::bigint, '[{"principal":"vexfs_pg_find_reader","effect":"deny","permissions":"read","inherit":0}]');
+  expect:
+  - - 1
+- query: SELECT vexfs_set_times('pg-find', (vexfs_stat('pg-find','/src/a.txt')->>'inode')::bigint, 1700000000123, 1700000100456, 3);
+  expect:
+  - - 3
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src','*.txt','file',NULL,NULL,NULL,NULL,NULL,100)->'entries') AS entry;
+  expect:
+  - - /src/a.txt
+  - - /src/sub/c.txt
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src','?.md','file',NULL,NULL,NULL,NULL,NULL,10)->'entries') AS entry;
+  expect:
+  - - /src/你.md
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src',NULL,'file',NULL,NULL,NULL,NULL,NULL,2)->'entries') AS entry;
+  expect:
+  - - /src/a.txt
+  - - /src/b.bin
+- query: SELECT vexfs_find('pg-find','/src',NULL,'file',NULL,NULL,NULL,NULL,NULL,2)->>'next_cursor';
+  expect:
+  - - /src/b.bin
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src',NULL,'file',NULL,NULL,NULL,NULL,'/src/b.bin',2)->'entries') AS entry;
+  expect:
+  - - /src/sub/c.txt
+  - - /src/你.md
+- query: SELECT vexfs_find('pg-find','/src',NULL,'file',NULL,NULL,NULL,NULL,'/src/b.bin',2)->>'next_cursor' IS NULL;
+  expect:
+  - - true
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src',NULL,'file',3,3,NULL,NULL,NULL,10)->'entries') AS entry;
+  expect:
+  - - /src/sub/c.txt
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/src','*.txt','file',NULL,NULL,NULL,1700000200000,NULL,10)->'entries') AS entry;
+  expect:
+  - - /src/a.txt
+- query: SELECT vexfs_find('pg-find','/src',NULL,NULL,NULL,NULL,NULL,NULL,NULL,1001);
+  expect_error: VEXFS_INVALID_FIND
+- query: SELECT vexfs_find('pg-find','/src','',NULL,NULL,NULL,NULL,NULL,NULL,10);
+  expect_error: VEXFS_INVALID_FIND
+- query: SELECT vexfs_find('pg-find','/src',NULL,NULL,NULL,NULL,253402300800000,NULL,NULL,10);
+  expect_error: VEXFS_INVALID_FIND
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_find_reader;
+- query: SELECT entry->>'path' FROM jsonb_array_elements(vexfs_find('pg-find','/','*.txt','file',NULL,NULL,NULL,NULL,NULL,100)->'entries') AS entry;
+  expect:
+  - - /src/a.txt
+  - - /src/sub/c.txt
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_find_owner;
+- query: SELECT vexfs_workspace_drop('pg-find');
+  expect:
+  - - 1
+- statement: RESET SESSION AUTHORIZATION;
+- statement: DROP ROLE vexfs_pg_find_reader;
+- statement: DROP ROLE vexfs_pg_find_owner;

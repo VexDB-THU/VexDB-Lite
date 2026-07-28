@@ -20,6 +20,15 @@ vexfs_mount_status vexfs_mount_grep(vexfs_mount_session *session, const char *pa
                                     const char *pattern, uint32_t flags,
                                     uint32_t limit, vexfs_mount_bytes *json,
                                     vexfs_mount_error *error);
+// Finds current workspace entries without reading file bodies. Empty pattern,
+// kind, and cursor values disable those filters. Numeric filters use -1 when
+// disabled. Results are ordered by binary path and use an exclusive path cursor.
+vexfs_mount_status vexfs_mount_find(
+    vexfs_mount_session *session, const char *path, const char *name_pattern,
+    const char *kind, int64_t min_size, int64_t max_size,
+    int64_t modified_after_ms, int64_t modified_before_ms,
+    const char *after_path, uint32_t limit, vexfs_mount_bytes *json,
+    vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_grep_index(vexfs_mount_session *session,
                                           const char *action,
                                           vexfs_mount_bytes *json,
@@ -71,6 +80,14 @@ vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *session,
                                                 const char *name, int64_t expected_head,
                                                 int64_t *new_commit,
                                                 vexfs_mount_error *error);
+// Restores and atomically preserves the pre-restore workspace as safety_name.
+// The safety snapshot is created only when the restore transaction commits.
+vexfs_mount_status vexfs_mount_snapshot_restore_safe(vexfs_mount_session *session,
+                                                     const char *name,
+                                                     int64_t expected_head,
+                                                     const char *safety_name,
+                                                     int64_t *new_commit,
+                                                     vexfs_mount_error *error);
 // Quota values use -1 for unlimited and non-negative values for a hard limit.
 vexfs_mount_status vexfs_mount_quota_set(vexfs_mount_session *session,
                                          int64_t max_bytes, int64_t max_files,
