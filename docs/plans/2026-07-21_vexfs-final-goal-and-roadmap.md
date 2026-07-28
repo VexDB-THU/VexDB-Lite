@@ -39,7 +39,8 @@
 3. **部分完成**：Bash、Git、hardlink、xattr、fsync、单机跨进程 `flock`/`fcntl`、轻量 npm/Cargo 和单次真实 OpenCode 已进入真机 eval；
    跨机器锁、长任务和 sleep/wake 尚待补齐；gateway `SIGKILL` + PG immediate restart 历史完成连续 20/20 轮、累计 320 项检查，当前 fsid 身份修复源码完成 2/2 轮、每轮 18 项；真实 TCP 中途断线当前完成连续 4/4 轮、每轮 21 项；
 4. **已完成首轮**：1,000 小文件为 205.643 files/s，同轮 APFS 为 16940.431 files/s；
-5. **待完成**：生成不含 FSKit 授权前置的签名公证包，在干净 Mac 验证安装和系统提示；
+5. **部分完成**：不含 FSKit 授权前置的 preview.38 签名公证包和本机隔离安装已通过；
+   当前 Mac 已安装更高的 preview.39，未强行降级，仍待第二台干净 Mac 复验；
 6. **代码已完成，发行待 Gate**：默认 backend 已改为 NFS，FSKit 只在显式选择时使用。
 
 ### 0.1 2026-07-24 本机 NFS 实现与验证
@@ -72,7 +73,8 @@ VexFS FSKit extension。
 
 - AppleDouble 隔离已进入 eval；后续每次 NFS 发布必须保留该断言；
 - 0.2 实现批量提交、写回合并和有界 metadata cache，再做同机 1,000/10,000 文件对照；
-- 0.1 发布前仍需完成当前源码公证、实际 sleep/wake、跨机器锁边界与长期运行 Gate。长循环 gateway crash 已完成。
+- 0.1 发布前仍需完成实际 sleep/wake、跨机器锁边界、第二台干净 Mac 和长期运行 Gate。
+  当前源码公证和长循环 gateway crash 已完成。
 
 ## 1. 这份文档解决什么问题
 
@@ -165,10 +167,10 @@ vexdb fs --workspace workspace snapshot restore before-refactor
 | 文件语义 | 文件、目录、四类时间戳、并发 append、进程锁、mode、symlink、xattr、hardlink、owner/group 元数据、便携 ACL 已进入数据库合同和测试；PG 已执行 ACL 和继承 | SQLite 尚未执行完整 ACL 授权；特殊文件不支持 |
 | 版本恢复 | 单文件版本、workspace commit、snapshot、diff、expected-head restore、原生备份、retention、显式分批 GC、live quota 和 format v2 逻辑导入导出已实现 | 自动维护、history/staging/index/total quota 和 DuckDB 导入端未完成 |
 | 长期校验 | `chunked-manifest-v1` 使用不可变 manifest、64 KiB 块、逐块 SHA-256 和有序块根哈希；deep check 逐块校验真实正文，publish 不再拼整文件 | 自动 repair、跨文件通用去重和按需标准整文件 SHA-256 命令不在当前范围 |
-| macOS | 默认 NFS 已连接 SQLite 和 PG runtime；PG 14/14 场景、252 项检查通过，SQLite 完整真机 eval、OpenCode、package smoke、hardlink、COMMIT/fsync、Git、单机锁、npm/Cargo、重挂载和快照恢复均有证据；PG strict crash 历史连续 20/20，当前 fsid 身份修复源码 2/2 轮、每轮 18 项通过；NFSv3 xattr 明确不支持且不生成 `._*`；macOS 13.0 deployment target 构建通过；既有 FSKit 仍保留历史真机证据 | 当前源码只有 Developer ID 候选包，尚未从干净提交生成公证包，也未在 macOS 13–15 或未启用 FSKit 的干净 Mac 验证；实际 sleep/wake、跨机器锁、长期 Agent 和 x86_64 待补 |
+| macOS | 默认 NFS 已连接 SQLite 和 PG runtime；PG 14/14 场景、252 项检查通过，SQLite 完整真机 eval、OpenCode、package smoke、hardlink、COMMIT/fsync、Git、单机锁、npm/Cargo、重挂载和快照恢复均有证据；PG strict crash 历史连续 20/20，当前 fsid 身份修复源码 2/2 轮、每轮 18 项通过；NFSv3 xattr 明确不支持且不生成 `._*`；macOS 13.0 deployment target 构建通过；preview.38 已从干净提交完成公证，并在当前 Mac 的隔离 HOME 通过真实 NFS 安装 Gate；既有 FSKit 仍保留历史真机证据 | 未在 macOS 13–15 或未启用 FSKit 的第二台干净 Mac 验证；实际 sleep/wake、跨机器锁、长期 Agent 和 x86_64 待补 |
 | Linux | libfuse3 真实挂载已通过 root 和 uid 1000 各 9 组；时间戳、并发 append、进程锁、打开文件生命周期、强制卸载和 helper 崩溃恢复已验证；异常撤销后底层目录保持 0500，显式卸载恢复 0700；x86_64/AArch64 manylinux 安装包已在对应架构真机完成无 root 安装回归 | 更多干净发行版、长期运行和真实挂载安装回归仍不足 |
 | Windows | 只有平台边界和规划 | WinFsp adapter、安装签名、路径/ACL/SID 合同均未实现 |
-| 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项和故障恢复 25 项；当前默认 NFS 又完成本机双 gateway 15 项和当前源码真实 TCP 中途断线连续 4/4 轮、每轮 21 项，PG `pg_trgm` 索引已实现 | 当前默认 NFS 源码对应的公证包和第二台 Mac NFS 复验尚未完成；同时覆盖同一文件只报告版本冲突，不自动合并 |
+| 远程共享 | PostgreSQL 已通过多 gateway、macOS FSKit、Linux FUSE、数据库重启、macOS↔Linux 47 项、两台 Mac 文件/快照 50 项、双 Mac 串行真实 OpenCode 7 + 9 + 21 项和故障恢复 25 项；当前默认 NFS 又完成本机双 gateway 15 项和当前源码真实 TCP 中途断线连续 4/4 轮、每轮 21 项，PG `pg_trgm` 索引已实现；当前默认 NFS 公证包已生成 | 第二台 Mac 当前仍不可达，preview.38 NFS 复验尚未完成；同时覆盖同一文件只报告版本冲突，不自动合并 |
 | 性能规模 | SQLite 直连已完成 10 万文件；最新数据库 `find` 在 SQLite 1 万文件首/次页约 19.8/18.2 ms，10 万约 205.3/200.1 ms，RSS 约 93.8 MB；PG 1 万约 22.1/22.0 ms，10 万约 78.7/83.9 ms；PG 16 MiB 文件修改 4 KiB 的组合发布从 589.357 ms 降到中位 10.289 ms，publish-only 两次正式复跑中位 4.020/9.828 ms；逐文件后台事务后的 PG NFS 两轮 8 MiB 写 46.430～46.516 MiB/s、随机覆盖 386.139～482.743 ops/s；strict fsync → gateway SIGKILL → PG immediate restart 历史连续 20/20，当前修复源码 2/2；真实 TCP 黑洞重连最长约 5.02 秒有界返回并连续 4/4 轮恢复；服务端已提交但客户端不读结果的 generation 重试通过；1 GiB 容器 `oom_kill=0` | 仍需补远程 ARM 同版基准、长 Agent、冷读和长时间运行；PG 逐文件批量创建路径仍需优化 |
 
 “合同中已保存”不等于“所有平台已经完整执行”。例如 owner/group 和便携 ACL 已经可以保存、读取和恢复，但身份认证、权限判断和各系统的原生 ACL 映射仍属于后续阶段。
