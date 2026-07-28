@@ -4,7 +4,7 @@
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
 - 日期：2026-07-28
 - 分支：`feature/agent_files`
-- 文档版本：3.5
+- 文档版本：3.6
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
 - 当前阶段：Phase 2 PostgreSQL 数据库合同和本机默认 NFS 验收已完成。PG VexFS spec 12/12、
   libpq runtime 132 项、manifest publish 专项 10 项和真实 macOS NFS 性能 18 项检查通过。
@@ -15,8 +15,9 @@
   macOS↔Linux、PG 16–19、备份、
   format v2 和真实 OpenCode 证据继续有效。当前源码的 Developer ID 候选包已经通过文档、
   安装和解压签名检查，但正式 preview.38 仍需从干净提交生成并提交 Apple 公证；第二台 Mac
-  NFS 复验也没有完成。下一步先提交当前 ACL 收口，再按 workspace log、快照策略、Agent
-  checkpoint 和发行 Gate 推进；DuckDB adapter 已交由其他方向负责，不在本路线继续开发。
+  NFS 复验也没有完成。PG ACL 收口和 SQLite/PG 统一 workspace log 已提交实现；下一步按
+  快照分类与自动保留、Agent checkpoint 和发行 Gate 推进；DuckDB adapter 已交由其他方向
+  负责，不在本路线继续开发。
 
 ## 0. 2026-07-24 路线调整
 
@@ -429,9 +430,10 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
 
 ### 当前固定顺序（2026-07-28 Agent 版本闭环）
 
-1. **当前收口：**提交并推送 PG ACL 不可变集合、写时复制、快照引用和 1k/10k/100k 性能 Gate。
-2. **P1：**实现 SQLite/PG 统一的 `vexdb fs workspace log`，默认新到旧、有界分页并支持 JSON。
-3. **P1：**增加 manual/agent/safety 快照分类、保留规则和 `prune --dry-run`。
+1. **已完成：**提交并推送 PG ACL 不可变集合、写时复制、快照引用和 1k/10k/100k 性能 Gate。
+2. **已完成：**实现 SQLite/PG 统一的 `vexdb fs workspace log`，默认新到旧、有界分页并支持 JSON；
+   10 万 commit 的 SQLite 查询为 0/3 ms、PG 为 157/158 ms，1 GiB Gate 内无 OOM。
+3. **当前任务：**增加 manual/agent/safety 快照分类、保留规则和 `prune --dry-run`。
 4. **P1：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，并给出恢复命令。
 5. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
    sleep/wake、跨机器锁和长时间 Agent 工作区。

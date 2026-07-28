@@ -417,8 +417,11 @@ CREATE TABLE _vexfs.commits (
     commit_no bigint NOT NULL CHECK (commit_no > 0),
     parent_commit bigint NOT NULL CHECK (parent_commit >= 0),
     operation text NOT NULL,
+    path text NOT NULL DEFAULT '/' CHECK (path <> '' AND octet_length(path) <= 4096),
     created_by_oid oid NOT NULL,
     created_by name NOT NULL,
+    session_id text CHECK (session_id IS NULL OR (session_id <> '' AND octet_length(session_id) <= 255)),
+    run_id text CHECK (run_id IS NULL OR (run_id <> '' AND octet_length(run_id) <= 255)),
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     PRIMARY KEY (workspace_id, commit_no)
 );
@@ -1390,6 +1393,8 @@ AS $$
 DECLARE
     v_commit bigint;
     v_principal_oid oid;
+    v_session_id text;
+    v_run_id text;
 BEGIN
     SELECT r.oid INTO STRICT v_principal_oid
       FROM pg_catalog.pg_roles AS r
@@ -1409,12 +1414,33 @@ BEGIN
             USING ERRCODE = 'P0002';
     END IF;
 
+    v_session_id := nullif(pg_catalog.current_setting('vexfs.session_id', true), '');
+    v_run_id := nullif(pg_catalog.current_setting('vexfs.run_id', true), '');
+    IF v_session_id IS NULL AND p_inode_id IS NOT NULL THEN
+        SELECT handle.session_id INTO v_session_id
+          FROM _vexfs.handles AS handle
+         WHERE handle.workspace_id = p_workspace_id
+           AND handle.inode_id = p_inode_id
+           AND handle.owner_oid = v_principal_oid
+           AND handle.session_id IS NOT NULL
+         ORDER BY handle.updated_at DESC, handle.handle_id DESC
+         LIMIT 1;
+    END IF;
+    IF v_session_id IS NOT NULL AND octet_length(v_session_id) > 255 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SESSION: session id is longer than 255 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+    IF v_run_id IS NOT NULL AND octet_length(v_run_id) > 255 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_RUN: run id is longer than 255 bytes'
+            USING ERRCODE = '22023';
+    END IF;
+
     INSERT INTO _vexfs.commits(
-        workspace_id, commit_no, parent_commit, operation,
-        created_by_oid, created_by)
+        workspace_id, commit_no, parent_commit, operation, path,
+        created_by_oid, created_by, session_id, run_id)
     VALUES (
-        p_workspace_id, v_commit, v_commit - 1, p_operation,
-        v_principal_oid, session_user);
+        p_workspace_id, v_commit, v_commit - 1, p_operation, coalesce(p_path, '/'),
+        v_principal_oid, session_user, v_session_id, v_run_id);
     PERFORM _vexfs.audit(
         p_workspace_id, v_commit, p_operation,
         p_path, p_inode_id, p_details);
@@ -7482,6 +7508,75 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION public.vexfs_workspace_log(
+    p_workspace text,
+    p_limit integer DEFAULT 100,
+    p_before_commit bigint DEFAULT 0)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_result jsonb;
+BEGIN
+    IF p_limit NOT BETWEEN 1 AND 1000 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_LIMIT: limit must be between 1 and 1000'
+            USING ERRCODE = '22023';
+    END IF;
+    IF coalesce(p_before_commit, 0) < 0 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_CURSOR: before commit must be non-negative'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'read');
+
+    WITH rows AS MATERIALIZED (
+        SELECT commit_row.*,
+               coalesce(role.rolname, commit_row.created_by)::text AS actor,
+               row_number() OVER (ORDER BY commit_row.commit_no DESC) AS ordinal
+          FROM _vexfs.commits AS commit_row
+          LEFT JOIN pg_catalog.pg_roles AS role
+            ON role.oid = commit_row.created_by_oid
+         WHERE commit_row.workspace_id = v_workspace.workspace_id
+           AND (coalesce(p_before_commit, 0) = 0
+                OR commit_row.commit_no < p_before_commit)
+         ORDER BY commit_row.commit_no DESC
+         LIMIT p_limit + 1
+    ), page AS (
+        SELECT * FROM rows WHERE ordinal <= p_limit
+    )
+    SELECT jsonb_build_object(
+        'entries', coalesce((
+            SELECT jsonb_agg(jsonb_build_object(
+                       'commit', item.commit_no,
+                       'parent_commit', nullif(item.parent_commit, 0),
+                       'created_at', (extract(epoch FROM item.created_at) * 1000)::bigint,
+                       'operation', item.operation,
+                       'path', item.path,
+                       'actor', item.actor,
+                       'session_id', item.session_id,
+                       'run_id', item.run_id,
+                       'has_snapshot', EXISTS (
+                           SELECT 1 FROM _vexfs.snapshots AS snapshot
+                            WHERE snapshot.workspace_id = item.workspace_id
+                              AND snapshot.head_commit = item.commit_no),
+                       'snapshots', coalesce((
+                           SELECT jsonb_agg(snapshot.name ORDER BY snapshot.name)
+                             FROM _vexfs.snapshots AS snapshot
+                            WHERE snapshot.workspace_id = item.workspace_id
+                              AND snapshot.head_commit = item.commit_no), '[]'::jsonb))
+                       ORDER BY item.commit_no DESC)
+              FROM page AS item), '[]'::jsonb),
+        'next_before', CASE WHEN EXISTS (
+            SELECT 1 FROM rows WHERE ordinal > p_limit)
+            THEN (SELECT min(commit_no) FROM page) ELSE NULL END)
+      INTO v_result;
+    RETURN v_result;
+END;
+$$;
+
 CREATE FUNCTION public.vexfs_create(
     p_workspace text, p_path text, p_kind text, p_mode integer)
 RETURNS bigint
@@ -10179,6 +10274,10 @@ BEGIN
                'source_id', c.commit_no,
                'parent_source_id', nullif(c.parent_commit, 0),
                'message', c.operation,
+               'path', c.path,
+               'actor', c.created_by::text,
+               'session_id', c.session_id,
+               'run_id', c.run_id,
                'created_at', floor(extract(epoch FROM c.created_at) * 1000)::bigint),
            NULL::bytea
       FROM _vexfs.commits AS c
@@ -10843,14 +10942,17 @@ BEGIN
     RETURNING workspace_id INTO v_workspace_id;
 
     INSERT INTO _vexfs.commits(
-        workspace_id, commit_no, parent_commit, operation,
-        created_by_oid, created_by, created_at)
+        workspace_id, commit_no, parent_commit, operation, path,
+        created_by_oid, created_by, session_id, run_id, created_at)
     SELECT v_workspace_id,
            map.local_id,
            map.local_id - 1,
            record.record_json->>'message',
+           record.record_json->>'path',
            v_actor,
            session_user,
+           record.record_json->>'session_id',
+           record.record_json->>'run_id',
            to_timestamp((record.record_json->>'created_at')::bigint / 1000.0)
       FROM _vexfs.archive_import_records AS record
       JOIN pg_temp.vexfs_import_commit_map AS map
@@ -11315,6 +11417,8 @@ COMMENT ON FUNCTION public.vexfs_init() IS
     'Idempotent PostgreSQL VexFS readiness probe; CREATE EXTENSION owns schema initialization';
 COMMENT ON FUNCTION public.vexfs_workspace_create(text) IS
     'Creates a PostgreSQL-managed VexFS workspace owned by the authenticated session role';
+COMMENT ON FUNCTION public.vexfs_workspace_log(text, integer, bigint) IS
+    'Returns one bounded page of workspace commits with path, actor, run and snapshot metadata';
 COMMENT ON FUNCTION public.vexfs_write(text, text, bytea) IS
     'Writes a complete file version in the caller transaction';
 COMMENT ON FUNCTION public.vexfs_create_batch(text, text, jsonb) IS

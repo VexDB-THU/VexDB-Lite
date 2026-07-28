@@ -40,6 +40,11 @@ vexfs_mount_status vexfs_mount_history_page(vexfs_mount_session *session, const 
                                             uint32_t limit, int64_t before_version,
                                             vexfs_mount_bytes *json,
                                             vexfs_mount_error *error);
+// Lists workspace commits from newest to oldest. before_commit=0 starts at HEAD;
+// a returned next_before cursor is exclusive and can fetch the following page.
+vexfs_mount_status vexfs_mount_workspace_log_page(
+    vexfs_mount_session *session, uint32_t limit, int64_t before_commit,
+    vexfs_mount_bytes *json, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_read_version(vexfs_mount_session *session, const char *path,
                                             int64_t version,
                                             vexfs_mount_bytes *content,

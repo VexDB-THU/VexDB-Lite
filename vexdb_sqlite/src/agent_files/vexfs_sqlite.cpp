@@ -630,8 +630,14 @@ CREATE TABLE IF NOT EXISTS _vexfs_commits(
     workspace_id INTEGER NOT NULL,
     parent_commit INTEGER,
     message TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '/',
+    actor TEXT NOT NULL DEFAULT 'local',
+    session_id TEXT,
+    run_id TEXT,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
 );
+CREATE INDEX IF NOT EXISTS _vexfs_commits_workspace_idx
+    ON _vexfs_commits(workspace_id,id DESC);
 CREATE TABLE IF NOT EXISTS _vexfs_manifests(
     id INTEGER PRIMARY KEY,
     workspace_id INTEGER NOT NULL,
@@ -1393,11 +1399,75 @@ WHERE workspace_id=?1 AND NOT EXISTS (
 
 sqlite3_int64 CreateCommitInTransaction(sqlite3 *db, const Workspace &workspace,
                                        const std::string &message) {
+    std::string path = "/";
+    {
+        Statement dirty_dentries(db,
+            "SELECT parent_inode,name FROM _vexfs_dirty_dentries "
+            "WHERE workspace_id=?1 ORDER BY length(name),name COLLATE BINARY");
+        dirty_dentries.BindInt64(1, workspace.id);
+        size_t best_length = std::numeric_limits<size_t>::max();
+        while (dirty_dentries.Row()) {
+            try {
+                std::string parent = PathForInode(db, workspace, dirty_dentries.Int64(0));
+                std::string candidate = parent == "/" ?
+                    "/" + dirty_dentries.Text(1) : parent + "/" + dirty_dentries.Text(1);
+                if (candidate.size() < best_length ||
+                    (candidate.size() == best_length && candidate < path)) {
+                    path = std::move(candidate);
+                    best_length = path.size();
+                }
+            } catch (const SqlError &) {
+                // Recursive remove may already have hidden this parent. A surviving
+                // top-level dirty dentry or inode below still provides the log path.
+            }
+        }
+        if (best_length == std::numeric_limits<size_t>::max()) {
+            Statement dirty_inodes(db,
+                "SELECT inode_id FROM _vexfs_dirty_inodes WHERE workspace_id=?1 "
+                "ORDER BY inode_id");
+            dirty_inodes.BindInt64(1, workspace.id);
+            while (dirty_inodes.Row()) {
+                try {
+                    const std::string candidate =
+                        PathForInode(db, workspace, dirty_inodes.Int64(0));
+                    if (candidate.size() < best_length ||
+                        (candidate.size() == best_length && candidate < path)) {
+                        path = candidate;
+                        best_length = path.size();
+                    }
+                } catch (const SqlError &) {
+                }
+            }
+        }
+    }
+    std::string session_id;
+    {
+        Statement session(db, R"SQL(
+SELECT COALESCE(handle.owner_session,'')
+FROM _vexfs_handles handle
+WHERE handle.workspace_id=?1 AND handle.owner_session IS NOT NULL
+  AND (EXISTS (
+        SELECT 1 FROM _vexfs_dirty_inodes dirty
+        WHERE dirty.workspace_id=handle.workspace_id
+          AND dirty.inode_id=handle.inode_id)
+       OR EXISTS (
+        SELECT 1 FROM _vexfs_dirty_dentries dirty
+        WHERE dirty.workspace_id=handle.workspace_id
+          AND dirty.inode_id=handle.inode_id))
+ORDER BY handle.updated_at DESC,handle.id DESC
+LIMIT 1
+)SQL");
+        session.BindInt64(1, workspace.id);
+        if (session.Row()) session_id = session.Text(0);
+    }
     Statement insert(db,
-        "INSERT INTO _vexfs_commits(workspace_id, parent_commit, message) "
-        "SELECT id, NULLIF(head_commit, 0), ?2 FROM _vexfs_workspaces WHERE id=?1");
+        "INSERT INTO _vexfs_commits(workspace_id,parent_commit,message,path,actor,session_id) "
+        "SELECT id,NULLIF(head_commit,0),?2,?3,'local',?4 "
+        "FROM _vexfs_workspaces WHERE id=?1");
     insert.BindInt64(1, workspace.id);
     insert.BindText(2, message);
+    insert.BindText(3, path);
+    if (session_id.empty()) insert.BindNull(4); else insert.BindText(4, session_id);
     insert.Done();
     if (sqlite3_changes64(db) != 1) {
         throw SqlError("workspace not found", SQLITE_NOTFOUND);
@@ -3122,6 +3192,78 @@ void HistoryFunction(sqlite3_context *context, int argument_count, sqlite3_value
         const std::string json = argument_count == 2 ? entries :
             "{\"entries\":" + entries + ",\"next_before\":" +
             (has_more ? std::to_string(last_version) : "null") + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void WorkspaceLogFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 limit = RequiredPositiveInteger(values[1], "limit");
+        const sqlite3_int64 before_commit =
+            sqlite3_value_type(values[2]) == SQLITE_NULL
+            ? 0 : RequiredNonnegativeInteger(values[2], "before commit");
+        if (limit > 1000) throw SqlError("workspace log limit must be at most 1000", SQLITE_RANGE);
+
+        Statement statement(db, R"SQL(
+SELECT commit_row.id,commit_row.parent_commit,commit_row.created_at,
+       commit_row.message,commit_row.path,commit_row.actor,
+       commit_row.session_id,commit_row.run_id,
+       COALESCE((
+         SELECT json_group_array(snapshot.name)
+         FROM (SELECT name FROM _vexfs_snapshots
+               WHERE workspace_id=commit_row.workspace_id
+                 AND commit_id=commit_row.id
+               ORDER BY name COLLATE BINARY) snapshot
+       ),'[]')
+FROM _vexfs_commits commit_row
+WHERE commit_row.workspace_id=?1
+  AND (?2=0 OR commit_row.id<?2)
+ORDER BY commit_row.id DESC
+LIMIT ?3
+)SQL");
+        statement.BindInt64(1, workspace.id);
+        statement.BindInt64(2, before_commit);
+        statement.BindInt64(3, limit + 1);
+        std::string entries = "[";
+        bool first = true;
+        sqlite3_int64 count = 0;
+        sqlite3_int64 last_commit = 0;
+        bool has_more = false;
+        while (statement.Row()) {
+            if (count == limit) {
+                has_more = true;
+                break;
+            }
+            if (!first) entries += ',';
+            first = false;
+            last_commit = statement.Int64(0);
+            entries += "{\"commit\":" + std::to_string(last_commit) +
+                ",\"parent_commit\":";
+            if (statement.Type(1) == SQLITE_NULL) entries += "null";
+            else entries += std::to_string(statement.Int64(1));
+            entries += ",\"created_at\":" + std::to_string(statement.Int64(2)) +
+                ",\"operation\":\"" + JsonEscape(statement.Text(3)) +
+                "\",\"path\":\"" + JsonEscape(statement.Text(4)) +
+                "\",\"actor\":\"" + JsonEscape(statement.Text(5)) +
+                "\",\"session_id\":";
+            if (statement.Type(6) == SQLITE_NULL) entries += "null";
+            else entries += "\"" + JsonEscape(statement.Text(6)) + "\"";
+            entries += ",\"run_id\":";
+            if (statement.Type(7) == SQLITE_NULL) entries += "null";
+            else entries += "\"" + JsonEscape(statement.Text(7)) + "\"";
+            const std::string snapshots = statement.Text(8);
+            entries += ",\"has_snapshot\":" +
+                std::string(snapshots == "[]" ? "false" : "true") +
+                ",\"snapshots\":" + snapshots + "}";
+            ++count;
+        }
+        entries += ']';
+        const std::string json = "{\"entries\":" + entries +
+            ",\"next_before\":" +
+            (has_more ? std::to_string(last_commit) : "null") + "}";
         sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
     });
 }
@@ -6819,6 +6961,7 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_grep_index", 1, GrepIndexFunction, SQLITE_UTF8},
         {"vexfs_history", 2, HistoryFunction, SQLITE_UTF8},
         {"vexfs_history", 4, HistoryFunction, SQLITE_UTF8},
+        {"vexfs_workspace_log", 3, WorkspaceLogFunction, SQLITE_UTF8},
         {"vexfs_read_version", 3, ReadVersionFunction, SQLITE_UTF8},
         {"vexfs_compare_versions", 4, CompareVersionsFunction, SQLITE_UTF8},
         {"vexfs_restore_version", 4, RestoreVersionFunction, SQLITE_UTF8},

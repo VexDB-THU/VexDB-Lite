@@ -68,6 +68,8 @@ void Usage(std::ostream &output) {
         "                               Current files, snapshots and handles are protected\n"
         "  gc pause|resume              Pause or resume history deletion\n"
         "  stat PATH                    Print file metadata as JSON\n"
+        "  workspace log [--limit N] [--before COMMIT] [--json]\n"
+        "                               List one page of workspace commits\n"
         "  history PATH [--limit N] [--before N] [--json]\n"
         "                               List one page of file versions\n"
         "  show PATH --version N        Print one historical version\n"
@@ -491,6 +493,31 @@ void PrintHistory(const std::string &json) {
                   << JsonInteger(row, "created_at") << '\t'
                   << (JsonBoolean(row, "current") ? "*" : "") << '\t'
                   << JsonString(row, "message") << '\n';
+        position = end + 1;
+    }
+    const std::string next_marker = "\"next_before\":";
+    const size_t next = json.find(next_marker);
+    if (next != std::string::npos && json.compare(next + next_marker.size(), 4, "null") != 0) {
+        std::cout << "NEXT_BEFORE\t" << JsonInteger(json, "next_before") << '\n';
+    }
+}
+
+void PrintWorkspaceLog(const std::string &json) {
+    std::cout << "COMMIT\tCREATED_AT\tACTOR\tOPERATION\tPATH\tSNAPSHOT\n";
+    const std::string entries_marker = "\"entries\":[";
+    size_t position = json.find(entries_marker);
+    if (position == std::string::npos) throw std::runtime_error("invalid workspace log JSON");
+    position += entries_marker.size();
+    while ((position = json.find('{', position)) != std::string::npos) {
+        const size_t end = json.find('}', position);
+        if (end == std::string::npos) throw std::runtime_error("invalid workspace log JSON");
+        const std::string row = json.substr(position, end - position + 1);
+        std::cout << JsonInteger(row, "commit") << '\t'
+                  << JsonInteger(row, "created_at") << '\t'
+                  << JsonString(row, "actor") << '\t'
+                  << JsonString(row, "operation") << '\t'
+                  << JsonString(row, "path") << '\t'
+                  << (JsonBoolean(row, "has_snapshot") ? "*" : "") << '\n';
         position = end + 1;
     }
     const std::string next_marker = "\"next_before\":";
@@ -1182,6 +1209,26 @@ int Run(const Options &options) {
         vexfs_mount_bytes json{};
         Check(vexfs_mount_stat(session.get(), options.arguments[1].c_str(), &json, &error), error);
         std::cout << BytesToString(&json) << '\n';
+    } else if (command == "workspace") {
+        const ParsedCommand parsed = ParseCommand(
+            options.arguments, {"--limit", "--before"}, {});
+        if (parsed.positional.size() != 1 || parsed.positional[0] != "log") {
+            throw std::runtime_error("workspace needs log with optional --limit/--before");
+        }
+        const std::string limit_value = parsed.Value("--limit", false);
+        const std::string before_value = parsed.Value("--before", false);
+        const int64_t limit = limit_value.empty() ? 100 :
+            PositiveInteger(limit_value, "limit");
+        const int64_t before = before_value.empty() ? 0 :
+            NonnegativeInteger(before_value, "before");
+        if (limit > 1000) {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, "limit must be at most 1000");
+        }
+        vexfs_mount_bytes json{};
+        Check(vexfs_mount_workspace_log_page(
+            session.get(), static_cast<uint32_t>(limit), before, &json, &error), error);
+        const std::string value = BytesToString(&json);
+        if (options.json) std::cout << value << '\n'; else PrintWorkspaceLog(value);
     } else if (command == "history") {
         const ParsedCommand parsed = ParseCommand(options.arguments, {"--limit", "--before"}, {});
         if (parsed.positional.size() != 1) throw std::runtime_error("history needs PATH");

@@ -107,9 +107,15 @@ PG_IMPORTED="$(docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t
               WHERE manifest.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces
                                              WHERE name='sqlite-to-pg')
                 AND manifest.file_size=0 AND manifest.chunk_count=0)=1,
+            EXISTS(
+              SELECT 1 FROM _vexfs.commits AS commit_row
+               WHERE commit_row.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces
+                                            WHERE name='sqlite-to-pg')
+                 AND commit_row.path='/tree/value.txt'),
+            jsonb_array_length(vexfs_workspace_log('sqlite-to-pg',10,NULL)->'entries')>0,
             (vexfs_check('sqlite-to-pg',1)->>'ok')::boolean;")"
 assert_equal "$PG_IMPORTED" \
-    "sqlite-v2|sqlite-v1|1|t|value.txt|sqlite-metadata|t|t|t|t" \
+    "sqlite-v2|sqlite-v1|1|t|value.txt|sqlite-metadata|t|t|t|t|t|t" \
     "SQLite 到 PostgreSQL format v2 往返错误"
 
 # 目标 workspace 已存在时必须拒绝，且不能改动已导入内容。
@@ -167,9 +173,16 @@ SQLITE_IMPORTED="$("$CLI" "$SQLITE_TARGET" \
                WHERE json_extract(value,'$.principal')='agent-portable'
                  AND json_extract(value,'$.permissions')='read'),
             length(vexfs_read('pg-imported','/tree/empty-a.txt'))=0,
+            EXISTS(
+              SELECT 1 FROM _vexfs_commits AS commit_row
+               WHERE commit_row.workspace_id=(SELECT workspace_id FROM _vexfs_workspaces
+                                            WHERE name='pg-imported')
+                 AND commit_row.path='/tree/value.txt'),
+            json_array_length(json_extract(
+              vexfs_workspace_log('pg-imported',10,NULL),'$.entries'))>0,
             json_extract(vexfs_check('pg-imported',1),'$.ok');")"
 assert_equal "$SQLITE_IMPORTED" \
-    "pg-v2|pg-v1|1|1|value.txt|pg-metadata|1|1|1" \
+    "pg-v2|pg-v1|1|1|value.txt|pg-metadata|1|1|1|1|1" \
     "PostgreSQL 到 SQLite format v2 往返错误"
 
 cp "$SQLITE_PACKAGE" "$CORRUPT_PACKAGE"

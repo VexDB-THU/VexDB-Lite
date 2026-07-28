@@ -2,8 +2,9 @@
 
 日期：2026-07-28
 
-当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。PG 批量历史和 ACL 不可变集合也已
-收口，全部 PG VexFS spec 为 12/12。下一项固定为批次 B 的 `workspace log`。正式发布前仍需
+当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。批次 B 的统一 `workspace log` 也已
+完成，全部 PG VexFS spec 为 13/13、SQLite spec 为 31/31。下一项固定为快照分类、保留规则和
+`snapshot prune --dry-run`。正式发布前仍需
 在最终 macOS NFS 包和 Linux FUSE 包上复跑真实挂载 Gate；这不是当前数据库实现缺口。
 
 ## 1. 产品目标
@@ -101,6 +102,8 @@ eval 和 PG CLI runtime。增强后的 `run_pg_runtime.sh` 会实际执行“恢
 
 ### P1-1：统一 workspace 日志
 
+状态：**已完成（2026-07-28）**。
+
 增加：
 
 ```bash
@@ -125,6 +128,15 @@ vexdb fs workspace log --limit 50 --json
 - 默认按新到旧排列，支持有界分页。
 - 查询不能扫描文件正文，也不能在大历史上一次加载全部结果。
 - actor 和 run ID 是通用审计字段，核心中不保存 prompt、memory 或模型语义。
+
+完成结果：
+
+- SQLite 和 PG 共用同一 JSON 字段、游标含义和 1～1000 条分页限制；
+- CLI 同时支持易读表格和 `--json`，`--before` 是排他的 commit 游标；
+- commit 路径、actor、session/run ID 已进入 format v2，SQLite↔PG 导入导出不会丢失；
+- 10 万条历史下 SQLite 头页/深页为 0/3 ms，PG 为 157/158 ms；PG 容器内存约
+  560.5 MiB，1 GiB 限制内无 OOM；
+- 详细证据见 `docs/reports/2026-07-28_vexfs-workspace-log.md`。
 
 ### P1-2：快照分类和自动保留策略
 
@@ -262,7 +274,7 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 | 1 | PG 多机恢复屏障 | P0 | 恢复期间不会被其他机器继续写坏 |
 | 2 | 恢复前自动安全快照 | P0 | 错误恢复可以撤销 |
 | 3 | 统一恢复正确性 Gate | P0 | SQLite、PG、macOS、Linux 不会各自漂移 |
-| 4 | workspace log | P1 | 用户能找到和理解历史版本 |
+| 4 | workspace log（已完成） | P1 | 用户能找到和理解历史版本 |
 | 5 | 快照分类、保留和 prune | P1 | 自动快照不会无限增长 |
 | 6 | `vexdb fs run --snapshot-before` | P1 | Agent 任务前自动留下恢复点 |
 | 7 | SQLite `snapshot create --commit` | P2 | 可以固定任意仍被保留的 SQLite commit |
@@ -282,6 +294,8 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 ### 批次 B：Agent 闭环
 
 做顺序 4～6。结束条件是用户可以运行一条 `vexdb fs run`，让 OpenCode 修改项目，并用输出中的恢复命令回到任务前。
+
+当前进度：顺序 4 已完成，正在进入顺序 5 的快照分类、保留和 prune。
 
 ### 批次 C：SQLite commit PITR
 

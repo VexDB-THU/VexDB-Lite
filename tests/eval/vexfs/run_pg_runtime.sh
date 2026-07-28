@@ -137,6 +137,16 @@ vexfs retention set --keep-versions 10 --keep-days 30 >"$TMP_DIR/retention.json"
 contains "$TMP_DIR/retention.json" '"keep_versions":10' "retention versions"
 
 vexfs snapshot create baseline >"$TMP_DIR/snapshot-create.out"
+vexfs --json workspace log --limit 2 >"$TMP_DIR/workspace-log.json"
+contains "$TMP_DIR/workspace-log.json" '"actor":"postgres"' "workspace log actor"
+contains "$TMP_DIR/workspace-log.json" '"has_snapshot":true' "workspace log snapshot link"
+contains "$TMP_DIR/workspace-log.json" '"snapshots":["baseline"]' "workspace log snapshot name"
+WORKSPACE_LOG_CURSOR="$(sed -n 's/.*"next_before":[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    "$TMP_DIR/workspace-log.json")"
+[ -n "$WORKSPACE_LOG_CURSOR" ] || { echo "workspace log 缺少 next_before" >&2; exit 1; }
+vexfs --json workspace log --limit 2 --before "$WORKSPACE_LOG_CURSOR" \
+    >"$TMP_DIR/workspace-log-next.json"
+contains "$TMP_DIR/workspace-log-next.json" '"entries":[' "workspace log next page"
 vexfs snapshot list >"$TMP_DIR/snapshot-list.out"
 contains "$TMP_DIR/snapshot-list.out" "baseline" "snapshot list"
 vexfs snapshot show baseline >"$TMP_DIR/snapshot-show.json"

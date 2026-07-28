@@ -1935,6 +1935,25 @@ extern "C" vexfs_mount_status vexfs_mount_history_page(
     });
 }
 
+extern "C" vexfs_mount_status vexfs_mount_workspace_log_page(
+    vexfs_mount_session *session, uint32_t limit, int64_t before_commit,
+    vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (json == nullptr || limit == 0 || limit > 1000 || before_commit < 0) {
+            throw CallError(
+                SQLITE_RANGE,
+                "workspace log output is required, limit must be 1..1000, and before must be non-negative");
+        }
+        Call call(session, "SELECT vexfs_workspace_log(?1,?2,?3)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, static_cast<int64_t>(limit));
+        call.Int64(3, before_commit);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
 extern "C" vexfs_mount_status vexfs_mount_read_version(vexfs_mount_session *session,
                                                           const char *path, int64_t version,
                                                           vexfs_mount_bytes *content,

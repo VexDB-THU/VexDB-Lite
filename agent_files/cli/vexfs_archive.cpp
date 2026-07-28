@@ -280,7 +280,8 @@ CREATE TABLE package.manifest(
  complete INTEGER NOT NULL CHECK(complete IN (0,1)));
 CREATE TABLE package.commits(
  record_key TEXT PRIMARY KEY,source_id INTEGER UNIQUE NOT NULL,parent_source_id INTEGER,
- message TEXT NOT NULL,created_at INTEGER NOT NULL,record_checksum TEXT NOT NULL);
+ message TEXT NOT NULL,path TEXT NOT NULL,actor TEXT NOT NULL,session_id TEXT,run_id TEXT,
+ created_at INTEGER NOT NULL,record_checksum TEXT NOT NULL);
 CREATE TABLE package.commit_changes(
  record_key TEXT PRIMARY KEY,source_commit INTEGER NOT NULL,ordinal INTEGER NOT NULL,
  operation TEXT NOT NULL,path TEXT NOT NULL,source_inode INTEGER,before_version INTEGER,
@@ -646,9 +647,12 @@ SELECT json_extract(record_json,'$.format_version'),
 FROM incoming WHERE record_type='manifest';
 
 INSERT INTO package.commits(
- record_key,source_id,parent_source_id,message,created_at,record_checksum)
+ record_key,source_id,parent_source_id,message,path,actor,session_id,run_id,
+ created_at,record_checksum)
 SELECT record_key,json_extract(record_json,'$.source_id'),
        json_extract(record_json,'$.parent_source_id'),json_extract(record_json,'$.message'),
+       json_extract(record_json,'$.path'),json_extract(record_json,'$.actor'),
+       json_extract(record_json,'$.session_id'),json_extract(record_json,'$.run_id'),
        json_extract(record_json,'$.created_at'),''
 FROM incoming WHERE record_type='commits';
 
@@ -760,7 +764,8 @@ SELECT record_key,json_extract(record_json,'$.source_principal'),''
 FROM incoming WHERE record_type='principals';
 
 UPDATE package.commits SET record_checksum=
- vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,created_at) AS BLOB));
+ vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,path,actor,
+  session_id,run_id,created_at) AS BLOB));
 UPDATE package.commit_changes SET record_checksum=
  vexfs_archive_sha256(CAST(json_array(source_commit,ordinal,operation,path,source_inode,
   before_version,after_version,json(details)) AS BLOB));
@@ -948,8 +953,10 @@ SELECT id,parent_commit FROM chain
 
         Exec(db.get(), R"SQL(
 INSERT INTO package.commits
-SELECT printf('%020lld',c.id),c.id,c.parent_commit,c.message,c.created_at,
-       vexfs_archive_sha256(CAST(json_array(c.id,c.parent_commit,c.message,c.created_at) AS BLOB))
+SELECT printf('%020lld',c.id),c.id,c.parent_commit,c.message,c.path,c.actor,
+       c.session_id,c.run_id,c.created_at,
+       vexfs_archive_sha256(CAST(json_array(c.id,c.parent_commit,c.message,c.path,c.actor,
+          c.session_id,c.run_id,c.created_at) AS BLOB))
 FROM _vexfs_commits c JOIN selected_commits selected ON selected.id=c.id;
 
 INSERT INTO package.inodes
@@ -1219,7 +1226,8 @@ FROM package.manifest
     RequireZero(db, R"SQL(
 SELECT sum(bad) FROM (
  SELECT count(*) bad FROM package.commits WHERE record_checksum<>
-  vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,created_at) AS BLOB))
+  vexfs_archive_sha256(CAST(json_array(source_id,parent_source_id,message,path,actor,
+   session_id,run_id,created_at) AS BLOB))
  UNION ALL SELECT count(*) FROM package.commit_changes WHERE record_checksum<>
   vexfs_archive_sha256(CAST(json_array(source_commit,ordinal,operation,path,source_inode,
    before_version,after_version,json(details)) AS BLOB))
@@ -1499,7 +1507,8 @@ FROM package.manifest
             {"commits", R"SQL(
 SELECT record_key,json_object(
  'source_id',source_id,'parent_source_id',parent_source_id,
- 'message',message,'created_at',created_at),NULL
+ 'message',message,'path',path,'actor',actor,'session_id',session_id,
+ 'run_id',run_id,'created_at',created_at),NULL
 FROM package.commits ORDER BY record_key)SQL", false},
             {"commit_changes", R"SQL(
 SELECT record_key,json_object(
@@ -1743,7 +1752,7 @@ CREATE TEMP TABLE import_chunk_map(
         std::unordered_map<sqlite3_int64, sqlite3_int64> commit_map;
         {
             Statement rows(db.get(),
-                "SELECT source_id,parent_source_id,message,created_at "
+                "SELECT source_id,parent_source_id,message,path,actor,session_id,run_id,created_at "
                 "FROM package.commits ORDER BY source_id");
             while (rows.Row()) {
                 const sqlite3_int64 source_id = rows.Int64(0);
@@ -1757,13 +1766,18 @@ CREATE TEMP TABLE import_chunk_map(
                     local_parent = parent->second;
                 }
                 Statement insert(db.get(), R"SQL(
-INSERT INTO _vexfs_commits(workspace_id,parent_commit,message,created_at)
-VALUES(?1,?2,?3,?4)
+INSERT INTO _vexfs_commits(
+ workspace_id,parent_commit,message,path,actor,session_id,run_id,created_at)
+VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
 )SQL");
                 insert.Int64(1, workspace_id);
                 if (has_parent) insert.Int64(2, local_parent); else insert.Null(2);
                 insert.Text(3, rows.Text(2));
-                insert.Int64(4, rows.Int64(3));
+                insert.Text(4, rows.Text(3));
+                insert.Text(5, rows.Text(4));
+                if (rows.Type(5) == SQLITE_NULL) insert.Null(6); else insert.Text(6, rows.Text(5));
+                if (rows.Type(6) == SQLITE_NULL) insert.Null(7); else insert.Text(7, rows.Text(6));
+                insert.Int64(8, rows.Int64(7));
                 insert.Done();
                 const sqlite3_int64 local_id = sqlite3_last_insert_rowid(db.get());
                 commit_map[source_id] = local_id;
