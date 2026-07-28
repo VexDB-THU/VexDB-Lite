@@ -6,6 +6,7 @@
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/storage/partial_block_manager.hpp"
+#include "duckdb/storage/table/append_state.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -239,7 +240,13 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     info.options["dimension"] = Value::UBIGINT(uint64_t(dimension_));
     info.options["m"] = Value::INTEGER(m_);
     info.options["ef_construction"] = Value::INTEGER(ef_construction_);
-    info.options["metric"] = Value("l2");
+    const char *metric_name = "l2";
+    if (metric_ == VexMetric::INNER_PRODUCT) {
+        metric_name = "ip";
+    } else if (metric_ == VexMetric::COSINE) {
+        metric_name = "cosine";
+    }
+    info.options["metric"] = Value(metric_name);
     info.options["node_count"] = Value::UBIGINT(uint64_t(store.elems.size()));
     info.options["upper_count"] = Value::UBIGINT(uint64_t(store.upper_points.size()));
     info.options["entry_id"] = Value::UBIGINT(uint64_t(store.entry_info.id));
@@ -314,48 +321,64 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     }
 
     if (pq_use_) {
+        // v2 stores fixed-width arrays as raw BLOBs. Value owns one copy, but
+        // unlike v1 we no longer build a second header-prefixed string first.
+        // At 1M rows this removes one full codes/order/map/checksum copy from
+        // checkpoint peak memory.
+        info.options["pq_storage_version"] = Value::UINTEGER(2);
         info.options["pq_m"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.M));
         info.options["pq_dim"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.d));
 
-        // Codebook: M * ksub * dsub floats. Pin layout in case future versions
-        // change the in-memory shape — write dimensions inline so reload doesn't
-        // have to reconstruct from pq_m alone.
-        string codebook_blob;
-        uint64_t centroids_n = pq_quantizer_.get_centroids_size();
-        codebook_blob.append(reinterpret_cast<const char *>(&centroids_n), sizeof(centroids_n));
-        codebook_blob.append(reinterpret_cast<const char *>(pq_quantizer_.centroids),
-                             centroids_n * sizeof(float));
-        info.options["pq_codebook"] = Value::BLOB(const_data_ptr_cast(codebook_blob.data()),
-                                                  codebook_blob.size());
+        const auto centroids_bytes =
+            pq_quantizer_.get_centroids_size() * sizeof(float);
+        info.options["pq_codebook"] = Value::BLOB(
+            const_data_ptr_cast(pq_quantizer_.centroids), centroids_bytes);
+        info.options["pq_codes"] = Value::BLOB(
+            const_data_ptr_cast(pq_codes_.data()), pq_codes_.size());
 
-        // Codes are indexed by row_id sort order; persist the order alongside the
-        // bytes so reload can reconstruct the row → code-slot mapping.
-        string codes_blob;
-        uint64_t codes_n = pq_codes_.size();
-        codes_blob.append(reinterpret_cast<const char *>(&codes_n), sizeof(codes_n));
-        codes_blob.append(reinterpret_cast<const char *>(pq_codes_.data()), codes_n);
-        info.options["pq_codes"] = Value::BLOB(const_data_ptr_cast(codes_blob.data()), codes_blob.size());
+        static_assert(sizeof(row_t) == sizeof(int64_t),
+                      "PQ row order persistence requires 64-bit row_t");
+        info.options["pq_row_order"] = Value::BLOB(
+            const_data_ptr_cast(pq_row_id_order_.data()),
+            pq_row_id_order_.size() * sizeof(row_t));
 
-        string order_blob;
-        uint64_t order_n = pq_row_id_order_.size();
-        order_blob.append(reinterpret_cast<const char *>(&order_n), sizeof(order_n));
-        for (auto &rid : pq_row_id_order_) {
-            int64_t v = static_cast<int64_t>(rid);
-            order_blob.append(reinterpret_cast<const char *>(&v), sizeof(v));
+        if (pq_node_code_positions_.size() != runtime_->store.elems.size()) {
+            throw InternalException("PQ node/code mapping does not match graph nodes");
         }
-        info.options["pq_row_order"] = Value::BLOB(const_data_ptr_cast(order_blob.data()), order_blob.size());
+        info.options["pq_node_code_positions"] = Value::BLOB(
+            const_data_ptr_cast(pq_node_code_positions_.data()),
+            pq_node_code_positions_.size() * sizeof(uint32_t));
 
         if (pq_vector_coverage_hashes_.size() == pq_row_id_order_.size()) {
-            string checksum_blob;
-            uint64_t checksum_n = pq_vector_coverage_hashes_.size();
-            checksum_blob.append(reinterpret_cast<const char *>(&checksum_n), sizeof(checksum_n));
-            if (checksum_n) {
-                checksum_blob.append(reinterpret_cast<const char *>(pq_vector_coverage_hashes_.data()),
-                                     checksum_n * sizeof(uint64_t));
-            }
-            info.options["pq_vector_coverage_hashes"] =
-                Value::BLOB(const_data_ptr_cast(checksum_blob.data()), checksum_blob.size());
+            info.options["pq_vector_coverage_hashes"] = Value::BLOB(
+                const_data_ptr_cast(pq_vector_coverage_hashes_.data()),
+                pq_vector_coverage_hashes_.size() * sizeof(uint64_t));
         }
+    }
+
+    if (rabitq_requested_) {
+        info.options["quantizer"] = Value("rabitq");
+    }
+    if (rabitq_use_ && rabitq_quantizer_) {
+        // v3 splits fixed arrays and stores codes directly. This avoids the
+        // temporary combined fixed BLOB and the header-prefixed codes BLOB,
+        // halving quantizer-side checkpoint copy overhead for large indexes.
+        info.options["rabitq_version"] = Value::UINTEGER(3);
+        info.options["rabitq_query_rescaling_factor"] =
+            Value::DOUBLE(rabitq_query_rescaling_factor_);
+
+        const size_t random_bytes = rabitq_quantizer_->get_random_matrix_size();
+        const size_t centroid_bytes = HNSW_RABITQ_NUM_CLUSTERS * dimension_ * sizeof(float);
+        const size_t rotated_bytes = HNSW_RABITQ_NUM_CLUSTERS *
+                                     RABITQ_PADDED_DIM(dimension_) * sizeof(float);
+        info.options["rabitq_random"] = Value::BLOB(
+            const_data_ptr_cast(rabitq_quantizer_->get_random_matrix()), random_bytes);
+        info.options["rabitq_centroids"] = Value::BLOB(
+            const_data_ptr_cast(rabitq_quantizer_->get_centroids()), centroid_bytes);
+        info.options["rabitq_rotated"] = Value::BLOB(
+            const_data_ptr_cast(rabitq_quantizer_->get_rotated_centroids()), rotated_bytes);
+        info.options["rabitq_codes"] = Value::BLOB(
+            const_data_ptr_cast(rabitq_codes_.data()), rabitq_codes_.size());
     }
 
     if (compact_mode_) {
@@ -367,6 +390,15 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
 
 IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
     (void)options;
+
+    // DuckDB can reuse an unchanged table's previous checkpoint after an
+    // index-only VACUUM. Bound physical history at the serialization boundary
+    // as well, so both checkpoint and WAL images remain O(live rows) even when
+    // that explicit maintenance state is not selected for the next restart.
+    if (HasExcessHistory()) {
+        IndexLock maintenance_lock;
+        Vacuum(maintenance_lock);
+    }
 
     if (!runtime_ || !runtime_->store.node_alloc_) {
         return ExportStorageInfo();
@@ -390,36 +422,25 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
 IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
     (void)options;
 
+    if (HasExcessHistory()) {
+        IndexLock maintenance_lock;
+        Vacuum(maintenance_lock);
+    }
+
     if (!runtime_ || !runtime_->store.node_alloc_) {
         return ExportStorageInfo();
     }
 
-    // Order matches ART::SerializeToWAL (duckdb/execution/index/art/art.cpp:1064):
-    // InitSerializationToWAL must run BEFORE GetInfo, because it sets each
-    // buffer's allocation_size and populates the serialization state that
-    // GetInfo() then reads. The returned IndexBufferInfo vectors MUST be
-    // placed into info.buffers, otherwise the WAL writes empty buffer data
-    // and reload populates the allocator's buffers map with INVALID_BLOCK
-    // block_pointers — first FixedSizeAllocator::Get() then SIGSEGVs in
-    // LoadFromDisk() because the BlockHandle points to no real block.
-    //
-    // Repro (m != 16 because m=16 happens to round to a buffer layout where
-    // the WAL replay path stumbles into a valid block by accident): 100 rows
-    // FLOAT[4] m=8 → CHECKPOINT → reopen → ANN query → SIGSEGV.
     IndexStorageInfo info(name);
-
+    info.root = 0;
     info.buffers.push_back(runtime_->store.node_alloc_->InitSerializationToWAL());
     info.buffers.push_back(runtime_->store.vector_alloc_->InitSerializationToWAL());
     info.buffers.push_back(runtime_->store.upper_alloc_->InitSerializationToWAL());
-
-    // Reuse ExportStorageInfo for the metadata (allocator_infos + options),
-    // but copy fields manually since IndexStorageInfo has a deleted copy ctor.
     auto src = ExportStorageInfo();
     for (auto &ainfo : src.allocator_infos) {
         info.allocator_infos.push_back(std::move(ainfo));
     }
     info.options = std::move(src.options);
-
     return info;
 }
 

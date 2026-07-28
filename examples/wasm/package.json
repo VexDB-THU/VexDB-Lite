@@ -1,0 +1,10 @@
+{
+  "name": "vexdb-lite-wasm-demo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bash build.sh",
+    "test": "node tests/smoke.mjs && node tests/image-smoke.mjs && node tests/scope-isolation-smoke.mjs && node tests/standalone-smoke.mjs",
+    "serve": "node serve.mjs"
+  }
+}

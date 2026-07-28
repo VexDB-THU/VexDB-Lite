@@ -6,13 +6,7 @@
 #define QUANTIZER_H
 
 #include "postgres.h"
-
-enum class QuantizerType : uint8 {
-	NONE = 0,
-	PQ,
-	RABITQ
-	/* others... */
-};
+#include "quantizer_type.h"
 inline const char *quantizer_name(QuantizerType qt)
 {
     if (qt == QuantizerType::PQ) {
@@ -39,7 +33,7 @@ struct PQMetaInfo {
 
 struct RaBitQMeta {
     bool enabled; /* RaBitQ is enabled for current index */
-    bool keep_vecs; /* unused now */
+    uint8 storage_version; /* code/fixed-data layout; unsupported versions require REINDEX */
     int quant_size; /* cid_size + bin_size + ext_size */
     double query_rescaling_factor; /* pre-computed factor for query only */
     void init(uint32 dim);
@@ -72,6 +66,11 @@ struct QuantizerMetaInfo {
         if (quantizer_type == QuantizerType::PQ) {
             return get_pq_metainfo().graph_pq ? QuantizerType::PQ : QuantizerType::NONE;
         } else if (quantizer_type == QuantizerType::RABITQ) {
+            if (get_rabitq_meta().enabled && get_rabitq_meta().storage_version != 2) {
+                ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                    errmsg("unsupported RaBitQ index format version %u; REINDEX required",
+                        (unsigned)get_rabitq_meta().storage_version)));
+            }
             return get_rabitq_meta().enabled ? QuantizerType::RABITQ : QuantizerType::NONE;
         } else {
             return QuantizerType::NONE;

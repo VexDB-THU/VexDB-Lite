@@ -21,7 +21,9 @@ if(CCACHE_PROGRAM)
     set(CMAKE_C_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
 endif()
 
-find_package(Threads REQUIRED)
+if(NOT EMSCRIPTEN)
+    find_package(Threads REQUIRED)
+endif()
 
 # macOS：默认对齐真实硬件架构。两个坑：① anaconda clang 默认 target 是 x86_64；
 # ② 在 Rosetta(x86_64) 进程里 `uname -m` 会谎报 x86_64。都会编出与系统 arm64
@@ -81,6 +83,15 @@ endif()
 set(VEXDB_DISTANCE_SRCS
     ${REPO_ROOT}/common/distance/src/architecture.cpp
     ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/pq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/rabitq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/vector_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/pq_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/annkmeans.cpp
+    ${REPO_ROOT}/common/quantizer/product_quantizer.cpp
+    ${REPO_ROOT}/common/rabitq/rabitq.cpp
+    ${REPO_ROOT}/common/rabitq/estimator.cpp
+    ${REPO_ROOT}/common/rabitq/rotator.cpp
     src/distance/general.cpp
 )
 if(_VEX_TARGET_ARCH MATCHES "x86_64|amd64|AMD64")
@@ -191,7 +202,7 @@ endif()
 # ---- 形态 1：loadable 扩展（.so/.dylib），不链 sqlite3，运行时用宿主 API ----
 # iOS 禁运行时加载（系统 libsqlite3 关 load_extension + App Store 动态代码限制），
 # 不产此形态；Android 保留（requery 等自带 SQLite 的宿主支持 load_extension）。
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS" AND NOT EMSCRIPTEN)
     add_library(vexdb_lite_loadable SHARED ${VEXDB_SQLITE_SRCS})
     target_include_directories(vexdb_lite_loadable PRIVATE ${VEXDB_SQLITE_INCLUDES})
     set_target_properties(vexdb_lite_loadable PROPERTIES OUTPUT_NAME "vexdb_lite" PREFIX "")
@@ -227,5 +238,12 @@ if(VEXDB_SQLITE_BUILD_TESTS)
     target_include_directories(m3p_parallel_smoke PRIVATE ${VEXDB_SQLITE_INCLUDES})
     target_compile_definitions(m3p_parallel_smoke PRIVATE VEXDB_SQLITE_CORE=1)
     target_link_libraries(m3p_parallel_smoke PRIVATE
+        vexdb_lite_static sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
+
+    # RaBitQ 必须拿到当前 CPU 的 SIMD 内核，不能因 switch 穿透退回 general。
+    add_executable(simd_dispatch_smoke test/simd_dispatch_smoke.cpp)
+    target_include_directories(simd_dispatch_smoke PRIVATE ${VEXDB_SQLITE_INCLUDES})
+    target_compile_definitions(simd_dispatch_smoke PRIVATE VEXDB_SQLITE_CORE=1)
+    target_link_libraries(simd_dispatch_smoke PRIVATE
         vexdb_lite_static sqlite3_amalg Threads::Threads ${CMAKE_DL_LIBS})
 endif()

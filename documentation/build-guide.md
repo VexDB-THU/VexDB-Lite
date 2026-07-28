@@ -81,6 +81,8 @@ PG_SHARE=$(pg_config --sharedir)/extension
 sudo cp build/pg/vexdb_lite.so ${PG_PKGLIB}/
 sudo cp vexdb_pg/vexdb_lite.control ${PG_SHARE}/
 sudo cp vexdb_pg/sql/vexdb_lite--1.0.sql ${PG_SHARE}/
+sudo cp vexdb_pg/sql/vexdb_lite--1.0.sql ${PG_SHARE}/vexdb_lite--1.1.sql
+sudo cp vexdb_pg/sql/vexdb_lite--1.0--1.1.sql ${PG_SHARE}/
 ```
 
 ### 在 PostgreSQL 中启用
@@ -213,7 +215,9 @@ bash scripts/release.sh package
 | `vexdb_lite.so` | PG 插件（stripped，含 `.gnu_debuglink`） |
 | `vexdb_lite.so.debug` | PG 插件的独立 debug symbols（split-debug） |
 | `vexdb_lite.control` | PG 控制文件 |
-| `vexdb_lite--1.0.sql` | PG 安装 SQL |
+| `vexdb_lite--1.0.sql` | PG 1.0 安装 SQL |
+| `vexdb_lite--1.1.sql` | PG 1.1 安装 SQL（默认版本） |
+| `vexdb_lite--1.0--1.1.sql` | PG 1.0 到 1.1 升级 SQL |
 
 打包后的 Release tarballs（`dist/release/`）：
 

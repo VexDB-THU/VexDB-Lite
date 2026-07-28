@@ -172,6 +172,8 @@ set(DISTANCE_SRCS
     ${REPO_ROOT}/common/distance/src/architecture.cpp
     ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
     ${REPO_ROOT}/common/distance/src/pq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/rabitq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/vector_alloc.cpp
     src/distance/distance.cpp
     src/distance/general.cpp
 )
@@ -179,6 +181,10 @@ set(DISTANCE_SRCS
 set(QUANTIZER_SRCS
     ${REPO_ROOT}/common/quantizer/annkmeans.cpp
     ${REPO_ROOT}/common/quantizer/pq_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/product_quantizer.cpp
+    ${REPO_ROOT}/common/rabitq/rabitq.cpp
+    ${REPO_ROOT}/common/rabitq/estimator.cpp
+    ${REPO_ROOT}/common/rabitq/rotator.cpp
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
@@ -213,4 +219,8 @@ endif()
 
 install(TARGETS vexdb_lite LIBRARY DESTINATION "${PG_PKGLIB_DIR}")
 install(FILES sql/vexdb_lite--1.0.sql DESTINATION "${PG_SHARE_DIR}/extension")
+install(FILES sql/vexdb_lite--1.0.sql
+        DESTINATION "${PG_SHARE_DIR}/extension"
+        RENAME vexdb_lite--1.1.sql)
+install(FILES sql/vexdb_lite--1.0--1.1.sql DESTINATION "${PG_SHARE_DIR}/extension")
 install(FILES vexdb_lite.control DESTINATION "${PG_SHARE_DIR}/extension")

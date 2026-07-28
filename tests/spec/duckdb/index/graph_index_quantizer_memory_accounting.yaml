@@ -1,0 +1,39 @@
+name: duckdb_graph_index_quantizer_memory_accounting
+tags: [duckdb-only, pq, compact, memory, regression]
+engines: [duckdb]
+description: memory_bytes includes the raw-vector mirror and compact PQ reports less memory than full mode.
+steps:
+  - statement: CREATE TABLE mem_vecs (id INTEGER, vec FLOAT[32]);
+  - statement: |
+      INSERT INTO mem_vecs
+      SELECT i, array_value(
+        i::FLOAT, (i+1)::FLOAT, (i+2)::FLOAT, (i+3)::FLOAT,
+        (i+4)::FLOAT, (i+5)::FLOAT, (i+6)::FLOAT, (i+7)::FLOAT,
+        (i+8)::FLOAT, (i+9)::FLOAT, (i+10)::FLOAT, (i+11)::FLOAT,
+        (i+12)::FLOAT, (i+13)::FLOAT, (i+14)::FLOAT, (i+15)::FLOAT,
+        (i+16)::FLOAT, (i+17)::FLOAT, (i+18)::FLOAT, (i+19)::FLOAT,
+        (i+20)::FLOAT, (i+21)::FLOAT, (i+22)::FLOAT, (i+23)::FLOAT,
+        (i+24)::FLOAT, (i+25)::FLOAT, (i+26)::FLOAT, (i+27)::FLOAT,
+        (i+28)::FLOAT, (i+29)::FLOAT, (i+30)::FLOAT, (i+31)::FLOAT)
+      FROM range(1024) t(i);
+  - statement: |
+      CREATE INDEX mem_full ON mem_vecs USING GRAPH_INDEX (vec)
+      WITH (metric='l2', quantizer='pq', pq_m=16, memory_mode='full',
+            m=16, ef_construction=100);
+  - statement: |
+      CREATE TEMP TABLE full_memory AS
+      SELECT memory_bytes FROM vexdb_index_info() WHERE index_name='mem_full';
+  - statement: DROP INDEX mem_full;
+  - statement: |
+      CREATE INDEX mem_compact ON mem_vecs USING GRAPH_INDEX (vec)
+      WITH (metric='l2', quantizer='pq', pq_m=16, memory_mode='compact',
+            m=16, ef_construction=100);
+  - query: |-
+      SELECT (f.memory_bytes > c.memory_bytes)::INTEGER,
+             ((f.memory_bytes - c.memory_bytes) >= 1024 * 32 * 4)::INTEGER
+      FROM full_memory f,
+           (SELECT memory_bytes FROM vexdb_index_info()
+            WHERE index_name='mem_compact') c
+    expect:
+      - [1, 1]
+  - statement: DROP TABLE mem_vecs;

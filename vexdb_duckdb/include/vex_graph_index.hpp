@@ -7,7 +7,10 @@
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
 #include "quantizer/product_quantizer.h"
+#include "rabitq/rabitq.h"
 
+#include <atomic>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
@@ -53,19 +56,20 @@ public:
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
                idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false,
-               int build_threads = 1);
+               int build_threads = 1, bool rabitq_requested = false);
+    ~GraphIndex() override;
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
-    // Brute-force scan over PQ codes using a precomputed distance table. Skips
-    // the HNSW graph entirely; result is approximate but the per-row cost is
-    // an M-byte lookup vs a dim-float dot product, so this is faster than a
-    // raw seq_scan for indexes that fit in memory.
+    // PQ ADC search over the shared graph topology. The graph keeps query cost
+    // bounded by ef instead of scanning every code as the table grows.
     // refine_factor > 1.0 takes top k*factor by PQ distance then re-ranks via
     // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
-    void SearchPQ(const float *query_vec, idx_t k, std::vector<row_t> &row_ids,
+    void SearchPQ(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                   std::vector<float> &distances, double refine_factor = 1.0) const;
+    void SearchRaBitQ(const float *query_vec, idx_t k, int ef,
+                      std::vector<row_t> &row_ids, std::vector<float> &distances) const;
 
     idx_t GetDimension() const {
         return dimension_;
@@ -86,20 +90,33 @@ public:
     bool HasVectorCoverageChecksum() const;
     bool UsesPQCoverageChecksum() const;
     uint64_t HashPQVectorForCoverage(row_t row_id, const float *vec) const;
-    bool HasRowIdCoverageCheck() const { return rowid_coverage_checked_; }
-    bool IsRowIdCoverageStale() const { return rowid_coverage_stale_; }
+    bool UsesRaBitQCoverageChecksum() const;
+    uint64_t HashRaBitQVectorForCoverage(row_t row_id, const float *vec) const;
+    bool HasRowIdCoverageCheck() const {
+        return rowid_coverage_checked_.load(std::memory_order_acquire);
+    }
+    bool IsRowIdCoverageStale() const {
+        return rowid_coverage_stale_.load(std::memory_order_acquire);
+    }
     void MarkRowIdCoverageChecked(bool stale) {
-        rowid_coverage_checked_ = true;
-        rowid_coverage_stale_ = stale;
+        // Publish the result before the checked bit. Optimizer threads may read
+        // this without graph_rwlock_, so the opposite order can expose a stale
+        // checked=true / stale=false pair during concurrent mutation.
+        rowid_coverage_stale_.store(stale, std::memory_order_relaxed);
+        rowid_coverage_checked_.store(true, std::memory_order_release);
     }
     // HNSW entry-point level (top layer). -1 when the index has no nodes.
     int GetMaxLevel() const;
     bool UsesPQ() const { return pq_use_; }
+    bool UsesRaBitQ() const;
+    const char *GetQuantizerName() const;
     uint32_t GetPQM() const { return pq_use_ ? static_cast<uint32_t>(pq_quantizer_.M) : 0u; }
     idx_t GetPQCodesBytes() const { return pq_codes_.size(); }
     idx_t GetPQCodebookBytes() const {
         return pq_use_ ? pq_quantizer_.get_centroids_size() * sizeof(float) : 0u;
     }
+    idx_t GetRaBitQCodesBytes() const;
+    idx_t GetRaBitQFixedBytes() const;
     bool IsCompactMode() const { return compact_mode_; }
 
 public:
@@ -140,6 +157,7 @@ private:
     void DeserializeFromStorage(const IndexStorageInfo &info);
     void DeserializePQAndModeFromStorage(const IndexStorageInfo &info);
     void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
+    void TrainAndEncodeRaBitQ();
 
     idx_t dimension_;
     int m_;
@@ -165,28 +183,58 @@ private:
 
     // Product Quantization state. pq_m_ = 0 / pq_use_ = false means PQ disabled.
     // Once Train() runs (after BuildBulk completes), pq_quantizer_.trained = true
-    // and pq_codes_ holds m bytes per row, indexed by row_id sort order so reload
-    // can restore the alignment.
+    // and pq_codes_ holds m bytes per row. Graph search addresses nodes by
+    // internal id, so pq_node_code_positions_ maps nodes to code slots.
     uint32_t pq_m_ = 0;
     bool pq_use_ = false;
     ::vex::quantizer::ProductQuantizer pq_quantizer_;
     std::vector<uint8_t> pq_codes_;
     std::vector<row_t> pq_row_id_order_;
     std::vector<uint64_t> pq_vector_coverage_hashes_;
+    std::vector<uint32_t> pq_node_code_positions_;
+    // pq_row_id_order_ is append-only so persisted indexes remain compatible.
+    // UPDATE/reinsert can therefore leave historical code slots for the same
+    // physical row_id. Only the newest slot is live; older slots remain useful
+    // to historical graph nodes as navigation anchors but must never be emitted.
+    std::unordered_map<row_t, uint32_t> pq_latest_code_positions_;
 
-    // memory_mode='compact' (PQ-only). After BuildBulk + TrainAndEncodePQ
-    // releases the raw vector tier, SearchANN refuses to run and post-build
-    // INSERTs encode into pq_codes_ without traversing the (now-broken) HNSW
-    // graph. Persisted across CommitDrop / Vacuum / Reload.
+    // RaBitQ shares the graph topology with the raw-vector index, but replaces
+    // distance reads during search with compact codes aligned by internal node
+    // id. Training and estimation live in common/rabitq; this class only adapts
+    // DuckDB build, persistence and row-id filtering.
+    bool rabitq_requested_ = false;
+    bool rabitq_use_ = false;
+    std::unique_ptr<::rabitq::RaBitQuantizer> rabitq_quantizer_;
+    double rabitq_query_rescaling_factor_ = 0.0;
+    std::vector<uint8_t> rabitq_codes_;
+
+    // memory_mode='compact' releases only the index-side raw-vector mirror; the
+    // table column remains unchanged. PQ searches its code array, while RaBitQ
+    // keeps using the graph through a code-aware store. Post-build RaBitQ INSERTs
+    // are encoded before graph insertion. Persisted across CommitDrop / Vacuum /
+    // Reload.
     bool compact_mode_ = false;
 
-    // Lazy row_id → store_id index used by SearchPQ refine. Built on first
-    // refine query, invalidated on Append / Delete / CommitDrop.
-    mutable std::unordered_map<row_t, uint32_t> pq_refine_rid_map_;
-    mutable bool pq_refine_rid_map_dirty_ = true;
+    // Eager row_id → graph node map, rebuilt once after bulk load/recovery and
+    // maintained by every incremental insert. UPDATE is DELETE+INSERT in
+    // DuckDB; keeping this map avoids scanning every graph node to retire the
+    // previous row version. Duplicate-node history only exists in indexes
+    // written by older builds, so it is isolated in the sparse side map.
+    std::unordered_map<row_t, uint32_t> rowid_node_map_;
+    std::unordered_map<row_t, std::vector<uint32_t>> duplicate_rowid_nodes_;
 
-    bool rowid_coverage_checked_ = false;
-    bool rowid_coverage_stale_ = false;
+    void RebuildPQNodeCodePositions();
+    void RebuildPQLatestCodePositions();
+    void RebuildRowIdNodeMap();
+    void RecordRowIdNode(row_t row_id, uint32_t node_id);
+    bool IsLatestPQCodePosition(idx_t position) const;
+    void RetireDeletedRowVersion(row_t row_id);
+    // Checkpoint/WAL snapshots invoke maintenance once physical history grows
+    // beyond 2x the live row set. Explicit VACUUM remains the exact compactor.
+    bool HasExcessHistory() const;
+
+    std::atomic<bool> rowid_coverage_checked_{false};
+    std::atomic<bool> rowid_coverage_stale_{false};
 
     // Free the raw vector tier and clear the in-memory copy. Idempotent.
     void ReleaseRawVectors();

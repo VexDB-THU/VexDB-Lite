@@ -124,10 +124,24 @@ static void graph_index_inspect(Relation index, IndexInspectResult &res)
     res.append_attr("Setting Quantizer");
     QuantizerType sqt = metap->quantizer_metainfo.get_setting_type();
     res.fill_content(quantizer_name(sqt));
-    
+
+    QuantizerType working_qt = metap->quantizer_metainfo.get_type();
+    const bool compact_mode = graph_index_get_compact_mode(index) &&
+        working_qt != QuantizerType::NONE;
+    res.append_attr("Memory Mode");
+    res.fill_content(compact_mode ? "compact" : "full");
+    res.append_attr("Vector Storage");
+    if (working_qt == QuantizerType::PQ) {
+        res.fill_content("PQ Code");
+    } else if (working_qt == QuantizerType::RABITQ) {
+        res.fill_content("RaBitQ Code");
+    } else {
+        res.fill_content("Raw Vector");
+    }
+
     if (sqt != QuantizerType::NONE) {
         res.append_attr("Working Quantizer");
-        res.fill_content(quantizer_name(metap->quantizer_metainfo.get_type()));
+        res.fill_content(quantizer_name(working_qt));
         res.append_attr("Number of Data Waiting for Quantizer Update");
         res.fill_content("%lu", metap->quantizer_metainfo.num_new_data);
     }
@@ -156,10 +170,12 @@ Datum index_inspect(PG_FUNCTION_ARGS)
         
         index_close(index, AccessShareLock);
         
-        TupleDesc tupdesc = CreateTemplateTupleDesc(2);
-        TupleDescInitEntry(tupdesc, (AttrNumber)1, "attribute", TEXTOID, -1, 0);
-        TupleDescInitEntry(tupdesc, (AttrNumber)2, "content", TEXTOID, -1, 0);
-        TupleDescFinalize(tupdesc);
+        TupleDesc tupdesc;
+        if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE) {
+            ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                errmsg("index_inspect() must be called in a context that "
+                       "expects a record type")));
+        }
         funcctx->tuple_desc = BlessTupleDesc(tupdesc);
         funcctx->max_calls = res->nattr;
         funcctx->user_fctx = res;

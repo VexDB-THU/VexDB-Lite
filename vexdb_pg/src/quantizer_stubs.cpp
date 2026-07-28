@@ -5,11 +5,34 @@
 #include "rabitq/estimator.h"
 #include "pq.h"
 
+#include <algorithm>
+#include <cstdint>
+
+namespace {
+
+uint64_t NextReservoirRandom(uint64_t &state)
+{
+    // SplitMix64: deterministic across PG versions and platforms, with no
+    // dependency on backend-global PRNG state.
+    state += UINT64_C(0x9E3779B97F4A7C15);
+    uint64_t z = state;
+    z = (z ^ (z >> 30)) * UINT64_C(0xBF58476D1CE4E5B9);
+    z = (z ^ (z >> 27)) * UINT64_C(0x94D049BB133111EB);
+    return z ^ (z >> 31);
+}
+
+uint64_t ReservoirIndex(uint64_t &state, uint64_t upper_bound)
+{
+    return upper_bound == 0 ? 0 : NextReservoirRandom(state) % upper_bound;
+}
+
+} // namespace
+
 QuantizerType extract_qt(const char *qt_type)
 {
     if (qt_type == nullptr) return QuantizerType::NONE;
-    if (strcmp(qt_type, "pq") == 0)     return QuantizerType::PQ;
-    if (strcmp(qt_type, "rabitq") == 0) return QuantizerType::RABITQ;
+    if (pg_strcasecmp(qt_type, "pq") == 0)     return QuantizerType::PQ;
+    if (pg_strcasecmp(qt_type, "rabitq") == 0) return QuantizerType::RABITQ;
     return QuantizerType::NONE;
 }
 
@@ -64,12 +87,16 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     int dimensions, int sample_nums, bool need_norm, DistPrecisionType dist_type)
 {
     (void)dist_type;
-    (void)need_norm;
     if (heap == NULL || samples == NULL) return;
 
-    // Sequential scan, take first sample_nums non-null vectors. Not random
-    // sampling — fine for codebook training when the table is in roughly
-    // arbitrary insertion order. Random sampling can land here later.
+    ann_helper::vector_preprocess_func norm_func = need_norm
+        ? ann_helper::get_vector_preprocess_func(Metric::FAST_COSINE,
+              DistPrecisionType::FLOAT, dimensions)
+        : nullptr;
+
+    // One-pass reservoir sampling keeps memory bounded and gives every valid
+    // row the same chance even when the heap is ordered by time, tenant or
+    // cluster. A fixed seed keeps CREATE INDEX output reproducible.
     samples->length = 0;
     Snapshot snap = GetActiveSnapshot();
 #if PG_VERSION_NUM >= 190000
@@ -89,23 +116,57 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     Datum values[INDEX_MAX_KEYS];
     bool isnull[INDEX_MAX_KEYS];
 
-    int collected = 0;
-    while (collected < sample_nums &&
-           table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+    uint64_t seen = 0;
+    uint64_t scanned = 0;
+    // Do not mix the relation OID into the seed. The same ordered data should
+    // train the same codebook after dump/restore or in a freshly created test
+    // database, where OIDs are expected to differ.
+    uint64_t random_state = UINT64_C(0x6A09E667F3BCC909) ^
+                            (uint64_t)sample_nums ^ (uint64_t)dimensions;
+    while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
+        scanned++;
         econtext->ecxt_scantuple = slot;
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
-        if (isnull[0]) continue;
-        FloatVector *fv = DatumGetFloatVector(values[0]);
-        if (fv->dim != dimensions) continue;
-        std::memcpy(FloatVectorArrayGet(samples, collected), fv->x,
-                    sizeof(float) * dimensions);
-        collected++;
-        samples->length = collected;
+        if (!isnull[0]) {
+            FloatVector *fv = DatumGetFloatVector(values[0]);
+            if (fv->dim == dimensions) {
+                uint64_t sample_index;
+                if (seen < (uint64_t)sample_nums) {
+                    sample_index = seen;
+                } else {
+                    sample_index = ReservoirIndex(random_state, seen + 1);
+                }
+                if (sample_index < (uint64_t)sample_nums) {
+                    float *sample = FloatVectorArrayGet(samples, (int)sample_index);
+                    std::memcpy(sample, fv->x, sizeof(float) * dimensions);
+                    if (norm_func != nullptr) {
+                        norm_func(sample, dimensions, sample);
+                    }
+                }
+                seen++;
+            }
+        }
         ResetExprContext(econtext);
+        if ((scanned & UINT64_C(0xFFF)) == 0) {
+            CHECK_FOR_INTERRUPTS();
+        }
     }
+    samples->length = (int)std::min<uint64_t>(seen, (uint64_t)sample_nums);
     FreeExecutorState(estate);
     ExecDropSingleTupleTableSlot(slot);
     table_endscan(scan);
+}
+
+void RaBitQMeta::init(uint32 dim)
+{
+    enabled = false;
+    storage_version = 2;
+    size_t padded_dim = RABITQ_PADDED_DIM(dim);
+    size_t cid_size = rabitq::kCodeHeaderSize;
+    size_t bin_size = RABITQ_BIN_DATA_SIZE(padded_dim);
+    size_t ext_size = RABITQ_EXT_DATA_SIZE(padded_dim);
+    quant_size = cid_size + bin_size + ext_size;
+    query_rescaling_factor = rabitq::get_const_scaling_factors(padded_dim, 3);
 }
 
 namespace ann_helper {
@@ -142,31 +203,6 @@ void QuantizerMetaInfo::init(QuantizerType qt_type, uint32 dimension, uint32 req
         pq_set_param(dimension, metainfo.pq_metainfo.m, metainfo.pq_metainfo.k,
                      requested_pq_m);
     } else if (qt_type == QuantizerType::RABITQ) {
-        metainfo.rbq_meta.enabled               = false;
-        metainfo.rbq_meta.keep_vecs             = false;
-        metainfo.rbq_meta.quant_size            = 0;
-        metainfo.rbq_meta.query_rescaling_factor = 0.0;
+        metainfo.rbq_meta.init(dimension);
     }
-}
-
-namespace rabitq {
-
-int RaBitQuantizer::quantize(float *, char *, char *)
-{
-    return 0;
-}
-
-void RaBitQuantizer::train()
-{
-}
-
-float RaBitQEstimator::get_full_dist(int, char*, char*)
-{
-    return 0.0f;
-}
-
-void RaBitQEstimator::get_full_dist(int, char*, char*, EstimateRecord&)
-{
-}
-
 }

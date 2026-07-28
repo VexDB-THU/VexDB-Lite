@@ -5,16 +5,19 @@
 > 完整计划：`docs/plans/2026-06-10_sqlite-adapter-v1-plan.md`
 > 范围调研：`docs/research/2026-06-10_sqlite-v1-scope-reinvestigation.md`
 
-## 当前进度：M0 骨架 ✅ → M1 距离层 ✅ → M2 虚拟表+暴力 KNN ✅
+## 当前进度：M0～M4 ✅，PQ / RaBitQ 已接入共享图算法
 
 ```sql
 .load ./vexdb_lite              -- 桌面；移动端走静态注册
 
 SELECT vexdb_l2_distance('[1,2,3]', '[4,5,6]');      -- 4 个距离函数 + vexdb_f32/vector_to_json
 
-CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(embedding FLOAT[128], metric=cosine, m=16);
+CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(
+    embedding FLOAT[128], metric=cosine,
+    quantizer=pq, pq_m=32, memory_mode=compact, m=16
+);
 INSERT INTO idx(rowid, embedding) VALUES (1, :blob_or_json);
-SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;  -- 暴力 KNN（M3 切 HNSW）
+SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;
 ```
 
 | 里程碑 | 验证 | 状态 |
@@ -24,9 +27,26 @@ SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;  -- 暴
 | M2 虚拟表（shadow table 持久化 + 暴力 KNN） | `m2_vtab_smoke`（KNN 正确性/事务回滚/关库重开/错误路径） | ✅ arm64 + x86_64 |
 | M3 HNSW（共享算法 × SQLite store，>64 行走图，`%_graph` blob 持久化） | `m3_hnsw_smoke`（recall@10=1.000、增量、重开 blob 还原、DELETE/ROLLBACK） | ✅ arm64 + x86_64 |
 | M3+ 并行建图（rebuild 预读后多线程，publish fence，TSan 零 race） | `m3p_parallel_smoke`（N=40000、8 线程 ×3 轮 recall==串行 baseline） | ✅ |
-| M4 spec 落地 / M5 桌面发版 | — | 下一步 |
+| M4 spec 落地 | SQLite spec 31 passed / 0 failed | ✅ |
+| PQ（共享训练、编码、ADC、SIMD） | full/compact、L2/cosine/IP、精确重排、增量和重启 | ✅ macOS arm64 |
+| RaBitQ（共享量化器、图遍历、持久化） | L2/cosine/IP recall@10 均为 1.000 | ✅ macOS arm64 |
+| M5 桌面发版 | — | 下一步 |
 
 距离语义三 metric 统一 **lower = closer**（L2=sqrt、cosine=1-sim、ip=负内积），`ORDER BY distance ASC` 即最近优先。跨 ISA（NEON/SSE）允许 ~1e-6 级 float32 重排序分歧。
+
+`quantizer=pq, pq_m=N` 开启 PQ，`quantizer=rabitq` 开启 RaBitQ，`quantizer=none` 关闭量化。PQ 的 K-means、编码、ADC 距离和 SIMD 分发直接复用 `common/`，SQLite 只实现虚拟表、事务、缓存和持久化适配。PQ 查询按 `ef_search × 1.25` 保留候选，再从 `%_vectors` 读取业务向量做精确重排；full 和 compact 使用同一搜索逻辑。
+
+训练固定数据和每个节点的 code 会写入 `%_graph` shadow table，关库重开后直接恢复。设置 `memory_mode=compact` 后，`%_vectors` 中的业务向量仍保留，但索引 blob 不再写原始向量镜像；PQ / RaBitQ 的搜索、增量写入和重开都使用 code-aware 图路径。compact 未指定量化器时自动选择 PQ；显式 `quantizer=none` 会报错。
+
+本地 Release 性能与召回 eval：
+
+```bash
+cmake -S vexdb_sqlite -B vexdb_sqlite/build-perf \
+  -DCMAKE_BUILD_TYPE=Release -DVEXDB_SQLITE_BUILD_TESTS=OFF
+cmake --build vexdb_sqlite/build-perf -j4
+python3 vexdb_sqlite/test/quantizer_benchmark.py \
+  vexdb_sqlite/build-perf/vexdb_lite.dylib --check
+```
 
 ## 双形态分发（架构前置决策）
 

@@ -1,0 +1,129 @@
+name: graph_index_rabitq_mutation_eval
+tags: [pg-only, eval, rabitq, dml, active-quantizer]
+engines: [pg]
+description: |
+  RaBitQ 增量写入 eval。索引真实激活后批量 INSERT 16 条同分布向量，要求
+  自查询 Top-1 至少命中 12 条；再批量 UPDATE 到另一组位置，要求全部命中；
+  删除一半后，旧查询不能再返回已删除 row id，保留行仍需全部命中。
+steps:
+  - statement: SET maintenance_work_mem = '512MB';
+  - statement: SET vexdb.ef_search = 200;
+  - statement: DROP TABLE IF EXISTS rbq_mutation_eval CASCADE;
+  - statement: DROP FUNCTION IF EXISTS __rbq_mutation_vec32(int, float8);
+  - statement: DROP FUNCTION IF EXISTS __rbq_mutation_plan_uses_index(text, text);
+  - statement: |
+      CREATE FUNCTION __rbq_mutation_vec32(i int, phase float8) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin((i + phase) * 0.013 + j * 0.17) +
+           cos((i + phase) * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 31) AS j
+      $$;
+  - statement: |
+      CREATE FUNCTION __rbq_mutation_plan_uses_index(sql_text text, index_name text)
+      RETURNS boolean LANGUAGE plpgsql AS $$
+      DECLARE plan_line text;
+      BEGIN
+        FOR plan_line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || sql_text LOOP
+          IF plan_line LIKE '%' || index_name || '%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END
+      $$;
+  - statement: CREATE TABLE rbq_mutation_eval (id int PRIMARY KEY, vec floatvector(32));
+  - statement: |
+      INSERT INTO rbq_mutation_eval
+      SELECT i, __rbq_mutation_vec32(i, 0.0)
+      FROM generate_series(1, 12000) AS i;
+  - statement: |
+      CREATE INDEX rbq_mutation_eval_idx
+      ON rbq_mutation_eval USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=rabitq, m=16, ef_construction=100, parallel_workers=4);
+  - query: |
+      SELECT content::text FROM index_inspect('rbq_mutation_eval_idx')
+      WHERE attribute = 'Working Quantizer';
+    expect: [[RaBitQ]]
+
+  # Batch INSERT: use in-distribution points not present during training.
+  - statement: |
+      INSERT INTO rbq_mutation_eval
+      SELECT 20000 + i, __rbq_mutation_vec32(6000 + i, 0.37)
+      FROM generate_series(1, 16) AS i;
+  - statement: CREATE TABLE rbq_insert_queries AS SELECT id, vec FROM rbq_mutation_eval WHERE id BETWEEN 20001 AND 20016;
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT __rbq_mutation_plan_uses_index(
+        $$SELECT id FROM rbq_mutation_eval
+          ORDER BY vec <-> __rbq_mutation_vec32(6001, 0.37) LIMIT 1$$,
+        'rbq_mutation_eval_idx');
+    expect: [["t"]]
+  - query: |
+      SELECT CASE WHEN count(*) >= 12 THEN 1 ELSE 0 END
+      FROM rbq_insert_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_mutation_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 1
+      ) ann
+      WHERE ann.id = q.id;
+    expect: [[1]]
+  - statement: SET enable_seqscan = on;
+
+  # Batch UPDATE: index delete+insert path must publish the new codes.
+  - statement: |
+      UPDATE rbq_mutation_eval
+      SET vec = __rbq_mutation_vec32(9000 + id - 20000, 0.73)
+      WHERE id BETWEEN 20001 AND 20016;
+  - statement: CREATE TABLE rbq_update_queries AS SELECT id, vec FROM rbq_mutation_eval WHERE id BETWEEN 20001 AND 20016;
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*)
+      FROM rbq_update_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_mutation_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 1
+      ) ann
+      WHERE ann.id = q.id;
+    expect: [[16]]
+  - statement: SET enable_seqscan = on;
+
+  # DELETE: save old query vectors, then ensure deleted ids never reappear.
+  - statement: CREATE TABLE rbq_deleted_queries AS SELECT id, vec FROM rbq_mutation_eval WHERE id BETWEEN 20001 AND 20016 AND id % 2 = 1;
+  - statement: DELETE FROM rbq_mutation_eval WHERE id BETWEEN 20001 AND 20016 AND id % 2 = 1;
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*)
+      FROM rbq_deleted_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_mutation_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann
+      WHERE ann.id = q.id;
+    expect: [[0]]
+  - query: |
+      SELECT count(*)
+      FROM rbq_update_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_mutation_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 1
+      ) ann
+      WHERE q.id % 2 = 0 AND ann.id = q.id;
+    expect: [[8]]
+  - statement: SET enable_seqscan = on;
+
+  - statement: DROP TABLE rbq_mutation_eval CASCADE;
+  - statement: DROP TABLE rbq_insert_queries;
+  - statement: DROP TABLE rbq_update_queries;
+  - statement: DROP TABLE rbq_deleted_queries;
+  - statement: DROP FUNCTION __rbq_mutation_vec32(int, float8);
+  - statement: DROP FUNCTION __rbq_mutation_plan_uses_index(text, text);

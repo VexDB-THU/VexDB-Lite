@@ -39,6 +39,9 @@ struct VexIndexInfoGlobalState : public GlobalTableFunctionState {
         int64_t pq_codes_bytes;
         int64_t pq_codebook_bytes;
         string memory_mode;
+        string quantizer;
+        int64_t rabitq_codes_bytes;
+        int64_t rabitq_fixed_bytes;
     };
     std::vector<IndexEntry> entries;
     idx_t current_offset = 0;
@@ -77,6 +80,9 @@ static unique_ptr<FunctionData> VexIndexInfoBind(ClientContext &context, TableFu
     add("pq_codes_bytes",   LogicalType::BIGINT);
     add("pq_codebook_bytes",LogicalType::BIGINT);
     add("memory_mode",      LogicalType::VARCHAR);
+    add("quantizer",        LogicalType::VARCHAR);
+    add("rabitq_codes_bytes", LogicalType::BIGINT);
+    add("rabitq_fixed_bytes", LogicalType::BIGINT);
     return make_uniq<VexIndexInfoBindData>();
 }
 
@@ -153,6 +159,9 @@ static unique_ptr<GlobalTableFunctionState> VexIndexInfoInit(ClientContext &cont
                 e.memory_bytes = static_cast<int64_t>(graph_idx.GetInMemorySize(mem_lock));
             }
             e.memory_mode       = graph_idx.IsCompactMode() ? "compact" : "full";
+            e.quantizer         = graph_idx.GetQuantizerName();
+            e.rabitq_codes_bytes = static_cast<int64_t>(graph_idx.GetRaBitQCodesBytes());
+            e.rabitq_fixed_bytes = static_cast<int64_t>(graph_idx.GetRaBitQFixedBytes());
             state->entries.push_back(std::move(e));
             break;
         }
@@ -171,6 +180,7 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
     auto &table_vec  = output.data[2];
     auto &metric_vec = output.data[10];
     auto &mm_vec     = output.data[16];
+    auto &quantizer_vec = output.data[17];
 
     auto name_data            = FlatVector::GetData<string_t>(name_vec);
     auto type_data            = FlatVector::GetData<string_t>(type_vec);
@@ -189,6 +199,9 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
     auto pq_codes_bytes_data  = FlatVector::GetData<int64_t>(output.data[14]);
     auto pq_codebook_bytes_data = FlatVector::GetData<int64_t>(output.data[15]);
     auto mm_data              = FlatVector::GetData<string_t>(mm_vec);
+    auto quantizer_data       = FlatVector::GetData<string_t>(quantizer_vec);
+    auto rabitq_codes_data    = FlatVector::GetData<int64_t>(output.data[18]);
+    auto rabitq_fixed_data    = FlatVector::GetData<int64_t>(output.data[19]);
 
     while (state.current_offset < state.entries.size() && count < max_count) {
         auto &e = state.entries[state.current_offset];
@@ -209,6 +222,9 @@ static void VexIndexInfoExecute(ClientContext &context, TableFunctionInput &data
         pq_codes_bytes_data[count]    = e.pq_codes_bytes;
         pq_codebook_bytes_data[count] = e.pq_codebook_bytes;
         mm_data[count]                = StringVector::AddString(mm_vec, e.memory_mode);
+        quantizer_data[count]         = StringVector::AddString(quantizer_vec, e.quantizer);
+        rabitq_codes_data[count]      = e.rabitq_codes_bytes;
+        rabitq_fixed_data[count]      = e.rabitq_fixed_bytes;
         count++;
         state.current_offset++;
     }

@@ -2,7 +2,7 @@
 
 **[English](README.md)** | **中文**
 
-`VexDB-Lite` 是一个高性能向量检索系统，提供 PostgreSQL（`vexdb_lite` 扩展）和 DuckDB（`vexdb_lite` 扩展）两种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和量化器内核。
+`VexDB-Lite` 是一个高性能向量检索系统，提供 PostgreSQL、DuckDB 和 SQLite 三种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和 PQ/RaBitQ 量化内核。
 
 > DuckDB 扩展详见 [vexdb_duckdb/README.md](vexdb_duckdb/README.md)。  
 > 本根 README 只做项目级综述与构建总览。
@@ -22,8 +22,8 @@
   - `inner_product`（负内积/最大内积检索用 `<~>`）
 - 标量工具：`vector_dims()`、`vector_norm()`、`l2_normalize()`、`vexdb_index_info()`
 - `CREATE INDEX ... USING vexdb_graph`
-- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer` / `pq_m`（PQ）
-- 产品量化 PQ + compact 模式
+- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer`（`pq` / `rabitq`）、`pq_m` 和 `memory_mode`
+- PQ、RaBitQ code-only 存储；`memory_mode='compact'` 强制量化器必须成功激活
 - 优化器生成 Index Scan，执行器走 ANN 索引检索
 - 共享内存向量缓存、并行建索引
 - 运行参数：`vexdb.ef_search`、`vexdb.vec_architecture`
@@ -39,8 +39,8 @@
   - `inner_product`（负内积/最大内积检索用 `<~>`）
 - 标量工具：`vector_dims()`、`l2_normalize()`、`vexdb_version()`、`vexdb_index_info()`
 - `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])`，支持元数据过滤
-- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer` / `pq_m`（PQ）
-- 产品量化 PQ + compact 模式（百亿级内存优化）
+- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer`（`pq` / `rabitq`）和 `pq_m`
+- PQ 和 RaBitQ 都支持 `memory_mode='compact'`；RaBitQ 在 compact 下仍走量化 code 图遍历
 - 优化器生成 `VEXDB_INDEX_SCAN`
 - 向量缓存、并行建索引
 - 运行参数：`vexdb_ef_search`、`vexdb_brute_force_threshold`、`vexdb_pq_search_mode`、`vexdb_pq_refine_k_factor`
@@ -61,7 +61,7 @@
 | 数据类型 | halfvector | 半精度 float16 向量类型 | ✅ | 🟡 | ✅ |
 | 数据类型 | int8vector | int8 向量类型 | ❌ | 🟡 | ✅ |
 | 量化 | PQ 量化 | 向量压缩比最大，QPS 与原始向量相近 | ❌ | 🟡 | ✅ |
-| 量化 | RaBitQ 量化 | 向量压缩比中等，QPS 优于原始向量 | ❌ | 🟡 | ✅ |
+| 量化 | RaBitQ 量化 | 量化距离参与图遍历，索引只保存 code | ❌ | ✅ | ✅ |
 | 量化 | 量化自动开启 | 后台自动开启量化，支持空表建量化索引 | ❌ | ❌ | ✅ |
 | 图索引增强 | 图索引异步插入 | 多写少读场景下快速入库 | ❌ | ❌ | ✅ |
 | 图索引增强 | 图挂桶功能 | 小规格机器承载大规模向量检索 | ❌ | ❌ | ✅ |
@@ -76,7 +76,7 @@
 | 索引 | 图索引 | VSS：HNSW；VexDB：graph_index（自研融合图索引） | ✅ | ✅ |
 | 距离计算 | SIMD 分发 | 内联距离计算函数，编译时优化 | ❌ | ✅ |
 | 量化 | PQ 量化 | 内存受限场景下的向量压缩 | ❌ | ✅ |
-| 量化 | RaBitQ 量化 | 内存受限场景下的向量压缩 | ❌ | 🟡 |
+| 量化 | RaBitQ 量化 | 共享量化图遍历，支持不保留索引侧原始向量镜像的 compact 模式 | ❌ | ✅ |
 | 缓存 | 缓存管理 | 磁盘到内存向量缓存 | ❌ | ✅ |
 | 运维 | 索引压缩 | 回收软删除条目的空间 | ✅ | ❌ |
 | 搜索 | 过滤 ANN 搜索 | WHERE 过滤 + 自动过采样 | ❌ | ✅ |
@@ -140,6 +140,26 @@ WITH (quantizer = 'pq', pq_m = 4);
 SELECT indexname, use_pq, pq_m FROM vexdb_index_info()
 WHERE indexname = 'idx_pq';
 ```
+
+#### 3.2.2 RaBitQ 索引
+
+```sql
+CREATE INDEX idx_rabitq
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (quantizer = 'rabitq', m = 16, ef_construction = 100);
+```
+
+PG 至少需要 10000 条训练样本，并且样本要能放进 `maintenance_work_mem`。默认 `full` 模式下，条件不足时会输出 NOTICE 并回退为普通图索引；`memory_mode='compact'` 则要求量化器必须成功激活，失败时直接终止建索引，不会写入原始向量：
+
+```sql
+CREATE INDEX idx_rabitq_compact
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (quantizer = 'rabitq', memory_mode = 'compact');
+```
+
+PG 的量化索引原本就只在索引向量文件中保存 PQ/RaBitQ code，不会额外保留原始向量镜像，所以 `compact` 是严格存储契约，不是再压缩一次。compact 未指定 `quantizer` 时自动使用 PQ；显式设置 `quantizer='none'` 会报错；unlogged 表暂不支持 compact。`ALTER INDEX ... SET (memory_mode='compact')` 不会重写已有 raw 索引，需要执行 `REINDEX`，并通过 `vexdb_index_info().memory_mode`、`index_inspect()` 的 `Working Quantizer` 和 `Vector Storage` 核对实际状态。
 
 ### 3.3 ANN 查询
 
@@ -411,8 +431,9 @@ bash tests/spec/_lib/docker/run_pg.sh test      # 运行 PG spec 测试（需 Do
 | `common/` | 双端共享内核：图索引算法、SIMD 距离分发、量化器（PQ/RaBitQ）、模板容器 |
 | `vexdb_pg/` | PostgreSQL 扩展：索引 AM、构建、搜索、DML、WAL、距离分发入口 |
 | `vexdb_duckdb/` | DuckDB 扩展：索引生命周期、优化器改写、距离函数 → [README](vexdb_duckdb/README.md) |
+| `vexdb_sqlite/` | SQLite 扩展：虚拟表、shadow table 持久化、PQ/RaBitQ → [README](vexdb_sqlite/README.md) |
 | `documentation/` | 功能文档、构建指南 |
-| `tests/spec/` | 基于 YAML 的 spec 测试（shared / pg / duckdb） |
+| `tests/spec/` | 基于 YAML 的 spec 测试（shared / pg / duckdb / sqlite） |
 | `scripts/` | 构建、发版、打包脚本 |
 | `thirdparties/` | 第三方依赖（patched Boost） |
 

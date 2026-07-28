@@ -8,7 +8,7 @@ steps:
     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 200)
     INSERT INTO idx(rowid, embedding, category)
     SELECT i, vexdb_f32('[' || i || ',0]'), CASE WHEN i%2=0 THEN 'even' ELSE 'odd' END FROM c;
-# INSERT 事务的 xSync 已落盘 v3 段：5 种 kind（meta/elems/upper/base/vec）齐全
+# INSERT 事务的 xSync 已落盘当前 v4 段：5 种 kind（meta/elems/upper/base/vec）齐全
 # （base/vec 段数随 SEG_RECORDS 调参漂移，只断言存在性）
 - query: SELECT kind, count(*) > 0 FROM idx_graph GROUP BY kind ORDER BY kind;
   expect:

@@ -13,17 +13,11 @@ steps:
     99) t(i);
 - statement: CREATE INDEX idx_param ON t_param USING vexdb_graph (vec);
 - statement: SET vexdb.ef_search = -1;
-- query: SELECT * FROM t_param ORDER BY l2_distance(vec, '[0.1, 0.2, 0.3, 0.4]'::floatvector) LIMIT 5;
-  expect:
-  - - ERROR ~ vexdb.ef_search
+  expect_error: vexdb.ef_search
 - statement: SET vexdb.ef_search = 0;
-- query: SELECT * FROM t_param ORDER BY l2_distance(vec, '[0.1, 0.2, 0.3, 0.4]'::floatvector) LIMIT 5;
-  expect:
-  - - ERROR ~ vexdb.ef_search
+  expect_error: vexdb.ef_search
 - statement: SET vexdb.ef_search = 99999;
-- query: SELECT * FROM t_param ORDER BY l2_distance(vec, '[0.1, 0.2, 0.3, 0.4]'::floatvector) LIMIT 5;
-  expect:
-  - - ERROR ~ vexdb.ef_search
+  expect_error: vexdb.ef_search
 - statement: SET vexdb.ef_search = 40;
 - query: SELECT count(*) FROM (SELECT * FROM t_param ORDER BY l2_distance(vec, '[0.1, 0.2, 0.3, 0.4]'::floatvector) LIMIT 5);
   expect:

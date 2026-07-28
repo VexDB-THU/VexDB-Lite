@@ -1,0 +1,110 @@
+name: duckdb_graph_index_rabitq_compact_reload
+tags: [duckdb, rabitq, compact, persistence, regression]
+engines: [duckdb]
+description: RaBitQ compact releases raw vectors while graph search, append, checkpoint and reload keep working from codes.
+steps:
+  - raw_directive: load __TEST_DIR__/rabitq_compact_reload.db
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: CREATE TABLE rq_compact_r (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_compact_r SELECT i, ${VEC_LITERAL([
+      sin(i*0.07)::FLOAT, cos(i*0.09)::FLOAT,
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT,
+      sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT], 8)}
+      FROM ${RANGE2(1, 1501)} t(i);"
+  - statement: CREATE INDEX idx_rq_compact_r ON rq_compact_r USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - query: SELECT memory_mode, quantizer, use_pq::INTEGER, node_count, rabitq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_compact_r';
+    _field_types: TTIII
+    expect:
+      - [compact, rabitq, 0, 1500, true]
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: EXPLAIN SELECT id FROM rq_compact_r ORDER BY ${L2(vec, ${VEC_LITERAL([
+      sin(125.0*0.07)::FLOAT, cos(125.0*0.09)::FLOAT,
+      sin(125.0*0.11)::FLOAT, cos(125.0*0.13)::FLOAT,
+      sin(125.0*0.17)::FLOAT, cos(125.0*0.19)::FLOAT,
+      sin(125.0*0.23)::FLOAT, cos(125.0*0.29)::FLOAT], 8)})} LIMIT 1;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: SELECT id FROM rq_compact_r ORDER BY ${L2(vec, ${VEC_LITERAL([
+      sin(125.0*0.07)::FLOAT, cos(125.0*0.09)::FLOAT,
+      sin(125.0*0.11)::FLOAT, cos(125.0*0.13)::FLOAT,
+      sin(125.0*0.17)::FLOAT, cos(125.0*0.19)::FLOAT,
+      sin(125.0*0.23)::FLOAT, cos(125.0*0.29)::FLOAT], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [125]
+  - statement: "INSERT INTO rq_compact_r VALUES (9003, ${VEC_LITERAL([11.1,11.2,11.3,11.4,11.5,11.6,11.7,11.8], 8)});"
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: SELECT memory_mode, quantizer, node_count, rabitq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_compact_r';
+    _field_types: TTII
+    expect:
+      - [compact, rabitq, 1501, true]
+  - query: SELECT id FROM rq_compact_r ORDER BY ${L2(vec, ${VEC_LITERAL([11.1,11.2,11.3,11.4,11.5,11.6,11.7,11.8], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [9003]
+  - statement: DROP TABLE rq_compact_r;
+
+  # Cosine 在建图、code 覆盖校验和查询时都要对向量归一化。
+  # 重启后仍能改写为索引扫描，也证明校验没有误判 compact 索引过期。
+  - statement: CREATE TABLE rq_compact_cos (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_compact_cos SELECT i, ${VEC_LITERAL([
+      (sqrt(i) * sin(i*0.07))::FLOAT, (sqrt(i) * cos(i*0.07))::FLOAT,
+      (sqrt(i) * sin(i*0.11))::FLOAT, (sqrt(i) * cos(i*0.11))::FLOAT,
+      (sqrt(i) * sin(i*0.17))::FLOAT, (sqrt(i) * cos(i*0.17))::FLOAT,
+      (sqrt(i) * sin(i*0.23))::FLOAT, (sqrt(i) * cos(i*0.23))::FLOAT], 8)}
+      FROM ${RANGE2(1, 1501)} t(i);"
+  - statement: SET ${GUC_BF_THRESHOLD} = 1000000;
+  - statement: "CREATE TABLE rq_compact_cos_truth AS SELECT id FROM rq_compact_cos
+      ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;"
+  - statement: CREATE INDEX idx_rq_compact_cos ON rq_compact_cos USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_WITH_COSINE(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 160;
+  - query: EXPLAIN SELECT id FROM rq_compact_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "WITH ann AS (SELECT id FROM rq_compact_cos
+      ORDER BY ${COSINE(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10)
+      SELECT count(*) >= 8 FROM ann JOIN rq_compact_cos_truth USING (id);"
+    _field_types: I
+    expect:
+      - [true]
+  - statement: DROP TABLE rq_compact_cos;
+  - statement: DROP TABLE rq_compact_cos_truth;
+
+  # Inner product 不做归一化，单独覆盖 compact 持久化与距离语义。
+  - statement: CREATE TABLE rq_compact_ip (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_compact_ip SELECT i, ${VEC_LITERAL([
+      (i * sin(i*0.07))::FLOAT, (i * cos(i*0.07))::FLOAT,
+      (i * sin(i*0.11))::FLOAT, (i * cos(i*0.11))::FLOAT,
+      (i * sin(i*0.17))::FLOAT, (i * cos(i*0.17))::FLOAT,
+      (i * sin(i*0.23))::FLOAT, (i * cos(i*0.23))::FLOAT], 8)}
+      FROM ${RANGE2(1, 1501)} t(i);"
+  - statement: SET ${GUC_BF_THRESHOLD} = 1000000;
+  - statement: "CREATE TABLE rq_compact_ip_truth AS SELECT id FROM rq_compact_ip
+      ORDER BY ${IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} DESC LIMIT 10;"
+  - statement: CREATE INDEX idx_rq_compact_ip ON rq_compact_ip USING ${VEX_INDEX} (vec${OPS_IP_COL})${IDX_WITH_IP(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 160;
+  - query: EXPLAIN SELECT id FROM rq_compact_ip ORDER BY ${NEG_IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "WITH ann AS (SELECT id FROM rq_compact_ip
+      ORDER BY ${NEG_IP(vec, ${VEC_LITERAL([0.7,0.2,0.5,0.4,0.3,0.8,0.1,0.6], 8)})} LIMIT 10)
+      SELECT count(*) >= 8 FROM ann JOIN rq_compact_ip_truth USING (id);"
+    _field_types: I
+    expect:
+      - [true]
+  - statement: DROP TABLE rq_compact_ip;
+  - statement: DROP TABLE rq_compact_ip_truth;

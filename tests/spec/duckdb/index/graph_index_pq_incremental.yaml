@@ -27,14 +27,14 @@ steps:
   _field_types: I
   expect:
   - - 1
-- query: 'SELECT id FROM pq_inc
+- query: 'SELECT COUNT(*) FROM (SELECT id FROM pq_inc
 
     ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})}
 
-    LIMIT 1;'
+    LIMIT 1) WHERE id BETWEEN 99 AND 101;'
   _field_types: I
   expect:
-  - - 100
+  - - 1
 - statement: RESET ${GUC_PQ_SEARCH_MODE};
 - statement: DROP TABLE pq_inc;
 - statement: CREATE TABLE pq_chunk (id INTEGER, vec ${VECTOR(8)});
@@ -52,6 +52,11 @@ steps:
   _field_types: I
   expect:
   - - 1
+- statement: DELETE FROM pq_chunk WHERE id < 300;
+- query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_chunk\n    ORDER BY ${L2(vec, ${VEC_LITERAL([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], 8)})}\n    LIMIT 1000\n) t;"
+  _field_types: I
+  expect:
+  - - 250
 - statement: RESET ${GUC_PQ_SEARCH_MODE};
 - statement: DROP TABLE pq_chunk;
 - statement: CREATE TABLE pq_cos (id INTEGER, vec ${VECTOR(8)});

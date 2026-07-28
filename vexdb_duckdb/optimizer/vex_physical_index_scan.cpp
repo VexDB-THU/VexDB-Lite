@@ -214,14 +214,17 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                     "vexdb_pq_search_mode must be 'off' or 'pq_only', got '%s'", pq_mode_val.ToString());
             }
         }
-        // compact mode 不保留原始向量，只能走 PQ 搜索；无视 GUC 自动路由
+        // compact mode 不保留索引侧原始向量。RaBitQ 在下方优先走
+        // code-aware 图搜索；PQ 则强制走 code 搜索，不允许落到原始向量路径。
         if (graph_index.IsCompactMode()) {
             pq_only = true;
         }
 
         vector<row_t> result_row_ids;
         vector<float> result_distances;
-        if (pq_only) {
+        if (graph_index.UsesRaBitQ()) {
+            graph_index.SearchRaBitQ(query_vec.data(), k, ef, result_row_ids, result_distances);
+        } else if (pq_only) {
             if (!graph_index.UsesPQ()) {
                 throw InvalidInputException(
                     "vexdb_pq_search_mode='pq_only' requires the index to be built with WITH (quantizer='pq', pq_m=N)");
@@ -235,7 +238,8 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                         "vexdb_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", refine_factor);
                 }
             }
-            graph_index.SearchPQ(query_vec.data(), k, result_row_ids, result_distances, refine_factor);
+            graph_index.SearchPQ(query_vec.data(), k, ef, result_row_ids, result_distances,
+                                 refine_factor);
         } else {
             graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
         }

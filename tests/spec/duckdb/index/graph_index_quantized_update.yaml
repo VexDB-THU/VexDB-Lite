@@ -1,0 +1,120 @@
+name: duckdb_graph_index_quantized_update
+tags: [duckdb, quantizer, mutation, regression]
+engines: [duckdb]
+description: UPDATE and rollback must not revive stale PQ or RaBitQ versions for the same row_id.
+steps:
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+
+  # Full and compact PQ both keep historical row-oriented codes. Only the newest
+  # code for a row_id may be visible after DuckDB implements UPDATE as delete+insert.
+  - statement: CREATE TABLE pq_update_full (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_update_full SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: CREATE INDEX idx_pq_update_full ON pq_update_full USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4)};
+  - statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
+  - statement: "UPDATE pq_update_full SET vec = ${VEC_LITERAL([100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 0;"
+  - query: "EXPLAIN SELECT id FROM pq_update_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 10;"
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_update_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [512, 512]
+  - query: "SELECT id FROM pq_update_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [1]
+  - statement: BEGIN;
+  - statement: "UPDATE pq_update_full SET vec = ${VEC_LITERAL([-100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 1;"
+  - statement: ROLLBACK;
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_update_full
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [512, 512]
+  - statement: RESET ${GUC_PQ_SEARCH_MODE};
+  - statement: DROP TABLE pq_update_full;
+
+  - statement: CREATE TABLE pq_update_compact (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_update_compact SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: CREATE INDEX idx_pq_update_compact ON pq_update_compact USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, memory_mode='compact')};
+  - statement: "UPDATE pq_update_compact SET vec = ${VEC_LITERAL([100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 0;"
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_update_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [512, 512]
+  - query: "SELECT id FROM pq_update_compact
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [1]
+  - statement: DROP TABLE pq_update_compact;
+
+  # RaBitQ codes are node-aligned instead of row-oriented, but stale graph tids
+  # must still stay retired after the replacement node is inserted.
+  - statement: CREATE TABLE rq_update (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_update SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(1024)} t(i);"
+  - statement: CREATE INDEX idx_rq_update ON rq_update USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', m=16, ef_construction=160)};
+  - statement: "UPDATE rq_update SET vec = ${VEC_LITERAL([100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 0;"
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM rq_update
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 2000);"
+    _field_types: II
+    expect:
+      - [1024, 1024]
+  - query: "SELECT id FROM rq_update
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [1]
+  - statement: DROP INDEX idx_rq_update;
+  - statement: CREATE INDEX idx_rq_update_compact ON rq_update USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - statement: "UPDATE rq_update SET vec = ${VEC_LITERAL([-100.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 1;"
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM rq_update
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 2000);"
+    _field_types: II
+    expect:
+      - [1024, 1024]
+  - query: "SELECT id FROM rq_update
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: I
+    expect:
+      - [2]
+  - statement: DROP TABLE rq_update;
+
+  # NULL rows have no graph node. NULL -> vector and vector -> NULL -> vector
+  # must not require a full side-map rebuild or leave a stale row version.
+  - statement: CREATE TABLE pq_null_update (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_null_update SELECT i, ${VEC_LITERAL([
+      (i*0.01)::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT,
+      0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT, 0.0::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: INSERT INTO pq_null_update VALUES (512, NULL);
+  - statement: CREATE INDEX idx_pq_null_update ON pq_null_update USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, memory_mode='compact')};
+  - statement: "UPDATE pq_null_update SET vec = ${VEC_LITERAL([-50.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 512;"
+  - statement: UPDATE pq_null_update SET vec = NULL WHERE id = 512;
+  - statement: "UPDATE pq_null_update SET vec = ${VEC_LITERAL([50.0::FLOAT,0,0,0,0,0,0,0], 8)} WHERE id = 512;"
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_null_update
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect:
+      - [513, 513]
+  - statement: DROP TABLE pq_null_update;

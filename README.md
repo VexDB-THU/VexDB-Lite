@@ -2,7 +2,7 @@
 
 **English** | **[中文](README.zh.md)**
 
-`VexDB-Lite` is a vector similarity search engine for PostgreSQL (`vexdb_lite` extension) and DuckDB (`vexdb_lite` extension). Both backends share the same graph index algorithm, SIMD distance dispatch, and quantization kernel.
+`VexDB-Lite` is a vector similarity search engine for PostgreSQL, DuckDB, and SQLite. The backends share the same graph index algorithm, SIMD distance dispatch, and PQ/RaBitQ quantization kernels.
 
 > See [vexdb_duckdb/README.md](vexdb_duckdb/README.md) for the DuckDB extension docs.  
 > This root README is a project-level overview and build guide.
@@ -22,8 +22,8 @@ Current functionality:
   - `inner_product` (use `<~>` for negative inner product / MIPS)
 - Scalar helpers: `vector_dims()`, `vector_norm()`, `l2_normalize()`, `vexdb_index_info()`
 - `CREATE INDEX ... USING vexdb_graph`
-- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` / `pq_m` (PQ)
-- Product quantization (PQ) with `compact` mode
+- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` (`pq` / `rabitq`), `pq_m`, and `memory_mode`
+- PQ and RaBitQ code-only storage; `memory_mode='compact'` makes quantizer activation mandatory
 - Optimizer rewrite into an ANN Index Scan
 - Shared-memory vector buffer cache and parallel index build
 - Runtime settings: `vexdb.ef_search`, `vexdb.vec_architecture`
@@ -40,8 +40,8 @@ Current functionality:
   > Note: `<#>` is unavailable in DuckDB (`#` clashes with its comment syntax); use `<~>` for negative inner product — same meaning as in PG.
 - Scalar helpers: `vector_dims()`, `l2_normalize()`, `vexdb_version()`, `vexdb_index_info()`
 - `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])` with metadata filtering
-- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` / `pq_m` (PQ)
-- Product quantization (PQ) with `compact` mode
+- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` (`pq` / `rabitq`) and `pq_m`
+- Both PQ and RaBitQ support `memory_mode='compact'`; compact RaBitQ still traverses the graph using quantized codes
 - Optimizer rewrite into `VEXDB_INDEX_SCAN`
 - Vector buffer cache and parallel index build
 - Runtime settings: `vexdb_ef_search`, `vexdb_brute_force_threshold`, `vexdb_pq_search_mode`, `vexdb_pq_refine_k_factor`
@@ -62,7 +62,7 @@ Current functionality:
 | Data types | halfvector | Float16 vector type | ✅ | 🟡 | ✅ |
 | Data types | int8vector | Int8 vector type | ❌ | 🟡 | ✅ |
 | Quantization | PQ quantization | Maximum compression, QPS close to raw vectors | ❌ | 🟡 | ✅ |
-| Quantization | RaBitQ quantization | Moderate compression, QPS better than raw vectors | ❌ | 🟡 | ✅ |
+| Quantization | RaBitQ quantization | Quantized graph traversal with code-only index storage | ❌ | ✅ | ✅ |
 | Quantization | Auto quantization | Background auto-enable, supports empty-table index build | ❌ | ❌ | ✅ |
 | Graph index enhancement | Async insert | Fast ingestion for write-heavy workloads | ❌ | ❌ | ✅ |
 | Graph index enhancement | Graph sharding | Large-scale vectors on small-memory machines | ❌ | ❌ | ✅ |
@@ -78,7 +78,7 @@ Current functionality:
 | Index | Graph index | VSS: HNSW; VexDB: graph_index (self-developed hybrid) | ✅ | ✅ |
 | Distance | SIMD dispatch | Inlined distance functions, compile-time optimized | ❌ | ✅ |
 | Quantization | PQ | Vector compression for memory-constrained scenarios | ❌ | ✅ |
-| Quantization | RaBitQ | Vector compression for memory-constrained scenarios | ❌ | 🟡 |
+| Quantization | RaBitQ | Shared quantized graph traversal with optional compact index-side storage | ❌ | ✅ |
 | Cache | Buffer management | Disk-to-memory vector caching | ❌ | ✅ |
 | Maintenance | Index compaction | Reclaim space from soft-deleted entries | ✅ | ❌ |
 | Search | Filtered ANN search | WHERE filter with automatic oversampling | ❌ | ✅ |
@@ -145,6 +145,26 @@ SELECT indexname, use_pq, pq_m
 FROM vexdb_index_info()
 WHERE indexname = 'idx_pq';
 ```
+
+#### 3.2.2 RaBitQ Index
+
+```sql
+CREATE INDEX idx_rabitq
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (quantizer = 'rabitq', m = 16, ef_construction = 100);
+```
+
+PG trains RaBitQ only when at least 10,000 samples fit in `maintenance_work_mem`. In the default `full` mode, an unavailable quantizer emits a NOTICE and falls back to a plain graph. With `memory_mode='compact'`, activation is mandatory and the build fails instead of writing raw vectors:
+
+```sql
+CREATE INDEX idx_rabitq_compact
+ON items
+USING vexdb_graph (vec floatvector_l2_ops)
+WITH (quantizer = 'rabitq', memory_mode = 'compact');
+```
+
+PG quantized indexes already store only PQ/RaBitQ codes in the index vector fork; they do not keep a second raw-vector mirror. `compact` therefore acts as a strict storage contract rather than a second compression pass. Omitting `quantizer` in compact mode selects PQ; `quantizer='none'` is rejected. Compact indexes are not supported on unlogged tables. `ALTER INDEX ... SET (memory_mode='compact')` does not rewrite an existing raw index; use `REINDEX` and verify the effective state through `vexdb_index_info().memory_mode` plus `index_inspect()` attributes `Working Quantizer` and `Vector Storage`.
 
 ### 3.3 ANN Query
 
@@ -402,8 +422,9 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 | `common/` | Shared core: graph index algorithm, SIMD distance dispatch, quantizer (PQ/RaBitQ), template containers |
 | `vexdb_pg/` | PostgreSQL extension: index AM, build, search, DML, WAL, distance entry |
 | `vexdb_duckdb/` | DuckDB extension: index lifecycle, optimizer rewrite, distance functions → [README](vexdb_duckdb/README.md) |
+| `vexdb_sqlite/` | SQLite extension: virtual table, shadow-table persistence, PQ/RaBitQ → [README](vexdb_sqlite/README.md) |
 | `documentation/` | Feature docs, build guide |
-| `tests/spec/` | YAML-based spec tests (shared / pg / duckdb) |
+| `tests/spec/` | YAML-based spec tests (shared / pg / duckdb / sqlite) |
 | `scripts/` | Build, release, and packaging scripts |
 | `thirdparties/` | Vendored dependencies (patched Boost) |
 

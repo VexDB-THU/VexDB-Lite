@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090e1b">
+  <title>VexDB Lite · WebAssembly 演示</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div class="header-row">
+        <span class="eyebrow">VEXDB LITE · WEBASSEMBLY</span>
+        <span id="runtimeBadge" class="runtime-badge" data-state="loading">正在载入 WASM</span>
+      </div>
+      <h1>VexDB Lite</h1>
+      <p>在浏览器本机运行 SQLite 向量索引，演示文本与图片的默认数据和自定义数据。</p>
+    </header>
+
+    <div class="navigation-stack">
+      <nav class="mode-switch" role="tablist" aria-label="检索内容">
+        <button id="textModeTab" class="mode-button" type="button" role="tab"
+                aria-selected="true" data-mode="text">
+          <span aria-hidden="true">文</span><strong>文本检索</strong>
+        </button>
+        <button id="imageModeTab" class="mode-button" type="button" role="tab"
+                aria-selected="false" data-mode="image">
+          <span aria-hidden="true">图</span><strong>图片检索</strong>
+        </button>
+      </nav>
+      <nav class="tab-switch" role="tablist" aria-label="数据来源">
+        <button id="defaultTab" class="tab-button" type="button" role="tab"
+                aria-selected="true" aria-controls="defaultPanel" data-source="default">
+          <span id="defaultTabIcon" class="tab-icon" aria-hidden="true">⌕</span>
+          <span><strong id="defaultTabTitle">默认文本示例</strong><small id="defaultTabCaption">内置向量，直接搜索</small></span>
+        </button>
+        <button id="customTab" class="tab-button" type="button" role="tab"
+                aria-selected="false" aria-controls="customPanel" data-source="custom">
+          <span id="customTabIcon" class="tab-icon" aria-hidden="true">✎</span>
+          <span><strong id="customTabTitle">自定义文本</strong><small id="customTabCaption">输入、分片并生成向量</small></span>
+        </button>
+      </nav>
+    </div>
+
+    <main>
+      <section id="defaultPanel" class="tab-panel" role="tabpanel" aria-labelledby="defaultTab" data-panel="text-default">
+        <section class="hero-block">
+          <span class="hero-label cyan">DEFAULT EXAMPLE · 当前浏览器</span>
+          <h2>用真实文档，<br>完成向量检索。</h2>
+          <p>示例数据随页面载入，SQLite 检索完全在本机完成。</p>
+          <div class="status-line"><span class="status-dot"></span><span id="defaultStatus">正在准备默认索引…</span></div>
+        </section>
+
+        <section class="demo-card document-card" aria-labelledby="documentTitle">
+          <div class="section-title">
+            <div><h3 id="documentTitle">默认示例</h3><p>《Embedding 召回测试文档》</p></div>
+            <button id="showChunks" class="text-action" type="button">查看全部分片和详情 ↗</button>
+          </div>
+          <div class="meta-row">
+            <span id="chunkCount">—</span><span id="dimensions">—</span><span>SQLite :memory:</span>
+          </div>
+          <button id="documentPreviewButton" class="preview-button" type="button">
+            <span id="documentPreview">正在读取示例文档…</span>
+            <small>点击查看全部分片</small>
+          </button>
+        </section>
+
+        <section class="flow-section" aria-labelledby="queryTitle">
+          <div class="section-title">
+            <div><h3 id="queryTitle">提一个完整问题</h3><p>先选择问题，再点击发送；预设问题无需 API Key</p></div>
+          </div>
+          <div id="presetQuestions" class="question-list" aria-label="预设问题"></div>
+          <form id="searchForm" class="search-row">
+            <label class="sr-only" for="queryInput">搜索问题</label>
+            <textarea id="queryInput" rows="1" placeholder="选择预设问题，或者输入自己的问题…"></textarea>
+            <button id="searchButton" class="send-button" type="submit" disabled aria-label="发送并搜索">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.4 11.1 20.5 3.8l-7.3 17.1-2.1-7.7-7.7-2.1Z"></path>
+                <path d="m11.1 13.2 9.4-9.4"></path>
+              </svg>
+            </button>
+          </form>
+          <div class="hint-row">
+            <p id="queryHint">预设问题使用内置向量；新问题需要先设置 Embedding API。</p>
+            <button id="defaultSettingsShortcut" class="embedding-settings-shortcut" type="button">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M3 6h14M3 14h14"></path>
+                <circle cx="7" cy="6" r="2"></circle>
+                <circle cx="13" cy="14" r="2"></circle>
+              </svg>
+              <span>Embedding 设置</span>
+              <small>新问题</small>
+              <span class="shortcut-arrow" aria-hidden="true">→</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="resultSection" class="demo-card result-section" aria-labelledby="resultTitle" hidden>
+          <div class="section-title result-heading">
+            <div><h3 id="resultTitle">搜索结果</h3><p>距离越小越相似，点击结果展开原文</p></div>
+            <div class="query-time"><strong id="queryTime">—</strong><small>WASM 查询耗时</small></div>
+          </div>
+          <div id="results" class="results"></div>
+        </section>
+
+        <section id="planSection" class="demo-card plan-section" hidden>
+          <div class="section-title"><div><h3>执行计划</h3><p>确认查询走 VexDB 向量索引</p></div></div>
+          <code id="queryPlan">—</code>
+        </section>
+
+        <p class="privacy-note">▣ 示例分片和预设问题向量已随页面打包；SQLite 索引和检索留在当前浏览器。</p>
+      </section>
+
+      <section id="customPanel" class="tab-panel" role="tabpanel" aria-labelledby="customTab" data-panel="text-custom" hidden>
+        <section class="hero-block custom-hero">
+          <span class="hero-label violet">CUSTOM TEXT · 当前浏览器</span>
+          <h2>检索自己的文本。</h2>
+          <p>设置模型、输入文本、确认分片，再生成向量。</p>
+          <div class="status-line"><span class="status-dot"></span><span id="customStatus">还没有生成自定义索引</span></div>
+          <progress id="customProgress" max="1" value="0" hidden></progress>
+        </section>
+
+        <details id="settingsCard" class="demo-card settings-card" open>
+          <summary>
+            <span class="settings-icon" aria-hidden="true">⌘</span>
+            <span><strong>Embedding 模型</strong><small id="settingsSummary">填写 API 地址、模型和 API Key</small></span>
+            <span class="summary-action">设置⌄</span>
+          </summary>
+          <div class="settings-body">
+            <label class="field-label">API 地址
+              <input id="endpointInput" type="url" inputmode="url" autocomplete="url"
+                     placeholder="https://…/v1">
+              <small>支持 OpenAI-compatible embeddings 接口</small>
+            </label>
+            <label class="field-label">模型
+              <input id="modelInput" type="text" autocomplete="off" placeholder="text-embedding-v4">
+            </label>
+            <label class="field-label">API Key
+              <input id="apiKeyInput" type="password" autocomplete="off" placeholder="sk-…">
+              <small>只保存在当前浏览器会话，不会写入 HTML 文件</small>
+            </label>
+            <div class="settings-actions">
+              <button id="testEmbeddingButton" class="secondary-button" type="button">用“你好”测试</button>
+              <button id="saveSettingsButton" class="primary-button" type="button">保存设置</button>
+            </div>
+            <p id="settingsMessage" class="inline-message" aria-live="polite"></p>
+          </div>
+        </details>
+
+        <section class="demo-card import-card" aria-labelledby="importTitle">
+          <div class="section-title editor-heading">
+            <div><h3 id="importTitle">1. 输入并分片</h3><p>最多 20 万个字符，分片会在生成向量前展示</p></div>
+            <button id="toggleEditorButton" class="text-action" type="button" hidden>收起输入框</button>
+          </div>
+
+          <div id="sourceEditorWrap" class="source-editor-wrap">
+            <label class="sr-only" for="sourceText">自定义文本</label>
+            <textarea id="sourceText" maxlength="200000"
+                      placeholder="在这里粘贴文章、笔记、产品资料或其他文本…"></textarea>
+            <div class="editor-toolbar">
+              <span id="sourceCount">0 / 200,000 字</span>
+              <button id="fillSampleText" class="text-action" type="button">填入示例文本</button>
+            </div>
+          </div>
+          <button id="sourceCollapsed" class="preview-button" type="button" hidden>
+            <span id="sourceCollapsedText"></span><small>点击展开继续编辑</small>
+          </button>
+
+          <div class="chunk-controls">
+            <label>每段约
+              <input id="chunkLength" type="number" min="100" max="2000" step="100" value="500">
+              个字符
+            </label>
+            <label>相邻段重叠
+              <input id="overlapLength" type="number" min="0" max="500" step="25" value="50">
+              个字符
+            </label>
+          </div>
+
+          <div class="preview-heading">
+            <span id="chunkPreviewSummary">输入文本后显示分片</span>
+            <button id="toggleChunkPreview" class="text-action" type="button" hidden>收起预览</button>
+          </div>
+          <div id="customChunkPreview" class="chunk-preview"></div>
+          <div class="generate-row">
+            <span id="generateHint">生成后会建立一个新的浏览器内 SQLite 索引</span>
+            <button id="generateVectorsButton" class="primary-button" type="button" disabled>生成向量</button>
+          </div>
+        </section>
+
+        <section class="flow-section custom-search-section" aria-labelledby="customSearchTitle">
+          <div class="section-title">
+            <div><h3 id="customSearchTitle">2. 搜索自己的内容</h3><p>问题使用同一模型生成向量，KNN 检索在本机完成</p></div>
+          </div>
+          <form id="customSearchForm" class="search-row">
+            <label class="sr-only" for="customQueryInput">搜索自己的内容</label>
+            <textarea id="customQueryInput" rows="1" placeholder="输入一个完整问题…"></textarea>
+            <button id="customSearchButton" class="send-button" type="submit" disabled aria-label="搜索自定义文本">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.4 11.1 20.5 3.8l-7.3 17.1-2.1-7.7-7.7-2.1Z"></path>
+                <path d="m11.1 13.2 9.4-9.4"></path>
+              </svg>
+            </button>
+          </form>
+          <div class="meta-row custom-stats"><span id="customRowCount">0 个分片</span><span id="customDimensions">尚未生成向量</span></div>
+        </section>
+
+        <section id="customResultSection" class="demo-card result-section" hidden>
+          <div class="section-title result-heading">
+            <div><h3>搜索结果</h3><p>距离越小越相似，点击结果展开原文</p></div>
+            <div class="query-time"><strong id="customQueryTime">—</strong><small>WASM 查询耗时</small></div>
+          </div>
+          <div id="customResults" class="results"></div>
+        </section>
+
+        <section id="customPlanSection" class="demo-card plan-section" hidden>
+          <div class="section-title"><div><h3>执行计划</h3><p>确认查询走 VexDB 向量索引</p></div></div>
+          <code id="customQueryPlan">—</code>
+        </section>
+
+        <p class="privacy-note">▣ 文本和问题会发送给你设置的 Embedding API；向量、SQLite 索引和搜索结果保留在当前浏览器。</p>
+      </section>
+
+      <section id="imageDefaultPanel" class="tab-panel" role="tabpanel" aria-labelledby="defaultTab" data-panel="image-default" hidden>
+        <section class="hero-block image-hero">
+          <span class="hero-label cyan">IMAGE SEARCH · 当前浏览器</span>
+          <h2>用完整问题，<br>检索图片。</h2>
+          <p>文字和图片进入同一个向量空间，SQLite 在本机找出最相似的图片。</p>
+          <div class="status-line"><span class="status-dot"></span><span id="imageDefaultStatus">正在准备内置图片索引…</span></div>
+        </section>
+
+        <section class="demo-card image-library-card" aria-labelledby="imageLibraryTitle">
+          <div class="section-title">
+            <div><h3 id="imageLibraryTitle">内置图片库</h3><p>图片和问题向量已经随页面打包</p></div>
+          </div>
+          <div class="meta-row">
+            <span id="imageCount">—</span><span id="imageDimensions">—</span><span>L2 距离</span>
+          </div>
+          <details class="image-library-details">
+            <summary>查看内置图片（用于检索演示）<span aria-hidden="true">⌄</span></summary>
+            <div id="imageGallery" class="image-gallery" aria-label="内置图片"></div>
+          </details>
+        </section>
+
+        <section class="flow-section" aria-labelledby="imageQueryTitle">
+          <div class="section-title">
+            <div><h3 id="imageQueryTitle">提一个完整问题</h3><p>先选择问题，再点击发送；预设问题无需 API Key</p></div>
+          </div>
+          <div id="imageQuestions" class="question-list" aria-label="图片预设问题"></div>
+          <form id="imageSearchForm" class="search-row">
+            <label class="sr-only" for="imageQueryInput">搜索图片的问题</label>
+            <textarea id="imageQueryInput" rows="1" placeholder="选择预设问题，或者描述你要找的图片…"></textarea>
+            <button id="imageSearchButton" class="send-button" type="submit" disabled aria-label="发送并搜索图片">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.4 11.1 20.5 3.8l-7.3 17.1-2.1-7.7-7.7-2.1Z"></path>
+                <path d="m11.1 13.2 9.4-9.4"></path>
+              </svg>
+            </button>
+          </form>
+          <div class="hint-row">
+            <p id="imageQueryHint">预设问题使用内置向量；新问题需要先设置图片 Embedding。</p>
+            <button id="imageDefaultSettingsShortcut" class="embedding-settings-shortcut" type="button">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M3 6h14M3 14h14"></path><circle cx="7" cy="6" r="2"></circle><circle cx="13" cy="14" r="2"></circle>
+              </svg>
+              <span>图片 Embedding 设置</span><small>新问题</small><span class="shortcut-arrow" aria-hidden="true">→</span>
+            </button>
+          </div>
+        </section>
+
+        <section id="imageResultSection" class="demo-card result-section" hidden>
+          <div class="section-title result-heading">
+            <div><h3>最匹配的图片</h3><p>系统从 Top-5 候选中突出展示第一名，避免相似图片干扰判断</p></div>
+            <div class="query-time"><strong id="imageQueryTime">—</strong><small>WASM 查询耗时</small></div>
+          </div>
+          <div id="imageResults" class="image-results"></div>
+        </section>
+
+        <section id="imagePlanSection" class="demo-card plan-section" hidden>
+          <div class="section-title"><div><h3>执行计划</h3><p>确认查询走 VexDB 图片向量索引</p></div></div>
+          <code id="imageQueryPlan">—</code>
+        </section>
+
+        <p class="privacy-note">▣ 图片和预设问题向量已经内置；图片索引和相似度检索完全留在当前浏览器。</p>
+      </section>
+
+      <section id="imageCustomPanel" class="tab-panel" role="tabpanel" aria-labelledby="customTab" data-panel="image-custom" hidden>
+        <section class="hero-block custom-hero">
+          <span class="hero-label violet">CUSTOM IMAGE · 当前浏览器</span>
+          <h2>建立自己的图片库。</h2>
+          <p>导入多张图片、生成向量，再用完整问题搜索最相似的图片。</p>
+          <div class="status-line"><span class="status-dot"></span><span id="customImageStatus">还没有生成自定义图片索引</span></div>
+          <progress id="customImageProgress" max="1" value="0" hidden></progress>
+        </section>
+
+        <details id="imageSettingsCard" class="demo-card settings-card" open>
+          <summary>
+            <span class="settings-icon" aria-hidden="true">⌘</span>
+            <span><strong>图片 Embedding 模型</strong><small id="imageSettingsSummary">填写多模态 API 地址、模型和 API Key</small></span>
+            <span class="summary-action">设置⌄</span>
+          </summary>
+          <div class="settings-body">
+            <label class="field-label">API 地址
+              <input id="imageEndpointInput" type="url" inputmode="url" autocomplete="url" placeholder="https://…/multimodal-embedding">
+              <small>接口需要支持图片和文字进入同一个向量空间</small>
+            </label>
+            <label class="field-label">模型
+              <input id="imageModelInput" type="text" autocomplete="off" placeholder="多模态向量模型">
+            </label>
+            <label class="field-label">API Key
+              <input id="imageApiKeyInput" type="password" autocomplete="off" placeholder="sk-…">
+              <small>只保存在当前浏览器会话，不会写入 HTML 文件</small>
+            </label>
+            <div class="settings-actions">
+              <button id="testImageEmbeddingButton" class="secondary-button" type="button">用内置图片测试</button>
+              <button id="saveImageSettingsButton" class="primary-button" type="button">保存设置</button>
+            </div>
+            <p id="imageSettingsMessage" class="inline-message" aria-live="polite"></p>
+          </div>
+        </details>
+
+        <section class="demo-card custom-image-import" aria-labelledby="customImageLibraryTitle">
+          <div class="section-title">
+            <div><h3 id="customImageLibraryTitle">1. 导入图片库</h3><p>最多 20 张；浏览器会统一压缩成适合生成向量的 JPEG</p></div>
+            <span id="selectedImageCount" class="quiet-count">0 张</span>
+          </div>
+          <input id="imageFileInput" class="sr-only" type="file" accept="image/*" multiple>
+          <div class="image-import-actions">
+            <label class="primary-button file-picker-button" for="imageFileInput">选择本机图片</label>
+            <button id="fillSampleImages" class="secondary-button" type="button">使用内置图片试试</button>
+          </div>
+          <div id="customImageGallery" class="custom-image-gallery"></div>
+          <div class="generate-row">
+            <span id="customImageGenerateHint">选择图片后，先生成向量并建立独立的 L2 索引</span>
+            <button id="generateImageVectorsButton" class="primary-button" type="button" disabled>生成图片向量</button>
+          </div>
+        </section>
+
+        <section class="flow-section custom-search-section" aria-labelledby="customImageSearchTitle">
+          <div class="section-title">
+            <div><h3 id="customImageSearchTitle">2. 搜索自己的图片</h3><p>问题和图片使用同一模型，top-K 检索在本机完成</p></div>
+          </div>
+          <form id="customImageSearchForm" class="search-row">
+            <label class="sr-only" for="customImageQueryInput">搜索自己的图片</label>
+            <textarea id="customImageQueryInput" rows="1" placeholder="描述你想找的图片…"></textarea>
+            <button id="customImageSearchButton" class="send-button" type="submit" disabled aria-label="搜索自定义图片">
+              <svg viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M3.4 11.1 20.5 3.8l-7.3 17.1-2.1-7.7-7.7-2.1Z"></path>
+                <path d="m11.1 13.2 9.4-9.4"></path>
+              </svg>
+            </button>
+          </form>
+          <div class="meta-row custom-stats"><span id="customImageRowCount">0 张图片</span><span id="customImageDimensions">尚未生成向量</span><span>L2 距离</span></div>
+        </section>
+
+        <section id="customImageResultSection" class="demo-card result-section" hidden>
+          <div class="section-title result-heading">
+            <div><h3>图片搜索结果</h3><p>结果图片保留在当前页面，点击删除不会影响默认图片库</p></div>
+            <div class="query-time"><strong id="customImageQueryTime">—</strong><small>WASM 查询耗时</small></div>
+          </div>
+          <div id="customImageResults" class="image-results"></div>
+        </section>
+
+        <section id="customImagePlanSection" class="demo-card plan-section" hidden>
+          <div class="section-title"><div><h3>执行计划</h3><p>确认查询走独立的自定义图片向量索引</p></div></div>
+          <code id="customImageQueryPlan">—</code>
+        </section>
+
+        <p class="privacy-note">▣ 图片和问题会发送给你设置的多模态 API；图片预览、向量、SQLite 索引和搜索结果保留在当前浏览器。</p>
+      </section>
+    </main>
+
+    <footer><span id="versionText">VexDB Lite WebAssembly</span><span>所有 SQLite 检索都在本机执行</span></footer>
+  </div>
+
+  <button id="backToTop" class="back-to-top" type="button" aria-label="返回页面顶部" hidden>
+    <span>返回顶部</span>
+    <svg viewBox="0 0 20 20" aria-hidden="true">
+      <path d="m5.5 9 4.5-4.5L14.5 9M10 4.5v11"></path>
+    </svg>
+  </button>
+
+  <dialog id="chunksDialog">
+    <div class="dialog-head">
+      <div><span class="hero-label cyan">DOCUMENT CHUNKS</span><h2>全部分片</h2></div>
+      <button id="closeChunks" class="close-button" type="button" aria-label="关闭">×</button>
+    </div>
+    <p id="dialogMeta" class="dialog-meta"></p>
+    <div id="chunkList" class="chunk-list"></div>
+  </dialog>
+
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

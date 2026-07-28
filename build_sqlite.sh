@@ -3,10 +3,12 @@
 # 仿 vexdb_pg 独立 CMake 模式（根 build.sh 深耦合 DuckDB 源码树，不复用）。
 #
 #   bash build_sqlite.sh build    # 配置 + 编译双形态 + smoke test 二进制
-#   bash build_sqlite.sh test     # build + 跑五层测试（smoke ×4 + spec）
+#   bash build_sqlite.sh test     # build + 跑完整功能/并行/spec 测试
+#   bash build_sqlite.sh benchmark # Release 量化器功能 + 性能门槛
 #   bash build_sqlite.sh package  # Release 编 macOS arm64+x86_64 → dist/ tarball + SHA256
 #   bash build_sqlite.sh ios      # Stage C：device+sim 静态库 → XCFramework（+sim smoke）
 #   bash build_sqlite.sh android  # Stage C：NDK arm64-v8a/x86_64 静态库 + loadable .so
+#   bash build_sqlite.sh wasm     # 浏览器版：构建 WASM + 跑真实图索引冒烟测试
 #   bash build_sqlite.sh vendor   # 仅拉取 SQLite amalgamation
 #   bash build_sqlite.sh clean    # 删 build 目录
 set -e
@@ -15,6 +17,7 @@ DIR="$(cd "$(dirname "$0")" && pwd)/vexdb_sqlite"
 BUILD_DIR="$DIR/build"
 CMD="${1:-build}"
 NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # 解析 cmake：优先 PATH，其次 conan/brew 常见位置（非交互 shell 常无 cmake on PATH）。
 CMAKE="$(command -v cmake || true)"
@@ -30,13 +33,34 @@ if [ -z "$CMAKE" ]; then
 fi
 [ -z "$CMAKE" ] && { echo "找不到 cmake：brew install cmake，或激活含 cmake 的 conan/conda 环境" >&2; exit 1; }
 
+# 交叉 toolchain 不会搜索 host 的 Homebrew/Conda include。SQLite 距离 dispatcher
+# 只依赖 header-only boost/preprocessor，因此可以安全复用 host 头文件。允许调用方
+# 用 VEXDB_BOOST_INC 覆盖；否则从常见位置自动探测，并显式传给所有 CMake 配置。
+BOOST_INC="${VEXDB_BOOST_INC:-}"
+if [ -z "$BOOST_INC" ]; then
+    for b in \
+        "$DIR/../thirdparties/boost" \
+        /opt/homebrew/include \
+        /opt/anaconda3/include \
+        /usr/local/include \
+        /usr/include; do
+        if [ -f "$b/boost/preprocessor/seq.hpp" ]; then
+            BOOST_INC="$b"
+            break
+        fi
+    done
+fi
+BOOST_CMAKE_ARGS=()
+[ -n "$BOOST_INC" ] && BOOST_CMAKE_ARGS+=("-DVEXDB_BOOST_INC=$BOOST_INC")
+
 case "$CMD" in
     vendor)
         bash "$DIR/vendor_sqlite.sh"
         ;;
     build|test)
         [ -f "$DIR/third_party/sqlite/sqlite3ext.h" ] || bash "$DIR/vendor_sqlite.sh"
-        "$CMAKE" -S "$DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Debug}"
+        "$CMAKE" -S "$DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Debug}" \
+            "${BOOST_CMAKE_ARGS[@]}"
         "$CMAKE" --build "$BUILD_DIR" -j "$NCPU"
         echo ""
         echo "=== 产物 ==="
@@ -47,13 +71,30 @@ case "$CMD" in
             "$BUILD_DIR/m0_static_smoke"
             echo "=== M1 距离层冒烟 ==="
             "$BUILD_DIR/m1_distance_smoke"
+            echo "=== RaBitQ SIMD 分发冒烟 ==="
+            "$BUILD_DIR/simd_dispatch_smoke"
             echo "=== M2 虚拟表冒烟 ==="
             "$BUILD_DIR/m2_vtab_smoke"
             echo "=== M3 HNSW 冒烟 ==="
             "$BUILD_DIR/m3_hnsw_smoke"
+            echo "=== M3+ 4 万向量并行/持久化/有界写回归 ==="
+            "$BUILD_DIR/m3p_parallel_smoke"
+            echo "=== SQLite v3 固定持久化文件兼容 ==="
+            EXTENSION="$BUILD_DIR/vexdb_lite.dylib"
+            [ -f "$EXTENSION" ] || EXTENSION="$BUILD_DIR/vexdb_lite.so"
+            "$PYTHON_BIN" "$DIR/test/legacy_fixture_test.py" "$EXTENSION" \
+                "$DIR/test/fixtures/sqlite_quantizer_legacy_v3.db.gz"
             echo "=== M4 spec（L2 DSL 渲染 + runner） ==="
             bash "$DIR/../tests/spec/_lib/docker/run_sqlite.sh"
         fi
+        ;;
+    benchmark)
+        BUILD_TYPE=Release bash "$0" build
+        EXTENSION="$BUILD_DIR/vexdb_lite.dylib"
+        [ -f "$EXTENSION" ] || EXTENSION="$BUILD_DIR/vexdb_lite.so"
+        "$PYTHON_BIN" "$DIR/test/quantizer_benchmark.py" "$EXTENSION" \
+            --rows 20000 --queries 200 --repetitions 3 --pq-m 16 --check \
+            --min-pq-qps-ratio 0.70 --min-rabitq-qps-ratio 0.65
         ;;
     package)
         # macOS 双 arch 发版包：loadable dylib + 静态 .a + 公共头 + 文档。
@@ -65,7 +106,8 @@ case "$CMD" in
         for ARCH in arm64 x86_64; do
             BD="$DIR/build-pkg-$ARCH"
             "$CMAKE" -S "$DIR" -B "$BD" -DCMAKE_BUILD_TYPE=Release \
-                -DCMAKE_OSX_ARCHITECTURES=$ARCH -DVEXDB_SQLITE_BUILD_TESTS=OFF
+                -DCMAKE_OSX_ARCHITECTURES=$ARCH -DVEXDB_SQLITE_BUILD_TESTS=OFF \
+                "${BOOST_CMAKE_ARGS[@]}"
             "$CMAKE" --build "$BD" -j "$NCPU"
             PKG="vexdb-lite-sqlite-${VERSION}-macos-${ARCH}"
             STAGE="$DIST/$PKG"
@@ -104,7 +146,8 @@ case "$CMD" in
                 -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_ARCHITECTURES=arm64 \
                 -DCMAKE_OSX_SYSROOT=$SYSROOT \
                 -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_MIN" \
-                -DVEXDB_SQLITE_BUILD_TESTS=$TESTS
+                -DVEXDB_SQLITE_BUILD_TESTS=$TESTS \
+                "${BOOST_CMAKE_ARGS[@]}"
             "$CMAKE" --build "$BD" -j "$NCPU"
         done
         XCF="$DIST/vexdb_lite.xcframework"
@@ -124,8 +167,10 @@ case "$CMD" in
         BOOTED=$(xcrun simctl list devices booted 2>/dev/null | grep -c Booted || true)
         if [ "$BOOTED" -gt 0 ]; then
             echo "=== iOS Simulator 静态注册冒烟 ==="
-            xcrun simctl spawn booted "$DIR/build-ios-sim/m0_static_smoke" && \
-            xcrun simctl spawn booted "$DIR/build-ios-sim/m3_hnsw_smoke" || \
+            xcrun simctl spawn booted \
+                "$DIR/build-ios-sim/m0_static_smoke.app/m0_static_smoke" && \
+            xcrun simctl spawn booted \
+                "$DIR/build-ios-sim/m3_hnsw_smoke.app/m3_hnsw_smoke" || \
                 echo "sim smoke 失败（产物本身已构建成功）"
         else
             echo "（无已启动的模拟器，跳过 sim smoke：xcrun simctl boot <device> 后重跑）"
@@ -151,7 +196,8 @@ case "$CMD" in
                 -DANDROID_ABI=$ABI -DANDROID_PLATFORM=android-$ANDROID_API \
                 -DCMAKE_C_FLAGS_RELEASE="-O2 -DNDEBUG -g0" \
                 -DCMAKE_CXX_FLAGS_RELEASE="-O2 -DNDEBUG -g0" \
-                -DVEXDB_SQLITE_BUILD_TESTS=OFF
+                -DVEXDB_SQLITE_BUILD_TESTS=OFF \
+                "${BOOST_CMAKE_ARGS[@]}"
             "$CMAKE" --build "$BD" -j "$NCPU"
             mkdir -p "$DIST/$ABI"
             cp "$BD/libvexdb_lite_static.a" "$BD/vexdb_lite.so" "$DIST/$ABI/"
@@ -164,12 +210,20 @@ case "$CMD" in
         echo "=== Android 产物 ==="
         ls -la "$DIST"/*/
         ;;
+    wasm)
+        WASM_DIR="$DIR/../examples/wasm"
+        bash "$WASM_DIR/build.sh"
+        npm --prefix "$WASM_DIR" test
+        echo ""
+        echo "可直接打开: $WASM_DIR/dist/vexdb-lite-demo.html"
+        echo "开发调试服务: npm --prefix $WASM_DIR run serve"
+        ;;
     clean)
         rm -rf "$BUILD_DIR" "$DIR"/build-pkg-* "$DIR"/build-ios-* "$DIR"/build-android-*
         echo "已清理 build 目录"
         ;;
     *)
-        echo "Usage: $0 [build|test|package|ios|android|vendor|clean]"
+        echo "Usage: $0 [build|test|benchmark|package|ios|android|wasm|vendor|clean]"
         exit 1
         ;;
 esac

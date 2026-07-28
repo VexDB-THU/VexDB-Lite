@@ -2,7 +2,8 @@
 //
 // 验收覆盖（计划 M3）：超过暴力阈值(64)的表走 HNSW 图——recall@10 对照暴力
 // ground truth、distance 值与标量函数一致、增量 INSERT、**关库重开走 %_graph
-// blob 还原**、DELETE 后正确（invalidate+rebuild）、ROLLBACK 后图一致、cosine。
+// blob 还原**、DELETE 后正确（invalidate+rebuild）、ROLLBACK 后图一致、
+// cosine，以及 RaBitQ 的 L2/cosine/IP。
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -215,10 +216,11 @@ int main(void) {
         check(n == 1 && ids[0] != 9002, "rolled-back row absent from knn");
     }
 
-    // ── cosine 表：归一化语义 + distance 数值对照 ──
+    // ── RaBitQ cosine：归一化语义 + distance 数值对照 ──
     exec_ok(db, "CREATE VIRTUAL TABLE idxc USING GRAPH_INDEX("
-                "embedding FLOAT[16], metric=cosine, m=16, ef_construction=200, ef_search=120)",
-            "create cosine vtab");
+                "embedding FLOAT[16], metric=cosine, quantizer=rabitq, "
+                "m=16, ef_construction=200, ef_search=160)",
+            "create rabitq cosine vtab");
     exec_ok(db, "BEGIN", "begin cos bulk");
     for (int i = 0; i < N; i++) {
         char buf[2048], sql[2304];
@@ -232,10 +234,125 @@ int main(void) {
         double rc_sum = 0;
         for (int qi = 0; qi < 5; qi++) {
             rc_sum += recall_check(db, "idxc", "vexdb_cosine_distance", data[qi * 53 % N],
-                                   "cosine recall");
+                                   "rabitq cosine recall");
         }
-        printf("cosine recall@%d = %.3f (5 queries avg)\n", K, rc_sum / 5);
-        check(rc_sum / 5 >= 0.9, "cosine recall >= 0.9");
+        printf("rabitq cosine recall@%d = %.3f (5 queries avg)\n", K, rc_sum / 5);
+        check(rc_sum / 5 >= 0.8, "rabitq cosine recall >= 0.8");
+    }
+
+    // ── RaBitQ IP：lower=closer 的负内积语义 + recall ──
+    exec_ok(db, "CREATE VIRTUAL TABLE idxri USING GRAPH_INDEX("
+                "embedding FLOAT[16], metric=ip, quantizer=rabitq, "
+                "m=16, ef_construction=200, ef_search=160)",
+            "create rabitq ip vtab");
+    exec_ok(db, "BEGIN", "begin rabitq ip bulk");
+    for (int i = 0; i < N; i++) {
+        char buf[2048], sql[2304];
+        vec_json(buf, sizeof(buf), data[i]);
+        snprintf(sql, sizeof(sql), "INSERT INTO idxri(rowid, embedding) VALUES (%d, '%s')",
+                 i + 1, buf);
+        if (!exec_ok(db, sql, "rabitq ip bulk insert")) break;
+    }
+    exec_ok(db, "COMMIT", "commit rabitq ip bulk");
+    {
+        double ri_sum = 0;
+        for (int qi = 0; qi < 5; qi++) {
+            ri_sum += recall_check(db, "idxri", "vexdb_negative_inner_product",
+                                   data[qi * 67 % N], "rabitq ip recall");
+        }
+        printf("rabitq ip recall@%d = %.3f (5 queries avg)\n", K, ri_sum / 5);
+        check(ri_sum / 5 >= 0.8, "rabitq ip recall >= 0.8");
+    }
+
+    // ── RaBitQ：共享量化算法、增量编码、持久化重开 ──
+    exec_ok(db, "CREATE VIRTUAL TABLE idxr USING GRAPH_INDEX("
+                "embedding FLOAT[16], metric=l2, quantizer=rabitq, "
+                "m=16, ef_construction=200, ef_search=160)",
+            "create rabitq vtab");
+    exec_ok(db, "BEGIN", "begin rabitq bulk");
+    for (int i = 0; i < N; i++) {
+        char buf[2048], sql[2304];
+        vec_json(buf, sizeof(buf), data[i]);
+        snprintf(sql, sizeof(sql), "INSERT INTO idxr(rowid, embedding) VALUES (%d, '%s')",
+                 i + 1, buf);
+        if (!exec_ok(db, sql, "rabitq bulk insert")) break;
+    }
+    exec_ok(db, "COMMIT", "commit rabitq bulk");
+    {
+        double rr_sum = 0;
+        for (int qi = 0; qi < 5; qi++) {
+            rr_sum += recall_check(db, "idxr", "vexdb_l2_distance", data[qi * 41 % N],
+                                   "rabitq recall");
+        }
+        printf("rabitq recall@%d = %.3f (5 queries avg)\n", K, rr_sum / 5);
+        check(rr_sum / 5 >= 0.8, "rabitq recall >= 0.8");
+    }
+    {
+        float v[DIM];
+        for (int d = 0; d < DIM; d++) v[d] = 7.0f + d * 0.01f;
+        char buf[2048], sql[2304];
+        vec_json(buf, sizeof(buf), v);
+        snprintf(sql, sizeof(sql), "INSERT INTO idxr(rowid, embedding) VALUES (9100, '%s')", buf);
+        exec_ok(db, sql, "rabitq incremental insert");
+        sqlite3_int64 ids[K]; double ds[K];
+        int n = knn(db, "idxr", buf, 1, ids, ds);
+        check(n == 1 && ids[0] == 9100, "rabitq incremental insert searchable");
+    }
+    {
+        char old_buf[2048];
+        vec_json(old_buf, sizeof(old_buf), data[0]);
+        exec_ok(db, "DELETE FROM idxr WHERE rowid = 1", "rabitq delete");
+        sqlite3_int64 ids[K]; double ds[K];
+        int n = knn(db, "idxr", old_buf, K, ids, ds);
+        int found = 0;
+        for (int i = 0; i < n; i++) found |= ids[i] == 1;
+        check(!found, "rabitq deleted row stays filtered");
+
+        float updated[DIM];
+        for (int d = 0; d < DIM; d++) updated[d] = -8.0f - d * 0.01f;
+        char updated_buf[2048], sql[2304];
+        vec_json(updated_buf, sizeof(updated_buf), updated);
+        snprintf(sql, sizeof(sql), "UPDATE idxr SET embedding = '%s' WHERE rowid = 2",
+                 updated_buf);
+        exec_ok(db, sql, "rabitq update");
+        n = knn(db, "idxr", updated_buf, 1, ids, ds);
+        check(n == 1 && ids[0] == 2, "rabitq updated row searchable");
+
+        float rolled_back[DIM];
+        for (int d = 0; d < DIM; d++) rolled_back[d] = 11.0f + d * 0.01f;
+        char rollback_buf[2048];
+        vec_json(rollback_buf, sizeof(rollback_buf), rolled_back);
+        exec_ok(db, "BEGIN", "begin rabitq rollback");
+        snprintf(sql, sizeof(sql), "INSERT INTO idxr(rowid, embedding) VALUES (9200, '%s')",
+                 rollback_buf);
+        exec_ok(db, sql, "rabitq rollback insert");
+        exec_ok(db, "ROLLBACK", "rabitq rollback");
+        n = knn(db, "idxr", rollback_buf, K, ids, ds);
+        found = 0;
+        for (int i = 0; i < n; i++) found |= ids[i] == 9200;
+        check(!found, "rabitq rolled back row stays absent");
+    }
+    {
+        sqlite3_stmt *st = NULL;
+        sqlite3_prepare_v2(db,
+                           "SELECT sum(kind=5), sum(kind=6) FROM idxr_graph WHERE kind IN (5,6)",
+                           -1, &st, NULL);
+        int nfixed = -1, ncodes = -1;
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            nfixed = sqlite3_column_int(st, 0);
+            ncodes = sqlite3_column_int(st, 1);
+        }
+        sqlite3_finalize(st);
+        check(nfixed == 1 && ncodes > 1, "rabitq fixed and segmented codes persisted");
+    }
+    sqlite3_close(db);
+    db = NULL;
+    if (sqlite3_open(dbpath, &db) != SQLITE_OK) return 1;
+    if (vexdb_sqlite_register(db) != SQLITE_OK) return 1;
+    {
+        double rr = recall_check(db, "idxr", "vexdb_l2_distance", data[17],
+                                 "rabitq reopen recall");
+        check(rr >= 0.8, "rabitq reopen recall >= 0.8");
     }
 
     sqlite3_close(db);

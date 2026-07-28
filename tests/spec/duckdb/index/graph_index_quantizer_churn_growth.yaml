@@ -1,0 +1,97 @@
+name: duckdb_graph_index_quantizer_churn_growth
+tags: [duckdb, quantizer, mutation, vacuum, persistence, memory, regression]
+engines: [duckdb]
+description: Repeated UPDATE must not retain an unbounded history of PQ or RaBitQ codes after VACUUM.
+steps:
+  - raw_directive: load __TEST_DIR__/quantizer_churn_growth.db
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+
+  - statement: CREATE TABLE pq_churn (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO pq_churn SELECT i, ${VEC_LITERAL([
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT, sin(i*0.31)::FLOAT, cos(i*0.37)::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: CREATE INDEX idx_pq_churn ON pq_churn USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, memory_mode='compact', m=16, ef_construction=160)};
+  - query: SELECT pq_codes_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_pq_churn';
+    _field_types: I
+    expect: [[2048]]
+  - raw_directive: loop cycle 0 32
+    raw_body: ''
+  - statement: "UPDATE pq_churn SET vec = ${VEC_LITERAL([
+      (${cycle}*1000 + id)::FLOAT, (${cycle}*0.01 + id*0.001)::FLOAT,
+      sin(${cycle} + id)::FLOAT, cos(${cycle} + id)::FLOAT,
+      0.1::FLOAT, 0.2::FLOAT, 0.3::FLOAT, 0.4::FLOAT], 8)} WHERE id < 64;"
+  - raw_directive: endloop
+  - statement: SET ${GUC_BF_THRESHOLD} = 100000;
+  - statement: "CREATE TEMP TABLE pq_churn_gt AS
+      SELECT id FROM pq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([31000,0.31,0,1,0.1,0.2,0.3,0.4], 8)})} LIMIT 20;"
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: VACUUM pq_churn;
+  - query: SELECT pq_codes_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_pq_churn';
+    _field_types: I
+    expect: [[2048]]
+  - query: "SELECT count(*) >= 12 FROM (
+      SELECT id FROM pq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([31000,0.31,0,1,0.1,0.2,0.3,0.4], 8)})} LIMIT 20
+      ) ann JOIN pq_churn_gt USING (id);"
+    _field_types: I
+    expect: [[true]]
+  # VACUUM only mutates index-maintenance state, so DuckDB may skip a normal
+  # CHECKPOINT as "no database changes" and retain the pre-vacuum WAL image.
+  - statement: FORCE CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM pq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect: [[512, 512]]
+  - query: SELECT pq_codes_bytes <= 4096 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_pq_churn';
+    _field_types: I
+    expect: [[true]]
+  - statement: DROP TABLE pq_churn;
+
+  - statement: CREATE TABLE rq_churn (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_churn SELECT i, ${VEC_LITERAL([
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT, sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT, sin(i*0.31)::FLOAT, cos(i*0.37)::FLOAT], 8)}
+      FROM ${RANGE(512)} t(i);"
+  - statement: CREATE INDEX idx_rq_churn ON rq_churn USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+  - query: SELECT rabitq_codes_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_churn';
+    _field_types: I
+    expect: [[53248]]
+  - raw_directive: loop cycle 0 32
+    raw_body: ''
+  - statement: "UPDATE rq_churn SET vec = ${VEC_LITERAL([
+      (${cycle}*1000 + id)::FLOAT, (${cycle}*0.01 + id*0.001)::FLOAT,
+      sin(${cycle} + id)::FLOAT, cos(${cycle} + id)::FLOAT,
+      0.1::FLOAT, 0.2::FLOAT, 0.3::FLOAT, 0.4::FLOAT], 8)} WHERE id < 64;"
+  - raw_directive: endloop
+  - statement: SET ${GUC_BF_THRESHOLD} = 100000;
+  - statement: "CREATE TEMP TABLE rq_churn_gt AS
+      SELECT id FROM rq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([31000,0.31,0,1,0.1,0.2,0.3,0.4], 8)})} LIMIT 20;"
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: VACUUM rq_churn;
+  - query: SELECT rabitq_codes_bytes > 0 AND rabitq_codes_bytes <= 53248 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_churn';
+    _field_types: I
+    expect: [[true]]
+  - query: "SELECT count(*) >= 12 FROM (
+      SELECT id FROM rq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([31000,0.31,0,1,0.1,0.2,0.3,0.4], 8)})} LIMIT 20
+      ) ann JOIN rq_churn_gt USING (id);"
+    _field_types: I
+    expect: [[true]]
+  - statement: FORCE CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: "SELECT count(*), count(DISTINCT id) FROM (
+      SELECT id FROM rq_churn
+      ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1000);"
+    _field_types: II
+    expect: [[512, 512]]
+  - query: SELECT rabitq_codes_bytes <= 106496 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_churn';
+    _field_types: I
+    expect: [[true]]
+  - statement: DROP TABLE rq_churn;

@@ -70,6 +70,7 @@ bool GraphAlgoSelfTest() {
         auto res = algo.search(pctx, reinterpret_cast<const char *>(data[17].data()),
                                /*ef_search=*/40);
         ok = !res.empty() && res[0].tid.row_id == 18;
+        ann_helper::optional_destroy(res);
         return 0;
     });
     return ok;

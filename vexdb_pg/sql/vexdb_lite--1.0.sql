@@ -301,7 +301,10 @@ CREATE FUNCTION vexdb_index_info()
         memory_bytes      int8,
         pq_codes_bytes    int8,
         pq_codebook_bytes int8,
-        memory_mode       text)
+        memory_mode       text,
+        quantizer         text,
+        rabitq_codes_bytes int8,
+        rabitq_fixed_bytes int8)
     AS 'MODULE_PATHNAME' LANGUAGE C;
 
 COMMENT ON FUNCTION vexdb_index_info() IS

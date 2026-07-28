@@ -16,13 +16,21 @@
 #include <utility>
 #include <vector>
 
+#include "quantizer_type.h"
 #include "vex_distance_entry.h"
 
 namespace vexdb_sqlite {
 
 class GraphBridge {
 public:
-    GraphBridge(uint16_t dim, int m, int ef_construction, VexMetric metric);
+    GraphBridge(uint16_t dim, int m, int ef_construction, VexMetric metric,
+                QuantizerType quantizer = QuantizerType::NONE, uint32_t pq_m = 0,
+                bool compact_mode = false);
+    GraphBridge(uint16_t dim, int m, int ef_construction, VexMetric metric,
+                bool use_rabitq, bool compact_mode = false)
+        : GraphBridge(dim, m, ef_construction, metric,
+                      use_rabitq ? QuantizerType::RABITQ : QuantizerType::NONE,
+                      0, compact_mode) {}
     ~GraphBridge();
     GraphBridge(const GraphBridge &) = delete;
     GraphBridge &operator=(const GraphBridge &) = delete;
@@ -48,6 +56,10 @@ public:
                 std::vector<std::pair<double, int64_t>> &out);
 
     size_t Count() const;
+    QuantizerType Quantizer() const;
+    bool UsesPQ() const;
+    bool UsesRaBitQ() const;
+    bool IsCompactMode() const;
 
     // ---- tid 摘除（DELETE/UPDATE 增量化，对齐 MySQL 二级索引 delete-mark+
     // insert 范式）----
@@ -61,8 +73,9 @@ public:
     size_t DeadNodeCount() const;
 
     // ---- 格式 v2：段式（M9'，%_graph(kind, seg, data)）----
-    // kind：0=meta 1=elems 2=upper 3=base 段 4=vec 段（base/vec 按 4096 条定长
-    // 记录切段）。read 返回 false=段不存在；write 必须在宿主写事务内调用。
+    // kind：0=meta 1=elems 2=upper 3=base 段 4=vec 段 5=量化器固定数据
+    // 6=量化 code 段（记录段按 64 条切分）。read 返回 false=段不存在；
+    // write 必须在宿主写事务内调用。
     using SegReadFn = std::function<bool(int kind, uint32_t seg, std::vector<char> &out)>;
     using SegWriteFn = std::function<bool(int kind, uint32_t seg, const std::vector<char> &data)>;
     // 记录粒度读（M9'b）：只读段 blob 的 [offset, offset+len) 进 dst（建议用
@@ -72,6 +85,9 @@ public:
 
     // 是否 DiskStore 模式（OpenV2Disk 打开；内存有界，段 LRU 懒加载）。
     bool IsDiskMode() const;
+    // DiskStore 三类页（base/vec/量化 code）的统一缓存观测值；mem 模式为 0。
+    size_t CacheBytesUsed() const;
+    size_t CacheBudgetBytes() const;
     // DiskStore 模式专用：有未落盘的 dirty 段/常驻改动（全内存模式恒 false，
     // dirty 由 vtab 的 graph_dirty 管）。
     bool HasDirty() const;
@@ -90,7 +106,22 @@ public:
     // nullptr 并填 err。
     static std::unique_ptr<GraphBridge> OpenV2(const SegReadFn &read, uint16_t dim, int m,
                                                int ef_construction, VexMetric metric,
+                                               QuantizerType quantizer, uint32_t pq_m,
+                                               bool compact_mode,
                                                std::string &err);
+    static std::unique_ptr<GraphBridge> OpenV2(const SegReadFn &read, uint16_t dim, int m,
+                                               int ef_construction, VexMetric metric,
+                                               bool use_rabitq, bool compact_mode,
+                                               std::string &err) {
+        return OpenV2(read, dim, m, ef_construction, metric,
+                      use_rabitq ? QuantizerType::RABITQ : QuantizerType::NONE,
+                      0, compact_mode, err);
+    }
+    static std::unique_ptr<GraphBridge> OpenV2(const SegReadFn &read, uint16_t dim, int m,
+                                               int ef_construction, VexMetric metric,
+                                               bool use_rabitq, std::string &err) {
+        return OpenV2(read, dim, m, ef_construction, metric, use_rabitq, false, err);
+    }
 
     // 读持久化 meta 头的节点数（含空壳；-1=无段/不可读）。over_limit 模式
     // 分流用：实际加载体量由持久化 base_count 决定，存活行数在删除后会低估
@@ -104,7 +135,30 @@ public:
     static std::unique_ptr<GraphBridge> OpenV2Disk(const SegReadFn &read, const SegWriteFn &write,
                                                    const SegRecReadFn &read_rec, uint16_t dim,
                                                    int m, int ef_construction, VexMetric metric,
-                                                   size_t cache_budget, std::string &err);
+                                                   QuantizerType quantizer, uint32_t pq_m,
+                                                   bool compact_mode,
+                                                   size_t cache_budget,
+                                                   std::string &err);
+    static std::unique_ptr<GraphBridge> OpenV2Disk(const SegReadFn &read,
+                                                   const SegWriteFn &write,
+                                                   const SegRecReadFn &read_rec, uint16_t dim,
+                                                   int m, int ef_construction, VexMetric metric,
+                                                   bool use_rabitq, bool compact_mode,
+                                                   size_t cache_budget,
+                                                   std::string &err) {
+        return OpenV2Disk(read, write, read_rec, dim, m, ef_construction, metric,
+                          use_rabitq ? QuantizerType::RABITQ : QuantizerType::NONE,
+                          0, compact_mode, cache_budget, err);
+    }
+    static std::unique_ptr<GraphBridge> OpenV2Disk(const SegReadFn &read,
+                                                   const SegWriteFn &write,
+                                                   const SegRecReadFn &read_rec, uint16_t dim,
+                                                   int m, int ef_construction, VexMetric metric,
+                                                   bool use_rabitq, size_t cache_budget,
+                                                   std::string &err) {
+        return OpenV2Disk(read, write, read_rec, dim, m, ef_construction, metric,
+                          use_rabitq, false, cache_budget, err);
+    }
 
 private:
     struct Impl;

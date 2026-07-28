@@ -17,6 +17,7 @@
 #include "distance/core/distance.h"
 
 #include <cstring>
+#include <limits>
 #include <vector>
 
 namespace vex {
@@ -44,20 +45,30 @@ void ProductQuantizer::set_basic_values(size_t dim, size_t m, size_t nbits_in) {
 }
 
 void ProductQuantizer::set_derived_values(const PQContext &ctx) {
-    if (d % M != 0) {
-        VEX_QUANT_ERROR("PQ: dimension (" + std::to_string(d) +
-                        ") must be a multiple of subquantizer count (" + std::to_string(M) + ")");
+    if (d == 0 || M == 0 || d % M != 0) {
+        VEX_QUANT_ERRORF(
+            "PQ: dimension (%zu) must be a positive multiple of subquantizer count (%zu)",
+            d, M);
+    }
+    if (nbits == 0 || nbits >= std::numeric_limits<size_t>::digits ||
+        M > (std::numeric_limits<size_t>::max() - 7) / nbits) {
+        VEX_QUANT_ERROR("PQ: code configuration is too large");
     }
     dsub      = d / M;
     code_size = (nbits * M + 7) / 8;
     ksub      = 1ULL << nbits;
+    if (d > std::numeric_limits<size_t>::max() / ksub ||
+        d * ksub > std::numeric_limits<size_t>::max() / sizeof(float)) {
+        VEX_QUANT_ERROR("PQ: centroid allocation size overflow");
+    }
+    const size_t centroid_bytes = d * ksub * sizeof(float);
     // Centroid table can exceed 1GB (e.g. d=1024, M=64, ksub=256 -> ~1GB).
     // Route through AllocHugeZero so PG can pass MCXT_ALLOC_HUGE; std::malloc
     // already supports >1GB so duck falls through unchanged.
-    centroids = static_cast<float *>(ctx.allocator.AllocHugeZero(d * ksub * sizeof(float)));
+    centroids = static_cast<float *>(ctx.allocator.AllocHugeZero(centroid_bytes));
     if (centroids == nullptr) {
-        VEX_QUANT_ERROR("PQ: failed to allocate " +
-                        std::to_string(d * ksub * sizeof(float)) + " bytes for centroids");
+        VEX_QUANT_ERRORF("PQ: failed to allocate %zu bytes for centroids",
+                         centroid_bytes);
     }
 }
 
@@ -103,13 +114,39 @@ void ProductQuantizer::train(const KMeansState &kmeans_state,
     // task to ctx.parallel which serializes when no driver is provided.
     ctx.progress.Report(0, M, "kmeans subq");
     ctx.parallel.Run(M, [&](size_t m) {
+        PQContext task_ctx = ctx;
+        task_ctx.random.Seed(42 + static_cast<uint64_t>(m));
+        struct FloatArrayGuard {
+            const PQAllocator &allocator;
+            PQFloatArray &array;
+            ~FloatArrayGuard() {
+                allocator.Free(array.data);
+                array.data = nullptr;
+            }
+        };
+        auto checked_bytes = [](size_t count, size_t dim) {
+            if (count != 0 && dim > std::numeric_limits<size_t>::max() / count) {
+                VEX_QUANT_ERROR("PQ: training allocation size overflow");
+            }
+            const size_t floats = count * dim;
+            if (floats > std::numeric_limits<size_t>::max() / sizeof(float)) {
+                VEX_QUANT_ERROR("PQ: training allocation size overflow");
+            }
+            return floats * sizeof(float);
+        };
+
         // Subvector buffer: pack samples[*][m*dsub : (m+1)*dsub] into a
         // contiguous float array K-means expects.
         PQFloatArray subvecs;
         subvecs.maxlen = n;
         subvecs.length = n;
         subvecs.dim    = dsub;
-        subvecs.data   = static_cast<float *>(ctx.allocator.Alloc(n * dsub * sizeof(float)));
+        const size_t subvec_bytes = checked_bytes(n, dsub);
+        subvecs.data = static_cast<float *>(task_ctx.allocator.Alloc(subvec_bytes));
+        FloatArrayGuard subvecs_guard{task_ctx.allocator, subvecs};
+        if (!subvecs.data && subvec_bytes != 0) {
+            VEX_QUANT_ERRORF("PQ: failed to allocate %zu training bytes", subvec_bytes);
+        }
 
         for (size_t j = 0; j < n; j++) {
             const float *src = samples.Get(j);
@@ -120,15 +157,17 @@ void ProductQuantizer::train(const KMeansState &kmeans_state,
         subcenters.maxlen = ksub;
         subcenters.length = 0;
         subcenters.dim    = dsub;
-        subcenters.data   = static_cast<float *>(ctx.allocator.AllocZero(ksub * dsub * sizeof(float)));
+        const size_t center_bytes = checked_bytes(ksub, dsub);
+        subcenters.data = static_cast<float *>(task_ctx.allocator.AllocZero(center_bytes));
+        FloatArrayGuard subcenters_guard{task_ctx.allocator, subcenters};
+        if (!subcenters.data && center_bytes != 0) {
+            VEX_QUANT_ERRORF("PQ: failed to allocate %zu centroid bytes", center_bytes);
+        }
 
-        AnnKmeans(kmeans_state, subvecs, subcenters, avg_work_mem_kb, ctx);
+        AnnKmeans(kmeans_state, subvecs, subcenters, avg_work_mem_kb, task_ctx);
 
         // Copy trained centroids into the global table at slot m.
         set_params(subcenters, m);
-
-        ctx.allocator.Free(subvecs.data);
-        ctx.allocator.Free(subcenters.data);
 
         // Report progress per finished subquantizer. With ctx.parallel.Run
         // serialized (default), `m` increments monotonically; with a real
@@ -161,22 +200,60 @@ void compute_code_generic(const ProductQuantizer &pq, const float *x, uint8_t *c
 } // namespace
 
 void ProductQuantizer::compute_code(const float *x, uint8_t *code) const {
-    // Scratch buffer for the SIMD nearest-neighbor function. Stack-allocated
-    // since ksub is bounded (typically 256). Fall back to heap for huge nbits.
-    if (ksub <= 4096) {
-        float distances[4096];
+    auto encode = [&](float *distances) {
         switch (nbits) {
             case 8:  compute_code_generic<PQEncoder8>(*this, x, code, distances); break;
             case 16: compute_code_generic<PQEncoder16>(*this, x, code, distances); break;
             default: compute_code_generic<PQEncoderGeneric>(*this, x, code, distances); break;
         }
+    };
+
+    // The production profile uses 8-bit codes (256 centroids). Keep that hot
+    // path to 1 KiB of stack scratch instead of touching the old 16 KiB buffer
+    // for every encoded row. Larger custom profiles retain bounded fallbacks.
+    if (ksub <= 256) {
+        float distances[256];
+        encode(distances);
+        return;
+    }
+    if (ksub <= 4096) {
+        float distances[4096];
+        encode(distances);
         return;
     }
     std::vector<float> distances(ksub);
+    encode(distances.data());
+}
+
+template <typename Decoder>
+static void decode_code_generic(const ProductQuantizer &pq, const uint8_t *code,
+                                float *x) {
+    Decoder decoder(code, static_cast<int>(pq.nbits));
+    for (size_t m = 0; m < pq.M; m++) {
+        const auto centroid_id = static_cast<size_t>(decoder.decode());
+        if (centroid_id >= pq.ksub) {
+            VEX_QUANT_ERRORF("PQ: code centroid %zu is out of range [0, %zu)",
+                             centroid_id, pq.ksub);
+        }
+        std::memcpy(x + m * pq.dsub, pq.get_centroids(m, centroid_id),
+                    pq.dsub * sizeof(float));
+    }
+}
+
+void ProductQuantizer::decode_code(const uint8_t *code, float *x) const {
+    if (!trained || !centroids || !code || !x) {
+        VEX_QUANT_ERROR("PQ: cannot decode an untrained quantizer or null buffer");
+    }
     switch (nbits) {
-        case 8:  compute_code_generic<PQEncoder8>(*this, x, code, distances.data()); break;
-        case 16: compute_code_generic<PQEncoder16>(*this, x, code, distances.data()); break;
-        default: compute_code_generic<PQEncoderGeneric>(*this, x, code, distances.data()); break;
+        case 8:
+            decode_code_generic<PQDecoder8>(*this, code, x);
+            break;
+        case 16:
+            decode_code_generic<PQDecoder16>(*this, code, x);
+            break;
+        default:
+            decode_code_generic<PQDecoderGeneric>(*this, code, x);
+            break;
     }
 }
 

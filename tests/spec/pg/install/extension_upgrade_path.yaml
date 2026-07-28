@@ -1,0 +1,17 @@
+name: extension_upgrade_path
+tags: [pg-only, install, upgrade, rabitq]
+description: |
+  PostgreSQL packages must expose 1.1 as the default version and retain a
+  discoverable 1.0 -> 1.1 update path for the expanded vexdb_index_info schema.
+engines: [pg]
+steps:
+  - query: |
+      SELECT default_version, installed_version
+      FROM pg_available_extensions
+      WHERE name = 'vexdb_lite';
+    expect: [[1.1, 1.1]]
+  - query: |
+      SELECT source, target, path
+      FROM pg_extension_update_paths('vexdb_lite')
+      WHERE source = '1.0' AND target = '1.1';
+    expect: [[1.0, 1.1, 1.0--1.1]]

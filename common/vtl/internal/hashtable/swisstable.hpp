@@ -657,7 +657,7 @@ private:
         int16 res = vaddvq_u16((uint16x8_t)vzip1q_u8(masked, maskedhi));
         return ~res;
     #else
-        const int8* group_meta = _ctrl + group_idx;
+        const int8 *group_meta = reinterpret_cast<const int8 *>(_ctrl + group_idx);
         uint16 res = 0;
         for (uint32 i = 0; i < group_size; ++i) {
             if (group_meta[i] >= 0) {

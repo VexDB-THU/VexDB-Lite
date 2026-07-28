@@ -1,0 +1,55 @@
+name: duckdb_graph_index_rabitq_persistence
+tags: [duckdb, rabitq, persistence, regression]
+engines: [duckdb]
+description: RaBitQ top-k and incremental codes survive checkpoint and restart.
+steps:
+  - raw_directive: load __TEST_DIR__/rabitq_persistence.db
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: CREATE TABLE rq_p (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+  - statement: "INSERT INTO rq_p SELECT i, ${VEC_LITERAL([
+      sin(i*0.07)::FLOAT, cos(i*0.09)::FLOAT,
+      sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT,
+      sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+      sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT], 8)}
+      FROM ${RANGE2(1, 1501)} t(i);"
+  - statement: CREATE INDEX idx_rq_p ON rq_p USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', m=16, ef_construction=160)};
+  - statement: "CREATE TABLE rq_before AS SELECT id, row_number() OVER () rn FROM (
+      SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 20
+      );"
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: EXPLAIN SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 20;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: "WITH rq_after AS (
+      SELECT id, row_number() OVER () rn FROM (
+        SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 20
+      ))
+      SELECT count(*) FROM rq_before b JOIN rq_after a USING (rn) WHERE b.id <> a.id;"
+    _field_types: I
+    expect:
+      - [0]
+  - query: SELECT quantizer, rabitq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_p';
+    _field_types: TI
+    expect:
+      - [rabitq, true]
+  - statement: "INSERT INTO rq_p VALUES (9002, ${VEC_LITERAL([8.1,8.2,8.3,8.4,8.5,8.6,8.7,8.8], 8)});"
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - query: SELECT quantizer, rabitq_codes_bytes > 0, rabitq_fixed_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rq_p';
+    _field_types: TII
+    expect:
+      - [rabitq, true, true]
+  - query: EXPLAIN SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([8.1,8.2,8.3,8.4,8.5,8.6,8.7,8.8], 8)})} LIMIT 1;
+    _field_types: II
+    expect:
+      - [physical_plan, <REGEX>:.*VEXDB_INDEX_SCAN.*]
+  - query: SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([8.1,8.2,8.3,8.4,8.5,8.6,8.7,8.8], 8)})} LIMIT 1;
+    _field_types: I
+    expect:
+      - [9002]
+  - statement: DROP TABLE rq_p;
+  - statement: DROP TABLE rq_before;

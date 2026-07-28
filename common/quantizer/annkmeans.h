@@ -16,6 +16,7 @@
 
 #include "quantizer/pq_alloc.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace vex {
@@ -32,6 +33,14 @@ struct KMeansState {
     KMeansDistanceFn norm_fn     = nullptr;  // optional: apply unit-norm to centers (cosine)
     bool             skip_check_duplicate = false;
 };
+
+// Peak scratch owned by AnnKmeans itself. This excludes caller-owned samples
+// and centers so host adapters can combine it with their full training budget.
+// The estimate is saturating: SIZE_MAX means the requested shape cannot be
+// represented safely.
+size_t EstimateKMeansScratchBytes(size_t num_samples,
+                                  size_t num_centers,
+                                  size_t dim);
 
 // Run k-means on `samples`, write `centers->maxlen` centroids into `centers`.
 // On entry: centers->data must point to caller-allocated buffer of size

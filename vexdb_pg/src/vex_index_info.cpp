@@ -20,12 +20,13 @@ extern "C" {
 #include "graph_index/graph_index_struct.h"
 #include "quantizer.h"
 #include "ann_utils.h"
+#include "rabitq/utils.h"
 
 extern "C" {
 PG_FUNCTION_INFO_V1(vexdb_index_info);
 }
 
-#define VEX_INDEX_INFO_NCOLS 18
+#define VEX_INDEX_INFO_NCOLS 21
 
 static const char *metric_name(Metric m)
 {
@@ -111,6 +112,12 @@ Datum vexdb_index_info(PG_FUNCTION_ARGS)
     const char *metric_str = "l2";
     bool use_pq = false;
     int32 pq_m_val = 0;
+    int64 pq_codes_bytes = 0;
+    int64 pq_codebook_bytes = 0;
+    const char *quantizer_str = "none";
+    int64 rabitq_codes_bytes = 0;
+    int64 rabitq_fixed_bytes = 0;
+    bool quantizer_active = false;
 
     // Best-effort metapage read — guard against indexes whose main fork
     // is empty (e.g., ambuildempty before any CREATE INDEX populates it).
@@ -125,9 +132,28 @@ Datum vexdb_index_info(PG_FUNCTION_ARGS)
             m_val      = (int32)mp->m;
             efc_val    = (int32)mp->ef_construction;
             metric_str = metric_name(mp->metric);
+            quantizer_active = mp->quantizer_metainfo.get_type() != QuantizerType::NONE;
             use_pq     = (mp->quantizer_metainfo.get_type() == QuantizerType::PQ);
-            if (mp->quantizer_metainfo.get_setting_type() == QuantizerType::PQ) {
-                pq_m_val = (int32)mp->quantizer_metainfo.get_pq_metainfo().m;
+            QuantizerType configured_qt = mp->quantizer_metainfo.get_setting_type();
+            if (configured_qt == QuantizerType::PQ) {
+                quantizer_str = "pq";
+                const PQMetaInfo &pqi = mp->quantizer_metainfo.get_pq_metainfo();
+                pq_m_val = (int32)pqi.m;
+                if (use_pq) {
+                    pq_codes_bytes = (int64)pqi.code_size() * (int64)mp->num_vectors;
+                    pq_codebook_bytes = (int64)mp->dimension * (int64)pqi.k *
+                                        (int64)sizeof(float);
+                }
+            } else if (configured_qt == QuantizerType::RABITQ) {
+                quantizer_str = "rabitq";
+                const RaBitQMeta &rbq = mp->quantizer_metainfo.get_rabitq_meta();
+                if (rbq.enabled && rbq.storage_version == 2) {
+                    rabitq_codes_bytes = (int64)rbq.quant_size * (int64)mp->num_vectors;
+                    const int64 padded_dim = RABITQ_PADDED_DIM(mp->dimension);
+                    rabitq_fixed_bytes = padded_dim / 2 +
+                        (int64)GRAPH_INDEX_RABITQ_NUM_CLUSTERS *
+                        ((int64)mp->dimension + padded_dim) * sizeof(float);
+                }
             }
         }
         UnlockReleaseBuffer(mb);
@@ -155,9 +181,13 @@ Datum vexdb_index_info(PG_FUNCTION_ARGS)
 
     int64 mem = (int64)RelationGetNumberOfBlocks(index) * BLCKSZ;
     values[c++] = Int64GetDatum(mem);
-    values[c++] = Int64GetDatum(0);                            // pq_codes_bytes
-    values[c++] = Int64GetDatum(0);                            // pq_codebook_bytes
-    values[c++] = CStringGetTextDatum("full");
+    values[c++] = Int64GetDatum(pq_codes_bytes);
+    values[c++] = Int64GetDatum(pq_codebook_bytes);
+    values[c++] = CStringGetTextDatum(
+        graph_index_get_compact_mode(index) && quantizer_active ? "compact" : "full");
+    values[c++] = CStringGetTextDatum(quantizer_str);
+    values[c++] = Int64GetDatum(rabitq_codes_bytes);
+    values[c++] = Int64GetDatum(rabitq_fixed_bytes);
 
     relation_close(index, AccessShareLock);
 
