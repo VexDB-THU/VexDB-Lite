@@ -2,18 +2,21 @@
 
 - 文档类型：唯一有效的目标和开发顺序基线
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
-- 日期：2026-07-27
+- 日期：2026-07-28
 - 分支：`feature/agent_files`
-- 文档版本：3.4
+- 文档版本：3.5
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
-- 当前阶段：Phase 2 PostgreSQL 数据库合同和本机默认 NFS 验收已完成。PG VexFS spec 9/9、
+- 当前阶段：Phase 2 PostgreSQL 数据库合同和本机默认 NFS 验收已完成。PG VexFS spec 12/12、
   libpq runtime 132 项、manifest publish 专项 10 项和真实 macOS NFS 性能 18 项检查通过。
   PG writable handle 已使用基础 manifest + 64 KiB 脏块，发布直接复用未修改块并生成
-  `manifest-v1` 根哈希，不再在数据库进程中拼接完整文件。历史 FSKit 两 Mac、
+  `manifest-v1` 根哈希，不再在数据库进程中拼接完整文件。批量创建已经保持逐路径 change 和
+  逐文件 version，同时复用空 manifest 和不可变 ACL 集合；10 万文件有界性能 Gate 通过。
+  历史 FSKit 两 Mac、
   macOS↔Linux、PG 16–19、备份、
   format v2 和真实 OpenCode 证据继续有效。当前源码的 Developer ID 候选包已经通过文档、
   安装和解压签名检查，但正式 preview.38 仍需从干净提交生成并提交 Apple 公证；第二台 Mac
-  NFS 复验也没有完成。下一步只做发行 Gate；DuckDB adapter 已交由其他方向负责，不在本路线继续开发。
+  NFS 复验也没有完成。下一步先提交当前 ACL 收口，再按 workspace log、快照策略、Agent
+  checkpoint 和发行 Gate 推进；DuckDB adapter 已交由其他方向负责，不在本路线继续开发。
 
 ## 0. 2026-07-24 路线调整
 
@@ -240,8 +243,11 @@ SQLite 证据。当前 format v2 已支持 SQLite 和 PostgreSQL，DuckDB adapte
 - 最终 quick eval 为 57 passed、0 failed、18 个平台条件 skipped、2,863 checks，耗时 24.824 秒；
   SQLite spec、runtime smoke、VexFS CLI smoke 和 VexDB unified CLI smoke 全部通过。
 - 2026-07-27 根哈希规则已统一到 SQLite、PostgreSQL、共享 C++ 和 format v2；SQLite 全量 spec
-  30/30、PG VexFS spec 9/9、PG runtime 132 checks、SQLite ↔ PG 双向归档 6 checks 全部通过；
+  30/30、PG VexFS spec 12/12、PG runtime 132 checks、SQLite ↔ PG 双向归档 6 checks 全部通过；
   SQLite `diff` 的旧整文件哈希校验已改为清单根校验，并加入版本差异回归。
+- 2026-07-28 PG 批量创建和 ACL 历史完成收口：相同 ACL 以不可变集合复用，inode 与快照只保存
+  集合引用，ACL 修改使用写时复制。1 千文件比旧单文件接口快 4.06 倍；10 万文件创建 10.232 秒，
+  容器峰值 726,503,424 B，1 GiB 限制下 `oom_kill=0`。
 
 当前仍没有跨文件通用去重、自动 repair、自动 GC 或在线 VACUUM。完整证据见
 `docs/reports/2026-07-23_vexfs-chunk-manifest-v2.md`。
@@ -421,7 +427,20 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
 
 下一轮开发固定按以下顺序推进：
 
-### 当前固定顺序（2026-07-23 PostgreSQL Phase 2 收口）
+### 当前固定顺序（2026-07-28 Agent 版本闭环）
+
+1. **当前收口：**提交并推送 PG ACL 不可变集合、写时复制、快照引用和 1k/10k/100k 性能 Gate。
+2. **P1：**实现 SQLite/PG 统一的 `vexdb fs workspace log`，默认新到旧、有界分页并支持 JSON。
+3. **P1：**增加 manual/agent/safety 快照分类、保留规则和 `prune --dry-run`。
+4. **P1：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，并给出恢复命令。
+5. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
+   sleep/wake、跨机器锁和长时间 Agent 工作区。
+6. **后续：**按 PITR 路线图做 SQLite commit 固定快照、show/diff 和按时间选择；随后再做 Windows WinFsp。
+
+DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入当前队列。PG 逐 commit PITR
+必须先由真实快照规模数据证明需要，不能提前增加长期写放大。
+
+### 已完成的 PostgreSQL Phase 2 收口记录
 
 1. **P0（已完成）：修复 FSKit 元数据缓存失效。** hardlink 后立即刷新源 inode；create、symlink、
    hardlink、remove、rename 后刷新或失效相关父目录。250 ms TTL 只做兜底，不能代替
@@ -451,7 +470,7 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
 9. **P1（已完成 PG Alpha 规模和 Agent 验证）：** PostgreSQL 已完成有界性能、1 千文件、
    真实工具链和双 Mac 串行 OpenCode 完整闭环：第一台创建、第二台继承修改、第一台回看，
    两个 workspace 快照和一键恢复均通过。所有大测试继续保留 RSS 上限和低并发。
-10. **当前唯一动作：** 用户确认提交后，把已经通过自动测试、本机真挂载、长循环 crash、真实
+10. **发行遗留动作：** 把已经通过自动测试、本机真挂载、长循环 crash、真实
     TCP 断线和候选包 Gate 的工作树形成干净提交，生成并公证 `preview.38`，安装后再跑双机安装
     Gate。实际 sleep/wake 仍需交互式管理员授权；局域网直连另需第二台 Mac 在线并允许 VexDB Lite
     使用“本地网络”。
@@ -471,9 +490,9 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
 PG 逐 commit PITR 不是默认下一项，不能为了统一宣传提前引入长期写放大。
 
 PostgreSQL Phase 2 的 format v2、ACL、审计、libpq HostStore、远程 mount、备份和故障恢复
-已经完成。当前不再继续扩展 PG 代码；先关闭两台 Mac 对最终签名版本的系统授权验收点。DuckDB
-adapter 已明确不由本路线处理，后续平台开发只保留 Windows WinFsp。SQLite 的 10 万文件和小文件性能
-仍是独立的 Phase 1 发布优化，不再阻塞 PostgreSQL Alpha 功能结论。
+已经完成。除统一 workspace log、快照策略和 Agent checkpoint 所需公共合同外，不再单独扩展
+PG 文件语义。DuckDB adapter 已明确不由本路线处理，后续平台开发只保留 Windows WinFsp。
+SQLite 的 10 万文件和小文件性能仍是独立的 Phase 1 发布优化，不再阻塞 PostgreSQL Alpha 功能结论。
 
 ### N1. 共用 mount 一致性 eval
 

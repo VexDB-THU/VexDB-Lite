@@ -89,9 +89,16 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_PERF_FILES=1000 \
 # PG 批量历史写入：先用旧单文件接口建立 1000 文件控制组，再验证
 # 1k/10k/100k 批量创建。每批最多 1000 个文件、单连接串行执行，容器
 # 内存硬限制默认 1 GiB；同时检查一个批次一个 commit、逐路径 change、
-# 逐文件 version、共享空 manifest、deep/quick check 和至少 2x 加速。
+# 逐文件 version、共享空 manifest、千/万/十万文件只存一份继承 ACL、
+# deep/quick check 和至少 2x 加速。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
   bash tests/eval/vexfs/run_pg_create_batch_performance.sh
+
+# 16 个连接同时把相同 ACL 写到不同 inode，验证只生成一个不可变集合；
+# 再次并发写入必须幂等，快照不得复制 ACL 明细。容器 memory.max 必须
+# 不超过 1 GiB，并检查 oom_kill 没有增长。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+  bash tests/eval/vexfs/run_pg_acl_cow_concurrency.sh
 
 # PG manifest 根哈希专项：16 MiB 文件每轮只改 4 KiB，发布不得拼完整文件；
 # 默认重复 5 次，容器 memory.max 必须不超过 1 GiB，并检查 oom_kill 未增长。

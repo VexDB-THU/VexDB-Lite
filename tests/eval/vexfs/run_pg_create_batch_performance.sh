@@ -117,14 +117,19 @@ docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t -A \
     | grep -qx t || fail "测试数据库没有 vexfs_create_batch"
 
 mkdir -p "$REPORT_DIR"
-printf 'mode\tfiles\tbatch_size\tbatches\telapsed_ms\tcleanup_ms\tfiles_per_second\tcommits\tchanges\tversions\tmanifests\tpeak_memory_bytes\tcheck_ok\n' > "$REPORT"
+printf 'mode\tfiles\tbatch_size\tbatches\telapsed_ms\tcleanup_ms\tfiles_per_second\tcommits\tchanges\tversions\tmanifests\tacl_sets\tacl_set_entries\texpanded_acl_entries\tpeak_memory_bytes\tcheck_ok\n' > "$REPORT"
 
 # A small old-path control proves that batching removes real per-file commit
 # overhead without repeating the old design at 10k/100k scale.
 LEGACY_WORKSPACE="eval-batch-legacy-$$"
 ACTIVE_WORKSPACES+=("$LEGACY_WORKSPACE")
 docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q \
-    -v ON_ERROR_STOP=1 -c "SELECT public.vexfs_workspace_create('$LEGACY_WORKSPACE');" \
+    -v ON_ERROR_STOP=1 -c \
+    "SELECT public.vexfs_workspace_create('$LEGACY_WORKSPACE');
+     SELECT public.vexfs_acl_set(
+         '$LEGACY_WORKSPACE',
+         (public.vexfs_workspace_stat('$LEGACY_WORKSPACE')->>'root_inode')::bigint,
+         '[{\"principal\":\"public\",\"effect\":\"allow\",\"permissions\":\"read\",\"inherit\":1}]');" \
     >/dev/null
 LEGACY_SQL="$TMP/legacy.sql"
 {
@@ -142,10 +147,14 @@ LEGACY_STATE="$(docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" \
     -X -q -t -A -F '|' -v ON_ERROR_STOP=1 -c \
     "SELECT live_files,head_commit,
             (SELECT count(*) FROM _vexfs.commit_changes c WHERE c.workspace_id=w.workspace_id),
+            (SELECT count(*) FROM _vexfs.acl_sets s WHERE s.workspace_id=w.workspace_id),
+            (SELECT count(*) FROM _vexfs.acl_set_entries e JOIN _vexfs.acl_sets s USING (acl_set_id) WHERE s.workspace_id=w.workspace_id),
+            (SELECT count(*) FROM _vexfs.acl_entries a WHERE a.workspace_id=w.workspace_id),
             (public.vexfs_check('$LEGACY_WORKSPACE',0)->>'ok')::boolean
        FROM _vexfs.workspaces w WHERE name='$LEGACY_WORKSPACE';")"
-IFS='|' read -r LEGACY_FILES LEGACY_COMMITS LEGACY_CHANGES LEGACY_OK <<<"$LEGACY_STATE"
-[[ "$LEGACY_FILES|$LEGACY_COMMITS|$LEGACY_CHANGES|$LEGACY_OK" == "1000|1001|1001|t" ]] || \
+IFS='|' read -r LEGACY_FILES LEGACY_COMMITS LEGACY_CHANGES LEGACY_ACL_SETS \
+    LEGACY_ACL_ENTRIES LEGACY_EXPANDED_ACLS LEGACY_OK <<<"$LEGACY_STATE"
+[[ "$LEGACY_FILES|$LEGACY_COMMITS|$LEGACY_CHANGES|$LEGACY_ACL_SETS|$LEGACY_ACL_ENTRIES|$LEGACY_EXPANDED_ACLS|$LEGACY_OK" == "1000|1002|1002|1|1|1001|t" ]] || \
     fail "旧路径控制组状态不正确：$LEGACY_STATE"
 LEGACY_RATE="$("$PYTHON_BIN" -c \
     "print(round(1000 * 1000 / max(1, int('$LEGACY_ELAPSED')), 2))")"
@@ -158,9 +167,10 @@ LEGACY_CLEANUP=$(( $(now_ms) - LEGACY_DROP_STARTED ))
 LEGACY_DROP_PEAK="$(cat "$TMP/legacy-drop.peak")"
 (( LEGACY_DROP_PEAK > LEGACY_PEAK )) && LEGACY_PEAK="$LEGACY_DROP_PEAK"
 (( LEGACY_CLEANUP <= 30000 )) || fail "旧路径 1000 文件清理超过 30 秒"
-printf 'single\t1000\t1\t1000\t%s\t%s\t%s\t%s\t%s\t1000\t1\t%s\t%s\n' \
+printf 'single\t1000\t1\t1000\t%s\t%s\t%s\t%s\t%s\t1000\t1\t%s\t%s\t%s\t%s\t%s\n' \
     "$LEGACY_ELAPSED" "$LEGACY_CLEANUP" "$LEGACY_RATE" "$LEGACY_COMMITS" \
-    "$LEGACY_CHANGES" "$LEGACY_PEAK" "$LEGACY_OK" >> "$REPORT"
+    "$LEGACY_CHANGES" "$LEGACY_ACL_SETS" "$LEGACY_ACL_ENTRIES" \
+    "$LEGACY_EXPANDED_ACLS" "$LEGACY_PEAK" "$LEGACY_OK" >> "$REPORT"
 ACTIVE_WORKSPACES=()
 
 FIRST_BATCH_ELAPSED=""
@@ -171,7 +181,12 @@ for scale in $SCALES; do
     workspace="eval-batch-${scale}-$$"
     ACTIVE_WORKSPACES+=("$workspace")
     docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q \
-        -v ON_ERROR_STOP=1 -c "SELECT public.vexfs_workspace_create('$workspace');" \
+        -v ON_ERROR_STOP=1 -c \
+        "SELECT public.vexfs_workspace_create('$workspace');
+         SELECT public.vexfs_acl_set(
+             '$workspace',
+             (public.vexfs_workspace_stat('$workspace')->>'root_inode')::bigint,
+             '[{\"principal\":\"public\",\"effect\":\"allow\",\"permissions\":\"read\",\"inherit\":1}]');" \
         >/dev/null
 
     sql_file="$TMP/batch-$scale.sql"
@@ -202,15 +217,21 @@ for scale in $SCALES; do
                 (SELECT count(*) FROM _vexfs.commit_changes c WHERE c.workspace_id=w.workspace_id),
                 (SELECT count(*) FROM _vexfs.file_versions v WHERE v.workspace_id=w.workspace_id),
                 (SELECT count(*) FROM _vexfs.manifests m WHERE m.workspace_id=w.workspace_id),
+                (SELECT count(*) FROM _vexfs.acl_sets s WHERE s.workspace_id=w.workspace_id),
+                (SELECT count(*) FROM _vexfs.acl_set_entries e JOIN _vexfs.acl_sets s USING (acl_set_id) WHERE s.workspace_id=w.workspace_id),
+                (SELECT count(*) FROM _vexfs.acl_entries a WHERE a.workspace_id=w.workspace_id),
                 (SELECT count(*) FROM _vexfs.audit_events a WHERE a.workspace_id=w.workspace_id AND a.operation='create_batch'),
                 (public.vexfs_check('$workspace',$deep)->>'ok')::boolean
            FROM _vexfs.workspaces w WHERE name='$workspace';")"
-    IFS='|' read -r files commits changes versions manifests audits check_ok <<<"$state"
-    expected_commits=$((batches + 1))
-    expected_changes=$((scale + 1))
+    IFS='|' read -r files commits changes versions manifests acl_sets acl_entries \
+        expanded_acls audits check_ok <<<"$state"
+    expected_commits=$((batches + 2))
+    expected_changes=$((scale + 2))
     [[ "$files" == "$scale" && "$commits" == "$expected_commits" && \
        "$changes" == "$expected_changes" && "$versions" == "$scale" && \
-       "$manifests" == "1" && "$audits" == "$batches" && "$check_ok" == "t" ]] || \
+       "$manifests" == "1" && "$acl_sets" == "1" && "$acl_entries" == "1" && \
+       "$expanded_acls" == "$((scale + 1))" && "$audits" == "$batches" && \
+       "$check_ok" == "t" ]] || \
         fail "$scale 文件状态不正确：$state"
 
     case "$scale" in
@@ -238,10 +259,10 @@ for scale in $SCALES; do
     esac
     (( cleanup_elapsed <= cleanup_budget_ms )) || \
         fail "$scale 文件清理耗时 ${cleanup_elapsed}ms 超过预算 ${cleanup_budget_ms}ms"
-    printf 'batch\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf 'batch\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$scale" "$BATCH_SIZE" "$batches" "$elapsed" "$cleanup_elapsed" \
-        "$rate" "$commits" "$changes" "$versions" "$manifests" "$peak" \
-        "$check_ok" >> "$REPORT"
+        "$rate" "$commits" "$changes" "$versions" "$manifests" \
+        "$acl_sets" "$acl_entries" "$expanded_acls" "$peak" "$check_ok" >> "$REPORT"
     echo "batch files=$scale elapsed_ms=$elapsed cleanup_ms=$cleanup_elapsed rate=$rate peak_memory_bytes=$peak"
     ACTIVE_WORKSPACES=()
 done

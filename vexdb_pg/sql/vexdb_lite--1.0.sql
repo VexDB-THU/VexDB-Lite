@@ -343,6 +343,35 @@ CREATE TABLE _vexfs.workspaces (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- ACLs are immutable, content-addressed sets.  Inodes and snapshots reference
+-- one set instead of copying the same inherited entries for every file.
+CREATE TABLE _vexfs.acl_sets (
+    acl_set_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
+    fingerprint text NOT NULL CHECK (fingerprint ~ '^[0-9a-f]{64}$'),
+    canonical_acl jsonb NOT NULL CHECK (jsonb_typeof(canonical_acl) = 'array'),
+    entry_count integer NOT NULL CHECK (entry_count BETWEEN 1 AND 1024),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    UNIQUE (workspace_id, fingerprint)
+);
+
+CREATE INDEX vexfs_acl_sets_workspace_idx
+    ON _vexfs.acl_sets(workspace_id, acl_set_id);
+
+CREATE TABLE _vexfs.acl_set_entries (
+    acl_set_id bigint NOT NULL REFERENCES _vexfs.acl_sets(acl_set_id) ON DELETE CASCADE,
+    principal text NOT NULL CHECK (principal <> '' AND octet_length(principal) <= 255),
+    effect text NOT NULL CHECK (effect IN ('allow', 'deny')),
+    permissions text NOT NULL CHECK (permissions <> '' AND octet_length(permissions) <= 1024),
+    inherit_flags integer NOT NULL DEFAULT 0 CHECK (inherit_flags BETWEEN 0 AND 255),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (acl_set_id, principal, effect)
+);
+
+CREATE INDEX vexfs_acl_set_entries_principal_idx
+    ON _vexfs.acl_set_entries(principal, acl_set_id);
+
 CREATE TABLE _vexfs.inodes (
     inode_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -353,6 +382,7 @@ CREATE TABLE _vexfs.inodes (
     owner_principal text NOT NULL,
     uid bigint NOT NULL DEFAULT 0 CHECK (uid BETWEEN 0 AND 4294967295),
     gid bigint NOT NULL DEFAULT 0 CHECK (gid BETWEEN 0 AND 4294967295),
+    acl_set_id bigint REFERENCES _vexfs.acl_sets(acl_set_id) ON DELETE SET NULL,
     current_version bigint NOT NULL DEFAULT 0 CHECK (current_version >= 0),
     size_bytes bigint NOT NULL DEFAULT 0 CHECK (size_bytes >= 0),
     live boolean NOT NULL DEFAULT true,
@@ -364,6 +394,8 @@ CREATE TABLE _vexfs.inodes (
 
 CREATE INDEX vexfs_inodes_workspace_idx
     ON _vexfs.inodes(workspace_id, inode_id);
+CREATE INDEX vexfs_inodes_acl_set_fk_idx
+    ON _vexfs.inodes(acl_set_id) WHERE acl_set_id IS NOT NULL;
 
 CREATE TABLE _vexfs.dentries (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -489,22 +521,21 @@ CREATE TABLE _vexfs.xattrs (
 CREATE INDEX vexfs_xattrs_inode_fk_idx
     ON _vexfs.xattrs(inode_id);
 
-CREATE TABLE _vexfs.acl_entries (
-    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
-    inode_id bigint NOT NULL REFERENCES _vexfs.inodes(inode_id) ON DELETE CASCADE,
-    principal text NOT NULL CHECK (principal <> '' AND octet_length(principal) <= 255),
-    effect text NOT NULL CHECK (effect IN ('allow', 'deny')),
-    permissions text NOT NULL CHECK (permissions <> '' AND octet_length(permissions) <= 1024),
-    inherit_flags integer NOT NULL DEFAULT 0 CHECK (inherit_flags BETWEEN 0 AND 255),
-    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (workspace_id, inode_id, principal, effect)
-);
-
-CREATE INDEX vexfs_acl_entries_principal_idx
-    ON _vexfs.acl_entries(workspace_id, principal, inode_id);
-CREATE INDEX vexfs_acl_entries_inode_fk_idx
-    ON _vexfs.acl_entries(inode_id);
+-- Compatibility read model used by permission checks and archive export.
+-- Mutations go through the ACL API so changing one inode never mutates a set
+-- shared by another inode or snapshot.
+CREATE VIEW _vexfs.acl_entries AS
+SELECT inode.workspace_id,
+       inode.inode_id,
+       entry.principal,
+       entry.effect,
+       entry.permissions,
+       entry.inherit_flags,
+       entry.created_at,
+       entry.updated_at
+  FROM _vexfs.inodes AS inode
+  JOIN _vexfs.acl_set_entries AS entry
+    ON entry.acl_set_id = inode.acl_set_id;
 
 CREATE TABLE _vexfs.file_versions (
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
@@ -572,6 +603,7 @@ CREATE TABLE _vexfs.snapshot_inodes (
     owner_principal text NOT NULL,
     uid bigint NOT NULL CHECK (uid BETWEEN 0 AND 4294967295),
     gid bigint NOT NULL CHECK (gid BETWEEN 0 AND 4294967295),
+    acl_set_id bigint REFERENCES _vexfs.acl_sets(acl_set_id) ON DELETE SET NULL,
     current_version bigint NOT NULL CHECK (current_version >= 0),
     size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
     created_at timestamptz NOT NULL,
@@ -580,6 +612,9 @@ CREATE TABLE _vexfs.snapshot_inodes (
     changed_at timestamptz NOT NULL,
     PRIMARY KEY (snapshot_id, inode_id)
 );
+
+CREATE INDEX vexfs_snapshot_inodes_acl_set_fk_idx
+    ON _vexfs.snapshot_inodes(acl_set_id) WHERE acl_set_id IS NOT NULL;
 
 CREATE TABLE _vexfs.snapshot_dentries (
     snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
@@ -598,17 +633,18 @@ CREATE TABLE _vexfs.snapshot_xattrs (
     PRIMARY KEY (snapshot_id, inode_id, name)
 );
 
-CREATE TABLE _vexfs.snapshot_acl_entries (
-    snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
-    inode_id bigint NOT NULL,
-    principal text NOT NULL,
-    effect text NOT NULL CHECK (effect IN ('allow', 'deny')),
-    permissions text NOT NULL,
-    inherit_flags integer NOT NULL CHECK (inherit_flags BETWEEN 0 AND 255),
-    created_at timestamptz NOT NULL,
-    updated_at timestamptz NOT NULL,
-    PRIMARY KEY (snapshot_id, inode_id, principal, effect)
-);
+CREATE VIEW _vexfs.snapshot_acl_entries AS
+SELECT inode.snapshot_id,
+       inode.inode_id,
+       entry.principal,
+       entry.effect,
+       entry.permissions,
+       entry.inherit_flags,
+       entry.created_at,
+       entry.updated_at
+  FROM _vexfs.snapshot_inodes AS inode
+  JOIN _vexfs.acl_set_entries AS entry
+    ON entry.acl_set_id = inode.acl_set_id;
 
 CREATE TABLE _vexfs.audit_events (
     event_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -759,6 +795,8 @@ CREATE INDEX vexfs_file_locks_inode_fk_idx
 -- Version aliases are validated the same way instead of using a self-referencing
 -- file_versions foreign key, which would create another circular restore order.
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.workspaces', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.acl_sets', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.acl_set_entries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.inodes', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.dentries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.commits', '');
@@ -768,14 +806,13 @@ SELECT pg_catalog.pg_extension_config_dump('_vexfs.chunks', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.manifest_chunks', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.file_versions', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.xattrs', '');
-SELECT pg_catalog.pg_extension_config_dump('_vexfs.acl_entries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshots', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_inodes', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_dentries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_xattrs', '');
-SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_acl_entries', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.audit_events', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.workspaces_workspace_id_seq', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.acl_sets_acl_set_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.inodes_inode_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.manifests_manifest_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.chunks_chunk_id_seq', '');
@@ -928,6 +965,181 @@ BEGIN
     END LOOP;
     RETURN v_parts;
 END;
+$$;
+
+CREATE FUNCTION _vexfs.canonical_acl(p_acl jsonb)
+RETURNS jsonb
+LANGUAGE plpgsql
+IMMUTABLE
+PARALLEL SAFE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_canonical jsonb;
+BEGIN
+    IF p_acl IS NULL OR jsonb_typeof(p_acl) <> 'array'
+       OR jsonb_array_length(p_acl) > 1024 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_ACL: ACL must be an array with at most 1024 entries'
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+         FROM jsonb_array_elements(p_acl) AS item(value)
+         WHERE jsonb_typeof(item.value) <> 'object'
+            OR coalesce(item.value->'principal',
+                        item.value->'principal_id') IS NULL
+            OR jsonb_typeof(coalesce(item.value->'principal',
+                                     item.value->'principal_id')) <> 'string'
+            OR (item.value ? 'effect'
+                AND jsonb_typeof(item.value->'effect') <> 'string')
+            OR item.value->'permissions' IS NULL
+            OR jsonb_typeof(item.value->'permissions') <> 'string'
+            OR ((item.value ? 'inherit' OR item.value ? 'inherit_flags')
+                AND coalesce(item.value->>'inherit',
+                             item.value->>'inherit_flags') !~ '^[0-9]+$')
+            OR EXISTS (
+                SELECT 1 FROM jsonb_object_keys(item.value) AS key
+                 WHERE key NOT IN (
+                     'principal', 'principal_id', 'effect', 'permissions',
+                     'inherit', 'inherit_flags'))) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_ACL: invalid ACL entry'
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT coalesce(jsonb_agg(jsonb_build_object(
+               'principal', normalized.principal,
+               'effect', normalized.effect,
+               'permissions', normalized.permissions,
+               'inherit', normalized.inherit_flags)
+               ORDER BY normalized.principal, normalized.effect), '[]'::jsonb)
+      INTO v_canonical
+      FROM (
+          SELECT coalesce(item.value->>'principal',
+                          item.value->>'principal_id') AS principal,
+                 lower(coalesce(item.value->>'effect', 'allow')) AS effect,
+                 item.value->>'permissions' AS permissions,
+                 coalesce(item.value->>'inherit',
+                          item.value->>'inherit_flags', '0')::integer AS inherit_flags
+            FROM jsonb_array_elements(p_acl) AS item(value)
+      ) AS normalized;
+
+    IF EXISTS (
+        SELECT 1
+         FROM jsonb_array_elements(v_canonical) AS item(value)
+         WHERE item.value->>'principal' IS NULL
+            OR item.value->>'principal' = ''
+            OR octet_length(item.value->>'principal') > 255
+            OR item.value->>'effect' NOT IN ('allow', 'deny')
+            OR item.value->>'permissions' IS NULL
+            OR item.value->>'permissions' = ''
+            OR octet_length(item.value->>'permissions') > 1024
+            OR (item.value->>'inherit')::integer NOT BETWEEN 0 AND 255) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_ACL: invalid ACL entry'
+            USING ERRCODE = '22023';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(v_canonical) AS item(value)
+         GROUP BY item.value->>'principal', item.value->>'effect'
+        HAVING count(*) > 1) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_ACL: principal/effect entries must be unique'
+            USING ERRCODE = '22023';
+    END IF;
+    RETURN v_canonical;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.get_or_create_acl_set(
+    p_workspace_id bigint,
+    p_acl jsonb)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_canonical jsonb;
+    v_fingerprint text;
+    v_acl_set bigint;
+    v_existing jsonb;
+BEGIN
+    v_canonical := _vexfs.canonical_acl(p_acl);
+    IF jsonb_array_length(v_canonical) = 0 THEN
+        RETURN NULL;
+    END IF;
+    PERFORM 1 FROM _vexfs.workspaces AS workspace
+     WHERE workspace.workspace_id = p_workspace_id;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_WORKSPACE_NOT_FOUND: %', p_workspace_id
+            USING ERRCODE = 'P0002';
+    END IF;
+    v_fingerprint := encode(pg_catalog.sha256(
+        convert_to(v_canonical::text, 'UTF8')), 'hex');
+    SELECT acl_set.acl_set_id, acl_set.canonical_acl
+      INTO v_acl_set, v_existing
+      FROM _vexfs.acl_sets AS acl_set
+     WHERE acl_set.workspace_id = p_workspace_id
+       AND acl_set.fingerprint = v_fingerprint;
+    IF FOUND THEN
+        IF v_existing IS DISTINCT FROM v_canonical THEN
+            RAISE EXCEPTION 'VEXFS_CORRUPT: ACL fingerprint collision'
+                USING ERRCODE = 'XX001';
+        END IF;
+        RETURN v_acl_set;
+    END IF;
+
+    INSERT INTO _vexfs.acl_sets(
+        workspace_id, fingerprint, canonical_acl, entry_count)
+    VALUES (
+        p_workspace_id, v_fingerprint, v_canonical,
+        jsonb_array_length(v_canonical))
+    ON CONFLICT (workspace_id, fingerprint) DO NOTHING
+    RETURNING acl_set_id INTO v_acl_set;
+    IF v_acl_set IS NULL THEN
+        SELECT acl_set.acl_set_id, acl_set.canonical_acl
+          INTO v_acl_set, v_existing
+          FROM _vexfs.acl_sets AS acl_set
+         WHERE acl_set.workspace_id = p_workspace_id
+           AND acl_set.fingerprint = v_fingerprint;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VEXFS_ACL_RETRY: concurrent ACL set is not visible'
+                USING ERRCODE = '40001';
+        END IF;
+        IF v_existing IS DISTINCT FROM v_canonical THEN
+            RAISE EXCEPTION 'VEXFS_CORRUPT: ACL fingerprint collision'
+                USING ERRCODE = 'XX001';
+        END IF;
+        RETURN v_acl_set;
+    END IF;
+    INSERT INTO _vexfs.acl_set_entries(
+        acl_set_id, principal, effect, permissions, inherit_flags)
+    SELECT v_acl_set,
+           item.value->>'principal',
+           item.value->>'effect',
+           item.value->>'permissions',
+           (item.value->>'inherit')::integer
+      FROM jsonb_array_elements(v_canonical) AS item(value)
+    ;
+    RETURN v_acl_set;
+END;
+$$;
+
+CREATE FUNCTION _vexfs.acl_json_for_inode(
+    p_workspace_id bigint,
+    p_inode_id bigint)
+RETURNS jsonb
+LANGUAGE sql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+    SELECT coalesce(set.canonical_acl, '[]'::jsonb)
+      FROM _vexfs.inodes AS inode
+      LEFT JOIN _vexfs.acl_sets AS set
+        ON set.acl_set_id = inode.acl_set_id
+     WHERE inode.workspace_id = p_workspace_id
+       AND inode.inode_id = p_inode_id
 $$;
 
 CREATE FUNCTION _vexfs.permission_contains(
@@ -1369,6 +1581,56 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION _vexfs.inherited_acl_set_id(
+    p_workspace_id bigint,
+    p_parent_inode bigint)
+RETURNS bigint
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_parent_set bigint;
+    v_total integer;
+    v_inherited jsonb;
+BEGIN
+    SELECT inode.acl_set_id INTO v_parent_set
+      FROM _vexfs.inodes AS inode
+     WHERE inode.workspace_id = p_workspace_id
+       AND inode.inode_id = p_parent_inode;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'VEXFS_INODE_NOT_FOUND: %', p_parent_inode
+            USING ERRCODE = 'P0002';
+    END IF;
+    IF v_parent_set IS NULL THEN
+        RETURN NULL;
+    END IF;
+    SELECT set.entry_count,
+           coalesce(jsonb_agg(jsonb_build_object(
+               'principal', entry.principal,
+               'effect', entry.effect,
+               'permissions', entry.permissions,
+               'inherit', entry.inherit_flags)
+               ORDER BY entry.principal, entry.effect)
+               FILTER (WHERE entry.inherit_flags <> 0), '[]'::jsonb)
+      INTO v_total, v_inherited
+      FROM _vexfs.acl_sets AS set
+      JOIN _vexfs.acl_set_entries AS entry
+        ON entry.acl_set_id = set.acl_set_id
+     WHERE set.workspace_id = p_workspace_id
+       AND set.acl_set_id = v_parent_set
+     GROUP BY set.entry_count;
+    IF jsonb_array_length(v_inherited) = 0 THEN
+        RETURN NULL;
+    END IF;
+    IF jsonb_array_length(v_inherited) = v_total THEN
+        RETURN v_parent_set;
+    END IF;
+    RETURN _vexfs.get_or_create_acl_set(p_workspace_id, v_inherited);
+END;
+$$;
+
 CREATE FUNCTION _vexfs.inherit_acl(
     p_workspace_id bigint,
     p_parent_inode bigint,
@@ -1379,22 +1641,11 @@ SECURITY DEFINER
 VOLATILE
 SET search_path = pg_catalog, _vexfs
 AS $$
-    INSERT INTO _vexfs.acl_entries(
-        workspace_id, inode_id, principal, effect,
-        permissions, inherit_flags, created_at, updated_at)
-    SELECT p_workspace_id,
-           p_child_inode,
-           acl.principal,
-           acl.effect,
-           acl.permissions,
-           acl.inherit_flags,
-           clock_timestamp(),
-           clock_timestamp()
-      FROM _vexfs.acl_entries AS acl
-     WHERE acl.workspace_id = p_workspace_id
-       AND acl.inode_id = p_parent_inode
-       AND acl.inherit_flags <> 0
-    ON CONFLICT (workspace_id, inode_id, principal, effect) DO NOTHING
+    UPDATE _vexfs.inodes AS child
+       SET acl_set_id = _vexfs.inherited_acl_set_id(
+           p_workspace_id, p_parent_inode)
+     WHERE child.workspace_id = p_workspace_id
+       AND child.inode_id = p_child_inode
 $$;
 
 CREATE FUNCTION _vexfs.random_token(p_prefix text)
@@ -6885,24 +7136,20 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_workspace _vexfs.workspaces%ROWTYPE;
-    v_entry jsonb;
-    v_principal text;
-    v_effect text;
-    v_permissions text;
-    v_inherit integer;
-    v_count integer := 0;
+    v_canonical jsonb;
+    v_before_set bigint;
+    v_after_set bigint;
+    v_count integer;
     v_before_count integer;
     v_version bigint;
     v_path text;
 BEGIN
-    IF jsonb_typeof(p_acl) <> 'array' OR jsonb_array_length(p_acl) > 1024 THEN
-        RAISE EXCEPTION 'VEXFS_INVALID_ACL: ACL must be an array with at most 1024 entries'
-            USING ERRCODE = '22023';
-    END IF;
+    v_canonical := _vexfs.canonical_acl(p_acl);
+    v_count := jsonb_array_length(v_canonical);
     v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
     PERFORM _vexfs.require_inode_permission(
         v_workspace.workspace_id, p_inode, 'admin');
-    SELECT i.current_version INTO v_version
+    SELECT i.current_version, i.acl_set_id INTO v_version, v_before_set
       FROM _vexfs.inodes AS i
      WHERE i.workspace_id = v_workspace.workspace_id
        AND i.inode_id = p_inode AND i.live
@@ -6911,44 +7158,28 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_INODE_NOT_FOUND: %', p_inode USING ERRCODE = 'P0002';
     END IF;
     v_path := _vexfs.path_for_inode(v_workspace.workspace_id, p_inode);
-    SELECT count(*) INTO v_before_count
-      FROM _vexfs.acl_entries AS acl
-     WHERE acl.workspace_id = v_workspace.workspace_id
-       AND acl.inode_id = p_inode;
-    DELETE FROM _vexfs.acl_entries
-     WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
-    FOR v_entry IN SELECT value FROM jsonb_array_elements(p_acl)
-    LOOP
-        v_principal := coalesce(v_entry->>'principal', v_entry->>'principal_id');
-        v_effect := coalesce(v_entry->>'effect', 'allow');
-        v_permissions := v_entry->>'permissions';
-        v_inherit := coalesce((v_entry->>'inherit')::integer,
-                              (v_entry->>'inherit_flags')::integer, 0);
-        IF v_principal IS NULL OR v_principal = '' OR octet_length(v_principal) > 255
-           OR v_effect NOT IN ('allow', 'deny')
-           OR v_permissions IS NULL OR v_permissions = ''
-           OR octet_length(v_permissions) > 1024
-           OR v_inherit NOT BETWEEN 0 AND 255 THEN
-            RAISE EXCEPTION 'VEXFS_INVALID_ACL: invalid ACL entry'
-                USING ERRCODE = '22023';
-        END IF;
-        INSERT INTO _vexfs.acl_entries(
-            workspace_id, inode_id, principal, effect,
-            permissions, inherit_flags)
-        VALUES (
-            v_workspace.workspace_id, p_inode, v_principal, v_effect,
-            v_permissions, v_inherit);
-        v_count := v_count + 1;
-    END LOOP;
+    SELECT coalesce(set.entry_count, 0) INTO v_before_count
+      FROM _vexfs.inodes AS inode
+      LEFT JOIN _vexfs.acl_sets AS set ON set.acl_set_id = inode.acl_set_id
+     WHERE inode.workspace_id = v_workspace.workspace_id
+       AND inode.inode_id = p_inode;
+    v_after_set := _vexfs.get_or_create_acl_set(
+        v_workspace.workspace_id, v_canonical);
+    IF v_after_set IS NOT DISTINCT FROM v_before_set THEN
+        RETURN v_count;
+    END IF;
     UPDATE _vexfs.inodes SET changed_at = clock_timestamp()
-     WHERE inode_id = p_inode;
+         , acl_set_id = v_after_set
+     WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
     PERFORM _vexfs.record_commit(
         v_workspace.workspace_id, 'set_acl', v_path, p_inode,
         jsonb_build_object(
             'before_version', v_version,
             'after_version', v_version,
             'before_entries', v_before_count,
-            'after_entries', v_count));
+            'after_entries', v_count,
+            'before_acl_set', v_before_set,
+            'after_acl_set', v_after_set));
     RETURN v_count;
 END;
 $$;
@@ -6967,6 +7198,10 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_workspace _vexfs.workspaces%ROWTYPE;
+    v_before_acl jsonb;
+    v_after_acl jsonb;
+    v_before_set bigint;
+    v_after_set bigint;
     v_version bigint;
     v_path text;
 BEGIN
@@ -6978,7 +7213,7 @@ BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
     PERFORM _vexfs.require_inode_permission(
         v_workspace.workspace_id, p_inode, 'admin');
-    SELECT i.current_version INTO v_version
+    SELECT i.current_version, i.acl_set_id INTO v_version, v_before_set
       FROM _vexfs.inodes AS i
      WHERE i.workspace_id = v_workspace.workspace_id
        AND i.inode_id = p_inode AND i.live
@@ -6987,17 +7222,27 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_INODE_NOT_FOUND: %', p_inode USING ERRCODE = 'P0002';
     END IF;
     v_path := _vexfs.path_for_inode(v_workspace.workspace_id, p_inode);
-    INSERT INTO _vexfs.acl_entries(
-        workspace_id, inode_id, principal, effect, permissions, inherit_flags)
-    VALUES (
-        v_workspace.workspace_id, p_inode, p_principal,
-        p_effect, p_permissions, p_inherit)
-    ON CONFLICT (workspace_id, inode_id, principal, effect) DO UPDATE
-      SET permissions = EXCLUDED.permissions,
-          inherit_flags = EXCLUDED.inherit_flags,
-          updated_at = clock_timestamp();
+    v_before_acl := _vexfs.acl_json_for_inode(
+        v_workspace.workspace_id, p_inode);
+    SELECT coalesce(jsonb_agg(item.value ORDER BY item.value->>'principal',
+                                             item.value->>'effect'), '[]'::jsonb)
+      INTO v_after_acl
+      FROM jsonb_array_elements(v_before_acl) AS item(value)
+     WHERE item.value->>'principal' <> p_principal
+        OR item.value->>'effect' <> p_effect;
+    v_after_acl := v_after_acl || jsonb_build_array(jsonb_build_object(
+        'principal', p_principal,
+        'effect', p_effect,
+        'permissions', p_permissions,
+        'inherit', p_inherit));
+    v_after_set := _vexfs.get_or_create_acl_set(
+        v_workspace.workspace_id, v_after_acl);
+    IF v_after_set IS NOT DISTINCT FROM v_before_set THEN
+        RETURN 1;
+    END IF;
     UPDATE _vexfs.inodes SET changed_at = clock_timestamp()
-     WHERE inode_id = p_inode;
+         , acl_set_id = v_after_set
+     WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
     PERFORM _vexfs.record_commit(
         v_workspace.workspace_id, 'grant_acl', v_path, p_inode,
         jsonb_build_object(
@@ -7006,7 +7251,9 @@ BEGIN
             'principal', p_principal,
             'effect', p_effect,
             'permissions', p_permissions,
-            'inherit', p_inherit));
+            'inherit', p_inherit,
+            'before_acl_set', v_before_set,
+            'after_acl_set', v_after_set));
     RETURN 1;
 END;
 $$;
@@ -7023,6 +7270,10 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_workspace _vexfs.workspaces%ROWTYPE;
+    v_before_acl jsonb;
+    v_after_acl jsonb;
+    v_before_set bigint;
+    v_after_set bigint;
     v_removed integer;
     v_version bigint;
     v_path text;
@@ -7033,7 +7284,7 @@ BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
     PERFORM _vexfs.require_inode_permission(
         v_workspace.workspace_id, p_inode, 'admin');
-    SELECT i.current_version INTO v_version
+    SELECT i.current_version, i.acl_set_id INTO v_version, v_before_set
       FROM _vexfs.inodes AS i
      WHERE i.workspace_id = v_workspace.workspace_id
        AND i.inode_id = p_inode AND i.live
@@ -7042,15 +7293,24 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_INODE_NOT_FOUND: %', p_inode USING ERRCODE = 'P0002';
     END IF;
     v_path := _vexfs.path_for_inode(v_workspace.workspace_id, p_inode);
-    DELETE FROM _vexfs.acl_entries
-     WHERE workspace_id = v_workspace.workspace_id
-       AND inode_id = p_inode
-       AND principal = p_principal
-       AND (p_effect IS NULL OR effect = p_effect);
-    GET DIAGNOSTICS v_removed = ROW_COUNT;
+    v_before_acl := _vexfs.acl_json_for_inode(
+        v_workspace.workspace_id, p_inode);
+    SELECT coalesce(jsonb_agg(item.value ORDER BY item.value->>'principal',
+                                             item.value->>'effect') FILTER (
+               WHERE item.value->>'principal' <> p_principal
+                  OR (p_effect IS NOT NULL
+                      AND item.value->>'effect' <> p_effect)), '[]'::jsonb),
+           count(*) FILTER (
+               WHERE item.value->>'principal' = p_principal
+                 AND (p_effect IS NULL OR item.value->>'effect' = p_effect))
+      INTO v_after_acl, v_removed
+      FROM jsonb_array_elements(v_before_acl) AS item(value);
     IF v_removed > 0 THEN
+        v_after_set := _vexfs.get_or_create_acl_set(
+            v_workspace.workspace_id, v_after_acl);
         UPDATE _vexfs.inodes SET changed_at = clock_timestamp()
-         WHERE inode_id = p_inode;
+             , acl_set_id = v_after_set
+         WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
         PERFORM _vexfs.record_commit(
             v_workspace.workspace_id, 'revoke_acl', v_path, p_inode,
             jsonb_build_object(
@@ -7058,7 +7318,9 @@ BEGIN
                 'after_version', v_version,
                 'principal', p_principal,
                 'effect', p_effect,
-                'removed_entries', v_removed));
+                'removed_entries', v_removed,
+                'before_acl_set', v_before_set,
+                'after_acl_set', v_after_set));
     END IF;
     RETURN v_removed;
 END;
@@ -7074,6 +7336,7 @@ SET search_path = pg_catalog, _vexfs
 AS $$
 DECLARE
     v_workspace _vexfs.workspaces%ROWTYPE;
+    v_before_set bigint;
     v_removed integer;
     v_version bigint;
     v_path text;
@@ -7081,7 +7344,7 @@ BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
     PERFORM _vexfs.require_inode_permission(
         v_workspace.workspace_id, p_inode, 'admin');
-    SELECT i.current_version INTO v_version
+    SELECT i.current_version, i.acl_set_id INTO v_version, v_before_set
       FROM _vexfs.inodes AS i
      WHERE i.workspace_id = v_workspace.workspace_id
        AND i.inode_id = p_inode AND i.live
@@ -7090,18 +7353,22 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_INODE_NOT_FOUND: %', p_inode USING ERRCODE = 'P0002';
     END IF;
     v_path := _vexfs.path_for_inode(v_workspace.workspace_id, p_inode);
-    DELETE FROM _vexfs.acl_entries
-     WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
-    GET DIAGNOSTICS v_removed = ROW_COUNT;
+    SELECT coalesce(set.entry_count, 0) INTO v_removed
+      FROM _vexfs.inodes AS inode
+      LEFT JOIN _vexfs.acl_sets AS set ON set.acl_set_id = inode.acl_set_id
+     WHERE inode.workspace_id = v_workspace.workspace_id
+       AND inode.inode_id = p_inode;
     IF v_removed > 0 THEN
-        UPDATE _vexfs.inodes SET changed_at = clock_timestamp()
+        UPDATE _vexfs.inodes SET changed_at = clock_timestamp(), acl_set_id = NULL
          WHERE workspace_id = v_workspace.workspace_id AND inode_id = p_inode;
         PERFORM _vexfs.record_commit(
             v_workspace.workspace_id, 'delete_acl', v_path, p_inode,
             jsonb_build_object(
                 'before_version', v_version,
                 'after_version', v_version,
-                'removed_entries', v_removed));
+                'removed_entries', v_removed,
+                'before_acl_set', v_before_set,
+                'after_acl_set', NULL));
     END IF;
     RETURN v_removed;
 END;
@@ -7344,6 +7611,7 @@ DECLARE
     v_index integer;
     v_conflict text;
     v_manifest bigint;
+    v_acl_set bigint;
     v_checksum text;
     v_commit bigint;
     v_created jsonb;
@@ -7464,6 +7732,8 @@ BEGIN
     SELECT role.oid INTO STRICT v_actor
       FROM pg_catalog.pg_roles AS role
      WHERE role.rolname = session_user;
+    v_acl_set := _vexfs.inherited_acl_set_id(
+        v_workspace.workspace_id, v_parent);
 
     FOR v_index IN 1..v_count LOOP
         v_inodes := array_append(
@@ -7472,7 +7742,7 @@ BEGIN
     END LOOP;
     INSERT INTO _vexfs.inodes(
         inode_id, workspace_id, kind, mode, owner_oid, owner_role,
-        owner_principal, current_version, size_bytes)
+        owner_principal, acl_set_id, current_version, size_bytes)
     OVERRIDING SYSTEM VALUE
     SELECT item.inode_id,
            v_workspace.workspace_id,
@@ -7481,6 +7751,7 @@ BEGIN
            v_actor,
            session_user,
            session_user,
+           v_acl_set,
            CASE WHEN item.kind = 'file' THEN 1 ELSE 0 END,
            0
       FROM unnest(v_inodes, v_kinds, v_modes)
@@ -7488,23 +7759,6 @@ BEGIN
     INSERT INTO _vexfs.dentries(workspace_id, parent_inode, name, inode_id)
     SELECT v_workspace.workspace_id, v_parent, item.name, item.inode_id
       FROM unnest(v_names, v_inodes) AS item(name, inode_id);
-    INSERT INTO _vexfs.acl_entries(
-        workspace_id, inode_id, principal, effect,
-        permissions, inherit_flags, created_at, updated_at)
-    SELECT v_workspace.workspace_id,
-           child.inode_id,
-           acl.principal,
-           acl.effect,
-           acl.permissions,
-           acl.inherit_flags,
-           clock_timestamp(),
-           clock_timestamp()
-      FROM unnest(v_inodes) AS child(inode_id)
-      JOIN _vexfs.acl_entries AS acl
-        ON acl.workspace_id = v_workspace.workspace_id
-       AND acl.inode_id = v_parent
-       AND acl.inherit_flags <> 0;
-
     IF v_file_count > 0 THEN
         v_manifest := _vexfs.store_manifest(
             v_workspace.workspace_id, v_parent, NULL, ''::bytea);
@@ -8203,7 +8457,7 @@ BEGIN
     )
     INSERT INTO _vexfs.snapshot_inodes(
         snapshot_id, inode_id, kind, mode, owner_oid, owner_role, owner_principal,
-        uid, gid, current_version, size_bytes, created_at, accessed_at,
+        uid, gid, acl_set_id, current_version, size_bytes, created_at, accessed_at,
         modified_at, changed_at)
     SELECT v_snapshot_id,
            i.inode_id,
@@ -8214,6 +8468,7 @@ BEGIN
            i.owner_principal,
            i.uid,
            i.gid,
+           i.acl_set_id,
            i.current_version,
            i.size_bytes,
            i.created_at,
@@ -8241,15 +8496,6 @@ BEGIN
         ON i.snapshot_id = v_snapshot_id AND i.inode_id = x.inode_id
      WHERE x.workspace_id = v_workspace.workspace_id;
 
-    INSERT INTO _vexfs.snapshot_acl_entries(
-        snapshot_id, inode_id, principal, effect, permissions,
-        inherit_flags, created_at, updated_at)
-    SELECT v_snapshot_id, acl.inode_id, acl.principal, acl.effect,
-           acl.permissions, acl.inherit_flags, acl.created_at, acl.updated_at
-      FROM _vexfs.acl_entries AS acl
-      JOIN _vexfs.snapshot_inodes AS i
-        ON i.snapshot_id = v_snapshot_id AND i.inode_id = acl.inode_id
-     WHERE acl.workspace_id = v_workspace.workspace_id;
     PERFORM _vexfs.audit(
         v_workspace.workspace_id, v_head, 'snapshot_create',
         '/', v_workspace.root_inode,
@@ -8837,6 +9083,7 @@ BEGIN
            owner_principal = s.owner_principal,
            uid = s.uid,
            gid = s.gid,
+           acl_set_id = s.acl_set_id,
            size_bytes = s.size_bytes,
            live = true,
            created_at = s.created_at,
@@ -8896,15 +9143,6 @@ BEGIN
       FROM _vexfs.snapshot_xattrs AS x
      WHERE x.snapshot_id = v_snapshot_id;
 
-    DELETE FROM _vexfs.acl_entries
-     WHERE workspace_id = v_workspace.workspace_id;
-    INSERT INTO _vexfs.acl_entries(
-        workspace_id, inode_id, principal, effect, permissions,
-        inherit_flags, created_at, updated_at)
-    SELECT v_workspace.workspace_id, acl.inode_id, acl.principal, acl.effect,
-           acl.permissions, acl.inherit_flags, acl.created_at, acl.updated_at
-      FROM _vexfs.snapshot_acl_entries AS acl
-     WHERE acl.snapshot_id = v_snapshot_id;
     RETURN v_commit;
 END;
 $$;
@@ -9149,6 +9387,7 @@ DECLARE
     v_change_count bigint;
     v_request_count bigint;
     v_acl_count bigint;
+    v_acl_set_count bigint;
     v_xattr_count bigint;
     v_audit_count bigint;
     v_handle_count bigint;
@@ -9191,6 +9430,9 @@ BEGIN
     SELECT count(*) INTO v_acl_count
       FROM _vexfs.acl_entries AS acl
      WHERE acl.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_acl_set_count
+      FROM _vexfs.acl_sets AS acl_set
+     WHERE acl_set.workspace_id = v_workspace.workspace_id;
     SELECT count(*) INTO v_xattr_count
       FROM _vexfs.xattrs AS xattr
      WHERE xattr.workspace_id = v_workspace.workspace_id;
@@ -9285,6 +9527,40 @@ BEGIN
         v_issues := v_issues || jsonb_build_array(jsonb_build_object(
             'code', 'unreachable_inode', 'count', v_bad,
             'message', 'live inode is not reachable from root'));
+    END IF;
+
+    SELECT count(*) INTO v_bad
+      FROM _vexfs.acl_sets AS acl_set
+     WHERE acl_set.workspace_id = v_workspace.workspace_id
+       AND (acl_set.entry_count <> (
+               SELECT count(*) FROM _vexfs.acl_set_entries AS entry
+                WHERE entry.acl_set_id = acl_set.acl_set_id)
+            OR acl_set.fingerprint IS DISTINCT FROM encode(pg_catalog.sha256(
+                   convert_to(acl_set.canonical_acl::text, 'UTF8')), 'hex')
+            OR acl_set.canonical_acl IS DISTINCT FROM (
+               SELECT jsonb_agg(jsonb_build_object(
+                          'principal', entry.principal,
+                          'effect', entry.effect,
+                          'permissions', entry.permissions,
+                          'inherit', entry.inherit_flags)
+                          ORDER BY entry.principal, entry.effect)
+                 FROM _vexfs.acl_set_entries AS entry
+                WHERE entry.acl_set_id = acl_set.acl_set_id));
+    SELECT v_bad + count(*) INTO v_bad
+      FROM _vexfs.inodes AS inode
+      JOIN _vexfs.acl_sets AS acl_set ON acl_set.acl_set_id = inode.acl_set_id
+     WHERE inode.workspace_id = v_workspace.workspace_id
+       AND acl_set.workspace_id <> inode.workspace_id;
+    SELECT v_bad + count(*) INTO v_bad
+      FROM _vexfs.snapshot_inodes AS inode
+      JOIN _vexfs.snapshots AS snapshot ON snapshot.snapshot_id = inode.snapshot_id
+      JOIN _vexfs.acl_sets AS acl_set ON acl_set.acl_set_id = inode.acl_set_id
+     WHERE snapshot.workspace_id = v_workspace.workspace_id
+       AND acl_set.workspace_id <> snapshot.workspace_id;
+    IF v_bad <> 0 THEN
+        v_issues := v_issues || jsonb_build_array(jsonb_build_object(
+            'code', 'acl_set', 'count', v_bad,
+            'message', 'ACL set content, count, or workspace reference is invalid'));
     END IF;
 
     SELECT count(*) INTO v_bad
@@ -9639,6 +9915,7 @@ BEGIN
             'commits', v_commit_count,
             'commit_changes', v_change_count,
             'requests', v_request_count,
+            'acl_sets', v_acl_set_count,
             'acl_entries', v_acl_count,
             'xattrs', v_xattr_count,
             'audit_events', v_audit_count,
@@ -10463,6 +10740,8 @@ DECLARE
     v_versions bigint;
     v_content_bytes bigint;
     v_empty_manifest bigint;
+    v_acl record;
+    v_acl_set bigint;
 BEGIN
     SELECT r.oid INTO STRICT v_actor
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
@@ -10789,19 +11068,27 @@ BEGIN
       JOIN pg_temp.vexfs_import_inode_map AS inode_map
         ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
      WHERE record.job_id = p_job AND record.record_type = 'xattrs';
-    INSERT INTO _vexfs.acl_entries(
-        workspace_id, inode_id, principal, effect, permissions,
-        inherit_flags, created_at, updated_at)
-    SELECT v_workspace_id, inode_map.local_id,
-           record.record_json->>'principal_id', record.record_json->>'effect',
-           record.record_json->>'permissions',
-           (record.record_json->>'inherit_flags')::integer,
-           to_timestamp((record.record_json->>'created_at')::bigint / 1000.0),
-           to_timestamp((record.record_json->>'updated_at')::bigint / 1000.0)
-      FROM _vexfs.archive_import_records AS record
-      JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
-     WHERE record.job_id = p_job AND record.record_type = 'acl_entries';
+    FOR v_acl IN
+        SELECT inode_map.local_id AS inode_id,
+               jsonb_agg(jsonb_build_object(
+                   'principal', record.record_json->>'principal_id',
+                   'effect', record.record_json->>'effect',
+                   'permissions', record.record_json->>'permissions',
+                   'inherit', (record.record_json->>'inherit_flags')::integer)
+                   ORDER BY record.record_json->>'principal_id',
+                            record.record_json->>'effect') AS entries
+          FROM _vexfs.archive_import_records AS record
+          JOIN pg_temp.vexfs_import_inode_map AS inode_map
+            ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
+         WHERE record.job_id = p_job AND record.record_type = 'acl_entries'
+         GROUP BY inode_map.local_id
+    LOOP
+        v_acl_set := _vexfs.get_or_create_acl_set(v_workspace_id, v_acl.entries);
+        UPDATE _vexfs.inodes AS inode
+           SET acl_set_id = v_acl_set
+         WHERE inode.workspace_id = v_workspace_id
+           AND inode.inode_id = v_acl.inode_id;
+    END LOOP;
 
     INSERT INTO pg_temp.vexfs_import_snapshot_map(name, source_commit, local_id)
     SELECT record.record_json->>'name',
@@ -10924,39 +11211,45 @@ BEGIN
       JOIN pg_temp.vexfs_import_inode_map AS inode_map
         ON inode_map.source_id = state.source_inode;
 
-    INSERT INTO _vexfs.snapshot_acl_entries(
-        snapshot_id, inode_id, principal, effect, permissions,
-        inherit_flags, created_at, updated_at)
-    SELECT snapshot_map.local_id, inode_map.local_id,
-           state.principal, state.effect, state.permissions, state.inherit_flags,
-           to_timestamp((snapshot_record.record_json->>'created_at')::bigint / 1000.0),
-           to_timestamp((snapshot_record.record_json->>'created_at')::bigint / 1000.0)
-      FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
-      JOIN _vexfs.archive_import_records AS snapshot_record
-        ON snapshot_record.job_id = p_job
-       AND snapshot_record.record_type = 'snapshots'
-       AND snapshot_record.record_json->>'name' = snapshot_map.name
-      JOIN LATERAL (
-          SELECT DISTINCT ON (
-                     (record.record_json->>'source_inode')::bigint,
-                     record.record_json->>'principal_id',
-                     record.record_json->>'effect')
-                 (record.record_json->>'source_inode')::bigint AS source_inode,
-                 record.record_json->>'principal_id' AS principal,
-                 record.record_json->>'effect' AS effect,
-                 record.record_json->>'permissions' AS permissions,
-                 (record.record_json->>'inherit_flags')::integer AS inherit_flags,
-                 (record.record_json->>'deleted')::integer AS deleted
-            FROM _vexfs.archive_import_records AS record
-           WHERE record.job_id = p_job AND record.record_type = 'acl_states'
-             AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
-           ORDER BY (record.record_json->>'source_inode')::bigint,
-                    record.record_json->>'principal_id',
-                    record.record_json->>'effect',
-                    (record.record_json->>'source_commit')::bigint DESC) AS state
-        ON state.deleted = 0
-      JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = state.source_inode;
+    FOR v_acl IN
+        SELECT snapshot_map.local_id AS snapshot_id,
+               inode_map.local_id AS inode_id,
+               jsonb_agg(jsonb_build_object(
+                   'principal', state.principal,
+                   'effect', state.effect,
+                   'permissions', state.permissions,
+                   'inherit', state.inherit_flags)
+                   ORDER BY state.principal, state.effect) AS entries
+          FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
+          JOIN LATERAL (
+              SELECT DISTINCT ON (
+                         (record.record_json->>'source_inode')::bigint,
+                         record.record_json->>'principal_id',
+                         record.record_json->>'effect')
+                     (record.record_json->>'source_inode')::bigint AS source_inode,
+                     record.record_json->>'principal_id' AS principal,
+                     record.record_json->>'effect' AS effect,
+                     record.record_json->>'permissions' AS permissions,
+                     (record.record_json->>'inherit_flags')::integer AS inherit_flags,
+                     (record.record_json->>'deleted')::integer AS deleted
+                FROM _vexfs.archive_import_records AS record
+               WHERE record.job_id = p_job AND record.record_type = 'acl_states'
+                 AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
+               ORDER BY (record.record_json->>'source_inode')::bigint,
+                        record.record_json->>'principal_id',
+                        record.record_json->>'effect',
+                        (record.record_json->>'source_commit')::bigint DESC) AS state
+            ON state.deleted = 0
+          JOIN pg_temp.vexfs_import_inode_map AS inode_map
+            ON inode_map.source_id = state.source_inode
+         GROUP BY snapshot_map.local_id, inode_map.local_id
+    LOOP
+        v_acl_set := _vexfs.get_or_create_acl_set(v_workspace_id, v_acl.entries);
+        UPDATE _vexfs.snapshot_inodes AS inode
+           SET acl_set_id = v_acl_set
+         WHERE inode.snapshot_id = v_acl.snapshot_id
+           AND inode.inode_id = v_acl.inode_id;
+    END LOOP;
 
     UPDATE _vexfs.workspaces
        SET root_inode = v_root,
