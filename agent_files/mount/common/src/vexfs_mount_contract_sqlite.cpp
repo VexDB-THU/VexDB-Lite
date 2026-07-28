@@ -1493,6 +1493,43 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
         const std::string staging_layout = layout.ResultText();
         const bool schema_ready = contract_version == "0.9.0" &&
                                   staging_layout == "overlay-v1";
+        std::string recovery = "null";
+        const bool snapshot_policy_ready =
+            sqlite3_table_column_metadata(
+                session->db, "main", "_vexfs_snapshots", "snapshot_type",
+                nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK &&
+            sqlite3_table_column_metadata(
+                session->db, "main", "_vexfs_workspaces", "snapshot_agent_keep",
+                nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK &&
+            sqlite3_table_column_metadata(
+                session->db, "main", "_vexfs_workspaces", "snapshot_safety_keep",
+                nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK &&
+            sqlite3_table_column_metadata(
+                session->db, "main", "_vexfs_workspaces", "snapshot_keep_days",
+                nullptr, nullptr, nullptr, nullptr, nullptr) == SQLITE_OK;
+        if (schema_ready && snapshot_policy_ready && workspace_exists.ResultInt64() == 1) {
+            // 两个状态函数只创建连接级临时查询表，不改写数据库文件。doctor 因此仍然
+            // 不初始化、不迁移，同时可以给出版本恢复占用和可回收空间。
+            Call recovery_status(session, R"SQL(
+WITH status AS (
+  SELECT vexfs_snapshot_policy_get(?1) AS snapshot_policy,
+         vexfs_retention_get(?1) AS retention
+)
+SELECT json_object(
+  'snapshot_count',json_extract(snapshot_policy,'$.snapshots.total'),
+  'protected_history_bytes',max(
+    json_extract(retention,'$.retained_history_bytes')-
+    json_extract(retention,'$.reclaimable_bytes'),0),
+  'reclaimable_bytes',json_extract(retention,'$.reclaimable_bytes'),
+  'oldest_recovery_commit',json_extract(snapshot_policy,'$.oldest_recovery_commit'),
+  'oldest_recovery_created_at',
+    json_extract(snapshot_policy,'$.oldest_recovery_created_at'))
+FROM status
+)SQL");
+            recovery_status.Text(1, session->workspace.c_str());
+            recovery_status.Row();
+            recovery = recovery_status.ResultText();
+        }
         const std::string value =
             "{\"schema_version\":\"" + JsonEscape(contract_version) +
             "\",\"staging_layout\":\"" + JsonEscape(staging_layout) +
@@ -1509,6 +1546,7 @@ extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *sessi
             ",\"pending_handles\":" + std::to_string(pending.ResultInt64()) +
             ",\"retained_handles\":" + std::to_string(retained.ResultInt64()) +
             ",\"staging_bytes\":" + std::to_string(staging.ResultInt64()) +
+            ",\"recovery\":" + recovery +
             ",\"contract_calls\":" + std::to_string(session->contract_calls) +
             ",\"ordinary_mutation_calls\":" +
                 std::to_string(session->ordinary_mutation_calls) +
@@ -2308,16 +2346,16 @@ extern "C" vexfs_mount_status vexfs_mount_refresh_visibility(
     });
 }
 
-extern "C" vexfs_mount_status vexfs_mount_snapshot_create(vexfs_mount_session *session,
-                                                               const char *name,
-                                                               uint32_t flags,
-                                                               int64_t *commit,
-                                                               vexfs_mount_error *error) {
+vexfs_mount_status SnapshotCreate(vexfs_mount_session *session, const char *name,
+                                  const char *snapshot_type, uint32_t flags,
+                                  int64_t *commit, vexfs_mount_error *error) {
     return Guard(session, error, [&] {
         RequireSession(session);
         UseFullDurability(session);
-        if (name == nullptr || commit == nullptr) {
-            throw CallError(SQLITE_MISUSE, "snapshot name and commit output are required");
+        if (name == nullptr || snapshot_type == nullptr || commit == nullptr) {
+            throw CallError(
+                SQLITE_MISUSE,
+                "snapshot name, type and commit output are required");
         }
         if ((flags & ~VEXFS_SNAPSHOT_COMMITTED_ONLY) != 0) {
             throw CallError(SQLITE_MISUSE, "unsupported snapshot flags");
@@ -2334,14 +2372,27 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_create(vexfs_mount_session *s
             synchronize.Text(2, session->session_id.c_str());
             synchronize.Row();
         }
-        Call call(session, committed_only
-            ? "SELECT vexfs_snapshot_create(?1,?2,NULL,'committed-only')"
-            : "SELECT vexfs_snapshot_create(?1,?2)");
+        Call call(session,
+            "SELECT vexfs_snapshot_create(?1,?2,NULL,?3,?4)");
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
+        call.Text(3, committed_only ? "committed-only" : "consistent");
+        call.Text(4, snapshot_type);
         call.Row();
         *commit = call.ResultInt64();
     });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_create(
+        vexfs_mount_session *session, const char *name, uint32_t flags,
+        int64_t *commit, vexfs_mount_error *error) {
+    return SnapshotCreate(session, name, "manual", flags, commit, error);
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_create_typed(
+        vexfs_mount_session *session, const char *name, const char *snapshot_type,
+        uint32_t flags, int64_t *commit, vexfs_mount_error *error) {
+    return SnapshotCreate(session, name, snapshot_type, flags, commit, error);
 }
 
 extern "C" vexfs_mount_status vexfs_mount_snapshot_list(vexfs_mount_session *session,
@@ -2405,6 +2456,59 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_drop(vexfs_mount_session *ses
         call.Text(1, session->workspace.c_str());
         call.Text(2, name);
         call.Row();
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_policy_get(
+        vexfs_mount_session *session, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (json == nullptr) throw CallError(SQLITE_MISUSE, "output is NULL");
+        Call call(session, "SELECT vexfs_snapshot_policy_get(?1)");
+        call.Text(1, session->workspace.c_str());
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_policy_set(
+        vexfs_mount_session *session, uint32_t agent_keep,
+        uint32_t safety_keep, uint32_t keep_days,
+        vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (agent_keep > 1000000 || safety_keep > 1000000 ||
+            keep_days > 36500 || json == nullptr) {
+            throw CallError(
+                SQLITE_RANGE,
+                "snapshot keep counts must be at most 1000000 and days at most 36500");
+        }
+        Call call(session, "SELECT vexfs_snapshot_policy_set(?1,?2,?3,?4)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, agent_keep);
+        call.Int64(3, safety_keep);
+        call.Int64(4, keep_days);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_prune(
+        vexfs_mount_session *session, int dry_run, vexfs_mount_bytes *json,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if ((dry_run != 0 && dry_run != 1) || json == nullptr) {
+            throw CallError(SQLITE_RANGE, "dry_run must be 0 or 1 and output is required");
+        }
+        if (!dry_run) UseFullDurability(session);
+        Call call(session, "SELECT vexfs_snapshot_prune(?1,?2)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, dry_run);
+        call.Row();
+        CopyResult(call, json);
     });
 }
 

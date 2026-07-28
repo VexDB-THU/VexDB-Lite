@@ -78,9 +78,14 @@ vexdb fs grep -n hello /
 vexdb fs index enable       # 可选的 FTS5 trigram 文本索引
 vexdb fs history /hello.txt
 vexdb fs snapshot create before-agent
+vexdb fs snapshot create task-start --type agent
 vexdb fs snapshot diff before-agent
 vexdb fs snapshot restore before-agent --dry-run
 vexdb fs snapshot restore before-agent
+vexdb fs snapshot policy show
+vexdb fs snapshot policy set --agent-keep 20 --safety-keep 10 --days 30
+vexdb fs snapshot prune --dry-run
+vexdb fs snapshot prune
 vexdb fs check              # 深度检查结构、历史和内容 SHA-256
 vexdb fs check --quick      # 只检查结构和引用
 vexdb fs quota show         # 查看 live 文件数、字节和上限
@@ -92,6 +97,9 @@ vexdb fs archive verify workspace.vexfs
 
 已挂载 workspace 会在恢复时自动安全卸载并挂回原目录；正常卸载失败时不会开始恢复。
 `--force-unmount` 只用于用户明确接受中断打开文件的场景。
+
+手工快照类型是 `manual`，不会被自动清理；Agent checkpoint 使用 `agent`，恢复前自动生成的是
+`safety`。prune 只删除过期快照引用，不直接删除文件版本；随后仍由 `gc --batch` 分批回收。
 
 NFS gateway 异常退出后，底层 mountpoint 会保持不可写，避免 Bash 把文件误写进普通本机
 目录。此时先运行 `vexdb fs unmount --force MOUNTPOINT` 清理，再重新挂载。PostgreSQL 网络中断时，

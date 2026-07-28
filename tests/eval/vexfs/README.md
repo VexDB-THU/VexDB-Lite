@@ -107,6 +107,19 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXFS_WORKSPACE_LOG_COMMITS=10000 \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
   bash tests/eval/vexfs/run_workspace_log_performance.sh
 
+# SQLite 与 PG 各建立 1 万/10 万条快照元数据，验证 policy、dry-run、prune、
+# 100 条预览上限、manual 保护、5 秒预算、SQLite 512 MiB 和 PG 1 GiB/OOM Gate。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXFS_SNAPSHOT_POLICY_COUNT=10000 \
+  bash tests/eval/vexfs/run_snapshot_policy_performance.sh
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+  bash tests/eval/vexfs/run_snapshot_policy_performance.sh
+
+# SQLite 与 PG 同时运行 8 个 typed snapshot create 和 4 个 prune，最后必须只保留
+# 1 个 manual、5 个 agent、5 个 safety，且 deep check 通过。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
+  bash tests/eval/vexfs/run_snapshot_policy_concurrency.sh
+
 # PG manifest 根哈希专项：16 MiB 文件每轮只改 4 KiB，发布不得拼完整文件；
 # 默认重复 5 次，容器 memory.max 必须不超过 1 GiB，并检查 oom_kill 未增长。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_DATABASE=test \

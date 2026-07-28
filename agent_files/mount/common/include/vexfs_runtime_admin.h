@@ -67,6 +67,9 @@ vexfs_mount_status vexfs_mount_snapshot_create(vexfs_mount_session *session,
                                                const char *name, uint32_t flags,
                                                int64_t *commit,
                                                vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_snapshot_create_typed(
+    vexfs_mount_session *session, const char *name, const char *snapshot_type,
+    uint32_t flags, int64_t *commit, vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_snapshot_list(vexfs_mount_session *session,
                                              vexfs_mount_bytes *json,
                                              vexfs_mount_error *error);
@@ -81,6 +84,15 @@ vexfs_mount_status vexfs_mount_snapshot_diff(vexfs_mount_session *session,
 vexfs_mount_status vexfs_mount_snapshot_drop(vexfs_mount_session *session,
                                              const char *name,
                                              vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_snapshot_policy_get(
+    vexfs_mount_session *session, vexfs_mount_bytes *json,
+    vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_snapshot_policy_set(
+    vexfs_mount_session *session, uint32_t agent_keep, uint32_t safety_keep,
+    uint32_t keep_days, vexfs_mount_bytes *json, vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_snapshot_prune(
+    vexfs_mount_session *session, int dry_run, vexfs_mount_bytes *json,
+    vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_snapshot_restore(vexfs_mount_session *session,
                                                 const char *name, int64_t expected_head,
                                                 int64_t *new_commit,

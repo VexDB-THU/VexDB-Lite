@@ -100,7 +100,17 @@ printf '%s' "$SNAPSHOT_DIFF" | /usr/bin/python3 -c \
 "$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-baseline >/dev/null
 SNAPSHOT_LIST="$("$VEXFS" --db "$DB" --workspace smoke --json snapshot list)"
 printf '%s' "$SNAPSHOT_LIST" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); names=[row["name"] for row in value]; assert "cli-baseline" in names; assert any(name.startswith("vexfs-safety-smoke-") for name in names)'
+    'import json,sys; value=json.load(sys.stdin); names=[row["name"] for row in value]; assert "cli-baseline" in names; safety=[row for row in value if row["name"].startswith("vexfs-safety-smoke-")]; assert safety and all(row["type"]=="safety" for row in safety)'
+"$VEXFS" --db "$DB" --workspace smoke snapshot create cli-agent-prune --type agent >/dev/null
+"$VEXFS" --db "$DB" --workspace smoke snapshot policy set \
+    --agent-keep 0 --safety-keep 0 --days 0 | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["expired"]["agent"] >= 1; assert value["snapshots"]["manual"] >= 1'
+"$VEXFS" --db "$DB" --workspace smoke snapshot prune --dry-run | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["dry_run"] is True; assert value["deleted"] == 0; assert value["candidate_count"] >= 2'
+"$VEXFS" --db "$DB" --workspace smoke snapshot prune | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["deleted"] >= 2; assert value["policy"]["snapshots"]["manual"] >= 1'
+"$VEXFS" --db "$DB" --workspace smoke snapshot policy set \
+    --agent-keep 20 --safety-keep 10 --days 30 >/dev/null
 "$VEXFS" --db "$DB" --workspace smoke snapshot show cli-baseline | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["name"] == "cli-baseline"'
 "$VEXFS" --db "$DB" --workspace smoke snapshot drop cli-baseline
@@ -157,7 +167,7 @@ DOCTOR_STATUS=$?
 set -e
 [ "$DOCTOR_STATUS" -eq 0 ] || [ "$DOCTOR_STATUS" -eq 1 ]
 printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["database"]["schema_version"] == "0.9.0"'
+    'import json,sys; value=json.load(sys.stdin); database=value["database"]; assert database["schema_version"] == "0.9.0"; recovery=database["recovery"]; assert recovery["snapshot_count"] >= 0; assert recovery["protected_history_bytes"] >= 0; assert recovery["reclaimable_bytes"] >= 0; assert (recovery["oldest_recovery_commit"] is None) == (recovery["snapshot_count"] == 0)'
 
 MOUNTS="$("$VEXFS" --json mount status)"
 printf '%s' "$MOUNTS" | /usr/bin/python3 -c 'import json,sys; assert isinstance(json.load(sys.stdin), list)'

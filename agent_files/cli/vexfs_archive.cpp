@@ -236,7 +236,8 @@ std::string ComputePackageChecksum(sqlite3 *db) {
         Statement manifest(db, R"SQL(
 SELECT json_array(format_version,source_engine,source_workspace,source_commit,
  source_snapshot,root_source_inode,history_floor_source_commit,retention_keep_versions,
- retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes,created_at,complete)
+ retention_keep_days,snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days,
+ quota_max_bytes,quota_max_files,quota_max_file_bytes,created_at,complete)
 FROM package.manifest
 )SQL");
         if (!manifest.Row()) throw Error("archive manifest is missing");
@@ -275,7 +276,9 @@ CREATE TABLE package.manifest(
  format_version INTEGER NOT NULL,source_engine TEXT NOT NULL,source_workspace TEXT NOT NULL,
  source_commit INTEGER NOT NULL,source_snapshot TEXT,root_source_inode INTEGER NOT NULL,
  history_floor_source_commit INTEGER NOT NULL,retention_keep_versions INTEGER NOT NULL,
- retention_keep_days INTEGER NOT NULL,quota_max_bytes INTEGER,quota_max_files INTEGER,
+ retention_keep_days INTEGER NOT NULL,snapshot_agent_keep INTEGER NOT NULL,
+ snapshot_safety_keep INTEGER NOT NULL,snapshot_keep_days INTEGER NOT NULL,
+ quota_max_bytes INTEGER,quota_max_files INTEGER,
  quota_max_file_bytes INTEGER,created_at INTEGER NOT NULL,package_checksum TEXT,
  complete INTEGER NOT NULL CHECK(complete IN (0,1)));
 CREATE TABLE package.commits(
@@ -328,7 +331,8 @@ CREATE TABLE package.acl_states(
  effect TEXT NOT NULL,source_commit INTEGER NOT NULL,permissions TEXT NOT NULL,
  inherit_flags INTEGER NOT NULL,deleted INTEGER NOT NULL,record_checksum TEXT NOT NULL);
 CREATE TABLE package.snapshots(
- record_key TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,source_commit INTEGER NOT NULL,
+ record_key TEXT PRIMARY KEY,name TEXT UNIQUE NOT NULL,snapshot_type TEXT NOT NULL,
+ source_commit INTEGER NOT NULL,
  created_at INTEGER NOT NULL,record_checksum TEXT NOT NULL);
 CREATE TABLE package.xattrs(
  record_key TEXT PRIMARY KEY,source_inode INTEGER NOT NULL,name TEXT NOT NULL,value BLOB NOT NULL,
@@ -629,7 +633,8 @@ VALUES(?1,json_extract(?2,'$.source_manifest'),json_extract(?2,'$.chunk_no'),?3,
 INSERT INTO package.manifest(
  format_version,source_engine,source_workspace,source_commit,source_snapshot,
  root_source_inode,history_floor_source_commit,retention_keep_versions,
- retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes,
+ retention_keep_days,snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days,
+ quota_max_bytes,quota_max_files,quota_max_file_bytes,
  created_at,package_checksum,complete)
 SELECT json_extract(record_json,'$.format_version'),
        json_extract(record_json,'$.source_engine'),
@@ -640,6 +645,9 @@ SELECT json_extract(record_json,'$.format_version'),
        json_extract(record_json,'$.history_floor_source_commit'),
        json_extract(record_json,'$.retention_keep_versions'),
        json_extract(record_json,'$.retention_keep_days'),
+       json_extract(record_json,'$.snapshot_agent_keep'),
+       json_extract(record_json,'$.snapshot_safety_keep'),
+       json_extract(record_json,'$.snapshot_keep_days'),
        json_extract(record_json,'$.quota_max_bytes'),
        json_extract(record_json,'$.quota_max_files'),
        json_extract(record_json,'$.quota_max_file_bytes'),
@@ -739,8 +747,10 @@ SELECT record_key,json_extract(record_json,'$.source_inode'),
        json_extract(record_json,'$.inherit_flags'),json_extract(record_json,'$.deleted'),''
 FROM incoming WHERE record_type='acl_states';
 
-INSERT INTO package.snapshots(record_key,name,source_commit,created_at,record_checksum)
+INSERT INTO package.snapshots(
+ record_key,name,snapshot_type,source_commit,created_at,record_checksum)
 SELECT record_key,json_extract(record_json,'$.name'),
+       json_extract(record_json,'$.snapshot_type'),
        json_extract(record_json,'$.source_commit'),json_extract(record_json,'$.created_at'),''
 FROM incoming WHERE record_type='snapshots';
 
@@ -794,7 +804,7 @@ UPDATE package.acl_states SET record_checksum=
  vexfs_archive_sha256(CAST(json_array(source_inode,principal_id,effect,source_commit,
   permissions,inherit_flags,deleted) AS BLOB));
 UPDATE package.snapshots SET record_checksum=
- vexfs_archive_sha256(CAST(json_array(name,source_commit,created_at) AS BLOB));
+ vexfs_archive_sha256(CAST(json_array(name,snapshot_type,source_commit,created_at) AS BLOB));
 UPDATE package.xattrs SET record_checksum=
  vexfs_archive_sha256(CAST(json_array(source_inode,name,hex(value),updated_at) AS BLOB));
 UPDATE package.acl_entries SET record_checksum=
@@ -862,7 +872,8 @@ std::string ExportArchive(const std::string &database, const std::string &worksp
         Exec(db.get(), "BEGIN");
         Statement source(db.get(), R"SQL(
 SELECT id,root_inode,head_commit,history_floor_commit,retention_keep_versions,
-       retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes
+       retention_keep_days,snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days,
+       quota_max_bytes,quota_max_files,quota_max_file_bytes
 FROM _vexfs_workspaces WHERE name=?1 AND state='active'
 )SQL");
         source.Text(1, workspace);
@@ -873,12 +884,15 @@ FROM _vexfs_workspaces WHERE name=?1 AND state='active'
         const sqlite3_int64 history_floor = source.Int64(3);
         const sqlite3_int64 keep_versions = source.Int64(4);
         const sqlite3_int64 keep_days = source.Int64(5);
-        const bool max_bytes_null = source.Type(6) == SQLITE_NULL;
-        const bool max_files_null = source.Type(7) == SQLITE_NULL;
-        const bool max_file_bytes_null = source.Type(8) == SQLITE_NULL;
-        const sqlite3_int64 max_bytes = source.Int64(6);
-        const sqlite3_int64 max_files = source.Int64(7);
-        const sqlite3_int64 max_file_bytes = source.Int64(8);
+        const sqlite3_int64 snapshot_agent_keep = source.Int64(6);
+        const sqlite3_int64 snapshot_safety_keep = source.Int64(7);
+        const sqlite3_int64 snapshot_keep_days = source.Int64(8);
+        const bool max_bytes_null = source.Type(9) == SQLITE_NULL;
+        const bool max_files_null = source.Type(10) == SQLITE_NULL;
+        const bool max_file_bytes_null = source.Type(11) == SQLITE_NULL;
+        const sqlite3_int64 max_bytes = source.Int64(9);
+        const sqlite3_int64 max_files = source.Int64(10);
+        const sqlite3_int64 max_file_bytes = source.Int64(11);
 
         if (!snapshot.empty() && snapshot != "HEAD") {
             Statement selected(db.get(),
@@ -909,9 +923,10 @@ FROM _vexfs_workspaces WHERE name=?1 AND state='active'
 INSERT INTO package.manifest(
  format_version,source_engine,source_workspace,source_commit,source_snapshot,
  root_source_inode,history_floor_source_commit,retention_keep_versions,
- retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes,
+ retention_keep_days,snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days,
+ quota_max_bytes,quota_max_files,quota_max_file_bytes,
  created_at,package_checksum,complete)
-VALUES(?1,'sqlite',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
+VALUES(?1,'sqlite',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
        CAST(unixepoch('subsec')*1000 AS INTEGER),NULL,0)
 )SQL");
             manifest.Int64(1, kArchiveFormatVersion);
@@ -923,9 +938,12 @@ VALUES(?1,'sqlite',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,
             manifest.Int64(6, history_floor);
             manifest.Int64(7, keep_versions);
             manifest.Int64(8, keep_days);
-            if (max_bytes_null) manifest.Null(9); else manifest.Int64(9, max_bytes);
-            if (max_files_null) manifest.Null(10); else manifest.Int64(10, max_files);
-            if (max_file_bytes_null) manifest.Null(11); else manifest.Int64(11, max_file_bytes);
+            manifest.Int64(9, snapshot_agent_keep);
+            manifest.Int64(10, snapshot_safety_keep);
+            manifest.Int64(11, snapshot_keep_days);
+            if (max_bytes_null) manifest.Null(12); else manifest.Int64(12, max_bytes);
+            if (max_files_null) manifest.Null(13); else manifest.Int64(13, max_files);
+            if (max_file_bytes_null) manifest.Null(14); else manifest.Int64(14, max_file_bytes);
             manifest.Done();
         }
 
@@ -1068,8 +1086,9 @@ WHERE state.workspace_id=(SELECT id FROM _vexfs_workspaces
                           WHERE name=(SELECT source_workspace FROM package.manifest));
 
 INSERT INTO package.snapshots
-SELECT hex(snapshot.name),snapshot.name,snapshot.commit_id,snapshot.created_at,
-       vexfs_archive_sha256(CAST(json_array(snapshot.name,snapshot.commit_id,
+SELECT hex(snapshot.name),snapshot.name,snapshot.snapshot_type,
+       snapshot.commit_id,snapshot.created_at,
+       vexfs_archive_sha256(CAST(json_array(snapshot.name,snapshot.snapshot_type,snapshot.commit_id,
           snapshot.created_at) AS BLOB))
 FROM _vexfs_snapshots snapshot JOIN selected_commits selected ON selected.id=snapshot.commit_id
 WHERE snapshot.workspace_id=(SELECT id FROM _vexfs_workspaces
@@ -1259,7 +1278,7 @@ SELECT sum(bad) FROM (
   vexfs_archive_sha256(CAST(json_array(source_inode,principal_id,effect,source_commit,
    permissions,inherit_flags,deleted) AS BLOB))
  UNION ALL SELECT count(*) FROM package.snapshots WHERE record_checksum<>
-  vexfs_archive_sha256(CAST(json_array(name,source_commit,created_at) AS BLOB))
+  vexfs_archive_sha256(CAST(json_array(name,snapshot_type,source_commit,created_at) AS BLOB))
  UNION ALL SELECT count(*) FROM package.xattrs WHERE record_checksum<>
   vexfs_archive_sha256(CAST(json_array(source_inode,name,hex(value),updated_at) AS BLOB))
  UNION ALL SELECT count(*) FROM package.acl_entries WHERE record_checksum<>
@@ -1277,6 +1296,9 @@ WHERE NOT EXISTS(SELECT 1 FROM package.commits WHERE source_id=manifest.source_c
    OR NOT EXISTS(SELECT 1 FROM package.inodes
                  WHERE source_id=manifest.root_source_inode AND kind='directory'
                    AND deleted_at IS NULL)
+   OR manifest.snapshot_agent_keep NOT BETWEEN 0 AND 1000000
+   OR manifest.snapshot_safety_keep NOT BETWEEN 0 AND 1000000
+   OR manifest.snapshot_keep_days NOT BETWEEN 0 AND 36500
 )SQL", "archive manifest references a missing object");
     RequireZero(db, R"SQL(
 SELECT sum(bad) FROM (
@@ -1320,7 +1342,8 @@ SELECT sum(bad) FROM (
   WHERE version.source_inode=inode.source_id AND version.version_no=inode.current_version)
  UNION ALL SELECT count(*) FROM package.snapshots snapshot
  WHERE NOT EXISTS(SELECT 1 FROM package.commits commit_row
-                  WHERE commit_row.source_id=snapshot.source_commit))
+                  WHERE commit_row.source_id=snapshot.source_commit)
+    OR snapshot.snapshot_type NOT IN ('manual','agent','safety'))
 )SQL", "archive contains a broken object reference");
     RequireZero(db, R"SQL(
 SELECT count(*) FROM package.file_versions alias
@@ -1480,7 +1503,10 @@ SELECT json_object(
  'source_snapshot',source_snapshot,'root_source_inode',root_source_inode,
  'history_floor_source_commit',history_floor_source_commit,
  'retention_keep_versions',retention_keep_versions,
- 'retention_keep_days',retention_keep_days,'quota_max_bytes',quota_max_bytes,
+ 'retention_keep_days',retention_keep_days,
+ 'snapshot_agent_keep',snapshot_agent_keep,
+ 'snapshot_safety_keep',snapshot_safety_keep,
+ 'snapshot_keep_days',snapshot_keep_days,'quota_max_bytes',quota_max_bytes,
  'quota_max_files',quota_max_files,'quota_max_file_bytes',quota_max_file_bytes,
  'created_at',created_at)
 FROM package.manifest
@@ -1569,7 +1595,8 @@ SELECT record_key,json_object(
 FROM package.acl_states ORDER BY record_key)SQL", false},
             {"snapshots", R"SQL(
 SELECT record_key,json_object(
- 'name',name,'source_commit',source_commit,'created_at',created_at),NULL
+ 'name',name,'snapshot_type',snapshot_type,
+ 'source_commit',source_commit,'created_at',created_at),NULL
 FROM package.snapshots ORDER BY record_key)SQL", false},
             {"xattrs", R"SQL(
 SELECT record_key,json_object(
@@ -1713,7 +1740,8 @@ std::string ImportArchive(const std::string &database, const std::string &worksp
         }
         Statement source_manifest(db.get(), R"SQL(
 SELECT root_source_inode,source_commit,history_floor_source_commit,
- retention_keep_versions,retention_keep_days,quota_max_bytes,quota_max_files,
+ retention_keep_versions,retention_keep_days,snapshot_agent_keep,
+ snapshot_safety_keep,snapshot_keep_days,quota_max_bytes,quota_max_files,
  quota_max_file_bytes,created_at
 FROM package.manifest
 )SQL");
@@ -1725,19 +1753,23 @@ FROM package.manifest
         Statement workspace_insert(db.get(), R"SQL(
 INSERT INTO _vexfs_workspaces(
  name,state,root_inode,head_commit,history_floor_commit,retention_keep_versions,
- retention_keep_days,quota_max_bytes,quota_max_files,quota_max_file_bytes,created_at)
-VALUES(?1,'importing',NULL,NULL,NULL,?2,?3,?4,?5,?6,?7)
+ retention_keep_days,snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days,
+ quota_max_bytes,quota_max_files,quota_max_file_bytes,created_at)
+VALUES(?1,'importing',NULL,NULL,NULL,?2,?3,?4,?5,?6,?7,?8,?9,?10)
 )SQL");
         workspace_insert.Text(1, workspace);
         workspace_insert.Int64(2, source_manifest.Int64(3));
         workspace_insert.Int64(3, source_manifest.Int64(4));
-        if (source_manifest.Type(5) == SQLITE_NULL) workspace_insert.Null(4);
-        else workspace_insert.Int64(4, source_manifest.Int64(5));
-        if (source_manifest.Type(6) == SQLITE_NULL) workspace_insert.Null(5);
-        else workspace_insert.Int64(5, source_manifest.Int64(6));
-        if (source_manifest.Type(7) == SQLITE_NULL) workspace_insert.Null(6);
-        else workspace_insert.Int64(6, source_manifest.Int64(7));
-        workspace_insert.Int64(7, source_manifest.Int64(8));
+        workspace_insert.Int64(4, source_manifest.Int64(5));
+        workspace_insert.Int64(5, source_manifest.Int64(6));
+        workspace_insert.Int64(6, source_manifest.Int64(7));
+        if (source_manifest.Type(8) == SQLITE_NULL) workspace_insert.Null(7);
+        else workspace_insert.Int64(7, source_manifest.Int64(8));
+        if (source_manifest.Type(9) == SQLITE_NULL) workspace_insert.Null(8);
+        else workspace_insert.Int64(8, source_manifest.Int64(9));
+        if (source_manifest.Type(10) == SQLITE_NULL) workspace_insert.Null(9);
+        else workspace_insert.Int64(9, source_manifest.Int64(10));
+        workspace_insert.Int64(10, source_manifest.Int64(11));
         workspace_insert.Done();
         const sqlite3_int64 workspace_id = sqlite3_last_insert_rowid(db.get());
 
@@ -1973,8 +2005,10 @@ FROM package.acl_states state
 JOIN import_inode_map inode ON inode.source_id=state.source_inode
 JOIN import_commit_map commit_row ON commit_row.source_id=state.source_commit;
 
-INSERT INTO _vexfs_snapshots(workspace_id,name,commit_id,created_at)
+INSERT INTO _vexfs_snapshots(
+ workspace_id,name,snapshot_type,commit_id,created_at)
 SELECT (SELECT id FROM _vexfs_workspaces WHERE state='importing'),snapshot.name,
+       snapshot.snapshot_type,
        commit_row.local_id,snapshot.created_at
 FROM package.snapshots snapshot
 JOIN import_commit_map commit_row ON commit_row.source_id=snapshot.source_commit;

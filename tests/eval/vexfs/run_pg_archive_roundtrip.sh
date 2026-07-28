@@ -76,6 +76,8 @@ printf '[{"principal":"agent-portable","effect":"allow","permissions":"read","in
        'user.cross-engine',CAST('sqlite-metadata' AS BLOB),0);" >/dev/null
 "${SQLITE[@]}" snapshot create baseline >/dev/null
 printf 'sqlite-v2' | "${SQLITE[@]}" write /tree/value.txt >/dev/null
+"${SQLITE[@]}" snapshot create agent-tail --type agent >/dev/null
+"${SQLITE[@]}" snapshot policy set --agent-keep 7 --safety-keep 3 --days 11 >/dev/null
 "${SQLITE[@]}" export --output "$SQLITE_PACKAGE" >/dev/null
 
 VERIFY_SQLITE_PACKAGE="$("${SQLITE[@]}" archive verify "$SQLITE_PACKAGE")"
@@ -91,6 +93,11 @@ PG_IMPORTED="$(docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t
     "SELECT convert_from(vexfs_read('sqlite-to-pg','/tree/value.txt'),'UTF8'),
             convert_from(vexfs_read_version('sqlite-to-pg','/tree/value.txt',1),'UTF8'),
             (SELECT count(*) FROM vexfs_snapshot_list('sqlite-to-pg')),
+            (SELECT count(*) FROM vexfs_snapshot_list('sqlite-to-pg')
+              WHERE snapshot_type='agent'),
+            (vexfs_snapshot_policy_get('sqlite-to-pg')->>'agent_keep')::integer,
+            (vexfs_snapshot_policy_get('sqlite-to-pg')->>'safety_keep')::integer,
+            (vexfs_snapshot_policy_get('sqlite-to-pg')->>'keep_days')::integer,
             (vexfs_stat('sqlite-to-pg','/tree/value.txt')->>'inode') =
               (vexfs_stat('sqlite-to-pg','/tree/value-hard.txt')->>'inode'),
             convert_from(vexfs_readlink(
@@ -115,7 +122,7 @@ PG_IMPORTED="$(docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -X -q -t
             jsonb_array_length(vexfs_workspace_log('sqlite-to-pg',10,NULL)->'entries')>0,
             (vexfs_check('sqlite-to-pg',1)->>'ok')::boolean;")"
 assert_equal "$PG_IMPORTED" \
-    "sqlite-v2|sqlite-v1|1|t|value.txt|sqlite-metadata|t|t|t|t|t|t" \
+    "sqlite-v2|sqlite-v1|2|1|7|3|11|t|value.txt|sqlite-metadata|t|t|t|t|t|t" \
     "SQLite 到 PostgreSQL format v2 往返错误"
 
 # 目标 workspace 已存在时必须拒绝，且不能改动已导入内容。
@@ -143,6 +150,9 @@ SELECT vexfs_acl_grant(
   'agent-portable','read','allow',0);
 SELECT vexfs_snapshot_create('pg-to-sqlite','baseline');
 SELECT vexfs_write('pg-to-sqlite','/tree/value.txt',convert_to('pg-v2','UTF8'));
+SELECT vexfs_snapshot_create(
+  'pg-to-sqlite','safety-tail',NULL,'consistent','safety');
+SELECT vexfs_snapshot_policy_set('pg-to-sqlite',8,4,12);
 SQL
 
 PG_EXPORT=("$CLI" fs --backend pg --dsn "$DSN" --workspace pg-to-sqlite)
@@ -160,6 +170,12 @@ SQLITE_IMPORTED="$("$CLI" "$SQLITE_TARGET" \
     "SELECT CAST(vexfs_read('pg-imported','/tree/value.txt') AS TEXT),
             CAST(vexfs_read_version('pg-imported','/tree/value.txt',1) AS TEXT),
             (SELECT count(*) FROM json_each(vexfs_snapshot_list('pg-imported'))),
+            EXISTS(
+              SELECT 1 FROM json_each(vexfs_snapshot_list('pg-imported'))
+               WHERE json_extract(value,'$.type')='safety'),
+            json_extract(vexfs_snapshot_policy_get('pg-imported'),'$.agent_keep'),
+            json_extract(vexfs_snapshot_policy_get('pg-imported'),'$.safety_keep'),
+            json_extract(vexfs_snapshot_policy_get('pg-imported'),'$.keep_days'),
             json_extract(vexfs_stat('pg-imported','/tree/value.txt'),'$.inode') =
               json_extract(vexfs_stat('pg-imported','/tree/value-hard.txt'),'$.inode'),
             CAST(vexfs_readlink(
@@ -182,7 +198,7 @@ SQLITE_IMPORTED="$("$CLI" "$SQLITE_TARGET" \
               vexfs_workspace_log('pg-imported',10,NULL),'$.entries'))>0,
             json_extract(vexfs_check('pg-imported',1),'$.ok');")"
 assert_equal "$SQLITE_IMPORTED" \
-    "pg-v2|pg-v1|1|1|value.txt|pg-metadata|1|1|1|1|1" \
+    "pg-v2|pg-v1|2|1|8|4|12|1|value.txt|pg-metadata|1|1|1|1|1" \
     "PostgreSQL 到 SQLite format v2 往返错误"
 
 cp "$SQLITE_PACKAGE" "$CORRUPT_PACKAGE"

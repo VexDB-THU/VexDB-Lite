@@ -337,6 +337,12 @@ CREATE TABLE _vexfs.workspaces (
         CHECK (retention_keep_versions BETWEEN 0 AND 1000000),
     retention_keep_days integer NOT NULL DEFAULT 30
         CHECK (retention_keep_days BETWEEN 0 AND 36500),
+    snapshot_agent_keep integer NOT NULL DEFAULT 20
+        CHECK (snapshot_agent_keep BETWEEN 0 AND 1000000),
+    snapshot_safety_keep integer NOT NULL DEFAULT 10
+        CHECK (snapshot_safety_keep BETWEEN 0 AND 1000000),
+    snapshot_keep_days integer NOT NULL DEFAULT 30
+        CHECK (snapshot_keep_days BETWEEN 0 AND 36500),
     gc_paused boolean NOT NULL DEFAULT false,
     grep_index_enabled boolean NOT NULL DEFAULT false,
     grep_index_dirty boolean NOT NULL DEFAULT false,
@@ -584,6 +590,8 @@ CREATE TABLE _vexfs.snapshots (
     snapshot_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
     name text NOT NULL CHECK (name <> ''),
+    snapshot_type text NOT NULL DEFAULT 'manual'
+        CHECK (snapshot_type IN ('manual', 'agent', 'safety')),
     head_commit bigint NOT NULL CHECK (head_commit > 0),
     created_by_oid oid NOT NULL,
     created_by name NOT NULL,
@@ -595,6 +603,10 @@ CREATE TABLE _vexfs.snapshots (
 
 CREATE INDEX vexfs_snapshots_commit_fk_idx
     ON _vexfs.snapshots(workspace_id, head_commit);
+
+CREATE INDEX vexfs_snapshots_policy_idx
+    ON _vexfs.snapshots(
+        workspace_id, snapshot_type, created_at DESC, snapshot_id DESC);
 
 CREATE TABLE _vexfs.snapshot_inodes (
     snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
@@ -6556,6 +6568,10 @@ DECLARE
     v_pending bigint;
     v_retained bigint;
     v_staging_bytes bigint;
+    v_snapshot_count bigint;
+    v_oldest_recovery_commit bigint;
+    v_oldest_recovery_created_at bigint;
+    v_retention jsonb;
 BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'read');
     SELECT count(*) FILTER (
@@ -6565,8 +6581,20 @@ BEGIN
                WHERE handle.state IN ('open', 'retained')), 0)
       INTO v_pending, v_retained, v_staging_bytes
       FROM _vexfs.handles AS handle
-      LEFT JOIN _vexfs.handle_staging AS staging USING (handle_id)
+     LEFT JOIN _vexfs.handle_staging AS staging USING (handle_id)
      WHERE handle.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_snapshot_count
+      FROM _vexfs.snapshots AS snapshot
+     WHERE snapshot.workspace_id = v_workspace.workspace_id;
+    SELECT snapshot.head_commit,
+           (extract(epoch FROM snapshot.created_at) * 1000)::bigint
+      INTO v_oldest_recovery_commit,v_oldest_recovery_created_at
+      FROM _vexfs.snapshots AS snapshot
+     WHERE snapshot.workspace_id = v_workspace.workspace_id
+     ORDER BY snapshot.created_at,snapshot.snapshot_id
+     LIMIT 1;
+    v_retention := _vexfs.retention_status(
+        v_workspace.workspace_id, p_workspace);
     RETURN jsonb_build_object(
         'schema_version', public.vexfs_contract_version(),
         'adapter_version', public.vexfs_pg_adapter_version(),
@@ -6583,7 +6611,15 @@ BEGIN
         'cache_generation', v_workspace.cache_generation,
         'pending_handles', v_pending,
         'retained_handles', v_retained,
-        'staging_bytes', v_staging_bytes);
+        'staging_bytes', v_staging_bytes,
+        'recovery', jsonb_build_object(
+            'snapshot_count', v_snapshot_count,
+            'protected_history_bytes', greatest(
+                (v_retention->>'retained_history_bytes')::bigint -
+                (v_retention->>'reclaimable_bytes')::bigint, 0),
+            'reclaimable_bytes', (v_retention->>'reclaimable_bytes')::bigint,
+            'oldest_recovery_commit', v_oldest_recovery_commit,
+            'oldest_recovery_created_at', v_oldest_recovery_created_at));
 END;
 $$;
 
@@ -8495,7 +8531,8 @@ CREATE FUNCTION public.vexfs_snapshot_create(
     p_workspace text,
     p_name text,
     p_expected_head bigint DEFAULT NULL,
-    p_mode text DEFAULT 'consistent')
+    p_mode text DEFAULT 'consistent',
+    p_snapshot_type text DEFAULT 'manual')
 RETURNS bigint
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -8513,6 +8550,11 @@ BEGIN
     END IF;
     IF p_mode NOT IN ('consistent', 'committed-only') THEN
         RAISE EXCEPTION 'VEXFS_INVALID_SNAPSHOT_MODE: use consistent or committed-only'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_snapshot_type IS NULL OR
+       p_snapshot_type NOT IN ('manual', 'agent', 'safety') THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SNAPSHOT_TYPE: use manual, agent or safety'
             USING ERRCODE = '22023';
     END IF;
     v_workspace := _vexfs.require_workspace(p_workspace, 'write');
@@ -8536,9 +8578,9 @@ BEGIN
     SELECT r.oid INTO STRICT v_principal_oid
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
     INSERT INTO _vexfs.snapshots(
-        workspace_id, name, head_commit, created_by_oid, created_by)
+        workspace_id, name, snapshot_type, head_commit, created_by_oid, created_by)
     VALUES (
-        v_workspace.workspace_id, p_name, v_head,
+        v_workspace.workspace_id, p_name, p_snapshot_type, v_head,
         v_principal_oid, session_user)
     RETURNING snapshot_id INTO v_snapshot_id;
 
@@ -8598,7 +8640,8 @@ BEGIN
             'before_version', v_head,
             'after_version', v_head,
             'snapshot', p_name,
-            'mode', p_mode));
+            'mode', p_mode,
+            'snapshot_type', p_snapshot_type));
     RETURN v_head;
 END;
 $$;
@@ -8606,6 +8649,7 @@ $$;
 CREATE FUNCTION public.vexfs_snapshot_list(p_workspace text)
 RETURNS TABLE(
     name text,
+    snapshot_type text,
     head_commit bigint,
     created_by name,
     created_at timestamptz)
@@ -8620,6 +8664,7 @@ BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'read');
     RETURN QUERY
     SELECT s.name,
+           s.snapshot_type,
            s.head_commit,
            coalesce(r.rolname, s.created_by)::name,
            s.created_at
@@ -8639,6 +8684,7 @@ SET search_path = pg_catalog, _vexfs
 AS $$
     SELECT coalesce(jsonb_agg(jsonb_build_object(
                'name', snapshot.name,
+               'type', snapshot.snapshot_type,
                'commit', snapshot.head_commit,
                'created_by', snapshot.created_by,
                'created_at', (extract(epoch FROM snapshot.created_at) * 1000)::bigint)
@@ -8660,6 +8706,7 @@ BEGIN
     v_workspace := _vexfs.require_workspace(p_workspace, 'read');
     SELECT jsonb_build_object(
                'name', s.name,
+               'type', s.snapshot_type,
                'commit', s.head_commit,
                'head_commit', s.head_commit,
                'inode_count', (SELECT count(*) FROM _vexfs.snapshot_inodes AS i
@@ -8954,6 +9001,236 @@ BEGIN
 END;
 $$;
 
+CREATE FUNCTION _vexfs.snapshot_policy_status(
+    p_workspace_id bigint,
+    p_workspace_name text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_agent_keep integer;
+    v_safety_keep integer;
+    v_keep_days integer;
+    v_total bigint;
+    v_manual bigint;
+    v_agent bigint;
+    v_safety bigint;
+    v_expired bigint;
+    v_expired_agent bigint;
+    v_expired_safety bigint;
+    v_oldest_commit bigint;
+    v_oldest_created_at bigint;
+BEGIN
+    SELECT w.snapshot_agent_keep,w.snapshot_safety_keep,w.snapshot_keep_days
+      INTO STRICT v_agent_keep,v_safety_keep,v_keep_days
+      FROM _vexfs.workspaces AS w
+     WHERE w.workspace_id = p_workspace_id;
+    SELECT count(*),
+           count(*) FILTER (WHERE s.snapshot_type = 'manual'),
+           count(*) FILTER (WHERE s.snapshot_type = 'agent'),
+           count(*) FILTER (WHERE s.snapshot_type = 'safety')
+      INTO v_total,v_manual,v_agent,v_safety
+      FROM _vexfs.snapshots AS s
+     WHERE s.workspace_id = p_workspace_id;
+    WITH ranked AS (
+        SELECT s.*,
+               row_number() OVER (
+                   PARTITION BY s.snapshot_type
+                   ORDER BY s.created_at DESC,s.snapshot_id DESC) AS rank
+          FROM _vexfs.snapshots AS s
+         WHERE s.workspace_id = p_workspace_id
+           AND s.snapshot_type IN ('agent','safety')
+    ), candidates AS (
+        SELECT * FROM ranked
+         WHERE ((snapshot_type = 'agent' AND rank > v_agent_keep)
+                OR (snapshot_type = 'safety' AND rank > v_safety_keep))
+           AND (v_keep_days = 0 OR
+                created_at < clock_timestamp() - make_interval(days => v_keep_days))
+    )
+    SELECT count(*),
+           count(*) FILTER (WHERE snapshot_type = 'agent'),
+           count(*) FILTER (WHERE snapshot_type = 'safety')
+      INTO v_expired,v_expired_agent,v_expired_safety
+      FROM candidates;
+    SELECT s.head_commit,
+           (extract(epoch FROM s.created_at) * 1000)::bigint
+      INTO v_oldest_commit,v_oldest_created_at
+      FROM _vexfs.snapshots AS s
+     WHERE s.workspace_id = p_workspace_id
+     ORDER BY s.created_at,s.snapshot_id
+     LIMIT 1;
+    RETURN jsonb_build_object(
+        'workspace', p_workspace_name,
+        'agent_keep', v_agent_keep,
+        'safety_keep', v_safety_keep,
+        'keep_days', v_keep_days,
+        'snapshots', jsonb_build_object(
+            'total', v_total,
+            'manual', v_manual,
+            'agent', v_agent,
+            'safety', v_safety),
+        'expired', jsonb_build_object(
+            'total', v_expired,
+            'agent', v_expired_agent,
+            'safety', v_expired_safety),
+        'oldest_recovery_commit', v_oldest_commit,
+        'oldest_recovery_created_at', v_oldest_created_at);
+END;
+$$;
+
+CREATE FUNCTION public.vexfs_snapshot_policy_get(p_workspace text)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+STABLE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+BEGIN
+    v_workspace := _vexfs.require_workspace(p_workspace, 'read');
+    RETURN _vexfs.snapshot_policy_status(v_workspace.workspace_id, p_workspace);
+END;
+$$;
+
+CREATE FUNCTION public.vexfs_snapshot_policy_set(
+    p_workspace text,
+    p_agent_keep integer,
+    p_safety_keep integer,
+    p_keep_days integer)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+BEGIN
+    IF p_agent_keep IS NULL OR p_agent_keep NOT BETWEEN 0 AND 1000000 OR
+       p_safety_keep IS NULL OR p_safety_keep NOT BETWEEN 0 AND 1000000 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SNAPSHOT_POLICY: keep counts must be between 0 and 1000000'
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_keep_days IS NULL OR p_keep_days NOT BETWEEN 0 AND 36500 THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_SNAPSHOT_POLICY: keep days must be between 0 and 36500'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
+    UPDATE _vexfs.workspaces AS w
+       SET snapshot_agent_keep = p_agent_keep,
+           snapshot_safety_keep = p_safety_keep,
+           snapshot_keep_days = p_keep_days
+     WHERE w.workspace_id = v_workspace.workspace_id;
+    RETURN _vexfs.snapshot_policy_status(v_workspace.workspace_id, p_workspace);
+END;
+$$;
+
+CREATE FUNCTION public.vexfs_snapshot_prune(
+    p_workspace text,
+    p_dry_run integer DEFAULT 0)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_workspace _vexfs.workspaces%ROWTYPE;
+    v_agent_keep integer;
+    v_safety_keep integer;
+    v_keep_days integer;
+    v_candidate_count bigint;
+    v_agent_candidates bigint;
+    v_safety_candidates bigint;
+    v_deleted bigint := 0;
+    v_sample jsonb := '[]'::jsonb;
+BEGIN
+    IF p_dry_run IS NULL OR p_dry_run NOT IN (0,1) THEN
+        RAISE EXCEPTION 'VEXFS_INVALID_DRY_RUN: dry_run must be 0 or 1'
+            USING ERRCODE = '22023';
+    END IF;
+    v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
+    SELECT w.snapshot_agent_keep,w.snapshot_safety_keep,w.snapshot_keep_days
+      INTO v_agent_keep,v_safety_keep,v_keep_days
+      FROM _vexfs.workspaces AS w
+     WHERE w.workspace_id = v_workspace.workspace_id
+     FOR UPDATE;
+    WITH ranked AS MATERIALIZED (
+        SELECT s.*,
+               row_number() OVER (
+                   PARTITION BY s.snapshot_type
+                   ORDER BY s.created_at DESC,s.snapshot_id DESC) AS rank
+          FROM _vexfs.snapshots AS s
+         WHERE s.workspace_id = v_workspace.workspace_id
+           AND s.snapshot_type IN ('agent','safety')
+    ), candidates AS MATERIALIZED (
+        SELECT * FROM ranked
+         WHERE ((snapshot_type = 'agent' AND rank > v_agent_keep)
+                OR (snapshot_type = 'safety' AND rank > v_safety_keep))
+           AND (v_keep_days = 0 OR
+                created_at < clock_timestamp() - make_interval(days => v_keep_days))
+    )
+    SELECT count(*),
+           count(*) FILTER (WHERE snapshot_type = 'agent'),
+           count(*) FILTER (WHERE snapshot_type = 'safety'),
+           coalesce((
+               SELECT jsonb_agg(jsonb_build_object(
+                          'name', sample.name,
+                          'type', sample.snapshot_type,
+                          'commit', sample.head_commit,
+                          'created_at',
+                              (extract(epoch FROM sample.created_at) * 1000)::bigint)
+                          ORDER BY sample.created_at,sample.snapshot_id)
+                 FROM (
+                     SELECT * FROM candidates
+                     ORDER BY created_at,snapshot_id LIMIT 100) AS sample),
+               '[]'::jsonb)
+      INTO v_candidate_count,v_agent_candidates,v_safety_candidates,v_sample
+      FROM candidates;
+    IF p_dry_run = 0 AND v_candidate_count > 0 THEN
+        WITH ranked AS MATERIALIZED (
+            SELECT s.*,
+                   row_number() OVER (
+                       PARTITION BY s.snapshot_type
+                       ORDER BY s.created_at DESC,s.snapshot_id DESC) AS rank
+              FROM _vexfs.snapshots AS s
+             WHERE s.workspace_id = v_workspace.workspace_id
+               AND s.snapshot_type IN ('agent','safety')
+        ), candidates AS (
+            SELECT * FROM ranked
+             WHERE ((snapshot_type = 'agent' AND rank > v_agent_keep)
+                    OR (snapshot_type = 'safety' AND rank > v_safety_keep))
+               AND (v_keep_days = 0 OR
+                    created_at < clock_timestamp() - make_interval(days => v_keep_days))
+        )
+        DELETE FROM _vexfs.snapshots AS snapshot
+         USING candidates AS candidate
+         WHERE snapshot.snapshot_id = candidate.snapshot_id;
+        GET DIAGNOSTICS v_deleted = ROW_COUNT;
+        PERFORM _vexfs.audit(
+            v_workspace.workspace_id, v_workspace.head_commit, 'snapshot_prune',
+            '/', v_workspace.root_inode,
+            jsonb_build_object(
+                'before_version', v_workspace.head_commit,
+                'after_version', v_workspace.head_commit,
+                'deleted', v_deleted));
+    END IF;
+    RETURN jsonb_build_object(
+        'workspace', p_workspace,
+        'dry_run', p_dry_run = 1,
+        'candidate_count', v_candidate_count,
+        'agent_candidates', v_agent_candidates,
+        'safety_candidates', v_safety_candidates,
+        'deleted', v_deleted,
+        'candidates', v_sample,
+        'truncated', v_candidate_count > 100,
+        'policy', _vexfs.snapshot_policy_status(
+            v_workspace.workspace_id, p_workspace));
+END;
+$$;
+
 CREATE FUNCTION public.vexfs_snapshot_restore(
     p_workspace text,
     p_name text,
@@ -9150,7 +9427,7 @@ BEGIN
         -- This call reuses the same row lock and transaction. If any later
         -- restore step fails, PostgreSQL rolls the safety snapshot back too.
         PERFORM public.vexfs_snapshot_create(
-            p_workspace, p_safety_name, v_current_head, 'consistent');
+            p_workspace, p_safety_name, v_current_head, 'consistent', 'safety');
     END IF;
     v_commit := _vexfs.record_commit(
         v_workspace.workspace_id, 'snapshot_restore', '/', v_workspace.root_inode,
@@ -10260,6 +10537,9 @@ BEGIN
         'history_floor_source_commit', v_workspace.history_floor_commit,
         'retention_keep_versions', v_workspace.retention_keep_versions,
         'retention_keep_days', v_workspace.retention_keep_days,
+        'snapshot_agent_keep', v_workspace.snapshot_agent_keep,
+        'snapshot_safety_keep', v_workspace.snapshot_safety_keep,
+        'snapshot_keep_days', v_workspace.snapshot_keep_days,
         'quota_max_bytes', v_workspace.quota_max_bytes,
         'quota_max_files', v_workspace.quota_max_files,
         'quota_max_file_bytes', v_workspace.quota_max_file_bytes,
@@ -10615,6 +10895,7 @@ BEGIN
            encode(convert_to(s.name, 'UTF8'), 'hex'),
            jsonb_build_object(
                'name', s.name,
+               'snapshot_type', s.snapshot_type,
                'source_commit', s.head_commit,
                'created_at', floor(extract(epoch FROM s.created_at) * 1000)::bigint),
            NULL::bytea
@@ -10697,6 +10978,12 @@ BEGIN
        OR coalesce((p_manifest->>'retention_keep_versions')::integer, -1)
           NOT BETWEEN 0 AND 1000000
        OR coalesce((p_manifest->>'retention_keep_days')::integer, -1)
+          NOT BETWEEN 0 AND 36500
+       OR coalesce((p_manifest->>'snapshot_agent_keep')::integer, -1)
+          NOT BETWEEN 0 AND 1000000
+       OR coalesce((p_manifest->>'snapshot_safety_keep')::integer, -1)
+          NOT BETWEEN 0 AND 1000000
+       OR coalesce((p_manifest->>'snapshot_keep_days')::integer, -1)
           NOT BETWEEN 0 AND 36500 THEN
         RAISE EXCEPTION 'VEXFS_INVALID_ARCHIVE: invalid format v2 manifest'
             USING ERRCODE = '22023';
@@ -10930,7 +11217,8 @@ BEGIN
     INSERT INTO _vexfs.workspaces(
         name, state, owner_oid, owner_role, root_inode, head_commit,
         history_floor_commit, cache_generation, quota_max_bytes, quota_max_files,
-        quota_max_file_bytes, retention_keep_versions, retention_keep_days, created_at)
+        quota_max_file_bytes, retention_keep_versions, retention_keep_days,
+        snapshot_agent_keep, snapshot_safety_keep, snapshot_keep_days, created_at)
     VALUES (
         v_job.workspace_name, 'importing', v_actor, session_user, NULL, 0, 0, 0,
         (v_job.manifest->>'quota_max_bytes')::bigint,
@@ -10938,6 +11226,9 @@ BEGIN
         (v_job.manifest->>'quota_max_file_bytes')::bigint,
         (v_job.manifest->>'retention_keep_versions')::integer,
         (v_job.manifest->>'retention_keep_days')::integer,
+        (v_job.manifest->>'snapshot_agent_keep')::integer,
+        (v_job.manifest->>'snapshot_safety_keep')::integer,
+        (v_job.manifest->>'snapshot_keep_days')::integer,
         to_timestamp((v_job.manifest->>'created_at')::bigint / 1000.0))
     RETURNING workspace_id INTO v_workspace_id;
 
@@ -11201,12 +11492,13 @@ BEGIN
      ORDER BY (record.record_json->>'source_commit')::bigint,
               record.record_json->>'name';
     INSERT INTO _vexfs.snapshots(
-        snapshot_id, workspace_id, name, head_commit,
+        snapshot_id, workspace_id, name, snapshot_type, head_commit,
         created_by_oid, created_by, created_at)
     OVERRIDING SYSTEM VALUE
     SELECT snapshot_map.local_id,
            v_workspace_id,
            snapshot_map.name,
+           record.record_json->>'snapshot_type',
            commit_map.local_id,
            v_actor,
            session_user,

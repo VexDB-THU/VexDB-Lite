@@ -273,12 +273,17 @@ CREATE TABLE IF NOT EXISTS _vexfs_snapshots(
     id INTEGER PRIMARY KEY,
     workspace_id INTEGER NOT NULL,
     name TEXT NOT NULL COLLATE BINARY,
+    snapshot_type TEXT NOT NULL DEFAULT 'manual'
+        CHECK(snapshot_type IN ('manual','agent','safety')),
     commit_id INTEGER NOT NULL,
     created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000),
     UNIQUE(workspace_id, name)
 );
 CREATE INDEX IF NOT EXISTS _vexfs_snapshots_commit_idx
     ON _vexfs_snapshots(workspace_id, commit_id);
+CREATE INDEX IF NOT EXISTS _vexfs_snapshots_policy_idx
+    ON _vexfs_snapshots(
+        workspace_id, snapshot_type, created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS _vexfs_dirty_inodes(
     workspace_id INTEGER NOT NULL,
@@ -560,6 +565,12 @@ CREATE TABLE IF NOT EXISTS _vexfs_workspaces(
         CHECK(retention_keep_versions >= 0),
     retention_keep_days INTEGER NOT NULL DEFAULT 30
         CHECK(retention_keep_days >= 0),
+    snapshot_agent_keep INTEGER NOT NULL DEFAULT 20
+        CHECK(snapshot_agent_keep >= 0),
+    snapshot_safety_keep INTEGER NOT NULL DEFAULT 10
+        CHECK(snapshot_safety_keep >= 0),
+    snapshot_keep_days INTEGER NOT NULL DEFAULT 30
+        CHECK(snapshot_keep_days >= 0),
     gc_paused INTEGER NOT NULL DEFAULT 0 CHECK(gc_paused IN (0,1)),
     quota_max_bytes INTEGER CHECK(quota_max_bytes IS NULL OR quota_max_bytes >= 0),
     quota_max_files INTEGER CHECK(quota_max_files IS NULL OR quota_max_files >= 0),
@@ -4855,6 +4866,7 @@ void SetXattrFunction(sqlite3_context *context, int, sqlite3_value **values) {
 struct SnapshotInfo {
     sqlite3_int64 id = 0;
     std::string name;
+    std::string type = "manual";
     sqlite3_int64 commit = 0;
     sqlite3_int64 created_at = 0;
 };
@@ -5000,13 +5012,13 @@ void ValidateHistoryCommit(sqlite3 *db, const Workspace &workspace, sqlite3_int6
 
 SnapshotInfo FindSnapshot(sqlite3 *db, const Workspace &workspace, const std::string &name) {
     Statement statement(db,
-        "SELECT id,name,commit_id,created_at FROM _vexfs_snapshots "
+        "SELECT id,name,snapshot_type,commit_id,created_at FROM _vexfs_snapshots "
         "WHERE workspace_id=?1 AND name=?2");
     statement.BindInt64(1, workspace.id);
     statement.BindText(2, name);
     if (!statement.Row()) throw SqlError("snapshot not found: " + name, SQLITE_NOTFOUND);
-    SnapshotInfo result{statement.Int64(0), statement.Text(1), statement.Int64(2),
-                        statement.Int64(3)};
+    SnapshotInfo result{statement.Int64(0), statement.Text(1), statement.Text(2),
+                        statement.Int64(3), statement.Int64(4)};
     ValidateHistoryCommit(db, workspace, result.commit);
     return result;
 }
@@ -5320,10 +5332,16 @@ void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
         if (name.empty() || name.size() > 128 || name == "HEAD") {
             throw SqlError("snapshot name must be 1..128 bytes and not HEAD", SQLITE_MISMATCH);
         }
-        const std::string mode = argument_count == 4
+        const std::string mode = argument_count >= 4
             ? RequiredText(values[3], "snapshot mode") : "consistent";
         if (mode != "consistent" && mode != "committed-only") {
             throw SqlError("snapshot mode must be consistent or committed-only", SQLITE_MISMATCH);
+        }
+        const std::string snapshot_type = argument_count >= 5
+            ? RequiredText(values[4], "snapshot type") : "manual";
+        if (snapshot_type != "manual" && snapshot_type != "agent" &&
+            snapshot_type != "safety") {
+            throw SqlError("snapshot type must be manual, agent or safety", SQLITE_MISMATCH);
         }
         Savepoint savepoint(db, "vexfs_snapshot_create");
         AcquireWriteLock(db);
@@ -5347,10 +5365,12 @@ void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
         }
         ValidateHistoryCommit(db, workspace, head);
         Statement insert(db,
-            "INSERT INTO _vexfs_snapshots(workspace_id,name,commit_id) VALUES(?1,?2,?3)");
+            "INSERT INTO _vexfs_snapshots(workspace_id,name,snapshot_type,commit_id) "
+            "VALUES(?1,?2,?3,?4)");
         insert.BindInt64(1, workspace.id);
         insert.BindText(2, name);
-        insert.BindInt64(3, head);
+        insert.BindText(3, snapshot_type);
+        insert.BindInt64(4, head);
         insert.Done();
         savepoint.Release();
         sqlite3_result_int64(context, head);
@@ -5363,7 +5383,7 @@ void SnapshotListFunction(sqlite3_context *context, int, sqlite3_value **values)
         EnsureSchema(db);
         const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         Statement statement(db,
-            "SELECT name,commit_id,created_at FROM _vexfs_snapshots "
+            "SELECT name,snapshot_type,commit_id,created_at FROM _vexfs_snapshots "
             "WHERE workspace_id=?1 ORDER BY created_at DESC,id DESC");
         statement.BindInt64(1, workspace.id);
         std::string json = "[";
@@ -5372,8 +5392,9 @@ void SnapshotListFunction(sqlite3_context *context, int, sqlite3_value **values)
             if (!first) json += ',';
             first = false;
             json += "{\"name\":\"" + JsonEscape(statement.Text(0)) +
-                "\",\"commit\":" + std::to_string(statement.Int64(1)) +
-                ",\"created_at\":" + std::to_string(statement.Int64(2)) + "}";
+                "\",\"type\":\"" + JsonEscape(statement.Text(1)) +
+                "\",\"commit\":" + std::to_string(statement.Int64(2)) +
+                ",\"created_at\":" + std::to_string(statement.Int64(3)) + "}";
         }
         json += ']';
         sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
@@ -5388,6 +5409,7 @@ void SnapshotShowFunction(sqlite3_context *context, int, sqlite3_value **values)
         const SnapshotInfo snapshot = FindSnapshot(
             db, workspace, RequiredText(values[1], "snapshot name"));
         const std::string json = "{\"name\":\"" + JsonEscape(snapshot.name) +
+            "\",\"type\":\"" + JsonEscape(snapshot.type) +
             "\",\"commit\":" + std::to_string(snapshot.commit) +
             ",\"created_at\":" + std::to_string(snapshot.created_at) +
             ",\"entries\":" + SnapshotTreeJson(TreeAtCommit(db, workspace, snapshot.commit)) + "}";
@@ -5432,6 +5454,243 @@ void SnapshotDropFunction(sqlite3_context *context, int, sqlite3_value **values)
             throw SqlError("snapshot not found: " + name, SQLITE_NOTFOUND);
         }
         sqlite3_result_int(context, 1);
+    });
+}
+
+struct SnapshotPolicy {
+    sqlite3_int64 agent_keep = 20;
+    sqlite3_int64 safety_keep = 10;
+    sqlite3_int64 keep_days = 30;
+};
+
+SnapshotPolicy ReadSnapshotPolicy(sqlite3 *db, const Workspace &workspace) {
+    Statement statement(db,
+        "SELECT snapshot_agent_keep,snapshot_safety_keep,snapshot_keep_days "
+        "FROM _vexfs_workspaces WHERE id=?1");
+    statement.BindInt64(1, workspace.id);
+    if (!statement.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    return {statement.Int64(0), statement.Int64(1), statement.Int64(2)};
+}
+
+std::string SnapshotPolicyJson(sqlite3 *db, const std::string &workspace_name,
+                               const Workspace &workspace,
+                               const SnapshotPolicy &policy) {
+    Statement counts(db, R"SQL(
+SELECT count(*),
+       count(*) FILTER(WHERE snapshot_type='manual'),
+       count(*) FILTER(WHERE snapshot_type='agent'),
+       count(*) FILTER(WHERE snapshot_type='safety')
+FROM _vexfs_snapshots WHERE workspace_id=?1
+)SQL");
+    counts.BindInt64(1, workspace.id);
+    counts.Row();
+    Statement expired(db, R"SQL(
+WITH ranked AS (
+  SELECT snapshot.*,
+         ROW_NUMBER() OVER(
+           PARTITION BY snapshot.snapshot_type
+           ORDER BY snapshot.created_at DESC,snapshot.id DESC) AS rank
+  FROM _vexfs_snapshots snapshot
+  WHERE snapshot.workspace_id=?1
+    AND snapshot.snapshot_type IN ('agent','safety')
+), candidates AS (
+  SELECT * FROM ranked
+  WHERE ((snapshot_type='agent' AND rank>?2)
+         OR (snapshot_type='safety' AND rank>?3))
+    AND (?4=0 OR created_at<CAST(unixepoch('subsec')*1000 AS INTEGER)-(?4*86400000))
+)
+SELECT count(*),
+       count(*) FILTER(WHERE snapshot_type='agent'),
+       count(*) FILTER(WHERE snapshot_type='safety')
+FROM candidates
+)SQL");
+    expired.BindInt64(1, workspace.id);
+    expired.BindInt64(2, policy.agent_keep);
+    expired.BindInt64(3, policy.safety_keep);
+    expired.BindInt64(4, policy.keep_days);
+    expired.Row();
+    Statement oldest(db,
+        "SELECT commit_id,created_at FROM _vexfs_snapshots "
+        "WHERE workspace_id=?1 ORDER BY created_at,id LIMIT 1");
+    oldest.BindInt64(1, workspace.id);
+    const bool has_oldest = oldest.Row();
+    return "{\"workspace\":\"" + JsonEscape(workspace_name) +
+        "\",\"agent_keep\":" + std::to_string(policy.agent_keep) +
+        ",\"safety_keep\":" + std::to_string(policy.safety_keep) +
+        ",\"keep_days\":" + std::to_string(policy.keep_days) +
+        ",\"snapshots\":{\"total\":" + std::to_string(counts.Int64(0)) +
+        ",\"manual\":" + std::to_string(counts.Int64(1)) +
+        ",\"agent\":" + std::to_string(counts.Int64(2)) +
+        ",\"safety\":" + std::to_string(counts.Int64(3)) + "}" +
+        ",\"expired\":{\"total\":" + std::to_string(expired.Int64(0)) +
+        ",\"agent\":" + std::to_string(expired.Int64(1)) +
+        ",\"safety\":" + std::to_string(expired.Int64(2)) + "}" +
+        ",\"oldest_recovery_commit\":" +
+        (has_oldest ? std::to_string(oldest.Int64(0)) : "null") +
+        ",\"oldest_recovery_created_at\":" +
+        (has_oldest ? std::to_string(oldest.Int64(1)) : "null") + "}";
+}
+
+void SnapshotPolicyGetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        const SnapshotPolicy policy = ReadSnapshotPolicy(db, workspace);
+        const std::string json = SnapshotPolicyJson(db, workspace_name, workspace, policy);
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SnapshotPolicySetFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        const SnapshotPolicy policy{
+            RequiredNonnegativeInteger(values[1], "agent_keep"),
+            RequiredNonnegativeInteger(values[2], "safety_keep"),
+            RequiredNonnegativeInteger(values[3], "keep_days")};
+        if (policy.agent_keep > 1000000 || policy.safety_keep > 1000000) {
+            throw SqlError("snapshot keep counts must be at most 1000000", SQLITE_RANGE);
+        }
+        if (policy.keep_days > 36500) {
+            throw SqlError("snapshot keep_days must be at most 36500", SQLITE_RANGE);
+        }
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        Savepoint savepoint(db, "vexfs_snapshot_policy_set");
+        AcquireWriteLock(db);
+        Statement update(db, R"SQL(
+UPDATE _vexfs_workspaces
+SET snapshot_agent_keep=?1,snapshot_safety_keep=?2,snapshot_keep_days=?3
+WHERE id=?4
+)SQL");
+        update.BindInt64(1, policy.agent_keep);
+        update.BindInt64(2, policy.safety_keep);
+        update.BindInt64(3, policy.keep_days);
+        update.BindInt64(4, workspace.id);
+        update.Done();
+        savepoint.Release();
+        const std::string json = SnapshotPolicyJson(db, workspace_name, workspace, policy);
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void SnapshotPruneFunction(sqlite3_context *context, int, sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const std::string workspace_name = RequiredText(values[0], "workspace");
+        if (sqlite3_value_type(values[1]) != SQLITE_INTEGER ||
+            (sqlite3_value_int(values[1]) != 0 && sqlite3_value_int(values[1]) != 1)) {
+            throw SqlError("dry_run must be 0 or 1", SQLITE_MISMATCH);
+        }
+        const bool dry_run = sqlite3_value_int(values[1]) != 0;
+        const Workspace workspace = FindWorkspace(db, workspace_name);
+        const SnapshotPolicy policy = ReadSnapshotPolicy(db, workspace);
+        Savepoint savepoint(db, "vexfs_snapshot_prune");
+        if (!dry_run) AcquireWriteLock(db);
+        Statement counts(db, R"SQL(
+WITH ranked AS (
+  SELECT snapshot.*,
+         ROW_NUMBER() OVER(
+           PARTITION BY snapshot.snapshot_type
+           ORDER BY snapshot.created_at DESC,snapshot.id DESC) AS rank
+  FROM _vexfs_snapshots snapshot
+  WHERE snapshot.workspace_id=?1
+    AND snapshot.snapshot_type IN ('agent','safety')
+), candidates AS (
+  SELECT * FROM ranked
+  WHERE ((snapshot_type='agent' AND rank>?2)
+         OR (snapshot_type='safety' AND rank>?3))
+    AND (?4=0 OR created_at<CAST(unixepoch('subsec')*1000 AS INTEGER)-(?4*86400000))
+)
+SELECT count(*),
+       count(*) FILTER(WHERE snapshot_type='agent'),
+       count(*) FILTER(WHERE snapshot_type='safety')
+FROM candidates
+)SQL");
+        counts.BindInt64(1, workspace.id);
+        counts.BindInt64(2, policy.agent_keep);
+        counts.BindInt64(3, policy.safety_keep);
+        counts.BindInt64(4, policy.keep_days);
+        counts.Row();
+        const sqlite3_int64 candidates = counts.Int64(0);
+        std::string sample = "[";
+        bool first = true;
+        Statement rows(db, R"SQL(
+WITH ranked AS (
+  SELECT snapshot.*,
+         ROW_NUMBER() OVER(
+           PARTITION BY snapshot.snapshot_type
+           ORDER BY snapshot.created_at DESC,snapshot.id DESC) AS rank
+  FROM _vexfs_snapshots snapshot
+  WHERE snapshot.workspace_id=?1
+    AND snapshot.snapshot_type IN ('agent','safety')
+), candidates AS (
+  SELECT * FROM ranked
+  WHERE ((snapshot_type='agent' AND rank>?2)
+         OR (snapshot_type='safety' AND rank>?3))
+    AND (?4=0 OR created_at<CAST(unixepoch('subsec')*1000 AS INTEGER)-(?4*86400000))
+)
+SELECT name,snapshot_type,commit_id,created_at
+FROM candidates
+ORDER BY created_at,id LIMIT 100
+)SQL");
+        rows.BindInt64(1, workspace.id);
+        rows.BindInt64(2, policy.agent_keep);
+        rows.BindInt64(3, policy.safety_keep);
+        rows.BindInt64(4, policy.keep_days);
+        while (rows.Row()) {
+            if (!first) sample += ',';
+            first = false;
+            sample += "{\"name\":\"" + JsonEscape(rows.Text(0)) +
+                "\",\"type\":\"" + JsonEscape(rows.Text(1)) +
+                "\",\"commit\":" + std::to_string(rows.Int64(2)) +
+                ",\"created_at\":" + std::to_string(rows.Int64(3)) + "}";
+        }
+        sample += ']';
+        sqlite3_int64 deleted = 0;
+        if (!dry_run && candidates > 0) {
+            Statement remove(db, R"SQL(
+DELETE FROM _vexfs_snapshots
+WHERE id IN (
+  WITH ranked AS (
+    SELECT snapshot.id,snapshot.snapshot_type,snapshot.created_at,
+           ROW_NUMBER() OVER(
+             PARTITION BY snapshot.snapshot_type
+             ORDER BY snapshot.created_at DESC,snapshot.id DESC) AS rank
+    FROM _vexfs_snapshots snapshot
+    WHERE snapshot.workspace_id=?1
+      AND snapshot.snapshot_type IN ('agent','safety')
+  )
+  SELECT id FROM ranked
+  WHERE ((snapshot_type='agent' AND rank>?2)
+         OR (snapshot_type='safety' AND rank>?3))
+    AND (?4=0 OR created_at<CAST(unixepoch('subsec')*1000 AS INTEGER)-(?4*86400000))
+)
+)SQL");
+            remove.BindInt64(1, workspace.id);
+            remove.BindInt64(2, policy.agent_keep);
+            remove.BindInt64(3, policy.safety_keep);
+            remove.BindInt64(4, policy.keep_days);
+            remove.Done();
+            deleted = sqlite3_changes64(db);
+        }
+        savepoint.Release();
+        const std::string policy_json = SnapshotPolicyJson(
+            db, workspace_name, workspace, ReadSnapshotPolicy(db, workspace));
+        const std::string json = "{\"workspace\":\"" + JsonEscape(workspace_name) +
+            "\",\"dry_run\":" + (dry_run ? "true" : "false") +
+            ",\"candidate_count\":" + std::to_string(candidates) +
+            ",\"agent_candidates\":" + std::to_string(counts.Int64(1)) +
+            ",\"safety_candidates\":" + std::to_string(counts.Int64(2)) +
+            ",\"deleted\":" + std::to_string(deleted) +
+            ",\"candidates\":" + sample +
+            ",\"truncated\":" + (candidates > 100 ? "true" : "false") +
+            ",\"policy\":" + policy_json + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
     });
 }
 
@@ -6149,7 +6408,8 @@ void SnapshotRestoreFunction(sqlite3_context *context, int argument_count,
         CheckQuotaForSnapshotRestore(db, workspace, current, target);
         if (create_safety_snapshot) {
             Statement safety(db,
-                "INSERT INTO _vexfs_snapshots(workspace_id,name,commit_id) VALUES(?1,?2,?3)");
+                "INSERT INTO _vexfs_snapshots(workspace_id,name,snapshot_type,commit_id) "
+                "VALUES(?1,?2,'safety',?3)");
             safety.BindInt64(1, workspace.id);
             safety.BindText(2, safety_name);
             safety.BindInt64(3, workspace.head_commit);
@@ -6989,10 +7249,14 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_snapshot_create", 2, SnapshotCreateFunction, SQLITE_UTF8},
         {"vexfs_snapshot_create", 3, SnapshotCreateFunction, SQLITE_UTF8},
         {"vexfs_snapshot_create", 4, SnapshotCreateFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create", 5, SnapshotCreateFunction, SQLITE_UTF8},
         {"vexfs_snapshot_list", 1, SnapshotListFunction, SQLITE_UTF8},
         {"vexfs_snapshot_show", 2, SnapshotShowFunction, SQLITE_UTF8},
         {"vexfs_snapshot_diff", 3, SnapshotDiffFunction, SQLITE_UTF8},
         {"vexfs_snapshot_drop", 2, SnapshotDropFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_policy_get", 1, SnapshotPolicyGetFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_policy_set", 4, SnapshotPolicySetFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_prune", 2, SnapshotPruneFunction, SQLITE_UTF8},
         {"vexfs_snapshot_restore", 3, SnapshotRestoreFunction, SQLITE_UTF8},
         {"vexfs_snapshot_restore", 4, SnapshotRestoreFunction, SQLITE_UTF8},
         {"vexfs_quota_get", 1, QuotaGetFunction, SQLITE_UTF8},

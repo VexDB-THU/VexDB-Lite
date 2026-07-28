@@ -91,6 +91,9 @@ steps:
 - query: SELECT count(*) FROM jsonb_array_elements(vexfs_snapshot_show('pg-a1', 'safety-before-baseline')->'entries') AS entry WHERE entry->>'path' = '/tree/new.txt';
   expect:
   - - 1
+- query: SELECT snapshot_type FROM vexfs_snapshot_list('pg-a1') WHERE name='safety-before-baseline';
+  expect:
+  - - safety
 - query: SELECT convert_from(vexfs_read('pg-a1', '/tree/file.txt'), 'UTF8'), (vexfs_stat('pg-a1', '/tree/file.txt')->>'version')::bigint, octet_length(vexfs_read('pg-a1', '/empty.txt'));
   expect:
   - - one

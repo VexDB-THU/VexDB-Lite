@@ -76,10 +76,14 @@ void Usage(std::ostream &output) {
         "  diff PATH --from N [--to N] Compare two versions (default: current)\n"
         "  restore PATH --version N [--dry-run]\n"
         "                               Restore as a new version\n"
-        "  snapshot create NAME [--committed-only]\n"
+        "  snapshot create NAME [--type manual|agent|safety] [--committed-only]\n"
         "                               Snapshot all published data; default refuses\n"
         "                               while another mount has unpublished writes\n"
         "  snapshot list                List workspace snapshots\n"
+        "  snapshot policy show         Show snapshot classes and retention policy\n"
+        "  snapshot policy set --agent-keep N --safety-keep N --days N\n"
+        "                               Set automatic snapshot retention policy\n"
+        "  snapshot prune [--dry-run]   Remove expired agent/safety snapshot references\n"
         "  snapshot show NAME           Show the complete historical tree as JSON\n"
         "  snapshot diff FROM [--to TO] Compare snapshots (default TO: HEAD)\n"
         "  snapshot restore NAME [--dry-run] [--force-unmount]\n"
@@ -450,6 +454,21 @@ bool JsonBoolean(const std::string &json, const std::string &name) {
     if (position == std::string::npos)
         throw std::runtime_error("invalid JSON result: missing " + name);
     return json.compare(position + marker.size(), 4, "true") == 0;
+}
+
+void PrintSnapshots(const std::string &json) {
+    std::cout << "NAME\tTYPE\tCOMMIT\tCREATED_AT\n";
+    const std::string marker = "\"name\":\"";
+    size_t position = 0;
+    while ((position = json.find(marker, position)) != std::string::npos) {
+        position += marker.size();
+        const std::string name = JsonUnescape(json, &position);
+        const std::string row = json.substr(position);
+        std::cout << name << '\t'
+                  << JsonString(row, "type") << '\t'
+                  << JsonInteger(row, "commit") << '\t'
+                  << JsonInteger(row, "created_at") << '\n';
+    }
 }
 
 void PrintCheck(const std::string &json) {
@@ -1283,20 +1302,33 @@ int Run(const Options &options) {
         }
     } else if (command == "snapshot") {
         if (options.arguments.size() < 2)
-            throw std::runtime_error("snapshot needs create, list, show, diff, restore or drop");
+            throw std::runtime_error(
+                "snapshot needs create, list, show, diff, restore, drop, policy or prune");
         const std::string &action = options.arguments[1];
         if (action == "create") {
-            const ParsedCommand parsed = ParseCommand(options.arguments, {}, {"--committed-only"});
+            const ParsedCommand parsed = ParseCommand(
+                options.arguments, {"--type"}, {"--committed-only"});
             if (parsed.positional.size() != 2 || parsed.positional[0] != "create")
-                throw std::runtime_error("snapshot create needs NAME and optional --committed-only");
+                throw std::runtime_error(
+                    "snapshot create needs NAME and optional --type/--committed-only");
+            const std::string snapshot_type = parsed.Value("--type", false).empty()
+                ? "manual" : parsed.Value("--type");
+            if (snapshot_type != "manual" && snapshot_type != "agent" &&
+                snapshot_type != "safety") {
+                throw CliError(
+                    VEXFS_MOUNT_INVALID_ARGUMENT,
+                    "snapshot type must be manual, agent or safety");
+            }
             const uint32_t flags = parsed.Flag("--committed-only")
                 ? VEXFS_SNAPSHOT_COMMITTED_ONLY : 0;
             int64_t commit = 0;
-            Check(vexfs_mount_snapshot_create(session.get(), parsed.positional[1].c_str(),
-                                              flags, &commit, &error), error);
+            Check(vexfs_mount_snapshot_create_typed(
+                session.get(), parsed.positional[1].c_str(), snapshot_type.c_str(),
+                flags, &commit, &error), error);
             if (options.json) {
                 std::cout << "{\"name\":\"" << JsonEscape(parsed.positional[1])
                           << "\",\"commit\":" << commit
+                          << ",\"type\":\"" << snapshot_type << "\""
                           << ",\"consistency\":\""
                           << (flags == 0 ? "consistent" : "committed-only") << "\"}\n";
             } else {
@@ -1308,7 +1340,55 @@ int Run(const Options &options) {
             vexfs_mount_bytes json{};
             Check(vexfs_mount_snapshot_list(session.get(), &json, &error), error);
             const std::string value = BytesToString(&json);
-            if (options.json) std::cout << value << '\n'; else PrintNames(value);
+            if (options.json) std::cout << value << '\n'; else PrintSnapshots(value);
+        } else if (action == "policy") {
+            if (options.arguments.size() < 3) {
+                throw std::runtime_error("snapshot policy needs show or set");
+            }
+            vexfs_mount_bytes json{};
+            if (options.arguments[2] == "show") {
+                if (options.arguments.size() != 3) {
+                    throw std::runtime_error("snapshot policy show accepts no arguments");
+                }
+                Check(vexfs_mount_snapshot_policy_get(session.get(), &json, &error), error);
+            } else if (options.arguments[2] == "set") {
+                const ParsedCommand parsed = ParseCommand(
+                    options.arguments,
+                    {"--agent-keep", "--safety-keep", "--days"}, {});
+                if (parsed.positional.size() != 2 ||
+                    parsed.positional[0] != "policy" ||
+                    parsed.positional[1] != "set") {
+                    throw std::runtime_error(
+                        "snapshot policy set needs --agent-keep N --safety-keep N --days N");
+                }
+                const int64_t agent_keep = NonnegativeInteger(
+                    parsed.Value("--agent-keep"), "agent-keep");
+                const int64_t safety_keep = NonnegativeInteger(
+                    parsed.Value("--safety-keep"), "safety-keep");
+                const int64_t days = NonnegativeInteger(parsed.Value("--days"), "days");
+                if (agent_keep > 1000000 || safety_keep > 1000000 || days > 36500) {
+                    throw CliError(
+                        VEXFS_MOUNT_INVALID_ARGUMENT,
+                        "snapshot keep counts must be at most 1000000 and days at most 36500");
+                }
+                Check(vexfs_mount_snapshot_policy_set(
+                    session.get(), static_cast<uint32_t>(agent_keep),
+                    static_cast<uint32_t>(safety_keep), static_cast<uint32_t>(days),
+                    &json, &error), error);
+            } else {
+                throw std::runtime_error("unknown snapshot policy command");
+            }
+            std::cout << BytesToString(&json) << '\n';
+        } else if (action == "prune") {
+            const ParsedCommand parsed = ParseCommand(
+                options.arguments, {}, {"--dry-run"});
+            if (parsed.positional.size() != 1 || parsed.positional[0] != "prune") {
+                throw std::runtime_error("snapshot prune accepts only --dry-run");
+            }
+            vexfs_mount_bytes json{};
+            Check(vexfs_mount_snapshot_prune(
+                session.get(), parsed.Flag("--dry-run") ? 1 : 0, &json, &error), error);
+            std::cout << BytesToString(&json) << '\n';
         } else if (action == "show") {
             if (options.arguments.size() != 3)
                 throw std::runtime_error("snapshot show needs NAME");

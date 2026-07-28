@@ -147,6 +147,26 @@ WORKSPACE_LOG_CURSOR="$(sed -n 's/.*"next_before":[[:space:]]*\([0-9][0-9]*\).*/
 vexfs --json workspace log --limit 2 --before "$WORKSPACE_LOG_CURSOR" \
     >"$TMP_DIR/workspace-log-next.json"
 contains "$TMP_DIR/workspace-log-next.json" '"entries":[' "workspace log next page"
+vexfs snapshot create agent-prune-check --type agent >/dev/null
+vexfs snapshot policy set --agent-keep 0 --safety-keep 10 --days 0 \
+    >"$TMP_DIR/snapshot-policy.json"
+contains "$TMP_DIR/snapshot-policy.json" '"agent":1' "snapshot policy agent candidate"
+vexfs snapshot prune --dry-run >"$TMP_DIR/snapshot-prune-dry.json"
+contains "$TMP_DIR/snapshot-prune-dry.json" '"deleted":0' "snapshot prune dry run"
+vexfs snapshot prune >"$TMP_DIR/snapshot-prune.json"
+contains "$TMP_DIR/snapshot-prune.json" '"deleted":1' "snapshot prune deletes agent snapshot"
+vexfs snapshot policy set --agent-keep 20 --safety-keep 10 --days 30 >/dev/null
+vexfs --json doctor >"$TMP_DIR/doctor.json" || true
+"$ROOT/tests/eval/vexfs/python.sh" -c \
+    'import json,sys
+database=json.load(open(sys.argv[1]))["database"]
+recovery=database["recovery"]
+assert recovery["snapshot_count"] >= 0
+assert recovery["protected_history_bytes"] >= 0
+assert recovery["reclaimable_bytes"] >= 0
+assert (recovery["oldest_recovery_commit"] is None) == (recovery["snapshot_count"] == 0)
+' "$TMP_DIR/doctor.json"
+CHECKS=$((CHECKS + 4))
 vexfs snapshot list >"$TMP_DIR/snapshot-list.out"
 contains "$TMP_DIR/snapshot-list.out" "baseline" "snapshot list"
 vexfs snapshot show baseline >"$TMP_DIR/snapshot-show.json"
@@ -169,6 +189,8 @@ equals "$(vexfs cat /project/src/main.txt)" "$(cat "$TMP_DIR/v2.txt")" "snapshot
 vexfs snapshot list >"$TMP_DIR/snapshot-list-after-restore.out"
 contains "$TMP_DIR/snapshot-list-after-restore.out" "$SAFETY_SNAPSHOT" \
     "safety snapshot listed"
+contains "$TMP_DIR/snapshot-list-after-restore.out" $'\tsafety\t' \
+    "safety snapshot classified"
 vexfs snapshot restore "$SAFETY_SNAPSHOT" >/dev/null
 equals "$(vexfs cat /project/src/main.txt)" "$(cat "$TMP_DIR/after.txt")" \
     "safety snapshot returns to pre-restore state"

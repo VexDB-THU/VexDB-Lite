@@ -2,9 +2,9 @@
 
 日期：2026-07-28
 
-当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。批次 B 的统一 `workspace log` 也已
-完成，全部 PG VexFS spec 为 13/13、SQLite spec 为 31/31。下一项固定为快照分类、保留规则和
-`snapshot prune --dry-run`。正式发布前仍需
+当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。批次 B 的统一 `workspace log`，以及
+快照分类、保留规则和 `snapshot prune --dry-run` 均已完成。全部 PG VexFS spec 为 14/14、
+SQLite spec 为 32/32。下一项固定为 `vexdb fs run --snapshot-before -- <command>`。正式发布前仍需
 在最终 macOS NFS 包和 Linux FUSE 包上复跑真实挂载 Gate；这不是当前数据库实现缺口。
 
 ## 1. 产品目标
@@ -140,6 +140,8 @@ vexdb fs workspace log --limit 50 --json
 
 ### P1-2：快照分类和自动保留策略
 
+状态：**已完成（2026-07-28）**。
+
 在自动创建 Agent 快照前，先解决无限增长问题。
 
 快照至少区分：
@@ -162,6 +164,17 @@ vexdb fs snapshot prune
 - 被保留的快照继续保护它引用的内容和历史。
 - prune 与 GC 分开：先删除过期快照引用，再由 GC 分批回收。
 - doctor/check 能报告快照数、受保护字节、可回收字节和最老恢复点。
+
+完成结果：
+
+- SQLite、PostgreSQL、C ABI、CLI 和 format v2 均保存 `manual`、`agent`、`safety` 类型；
+- `manual` 永不被自动 prune；`agent`、`safety` 分别保留最新 N 个，并同时保护最近 D 天；
+- prune 只删除过期快照引用，最多返回 100 条预览，正文版本仍由现有分批 GC 回收；
+- 同一 workspace 的 PG 快照创建和 prune 使用数据库锁串行，SQLite 使用写锁；并发 eval 已通过；
+- 10 万快照下，SQLite policy/dry-run/prune 为 100/281/356 ms，峰值约 24 MB；PG 为
+  389/706/1601 ms，1 GiB 容器内无 OOM；
+- `doctor --json` 的 `database.recovery` 返回快照数、受保护历史字节、可回收字节和最老恢复点；
+- 详细证据见 `docs/reports/2026-07-28_vexfs-snapshot-policy-prune.md`。
 
 ### P1-3：Agent 运行前自动 checkpoint
 
@@ -275,7 +288,7 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 | 2 | 恢复前自动安全快照 | P0 | 错误恢复可以撤销 |
 | 3 | 统一恢复正确性 Gate | P0 | SQLite、PG、macOS、Linux 不会各自漂移 |
 | 4 | workspace log（已完成） | P1 | 用户能找到和理解历史版本 |
-| 5 | 快照分类、保留和 prune | P1 | 自动快照不会无限增长 |
+| 5 | 快照分类、保留和 prune（已完成） | P1 | 自动快照不会无限增长 |
 | 6 | `vexdb fs run --snapshot-before` | P1 | Agent 任务前自动留下恢复点 |
 | 7 | SQLite `snapshot create --commit` | P2 | 可以固定任意仍被保留的 SQLite commit |
 | 8 | commit show/diff | P2 | 先看清差异再选择恢复点 |
@@ -295,7 +308,7 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 
 做顺序 4～6。结束条件是用户可以运行一条 `vexdb fs run`，让 OpenCode 修改项目，并用输出中的恢复命令回到任务前。
 
-当前进度：顺序 4 已完成，正在进入顺序 5 的快照分类、保留和 prune。
+当前进度：顺序 4、5 已完成，下一项是顺序 6 的通用 Agent 运行前 checkpoint。
 
 ### 批次 C：SQLite commit PITR
 
