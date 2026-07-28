@@ -416,10 +416,10 @@ class Call {
         Throw(rc);
         return false;
     }
-    int64_t ResultInt64() const {
+    int64_t ResultInt64(int column = 0) const {
 #if defined(VEXFS_HAVE_LIBPQ)
         if (pg_ != nullptr) {
-            const std::string value = ResultText();
+            const std::string value = ResultText(column);
             char *end = nullptr;
             const long long result = std::strtoll(value.c_str(), &end, 10);
             if (end == nullptr || *end != '\0') {
@@ -430,7 +430,7 @@ class Call {
             return static_cast<int64_t>(result);
         }
 #endif
-        return sqlite3_column_int64(statement_, 0);
+        return sqlite3_column_int64(statement_, column);
     }
     std::string ResultText(int column = 0) const {
 #if defined(VEXFS_HAVE_LIBPQ)
@@ -1992,6 +1992,63 @@ extern "C" vexfs_mount_status vexfs_mount_workspace_log_page(
     });
 }
 
+extern "C" vexfs_mount_status vexfs_mount_workspace_show_commit_page(
+    vexfs_mount_session *session, int64_t commit, const char *after_path,
+    uint32_t limit, vexfs_mount_bytes *json, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (commit <= 0 || after_path == nullptr || limit == 0 || json == nullptr) {
+            throw CallError(
+                SQLITE_MISUSE,
+                "positive commit, cursor, limit and output are required");
+        }
+        if (session->postgresql) {
+            throw CallError(
+                kUnsupportedBackend,
+                "historical commit inspection is currently supported only by SQLite",
+                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        Call call(session,
+            "SELECT vexfs_workspace_show_commit(?1,?2,?3,?4)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, commit);
+        call.Text(3, after_path);
+        call.Int64(4, limit);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_workspace_diff_commits_page(
+    vexfs_mount_session *session, int64_t from_commit, int64_t to_commit,
+    const char *after_path, uint32_t limit, vexfs_mount_bytes *json,
+    vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        if (from_commit <= 0 || to_commit < 0 || after_path == nullptr ||
+            limit == 0 || json == nullptr) {
+            throw CallError(
+                SQLITE_MISUSE,
+                "positive from commit, optional to commit, cursor, limit and output are required");
+        }
+        if (session->postgresql) {
+            throw CallError(
+                kUnsupportedBackend,
+                "historical commit inspection is currently supported only by SQLite",
+                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        Call call(session,
+            "SELECT vexfs_workspace_diff_commits(?1,?2,?3,?4,?5)");
+        call.Text(1, session->workspace.c_str());
+        call.Int64(2, from_commit);
+        if (to_commit == 0) call.Null(3); else call.Int64(3, to_commit);
+        call.Text(4, after_path);
+        call.Int64(5, limit);
+        call.Row();
+        CopyResult(call, json);
+    });
+}
+
 extern "C" vexfs_mount_status vexfs_mount_read_version(vexfs_mount_session *session,
                                                           const char *path, int64_t version,
                                                           vexfs_mount_bytes *content,
@@ -2393,6 +2450,72 @@ extern "C" vexfs_mount_status vexfs_mount_snapshot_create_typed(
         vexfs_mount_session *session, const char *name, const char *snapshot_type,
         uint32_t flags, int64_t *commit, vexfs_mount_error *error) {
     return SnapshotCreate(session, name, snapshot_type, flags, commit, error);
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_create_at_commit(
+        vexfs_mount_session *session, const char *name, const char *snapshot_type,
+        int64_t source_commit, int64_t *commit, vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (name == nullptr || snapshot_type == nullptr || commit == nullptr ||
+            source_commit <= 0) {
+            throw CallError(
+                SQLITE_MISUSE,
+                "snapshot name, type, positive source commit and output are required");
+        }
+        if (session->postgresql) {
+            throw CallError(
+                kUnsupportedBackend,
+                "historical commit snapshots are currently supported only by SQLite",
+                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        Call call(session,
+            "SELECT vexfs_snapshot_create_at_commit(?1,?2,?3,?4)");
+        call.Text(1, session->workspace.c_str());
+        call.Text(2, name);
+        call.Int64(3, source_commit);
+        call.Text(4, snapshot_type);
+        call.Row();
+        *commit = call.ResultInt64();
+    });
+}
+
+extern "C" vexfs_mount_status vexfs_mount_snapshot_create_at_time(
+        vexfs_mount_session *session, const char *name, const char *snapshot_type,
+        const char *requested_at, int64_t *commit, int64_t *commit_created_at,
+        vexfs_mount_error *error) {
+    return Guard(session, error, [&] {
+        RequireSession(session);
+        UseFullDurability(session);
+        if (name == nullptr || snapshot_type == nullptr || requested_at == nullptr ||
+            commit == nullptr || commit_created_at == nullptr) {
+            throw CallError(
+                SQLITE_MISUSE,
+                "snapshot name, type, time and commit outputs are required");
+        }
+        if (session->postgresql) {
+            throw CallError(
+                kUnsupportedBackend,
+                "historical time snapshots are currently supported only by SQLite",
+                VEXFS_RUNTIME_BACKEND_POSTGRESQL);
+        }
+        Call call(session, R"SQL(
+WITH created(result) AS MATERIALIZED (
+  SELECT vexfs_snapshot_create_at_time(?1,?2,?3,?4)
+)
+SELECT json_extract(result,'$.commit'),
+       json_extract(result,'$.commit_created_at')
+FROM created
+)SQL");
+        call.Text(1, session->workspace.c_str());
+        call.Text(2, name);
+        call.Text(3, requested_at);
+        call.Text(4, snapshot_type);
+        call.Row();
+        *commit = call.ResultInt64(0);
+        *commit_created_at = call.ResultInt64(1);
+    });
 }
 
 extern "C" vexfs_mount_status vexfs_mount_snapshot_list(vexfs_mount_session *session,

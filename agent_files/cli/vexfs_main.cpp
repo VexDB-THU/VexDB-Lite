@@ -4,7 +4,9 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <array>
 #include <cctype>
+#include <csignal>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +21,15 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#include <process.h>
+#else
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -70,6 +81,10 @@ void Usage(std::ostream &output) {
         "  stat PATH                    Print file metadata as JSON\n"
         "  workspace log [--limit N] [--before COMMIT] [--json]\n"
         "                               List one page of workspace commits\n"
+        "  workspace show --commit N [--limit N] [--after PATH] [--json]\n"
+        "                               List one page of a historical SQLite tree\n"
+        "  workspace diff --from N [--to N|HEAD] [--limit N] [--after PATH]\n"
+        "                               Compare two SQLite commits; default TO is HEAD\n"
         "  history PATH [--limit N] [--before N] [--json]\n"
         "                               List one page of file versions\n"
         "  show PATH --version N        Print one historical version\n"
@@ -77,8 +92,10 @@ void Usage(std::ostream &output) {
         "  restore PATH --version N [--dry-run]\n"
         "                               Restore as a new version\n"
         "  snapshot create NAME [--type manual|agent|safety] [--committed-only]\n"
+        "                       [--commit N | --at RFC3339_TIME]\n"
         "                               Snapshot all published data; default refuses\n"
         "                               while another mount has unpublished writes\n"
+        "                               --commit/--at pin SQLite history without changing HEAD\n"
         "  snapshot list                List workspace snapshots\n"
         "  snapshot policy show         Show snapshot classes and retention policy\n"
         "  snapshot policy set --agent-keep N --safety-keep N --days N\n"
@@ -89,6 +106,9 @@ void Usage(std::ostream &output) {
         "  snapshot restore NAME [--dry-run] [--force-unmount]\n"
         "                               Restore the complete tree as a new commit\n"
         "  snapshot drop NAME           Delete a snapshot name, not its history\n"
+        "  run --snapshot-before [--snapshot-after-success] -- COMMAND [ARGS]\n"
+        "                               Run a command inside the mounted workspace\n"
+        "                               after creating a consistent agent snapshot\n"
         "  export --output FILE [--snapshot NAME]\n"
         "                               Export a checked logical workspace package\n"
         "  import FILE                  Verify and atomically publish a new workspace\n"
@@ -113,7 +133,11 @@ Options ParseOptions(int argc, char **argv) {
     options.database = VexFSPlatformDefaultDatabasePath();
     for (int index = 1; index < argc; ++index) {
         std::string argument = argv[index];
-        if (argument == "--db" && index + 1 < argc) {
+        if (argument == "--") {
+            options.arguments.push_back(std::move(argument));
+            while (++index < argc) options.arguments.emplace_back(argv[index]);
+            break;
+        } else if (argument == "--db" && index + 1 < argc) {
             options.database = argv[++index];
         } else if (argument == "--backend" && index + 1 < argc) {
             options.backend = argv[++index];
@@ -346,6 +370,11 @@ struct ParsedCommand {
         return {};
     }
 
+    bool HasValue(const std::string &name) const {
+        for (const auto &entry : values) if (entry.first == name) return true;
+        return false;
+    }
+
     bool Flag(const std::string &name) const {
         for (const std::string &flag : flags) if (flag == name) return true;
         return false;
@@ -543,6 +572,37 @@ void PrintWorkspaceLog(const std::string &json) {
     const size_t next = json.find(next_marker);
     if (next != std::string::npos && json.compare(next + next_marker.size(), 4, "null") != 0) {
         std::cout << "NEXT_BEFORE\t" << JsonInteger(json, "next_before") << '\n';
+    }
+}
+
+void PrintWorkspaceDiff(const std::string &json) {
+    const std::string changes_marker = "\"changes\":[";
+    size_t position = json.find(changes_marker);
+    if (position == std::string::npos)
+        throw std::runtime_error("invalid workspace diff JSON");
+    position += changes_marker.size();
+    const int64_t change_count = JsonInteger(json, "change_count");
+    const std::string path_marker = "\"path\":\"";
+    const std::string change_marker = "\"change\":\"";
+    for (int64_t row = 0; row < change_count; ++row) {
+        position = json.find(path_marker, position);
+        if (position == std::string::npos)
+            throw std::runtime_error("invalid workspace diff JSON");
+        position += path_marker.size();
+        const std::string path = JsonUnescape(json, &position);
+        const size_t change_position = json.find(change_marker, position);
+        if (change_position == std::string::npos)
+            throw std::runtime_error("invalid workspace diff JSON");
+        size_t value_position = change_position + change_marker.size();
+        const std::string change = JsonUnescape(json, &value_position);
+        std::cout << change << '\t' << path << '\n';
+        position = value_position;
+    }
+    const std::string next_marker = "\"next_after\":\"";
+    const size_t next = json.find(next_marker);
+    if (next != std::string::npos) {
+        size_t value_position = next + next_marker.size();
+        std::cout << "NEXT_AFTER\t" << JsonUnescape(json, &value_position) << '\n';
     }
 }
 
@@ -853,6 +913,444 @@ std::string SafetySnapshotName(const std::string &workspace, int64_t head) {
            std::to_string(static_cast<unsigned long long>(monotonic));
 }
 
+std::string SafeNamePart(const std::string &value, std::size_t limit,
+                         const std::string &fallback) {
+    std::string result;
+    result.reserve(std::min(value.size(), limit));
+    for (const unsigned char byte : value) {
+        if (result.size() >= limit) break;
+        result.push_back(
+            std::isalnum(byte) || byte == '-' || byte == '_' ?
+                static_cast<char>(byte) : '_');
+    }
+    return result.empty() ? fallback : result;
+}
+
+int CurrentProcessId() {
+#if defined(_WIN32)
+    return _getpid();
+#else
+    return static_cast<int>(getpid());
+#endif
+}
+
+struct AgentRun {
+    bool snapshot_before = false;
+    bool snapshot_after_success = false;
+    std::vector<std::string> command;
+};
+
+AgentRun ParseAgentRun(const std::vector<std::string> &arguments) {
+    AgentRun run;
+    size_t index = 1;
+    for (; index < arguments.size() && arguments[index] != "--"; ++index) {
+        if (arguments[index] == "--snapshot-before") {
+            if (run.snapshot_before) {
+                throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                               "--snapshot-before may only be used once");
+            }
+            run.snapshot_before = true;
+        } else if (arguments[index] == "--snapshot-after-success") {
+            if (run.snapshot_after_success) {
+                throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                               "--snapshot-after-success may only be used once");
+            }
+            run.snapshot_after_success = true;
+        } else {
+            throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                           "unknown run option: " + arguments[index]);
+        }
+    }
+    if (index == arguments.size()) {
+        throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                       "run needs -- before the child command");
+    }
+    ++index;
+    while (index < arguments.size()) run.command.push_back(arguments[index++]);
+    if (!run.snapshot_before) {
+        throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                       "run currently requires --snapshot-before");
+    }
+    if (run.command.empty()) {
+        throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                       "run needs a command after --");
+    }
+    return run;
+}
+
+bool IsSameOrDescendant(const std::filesystem::path &child,
+                        const std::filesystem::path &parent) {
+    const std::filesystem::path normalized_child =
+        std::filesystem::path(NormalizedPath(child.string())).lexically_normal();
+    const std::filesystem::path normalized_parent =
+        std::filesystem::path(NormalizedPath(parent.string())).lexically_normal();
+    auto child_part = normalized_child.begin();
+    auto parent_part = normalized_parent.begin();
+    for (; parent_part != normalized_parent.end(); ++parent_part, ++child_part) {
+        if (child_part == normalized_child.end() || *child_part != *parent_part) return false;
+    }
+    return true;
+}
+
+std::string MountedWorkspaceForCurrentDirectory(const Options &options) {
+    const std::filesystem::path cwd = std::filesystem::current_path();
+    std::string selected;
+    for (const auto &mount : WorkspaceMounts(options)) {
+        if (!IsSameOrDescendant(cwd, mount.target)) continue;
+        if (selected.empty() || NormalizedPath(mount.target).size() > selected.size()) {
+            selected = NormalizedPath(mount.target);
+        }
+    }
+    if (selected.empty()) {
+        throw CliError(
+            VEXFS_MOUNT_INVALID_ARGUMENT,
+            "current directory is not inside an active mount for workspace " +
+                options.workspace);
+    }
+    return selected;
+}
+
+std::string ShellQuote(const std::string &value) {
+#if defined(_WIN32)
+    std::string quoted = "\"";
+    for (const char byte : value) {
+        if (byte == '\"') quoted += "\\\"";
+        else quoted.push_back(byte);
+    }
+    return quoted + "\"";
+#else
+    std::string quoted = "'";
+    for (const char byte : value) {
+        if (byte == '\'') quoted += "'\"'\"'";
+        else quoted.push_back(byte);
+    }
+    return quoted + "'";
+#endif
+}
+
+std::string RestoreProgram() {
+    if (g_program_name == "vexdb fs") return "vexdb fs";
+    return ShellQuote(g_program_name);
+}
+
+std::string MatchingDsnEnvironment(const std::string &dsn) {
+    for (const char *name : {"VEXDB_PG_DSN", "VEXFS_PG_DSN", "PG_DSN", "DATABASE_URL"}) {
+        const char *value = std::getenv(name);
+        if (value != nullptr && dsn == value) return name;
+    }
+    return "VEXDB_PG_DSN";
+}
+
+std::string RestoreCommand(const Options &options, const std::string &snapshot) {
+    std::string command = RestoreProgram();
+    if (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL) {
+        const std::string variable = MatchingDsnEnvironment(options.dsn);
+#if defined(_WIN32)
+        command += " --backend pg --dsn \"%" + variable + "%\"";
+#else
+        command += " --backend pg --dsn \"$" + variable + "\"";
+#endif
+    } else {
+        command += " --db " + ShellQuote(NormalizedPath(options.database));
+    }
+    command += " --workspace " + ShellQuote(options.workspace);
+    if (!options.mount_driver.empty()) {
+        command += " --mount-driver " + ShellQuote(options.mount_driver);
+    }
+    command += " snapshot restore " + ShellQuote(snapshot);
+    return command;
+}
+
+std::string AgentRunId() {
+    const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    const auto monotonic = std::chrono::steady_clock::now().time_since_epoch().count();
+    return std::to_string(wall) + "-" + std::to_string(CurrentProcessId()) + "-" +
+           std::to_string(static_cast<unsigned long long>(monotonic));
+}
+
+std::string AgentSnapshotName(const Options &options, const std::string &run_id,
+                              const std::string &boundary) {
+    return "vexfs-agent-" + SafeNamePart(options.workspace, 24, "workspace") + "-" +
+           run_id + "-" + boundary;
+}
+
+int64_t CreateAgentSnapshot(Session &session, const Options &options,
+                            const std::string &name) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(35);
+    bool reported_wait = false;
+    while (true) {
+        int64_t commit = 0;
+        vexfs_mount_error error{};
+        const vexfs_mount_status status = vexfs_mount_snapshot_create_typed(
+            session.get(), name.c_str(), "agent", 0, &commit, &error);
+        if (status == VEXFS_MOUNT_OK) return commit;
+        std::string message = ErrorMessage(error);
+        std::transform(message.begin(), message.end(), message.begin(),
+                       [](unsigned char byte) { return static_cast<char>(std::tolower(byte)); });
+        const bool waiting_for_mount = status == VEXFS_MOUNT_BUSY &&
+            (message.find("unpublished") != std::string::npos ||
+             message.find("file handle") != std::string::npos);
+        if (!waiting_for_mount || std::chrono::steady_clock::now() >= deadline) {
+            Check(status, error);
+        }
+        if (!reported_wait) {
+            if (options.json) {
+                std::cerr << "{\"event\":\"snapshot_wait\",\"workspace\":\""
+                          << JsonEscape(options.workspace) << "\",\"snapshot\":\""
+                          << JsonEscape(name) << "\"}\n";
+            } else {
+                std::cerr << g_program_name
+                          << ": waiting for the mounted workspace to publish pending writes\n";
+            }
+            reported_wait = true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+}
+
+struct ChildResult {
+    int exit_code = 1;
+    int exec_error = 0;
+};
+
+#if !defined(_WIN32)
+volatile std::sig_atomic_t g_child_process = -1;
+volatile std::sig_atomic_t g_forwarded_signal = 0;
+
+void ForwardChildSignal(int signal) {
+    g_forwarded_signal = signal;
+    const pid_t child = static_cast<pid_t>(g_child_process);
+    if (child > 0) kill(child, signal);
+}
+
+class ChildSignalGuard {
+  public:
+    ChildSignalGuard() {
+        struct sigaction action{};
+        action.sa_handler = ForwardChildSignal;
+        sigemptyset(&action.sa_mask);
+        for (size_t index = 0; index < signals_.size(); ++index) {
+            if (sigaction(signals_[index], &action, &previous_[index]) != 0) {
+                while (index > 0) {
+                    --index;
+                    sigaction(signals_[index], &previous_[index], nullptr);
+                }
+                throw std::runtime_error("cannot install child signal forwarding");
+            }
+        }
+    }
+
+    ~ChildSignalGuard() {
+        g_child_process = -1;
+        for (size_t index = 0; index < signals_.size(); ++index) {
+            sigaction(signals_[index], &previous_[index], nullptr);
+        }
+    }
+
+    void ResetInChild() const {
+        struct sigaction action{};
+        action.sa_handler = SIG_DFL;
+        sigemptyset(&action.sa_mask);
+        for (const int signal : signals_) sigaction(signal, &action, nullptr);
+    }
+
+  private:
+    const std::array<int, 3> signals_{{SIGINT, SIGTERM, SIGHUP}};
+    std::array<struct sigaction, 3> previous_{};
+};
+#endif
+
+ChildResult RunChild(const std::vector<std::string> &command,
+                     const std::string &run_id,
+                     const std::string &snapshot_before) {
+#if defined(_WIN32)
+    std::vector<const char *> arguments;
+#else
+    std::vector<char *> arguments;
+#endif
+    arguments.reserve(command.size() + 1);
+    for (const std::string &argument : command) {
+#if defined(_WIN32)
+        arguments.push_back(argument.c_str());
+#else
+        arguments.push_back(const_cast<char *>(argument.c_str()));
+#endif
+    }
+    arguments.push_back(nullptr);
+
+#if defined(_WIN32)
+    const char *old_run = std::getenv("VEXFS_RUN_ID");
+    const char *old_snapshot = std::getenv("VEXFS_SNAPSHOT_BEFORE");
+    const bool had_run = old_run != nullptr;
+    const bool had_snapshot = old_snapshot != nullptr;
+    const std::string saved_run = had_run ? old_run : "";
+    const std::string saved_snapshot = had_snapshot ? old_snapshot : "";
+    const errno_t run_environment = _putenv_s("VEXFS_RUN_ID", run_id.c_str());
+    const errno_t snapshot_environment = _putenv_s(
+        "VEXFS_SNAPSHOT_BEFORE", snapshot_before.c_str());
+    if (run_environment != 0 || snapshot_environment != 0) {
+        _putenv_s("VEXFS_RUN_ID", had_run ? saved_run.c_str() : "");
+        _putenv_s("VEXFS_SNAPSHOT_BEFORE", had_snapshot ? saved_snapshot.c_str() : "");
+        return {126, run_environment != 0 ? run_environment : snapshot_environment};
+    }
+    errno = 0;
+    const intptr_t result = _spawnvp(_P_WAIT, arguments.front(), arguments.data());
+    const int spawn_error = errno;
+    _putenv_s("VEXFS_RUN_ID", had_run ? saved_run.c_str() : "");
+    _putenv_s("VEXFS_SNAPSHOT_BEFORE", had_snapshot ? saved_snapshot.c_str() : "");
+    if (result == -1) return {spawn_error == ENOENT ? 127 : 126, spawn_error};
+    return {static_cast<int>(result), 0};
+#else
+    int exec_pipe[2] = {-1, -1};
+    if (pipe(exec_pipe) != 0) {
+        throw std::runtime_error("cannot create child status pipe: " +
+                                 std::string(std::strerror(errno)));
+    }
+    if (fcntl(exec_pipe[1], F_SETFD, FD_CLOEXEC) != 0) {
+        const int saved = errno;
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
+        throw std::runtime_error("cannot protect child status pipe: " +
+                                 std::string(std::strerror(saved)));
+    }
+    std::cout.flush();
+    std::cerr.flush();
+    ChildSignalGuard signals;
+    g_forwarded_signal = 0;
+    const pid_t child = fork();
+    if (child < 0) {
+        const int saved = errno;
+        close(exec_pipe[0]);
+        close(exec_pipe[1]);
+        throw std::runtime_error("cannot start child command: " +
+                                 std::string(std::strerror(saved)));
+    }
+    if (child == 0) {
+        close(exec_pipe[0]);
+        signals.ResetInChild();
+        if (setenv("VEXFS_RUN_ID", run_id.c_str(), 1) != 0 ||
+            setenv("VEXFS_SNAPSHOT_BEFORE", snapshot_before.c_str(), 1) != 0) {
+            const int saved = errno;
+            const ssize_t ignored = write(exec_pipe[1], &saved, sizeof(saved));
+            (void)ignored;
+            _exit(126);
+        }
+        execvp(arguments.front(), arguments.data());
+        const int saved = errno;
+        const ssize_t ignored = write(exec_pipe[1], &saved, sizeof(saved));
+        (void)ignored;
+        _exit(saved == ENOENT ? 127 : 126);
+    }
+
+    g_child_process = static_cast<std::sig_atomic_t>(child);
+    if (g_forwarded_signal != 0) kill(child, g_forwarded_signal);
+    close(exec_pipe[1]);
+    int exec_error = 0;
+    ssize_t read_result = -1;
+    int read_error = 0;
+    do {
+        read_result = read(exec_pipe[0], &exec_error, sizeof(exec_error));
+    } while (read_result < 0 && errno == EINTR);
+    if (read_result < 0) read_error = errno;
+    close(exec_pipe[0]);
+
+    int status = 0;
+    pid_t waited = -1;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    g_child_process = -1;
+    const int forwarded = g_forwarded_signal;
+    if (waited < 0) {
+        throw std::runtime_error("cannot wait for child command: " +
+                                 std::string(std::strerror(errno)));
+    }
+    if (read_error != 0 || (read_result > 0 &&
+                            read_result != static_cast<ssize_t>(sizeof(exec_error)))) {
+        throw std::runtime_error("cannot read child start status: " +
+                                 std::string(read_error == 0 ? "short read" :
+                                             std::strerror(read_error)));
+    }
+    if (WIFSIGNALED(status)) {
+        const int signal = WTERMSIG(status);
+        return {128 + signal, exec_error};
+    }
+    if (forwarded != 0) return {128 + forwarded, exec_error};
+    if (!WIFEXITED(status)) return {1, exec_error};
+    return {WEXITSTATUS(status), exec_error};
+#endif
+}
+
+void PrintRunEvent(const Options &options, const std::string &event,
+                   const std::string &run_id, const std::string &snapshot,
+                   int64_t commit, const std::string &mount_point,
+                   const std::string &command_type, int exit_code = -1,
+                   const std::string &restore = {}) {
+    if (options.json) {
+        const std::string started_at = run_id.substr(0, run_id.find('-'));
+        std::cerr << "{\"event\":\"" << event
+                  << "\",\"run_id\":\"" << JsonEscape(run_id)
+                  << "\",\"started_at_ms\":" << started_at
+                  << ",\"workspace\":\"" << JsonEscape(options.workspace)
+                  << "\",\"mount_point\":\"" << JsonEscape(mount_point)
+                  << "\",\"command\":\"" << JsonEscape(command_type) << "\"";
+        if (!snapshot.empty())
+            std::cerr << ",\"snapshot\":\"" << JsonEscape(snapshot)
+                      << "\",\"commit\":" << commit;
+        if (!restore.empty())
+            std::cerr << ",\"restore_command\":\"" << JsonEscape(restore) << "\"";
+        if (exit_code >= 0) std::cerr << ",\"exit_code\":" << exit_code;
+        std::cerr << "}\n";
+        return;
+    }
+    if (event == "snapshot_before") {
+        std::cerr << g_program_name << ": run " << run_id << " snapshot " << snapshot
+                  << " commit " << commit << " before " << command_type << '\n'
+                  << g_program_name << ": restore with: " << restore << '\n';
+        if (options.backend == VEXFS_RUNTIME_BACKEND_POSTGRESQL &&
+            std::getenv(MatchingDsnEnvironment(options.dsn).c_str()) == nullptr) {
+            std::cerr << g_program_name
+                      << ": set VEXDB_PG_DSN to the same PostgreSQL DSN before restoring\n";
+        }
+    } else if (event == "snapshot_after") {
+        std::cerr << g_program_name << ": run " << run_id << " completion snapshot "
+                  << snapshot << " commit " << commit << '\n';
+    } else {
+        std::cerr << g_program_name << ": run " << run_id << " exited " << exit_code << '\n';
+    }
+}
+
+int RunAgentCommand(const Options &options) {
+    const AgentRun run = ParseAgentRun(options.arguments);
+    const std::string mount_point = MountedWorkspaceForCurrentDirectory(options);
+    Session session(options);
+    const std::string run_id = AgentRunId();
+    const std::string command_type =
+        SafeNamePart(std::filesystem::path(run.command.front()).filename().string(),
+                     48, "command");
+    const std::string before = AgentSnapshotName(options, run_id, "before");
+    const int64_t before_commit = CreateAgentSnapshot(session, options, before);
+    const std::string restore = RestoreCommand(options, before);
+    PrintRunEvent(options, "snapshot_before", run_id, before, before_commit,
+                  mount_point, command_type, -1, restore);
+
+    const ChildResult child = RunChild(run.command, run_id, before);
+    if (child.exec_error != 0) {
+        std::cerr << g_program_name << ": cannot execute " << run.command.front()
+                  << ": " << std::strerror(child.exec_error) << '\n';
+    }
+    PrintRunEvent(options, "run_exit", run_id, {}, 0, mount_point,
+                  command_type, child.exit_code);
+    if (child.exit_code == 0 && run.snapshot_after_success) {
+        const std::string after = AgentSnapshotName(options, run_id, "after");
+        const int64_t after_commit = CreateAgentSnapshot(session, options, after);
+        PrintRunEvent(options, "snapshot_after", run_id, after, after_commit,
+                      mount_point, command_type);
+    }
+    return child.exit_code;
+}
+
 int64_t RestoreSnapshotAfterUnmount(Session &session, const std::string &name,
                                     int64_t head, const std::string &safety_name,
                                     bool wait_for_mount_shutdown,
@@ -1012,6 +1510,7 @@ int Run(const Options &options) {
         std::cout << vexfs_cli::VerifyArchive(options.arguments[2]) << '\n';
         return 0;
     }
+    if (command == "run") return RunAgentCommand(options);
 
     // check 必须保持只读边界：不创建数据库、workspace、WAL/SHM，也不发布 staging。
     Session session(options, command != "check");
@@ -1230,24 +1729,77 @@ int Run(const Options &options) {
         std::cout << BytesToString(&json) << '\n';
     } else if (command == "workspace") {
         const ParsedCommand parsed = ParseCommand(
-            options.arguments, {"--limit", "--before"}, {});
-        if (parsed.positional.size() != 1 || parsed.positional[0] != "log") {
-            throw std::runtime_error("workspace needs log with optional --limit/--before");
+            options.arguments,
+            {"--limit", "--before", "--commit", "--from", "--to", "--after"}, {});
+        if (parsed.positional.size() != 1) {
+            throw std::runtime_error("workspace needs log, show or diff");
         }
+        const std::string &action = parsed.positional[0];
         const std::string limit_value = parsed.Value("--limit", false);
-        const std::string before_value = parsed.Value("--before", false);
         const int64_t limit = limit_value.empty() ? 100 :
             PositiveInteger(limit_value, "limit");
-        const int64_t before = before_value.empty() ? 0 :
-            NonnegativeInteger(before_value, "before");
         if (limit > 1000) {
             throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT, "limit must be at most 1000");
         }
         vexfs_mount_bytes json{};
-        Check(vexfs_mount_workspace_log_page(
-            session.get(), static_cast<uint32_t>(limit), before, &json, &error), error);
+        if (action == "log") {
+            if (!parsed.Value("--commit", false).empty() ||
+                !parsed.Value("--from", false).empty() ||
+                !parsed.Value("--to", false).empty() ||
+                !parsed.Value("--after", false).empty()) {
+                throw std::runtime_error("workspace log accepts only --limit and --before");
+            }
+            const std::string before_value = parsed.Value("--before", false);
+            const int64_t before = before_value.empty() ? 0 :
+                NonnegativeInteger(before_value, "before");
+            Check(vexfs_mount_workspace_log_page(
+                session.get(), static_cast<uint32_t>(limit), before, &json, &error), error);
+        } else if (action == "show") {
+            if (!parsed.Value("--before", false).empty() ||
+                !parsed.Value("--from", false).empty() ||
+                !parsed.Value("--to", false).empty()) {
+                throw std::runtime_error(
+                    "workspace show accepts --commit, --limit and --after");
+            }
+            const int64_t commit = PositiveInteger(parsed.Value("--commit"), "commit");
+            const std::string after = parsed.Value("--after", false);
+            Check(vexfs_mount_workspace_show_commit_page(
+                session.get(), commit, after.c_str(), static_cast<uint32_t>(limit),
+                &json, &error), error);
+        } else if (action == "diff") {
+            if (!parsed.Value("--before", false).empty() ||
+                !parsed.Value("--commit", false).empty()) {
+                throw std::runtime_error(
+                    "workspace diff accepts --from, --to, --limit and --after");
+            }
+            const int64_t from = PositiveInteger(parsed.Value("--from"), "from commit");
+            const std::string to_value = parsed.Value("--to", false);
+            const int64_t to = to_value.empty() || to_value == "HEAD" ? 0 :
+                PositiveInteger(to_value, "to commit");
+            const std::string after = parsed.Value("--after", false);
+            Check(vexfs_mount_workspace_diff_commits_page(
+                session.get(), from, to, after.c_str(), static_cast<uint32_t>(limit),
+                &json, &error), error);
+        } else {
+            throw std::runtime_error("workspace needs log, show or diff");
+        }
         const std::string value = BytesToString(&json);
-        if (options.json) std::cout << value << '\n'; else PrintWorkspaceLog(value);
+        if (options.json) {
+            std::cout << value << '\n';
+        } else if (action == "log") {
+            PrintWorkspaceLog(value);
+        } else if (action == "show") {
+            PrintFindPaths(value);
+            const std::string next_marker = "\"next_after\":\"";
+            const size_t next = value.find(next_marker);
+            if (next != std::string::npos) {
+                size_t value_position = next + next_marker.size();
+                std::cout << "NEXT_AFTER\t" << JsonUnescape(value, &value_position) << '\n';
+            }
+        } else {
+            PrintWorkspaceDiff(value);
+        }
+        if (action == "diff" && JsonInteger(value, "change_count") != 0) return 1;
     } else if (command == "history") {
         const ParsedCommand parsed = ParseCommand(options.arguments, {"--limit", "--before"}, {});
         if (parsed.positional.size() != 1) throw std::runtime_error("history needs PATH");
@@ -1307,10 +1859,10 @@ int Run(const Options &options) {
         const std::string &action = options.arguments[1];
         if (action == "create") {
             const ParsedCommand parsed = ParseCommand(
-                options.arguments, {"--type"}, {"--committed-only"});
+                options.arguments, {"--type", "--commit", "--at"}, {"--committed-only"});
             if (parsed.positional.size() != 2 || parsed.positional[0] != "create")
                 throw std::runtime_error(
-                    "snapshot create needs NAME and optional --type/--committed-only");
+                    "snapshot create needs NAME and optional --type/--committed-only/--commit/--at");
             const std::string snapshot_type = parsed.Value("--type", false).empty()
                 ? "manual" : parsed.Value("--type");
             if (snapshot_type != "manual" && snapshot_type != "agent" &&
@@ -1321,16 +1873,52 @@ int Run(const Options &options) {
             }
             const uint32_t flags = parsed.Flag("--committed-only")
                 ? VEXFS_SNAPSHOT_COMMITTED_ONLY : 0;
+            const std::string source_commit_value = parsed.Value("--commit", false);
+            const std::string requested_at = parsed.Value("--at", false);
+            const bool has_source_commit = parsed.HasValue("--commit");
+            const bool has_requested_at = parsed.HasValue("--at");
+            if (has_source_commit && has_requested_at) {
+                throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                               "--commit and --at cannot be combined");
+            }
+            if ((has_source_commit || has_requested_at) && flags != 0) {
+                throw CliError(VEXFS_MOUNT_INVALID_ARGUMENT,
+                               "--commit/--at cannot be combined with --committed-only");
+            }
             int64_t commit = 0;
-            Check(vexfs_mount_snapshot_create_typed(
-                session.get(), parsed.positional[1].c_str(), snapshot_type.c_str(),
-                flags, &commit, &error), error);
+            int64_t commit_created_at = 0;
+            if (!has_source_commit && !has_requested_at) {
+                Check(vexfs_mount_snapshot_create_typed(
+                    session.get(), parsed.positional[1].c_str(), snapshot_type.c_str(),
+                    flags, &commit, &error), error);
+            } else if (has_source_commit) {
+                const int64_t source_commit = PositiveInteger(
+                    source_commit_value, "commit");
+                Check(vexfs_mount_snapshot_create_at_commit(
+                    session.get(), parsed.positional[1].c_str(), snapshot_type.c_str(),
+                    source_commit, &commit, &error), error);
+            } else {
+                Check(vexfs_mount_snapshot_create_at_time(
+                    session.get(), parsed.positional[1].c_str(), snapshot_type.c_str(),
+                    requested_at.c_str(), &commit, &commit_created_at, &error), error);
+            }
             if (options.json) {
                 std::cout << "{\"name\":\"" << JsonEscape(parsed.positional[1])
                           << "\",\"commit\":" << commit
                           << ",\"type\":\"" << snapshot_type << "\""
                           << ",\"consistency\":\""
-                          << (flags == 0 ? "consistent" : "committed-only") << "\"}\n";
+                          << (has_source_commit || has_requested_at
+                                  ? "historical" :
+                              (flags == 0 ? "consistent" : "committed-only"))
+                          << "\"";
+                if (has_requested_at) {
+                    std::cout << ",\"requested_at\":\"" << JsonEscape(requested_at)
+                              << "\",\"commit_created_at\":" << commit_created_at;
+                }
+                std::cout << "}\n";
+            } else if (has_requested_at) {
+                std::cout << "commit=" << commit
+                          << " commit_created_at=" << commit_created_at << '\n';
             } else {
                 std::cout << commit << '\n';
             }
@@ -1550,6 +2138,7 @@ int Run(const Options &options) {
 
 bool WantsJson(int argc, char **argv) {
     for (int index = 1; index < argc; ++index) {
+        if (std::strcmp(argv[index], "--") == 0) return false;
         if (std::strcmp(argv[index], "--json") == 0) return true;
     }
     return false;

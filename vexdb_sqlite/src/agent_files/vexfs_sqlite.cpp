@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -645,7 +647,7 @@ CREATE TABLE IF NOT EXISTS _vexfs_commits(
     actor TEXT NOT NULL DEFAULT 'local',
     session_id TEXT,
     run_id TEXT,
-    created_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s','now') AS INTEGER) * 1000)
+    created_at INTEGER NOT NULL DEFAULT (CAST(unixepoch('subsec')*1000 AS INTEGER))
 );
 CREATE INDEX IF NOT EXISTS _vexfs_commits_workspace_idx
     ON _vexfs_commits(workspace_id,id DESC);
@@ -4907,12 +4909,9 @@ QuotaStats SnapshotQuotaStats(const SnapshotTree &tree) {
     return result;
 }
 
-void CheckQuotaForSnapshotRestore(sqlite3 *db, const Workspace &workspace,
-                                  const SnapshotTree &current,
-                                  const SnapshotTree &target) {
-    const QuotaPolicy policy = ReadQuotaPolicy(db, workspace.id);
-    const QuotaStats before = SnapshotQuotaStats(current);
-    const QuotaStats after = SnapshotQuotaStats(target);
+void CheckQuotaForSnapshotRestore(const QuotaPolicy &policy,
+                                  const QuotaStats &before,
+                                  const QuotaStats &after) {
     if (policy.max_files >= 0 && after.live_files > policy.max_files &&
         after.live_files >= before.live_files) {
         throw SqlError("snapshot exceeds workspace file quota", SQLITE_FULL);
@@ -4926,6 +4925,35 @@ void CheckQuotaForSnapshotRestore(sqlite3 *db, const Workspace &workspace,
         after.largest_file_bytes >= before.largest_file_bytes) {
         throw SqlError("snapshot exceeds maximum file size quota", SQLITE_FULL);
     }
+}
+
+void CheckQuotaForSnapshotRestore(sqlite3 *db, const Workspace &workspace,
+                                  const SnapshotTree &current,
+                                  const SnapshotTree &target) {
+    CheckQuotaForSnapshotRestore(
+        ReadQuotaPolicy(db, workspace.id), SnapshotQuotaStats(current),
+        SnapshotQuotaStats(target));
+}
+
+QuotaStats CurrentQuotaStats(sqlite3 *db, const Workspace &workspace) {
+    Statement statement(db, R"SQL(
+WITH actual AS MATERIALIZED (
+  SELECT COUNT(*) AS live_files,COALESCE(SUM(size),0) AS live_bytes,
+         COALESCE(MAX(size),0) AS largest_file_bytes
+  FROM _vexfs_inodes
+  WHERE workspace_id=?1 AND deleted_at IS NULL AND kind<>'directory'
+)
+SELECT workspace.live_files,workspace.live_bytes,
+       actual.live_files,actual.live_bytes,actual.largest_file_bytes
+FROM _vexfs_workspaces workspace CROSS JOIN actual WHERE workspace.id=?1
+)SQL");
+    statement.BindInt64(1, workspace.id);
+    if (!statement.Row()) throw SqlError("workspace not found", SQLITE_NOTFOUND);
+    if (statement.Int64(0) != statement.Int64(2) ||
+        statement.Int64(1) != statement.Int64(3)) {
+        throw SqlError("workspace live quota counters are corrupt", SQLITE_CORRUPT);
+    }
+    return {statement.Int64(2), statement.Int64(3), statement.Int64(4)};
 }
 
 void ResolveSnapshotCanonicalVersions(sqlite3 *db, SnapshotTree &tree) {
@@ -5322,6 +5350,206 @@ std::string SnapshotDiffJson(const SnapshotTree &before, const SnapshotTree &aft
     return json;
 }
 
+std::string HistoricalTreePageJson(const SnapshotTree &tree, sqlite3_int64 commit,
+                                   const std::string &after_path,
+                                   sqlite3_int64 limit) {
+    auto entry = after_path.empty() ? tree.begin() : tree.upper_bound(after_path);
+    std::string entries = "[";
+    std::string last_path;
+    sqlite3_int64 count = 0;
+    while (entry != tree.end() && count < limit) {
+        if (count != 0) entries += ',';
+        last_path = entry->first;
+        entries += "{\"path\":\"" + JsonEscape(entry->first) + "\",\"state\":" +
+            SnapshotNodeJson(entry->second) + "}";
+        ++entry;
+        ++count;
+    }
+    entries += ']';
+    return "{\"commit\":" + std::to_string(commit) +
+        ",\"entries\":" + entries + ",\"count\":" + std::to_string(count) +
+        ",\"next_after\":" +
+        (entry == tree.end() ? "null" : "\"" + JsonEscape(last_path) + "\"") + "}";
+}
+
+std::string HistoricalDiffPageJson(const SnapshotTree &before,
+                                   const SnapshotTree &after,
+                                   sqlite3_int64 from_commit,
+                                   sqlite3_int64 to_commit,
+                                   const std::string &after_path,
+                                   sqlite3_int64 limit) {
+    std::string changes = "[";
+    std::string last_path;
+    sqlite3_int64 count = 0;
+    bool has_more = false;
+    auto append = [&](const std::string &path, const char *change,
+                      const SnapshotTreeNode *old_node,
+                      const SnapshotTreeNode *new_node) {
+        if (!after_path.empty() && path <= after_path) return true;
+        if (count == limit) {
+            has_more = true;
+            return false;
+        }
+        if (count != 0) changes += ',';
+        last_path = path;
+        changes += "{\"path\":\"" + JsonEscape(path) + "\",\"change\":\"" + change +
+            "\",\"before\":" +
+            (old_node == nullptr ? "null" : SnapshotNodeJson(*old_node)) +
+            ",\"after\":" +
+            (new_node == nullptr ? "null" : SnapshotNodeJson(*new_node)) + "}";
+        ++count;
+        return true;
+    };
+    auto left = before.begin();
+    auto right = after.begin();
+    while (!has_more && (left != before.end() || right != after.end())) {
+        if (right == after.end() || (left != before.end() && left->first < right->first)) {
+            if (!append(left->first, "delete", &left->second, nullptr)) break;
+            ++left;
+        } else if (left == before.end() || right->first < left->first) {
+            if (!append(right->first, "add", nullptr, &right->second)) break;
+            ++right;
+        } else {
+            if (!SnapshotNodesEqual(left->second, right->second) &&
+                !append(left->first, "modify", &left->second, &right->second)) break;
+            ++left;
+            ++right;
+        }
+    }
+    changes += ']';
+    return "{\"from_commit\":" + std::to_string(from_commit) +
+        ",\"to_commit\":" + std::to_string(to_commit) +
+        ",\"changes\":" + changes + ",\"change_count\":" +
+        std::to_string(count) + ",\"next_after\":" +
+        (has_more ? "\"" + JsonEscape(last_path) + "\"" : "null") + "}";
+}
+
+void ValidateSnapshotDefinition(const std::string &name,
+                                const std::string &snapshot_type) {
+    if (name.empty() || name.size() > 128 || name == "HEAD") {
+        throw SqlError("snapshot name must be 1..128 bytes and not HEAD", SQLITE_MISMATCH);
+    }
+    if (snapshot_type != "manual" && snapshot_type != "agent" &&
+        snapshot_type != "safety") {
+        throw SqlError("snapshot type must be manual, agent or safety", SQLITE_MISMATCH);
+    }
+}
+
+void InsertSnapshot(sqlite3 *db, const Workspace &workspace,
+                    const std::string &name, const std::string &snapshot_type,
+                    sqlite3_int64 commit) {
+    ValidateSnapshotDefinition(name, snapshot_type);
+    ValidateHistoryCommit(db, workspace, commit);
+    Statement insert(db,
+        "INSERT INTO _vexfs_snapshots(workspace_id,name,snapshot_type,commit_id) "
+        "VALUES(?1,?2,?3,?4)");
+    insert.BindInt64(1, workspace.id);
+    insert.BindText(2, name);
+    insert.BindText(3, snapshot_type);
+    insert.BindInt64(4, commit);
+    insert.Done();
+}
+
+void ValidateHistoricalSnapshotTarget(sqlite3 *db, const Workspace &workspace,
+                                      sqlite3_int64 commit) {
+    const SnapshotTree target = TreeAtCommit(db, workspace, commit);
+    CheckQuotaForSnapshotRestore(
+        ReadQuotaPolicy(db, workspace.id), CurrentQuotaStats(db, workspace),
+        SnapshotQuotaStats(target));
+    std::set<std::pair<sqlite3_int64, sqlite3_int64>> requested_versions;
+    std::string requested = "[";
+    bool first = true;
+    for (const auto &[path, node] : target) {
+        (void)path;
+        if (node.kind != "file" && node.kind != "symlink") continue;
+        if (!requested_versions.emplace(node.inode, node.version).second) continue;
+        if (!first) requested += ',';
+        first = false;
+        requested += "{\"inode\":" + std::to_string(node.inode) +
+            ",\"version\":" + std::to_string(node.version) +
+            ",\"canonical\":" + std::to_string(node.canonical_version) +
+            ",\"size\":" + std::to_string(node.size) + "}";
+    }
+    requested += ']';
+    if (requested_versions.empty()) return;
+
+    Statement versions(db, R"SQL(
+WITH requested AS MATERIALIZED (
+  SELECT CAST(json_extract(value,'$.inode') AS INTEGER) AS inode_id,
+         CAST(json_extract(value,'$.version') AS INTEGER) AS requested_version,
+         CAST(json_extract(value,'$.canonical') AS INTEGER) AS canonical_version,
+         CAST(json_extract(value,'$.size') AS INTEGER) AS state_size
+  FROM json_each(?1)
+)
+SELECT requested.inode_id,requested.requested_version,requested.state_size,
+       requested_version.size,requested_version.checksum,
+       canonical.version_no,canonical.manifest_id,canonical.checksum,
+       manifest.file_size,manifest.checksum,manifest.chunk_size,manifest.chunk_count
+FROM requested
+JOIN _vexfs_file_versions requested_version
+  ON requested_version.inode_id=requested.inode_id
+ AND requested_version.version_no=requested.requested_version
+JOIN _vexfs_file_versions canonical
+  ON canonical.inode_id=requested.inode_id
+ AND canonical.version_no=requested.canonical_version
+LEFT JOIN _vexfs_manifests manifest ON manifest.id=canonical.manifest_id
+)SQL");
+    versions.BindText(1, requested);
+    std::map<sqlite3_int64, VersionStorage> manifests;
+    size_t resolved_versions = 0;
+    while (versions.Row()) {
+        ++resolved_versions;
+        const sqlite3_int64 state_size = versions.Int64(2);
+        const sqlite3_int64 version_size = versions.Int64(3);
+        const sqlite3_int64 manifest_id = versions.Int64(6);
+        const sqlite3_int64 manifest_size = versions.Int64(8);
+        const sqlite3_int64 chunk_count = versions.Int64(11);
+        const sqlite3_int64 expected_chunk_count = version_size < 0 ||
+            version_size > kMaxStagedBytes ? -1 :
+            (version_size + kContentChunkBytes - 1) / kContentChunkBytes;
+        const std::string requested_checksum = versions.Text(4);
+        const std::string canonical_checksum = versions.Text(7);
+        const std::string manifest_checksum = versions.Text(9);
+        if (state_size != version_size || version_size != manifest_size ||
+            versions.Type(6) == SQLITE_NULL || manifest_id <= 0 ||
+            requested_checksum.size() != 64 ||
+            requested_checksum != canonical_checksum ||
+            requested_checksum != manifest_checksum ||
+            versions.Int64(10) != kContentChunkBytes ||
+            chunk_count != expected_chunk_count) {
+            throw SqlError(
+                "historical snapshot file content reference is corrupt",
+                SQLITE_CORRUPT);
+        }
+        const VersionStorage storage{
+            manifest_id, version_size, versions.Int64(5), chunk_count,
+            requested_checksum};
+        const auto [existing, inserted] = manifests.emplace(manifest_id, storage);
+        if (!inserted &&
+            (existing->second.size != storage.size ||
+             existing->second.chunk_count != storage.chunk_count ||
+             existing->second.checksum != storage.checksum)) {
+            throw SqlError(
+                "historical snapshot manifest metadata is inconsistent",
+                SQLITE_CORRUPT);
+        }
+    }
+    if (resolved_versions != requested_versions.size()) {
+        throw SqlError(
+            "historical snapshot references a missing file version",
+            SQLITE_CORRUPT);
+    }
+    for (const auto &[manifest_id, storage] : manifests) {
+        const std::string checksum = HashManifest(
+            db, manifest_id, storage.size, storage.chunk_count);
+        if (checksum != storage.checksum) {
+            throw SqlError(
+                "historical snapshot file content checksum does not match",
+                SQLITE_CORRUPT);
+        }
+    }
+}
+
 void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
                             sqlite3_value **values) {
     Guard(context, [&] {
@@ -5329,9 +5557,6 @@ void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
         EnsureSchema(db);
         const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
         const std::string name = RequiredText(values[1], "snapshot name");
-        if (name.empty() || name.size() > 128 || name == "HEAD") {
-            throw SqlError("snapshot name must be 1..128 bytes and not HEAD", SQLITE_MISMATCH);
-        }
         const std::string mode = argument_count >= 4
             ? RequiredText(values[3], "snapshot mode") : "consistent";
         if (mode != "consistent" && mode != "committed-only") {
@@ -5339,10 +5564,7 @@ void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
         }
         const std::string snapshot_type = argument_count >= 5
             ? RequiredText(values[4], "snapshot type") : "manual";
-        if (snapshot_type != "manual" && snapshot_type != "agent" &&
-            snapshot_type != "safety") {
-            throw SqlError("snapshot type must be manual, agent or safety", SQLITE_MISMATCH);
-        }
+        ValidateSnapshotDefinition(name, snapshot_type);
         Savepoint savepoint(db, "vexfs_snapshot_create");
         AcquireWriteLock(db);
         const sqlite3_int64 head = CurrentHead(db, workspace);
@@ -5363,17 +5585,149 @@ void SnapshotCreateFunction(sqlite3_context *context, int argument_count,
                     "or use committed-only", SQLITE_BUSY);
             }
         }
-        ValidateHistoryCommit(db, workspace, head);
-        Statement insert(db,
-            "INSERT INTO _vexfs_snapshots(workspace_id,name,snapshot_type,commit_id) "
-            "VALUES(?1,?2,?3,?4)");
-        insert.BindInt64(1, workspace.id);
-        insert.BindText(2, name);
-        insert.BindText(3, snapshot_type);
-        insert.BindInt64(4, head);
-        insert.Done();
+        InsertSnapshot(db, workspace, name, snapshot_type, head);
         savepoint.Release();
         sqlite3_result_int64(context, head);
+    });
+}
+
+void SnapshotCreateAtCommitFunction(sqlite3_context *context, int argument_count,
+                                    sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string name = RequiredText(values[1], "snapshot name");
+        const sqlite3_int64 commit = RequiredPositiveInteger(values[2], "commit");
+        const std::string snapshot_type = argument_count >= 4
+            ? RequiredText(values[3], "snapshot type") : "manual";
+        ValidateSnapshotDefinition(name, snapshot_type);
+        Savepoint savepoint(db, "vexfs_snapshot_create_at_commit");
+        AcquireWriteLock(db);
+        ValidateHistoricalSnapshotTarget(db, workspace, commit);
+        InsertSnapshot(db, workspace, name, snapshot_type, commit);
+        savepoint.Release();
+        sqlite3_result_int64(context, commit);
+    });
+}
+
+bool HasExplicitRfc3339Timezone(const std::string &value) {
+    if (value.size() < 20 || value[10] != 'T') return false;
+    const char last = value.back();
+    if (last == 'Z' || last == 'z') return true;
+    if (value.size() < 25) return false;
+    const size_t sign = value.size() - 6;
+    return (value[sign] == '+' || value[sign] == '-') &&
+        value[sign + 3] == ':' &&
+        std::isdigit(static_cast<unsigned char>(value[sign + 1])) &&
+        std::isdigit(static_cast<unsigned char>(value[sign + 2])) &&
+        std::isdigit(static_cast<unsigned char>(value[sign + 4])) &&
+        std::isdigit(static_cast<unsigned char>(value[sign + 5]));
+}
+
+std::pair<sqlite3_int64, sqlite3_int64> ResolveCommitAtTime(
+    sqlite3 *db, const Workspace &workspace, const std::string &requested_at) {
+    if (!HasExplicitRfc3339Timezone(requested_at)) {
+        throw SqlError(
+            "time must be RFC3339 with an explicit Z or +HH:MM timezone",
+            SQLITE_MISMATCH);
+    }
+    Statement parsed(db,
+        "SELECT CAST(ROUND((julianday(?1)-2440587.5)*86400000.0) AS INTEGER)");
+    parsed.BindText(1, requested_at);
+    if (!parsed.Row() || parsed.Type(0) == SQLITE_NULL) {
+        throw SqlError("time is not a valid RFC3339 timestamp", SQLITE_MISMATCH);
+    }
+    const sqlite3_int64 requested_at_ms = parsed.Int64(0);
+    Statement selected(db, R"SQL(
+SELECT history.id,history.created_at
+FROM _vexfs_commits history
+JOIN _vexfs_workspaces workspace ON workspace.id=history.workspace_id
+WHERE history.workspace_id=?1 AND history.created_at<=?2
+  AND workspace.history_floor_commit>0
+  AND history.id>=workspace.history_floor_commit
+ORDER BY history.created_at DESC,history.id DESC
+LIMIT 1
+)SQL");
+    selected.BindInt64(1, workspace.id);
+    selected.BindInt64(2, requested_at_ms);
+    if (!selected.Row()) {
+        throw SqlError(
+            "no restorable workspace commit exists at or before the requested time",
+            SQLITE_NOTFOUND);
+    }
+    return {selected.Int64(0), selected.Int64(1)};
+}
+
+void SnapshotCreateAtTimeFunction(sqlite3_context *context, int argument_count,
+                                  sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const std::string name = RequiredText(values[1], "snapshot name");
+        const std::string requested_at = RequiredText(values[2], "time");
+        const std::string snapshot_type = argument_count >= 4
+            ? RequiredText(values[3], "snapshot type") : "manual";
+        ValidateSnapshotDefinition(name, snapshot_type);
+        Savepoint savepoint(db, "vexfs_snapshot_create_at_time");
+        AcquireWriteLock(db);
+        const auto [commit, commit_created_at] =
+            ResolveCommitAtTime(db, workspace, requested_at);
+        ValidateHistoricalSnapshotTarget(db, workspace, commit);
+        InsertSnapshot(db, workspace, name, snapshot_type, commit);
+        savepoint.Release();
+        const std::string json = "{\"name\":\"" + JsonEscape(name) +
+            "\",\"type\":\"" + JsonEscape(snapshot_type) +
+            "\",\"consistency\":\"historical\",\"requested_at\":\"" +
+            JsonEscape(requested_at) + "\",\"commit\":" + std::to_string(commit) +
+            ",\"commit_created_at\":" + std::to_string(commit_created_at) + "}";
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()),
+                            SQLITE_TRANSIENT);
+    });
+}
+
+void WorkspaceShowCommitFunction(sqlite3_context *context, int,
+                                 sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 commit = RequiredPositiveInteger(values[1], "commit");
+        const std::string after_path = sqlite3_value_type(values[2]) == SQLITE_NULL
+            ? std::string() : RequiredText(values[2], "cursor");
+        const sqlite3_int64 limit = RequiredPositiveInteger(values[3], "limit");
+        if (limit > 1000) throw SqlError("workspace show limit must be at most 1000", SQLITE_RANGE);
+        if (!after_path.empty() && after_path.front() != '/') {
+            throw SqlError("workspace show cursor must be an absolute path", SQLITE_MISMATCH);
+        }
+        const SnapshotTree tree = TreeAtCommit(db, workspace, commit);
+        const std::string json = HistoricalTreePageJson(tree, commit, after_path, limit);
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
+    });
+}
+
+void WorkspaceDiffCommitsFunction(sqlite3_context *context, int,
+                                  sqlite3_value **values) {
+    Guard(context, [&] {
+        sqlite3 *db = sqlite3_context_db_handle(context);
+        EnsureSchema(db);
+        const Workspace workspace = FindWorkspace(db, RequiredText(values[0], "workspace"));
+        const sqlite3_int64 from_commit = RequiredPositiveInteger(values[1], "from commit");
+        const sqlite3_int64 to_commit = sqlite3_value_type(values[2]) == SQLITE_NULL
+            ? CurrentHead(db, workspace) : RequiredPositiveInteger(values[2], "to commit");
+        const std::string after_path = sqlite3_value_type(values[3]) == SQLITE_NULL
+            ? std::string() : RequiredText(values[3], "cursor");
+        const sqlite3_int64 limit = RequiredPositiveInteger(values[4], "limit");
+        if (limit > 1000) throw SqlError("workspace diff limit must be at most 1000", SQLITE_RANGE);
+        if (!after_path.empty() && after_path.front() != '/') {
+            throw SqlError("workspace diff cursor must be an absolute path", SQLITE_MISMATCH);
+        }
+        const SnapshotTree before = TreeAtCommit(db, workspace, from_commit);
+        const SnapshotTree after = TreeAtCommit(db, workspace, to_commit);
+        const std::string json = HistoricalDiffPageJson(
+            before, after, from_commit, to_commit, after_path, limit);
+        sqlite3_result_text(context, json.data(), static_cast<int>(json.size()), SQLITE_TRANSIENT);
     });
 }
 
@@ -7250,6 +7604,12 @@ extern "C" int vexfs_sqlite_register(sqlite3 *db) {
         {"vexfs_snapshot_create", 3, SnapshotCreateFunction, SQLITE_UTF8},
         {"vexfs_snapshot_create", 4, SnapshotCreateFunction, SQLITE_UTF8},
         {"vexfs_snapshot_create", 5, SnapshotCreateFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create_at_commit", 3, SnapshotCreateAtCommitFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create_at_commit", 4, SnapshotCreateAtCommitFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create_at_time", 3, SnapshotCreateAtTimeFunction, SQLITE_UTF8},
+        {"vexfs_snapshot_create_at_time", 4, SnapshotCreateAtTimeFunction, SQLITE_UTF8},
+        {"vexfs_workspace_show_commit", 4, WorkspaceShowCommitFunction, SQLITE_UTF8},
+        {"vexfs_workspace_diff_commits", 5, WorkspaceDiffCommitsFunction, SQLITE_UTF8},
         {"vexfs_snapshot_list", 1, SnapshotListFunction, SQLITE_UTF8},
         {"vexfs_snapshot_show", 2, SnapshotShowFunction, SQLITE_UTF8},
         {"vexfs_snapshot_diff", 3, SnapshotDiffFunction, SQLITE_UTF8},

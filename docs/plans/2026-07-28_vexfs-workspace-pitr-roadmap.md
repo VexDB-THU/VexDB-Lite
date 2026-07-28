@@ -4,8 +4,10 @@
 
 当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。批次 B 的统一 `workspace log`，以及
 快照分类、保留规则和 `snapshot prune --dry-run` 均已完成。PG 快照已经改为基线加增量状态，
-metadata GC、真实 history floor 和多快照 format v2 已完成；全部 PG VexFS spec 为 15/15，
-SQLite spec 为 32/32。下一项固定为 `vexdb fs run --snapshot-before -- <command>`。正式发布前仍需
+metadata GC、真实 history floor 和多快照 format v2 已完成；SQLite spec 当前为 33/33，PG C ABI
+runtime 为 151 项。`vexdb fs run --snapshot-before -- <command>` 已完成并通过 SQLite、PG
+真实 macOS NFS 挂载回归。批次 C 的 SQLite 历史 commit 固定、分页查看/比较和按时间选择也已
+完成。正式发布前仍需
 在最终 macOS NFS 包和 Linux FUSE 包上复跑真实挂载 Gate；这不是当前数据库实现缺口。
 
 ## 1. 产品目标
@@ -179,10 +181,11 @@ vexdb fs snapshot prune
 
 ### P1-3：Agent 运行前自动 checkpoint
 
-状态：**存储与性能前置 Gate 已完成；用户命令待实现**。
+状态：**已完成（2026-07-28）**。
 
-前置证据：10,000 文件、30 快照时，基线快照 104.662 ms、增量快照 P95 3.522 ms、format v2
-记录流 434 ms、最老快照恢复 1,043 ms；1 GiB 容器无 OOM。PG 不再为每个 Agent 快照复制整树。
+前置证据：10,000 文件、30 快照时，基线快照 115.698 ms、增量快照 P95 3.317 ms、format v2
+记录流 454 ms、最老快照恢复 992 ms、元数据压实 426 ms；1 GiB 容器无 OOM。PG 不再为每个
+Agent 快照复制整树。
 
 增加通用命令，不绑定某一个 Agent：
 
@@ -195,7 +198,7 @@ vexdb fs run --snapshot-before -- claude ...
 
 1. 确认命令运行目录属于目标 workspace。
 2. 等待已发布状态，创建 `agent` 快照。
-3. 记录 run ID、actor、命令类型和开始时间。
+3. 快照名持久保存 run ID；生命周期事件记录命令类型和开始时间，数据库保存快照创建者。
 4. 执行原命令，原样传递 stdin/stdout/stderr 和退出码。
 5. 可选 `--snapshot-after-success` 创建完成快照。
 6. 输出可以直接复制使用的恢复命令。
@@ -212,9 +215,21 @@ vexdb fs run --snapshot-before -- claude ...
 - 命令被 Ctrl-C、进程崩溃、网络断开时，运行前快照仍然可用。
 - SQLite 与远程 PG 使用相同命令和输出。
 
+完成结果：
+
+- `--` 后的参数不再被全局 CLI 解析，程序通过 `fork/exec` 直接启动，不用 shell 拼接；
+- stdin、stdout、stderr、普通退出码和信号退出码原样传递，Ctrl-C 回归返回 130；
+- 只允许从匹配 backend、connection、workspace 的活动挂载目录内启动；
+- 一致快照会等待挂载端发布，35 秒仍未完成就拒绝启动，不静默使用 `committed-only`；
+- 子进程启动前输出恢复命令，PG 只输出环境变量引用，不输出原始 DSN；
+- SQLite NFS 真挂载 68 项、PG NFS 专项 21 项通过；详细证据见
+  `docs/reports/2026-07-28_vexfs-agent-run-checkpoint.md`。
+
 ## 4. SQLite commit 级恢复
 
 ### P2-1：从历史 commit 固定成快照
+
+状态：**已完成（2026-07-28）**。
 
 增加：
 
@@ -232,7 +247,12 @@ vexdb fs snapshot create before-bug --commit 123
 - 损坏、缺失内容和配额问题在创建阶段就失败。
 - 第一版 SQLite 可用；PG 返回明确的 capability 错误，不能假装支持。
 
+完成结果：创建阶段验证 workspace、history floor、配额、manifest、chunk 和 SHA-256；成功后
+立即由现有 retention/GC 保护。CLI、C ABI 和 SQL UDF 均有正反用例。
+
 ### P2-2：历史 commit 查看和比较
+
+状态：**已完成（2026-07-28）**。
 
 在 P2-1 稳定后增加：
 
@@ -243,7 +263,12 @@ vexdb fs workspace diff --from 123 --to HEAD
 
 大 workspace 的输出必须流式或分页；默认只输出变化摘要，不直接输出所有文件。
 
+完成结果：`show` 和 `diff` 默认 100 条、最多 1000 条，使用排他的二进制路径 `--after` 游标；
+普通输出只打印路径或 `change + path`，JSON 才返回详细 inode 状态。差异存在时退出码为 1。
+
 ### P2-3：按时间选择 commit
+
+状态：**已完成（2026-07-28）**。
 
 `--at TIME` 只是“找出不晚于该时间的最后一个 commit”，最终仍转换成 commit ID 和命名快照：
 
@@ -252,6 +277,14 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 ```
 
 要求明确显示实际选中的 commit 和时间，不能让用户误以为文件系统能恢复到两个 commit 之间。
+
+完成结果：只接受带 `Z` 或 `+HH:MM` 的 RFC3339 时间，选择不晚于它的最后一个仍可恢复 commit；
+commit 时间已改为毫秒精度。CLI 返回请求时间、实际 commit 和 commit 时间，随后仍走命名快照、
+diff、安全恢复与 GC 合同。PG 对这三项历史能力都返回明确的不支持错误。
+
+性能 Gate：1 万/10 万文件下，show 深页为 43/518 ms，diff 深页为 45/513 ms，按时间建快照为
+64/786 ms，峰值 RSS 为 37.8/159.5 MB，均低于 512 MiB 上限。详细证据见
+`docs/reports/2026-07-28_vexfs-sqlite-commit-pitr.md`。
 
 ## 5. PostgreSQL 后续选择
 
@@ -299,9 +332,9 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 | 5 | 快照分类、保留和 prune（已完成） | P1 | 自动快照不会无限增长 |
 | 5.5 | PG 增量 checkpoint、metadata GC、真实 floor 和多快照 Gate（已完成） | P0 | 自动 checkpoint 不再隐藏整树写放大 |
 | 6 | `vexdb fs run --snapshot-before` | P1 | Agent 任务前自动留下恢复点 |
-| 7 | SQLite `snapshot create --commit` | P2 | 可以固定任意仍被保留的 SQLite commit |
-| 8 | commit show/diff | P2 | 先看清差异再选择恢复点 |
-| 9 | `--at TIME` 到 commit | P2 | 提供时间入口，但保持真实 commit 语义 |
+| 7 | SQLite `snapshot create --commit`（已完成） | P2 | 可以固定任意仍被保留的 SQLite commit |
+| 8 | commit show/diff（已完成） | P2 | 先看清差异再选择恢复点 |
+| 9 | `--at TIME` 到 commit（已完成） | P2 | 提供时间入口，但保持真实 commit 语义 |
 | 10 | PG 快照规模与长期评估 | P3 | 用数据决定是否做完整 PG PITR |
 | 11 | PG 逐 commit PITR | P3 条件项 | 只在真实需求成立时投入 |
 
@@ -317,10 +350,10 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 
 做顺序 4～6。结束条件是用户可以运行一条 `vexdb fs run`，让 OpenCode 修改项目，并用输出中的恢复命令回到任务前。
 
-当前进度：顺序 4、5 已完成，下一项是顺序 6 的通用 Agent 运行前 checkpoint。
+当前进度：顺序 4～6 已完成，可以用一条 `vexdb fs run` 自动留下任务恢复点。
 
 ### 批次 C：SQLite commit PITR
 
 做顺序 7～9。结束条件是用户能从日志选择一个 SQLite commit，固定成快照，查看差异并走统一恢复流程。
 
-PG 逐 commit PITR 不进入这三个批次。
+当前进度：顺序 7～9 已完成。PG 逐 commit PITR 不进入这三个批次。

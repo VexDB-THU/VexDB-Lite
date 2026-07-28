@@ -4,10 +4,10 @@
 - 所属产品：VexDB-Lite 的文件管理能力 VexFS
 - 日期：2026-07-28
 - 分支：`feature/agent_files`
-- 文档版本：3.7
+- 文档版本：3.8
 - macOS 默认入口：本机 NFS gateway；FSKit 延后为可选原生增强
-- 当前阶段：Phase 2 PostgreSQL 数据库合同和本机默认 NFS 验收已完成。PG VexFS spec 12/12、
-  libpq runtime 132 项、manifest publish 专项 10 项和真实 macOS NFS 性能 18 项检查通过。
+- 当前阶段：Phase 2 PostgreSQL 数据库合同、本机默认 NFS 和 SQLite commit 级恢复闭环已完成。
+  最新 SQLite spec 33/33、libpq runtime 151 项、SQLite 真挂载 68 项、PG Agent 真挂载 21 项通过。
   PG writable handle 已使用基础 manifest + 64 KiB 脏块，发布直接复用未修改块并生成
   `manifest-v1` 根哈希，不再在数据库进程中拼接完整文件。批量创建已经保持逐路径 change 和
   逐文件 version，同时复用空 manifest 和不可变 ACL 集合；10 万文件有界性能 Gate 通过。
@@ -15,8 +15,8 @@
   macOS↔Linux、PG 16–19、备份、
   format v2 和真实 OpenCode 证据继续有效。当前源码的 Developer ID 候选包已经通过文档、
   安装和解压签名检查，但正式 preview.38 仍需从干净提交生成并提交 Apple 公证；第二台 Mac
-  NFS 复验也没有完成。PG ACL 收口和 SQLite/PG 统一 workspace log 已提交实现；下一步按
-  快照分类与自动保留、Agent checkpoint 和发行 Gate 推进；DuckDB adapter 已交由其他方向
+  NFS 复验也没有完成。快照分类、自动保留、Agent checkpoint、SQLite 历史 commit 固定、
+  分页 show/diff 和 `--at` 均已实现；下一步做历史查询性能 Gate 和发行 Gate。DuckDB adapter 已交由其他方向
   负责，不在本路线继续开发。
 
 ## 0. 2026-07-24 路线调整
@@ -438,10 +438,14 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
 4. **已完成：**PG 快照改为基线加增量状态，补 metadata GC、真实 history floor、直接增量
    format v2 和 10,000 文件 × 30 快照 Gate；增量快照 P95 3.317 ms，最老快照恢复 992 ms，
    删除 29 个快照后的元数据压实 426 ms。
-5. **当前任务：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，并给出恢复命令。
+5. **已完成：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，
+   给出脱敏恢复命令；最新 SQLite 真挂载运行前 checkpoint 为 42 ms，PG 为 110 ms。
 6. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
    sleep/wake、跨机器锁和长时间 Agent 工作区。
-7. **后续：**按 PITR 路线图做 SQLite commit 固定快照、show/diff 和按时间选择；随后再做 Windows WinFsp。
+7. **已完成：**SQLite commit 固定快照、分页 show/diff 和按时间选择均已进入 SQL、C ABI、CLI 和 eval。
+8. **已完成：**SQLite 历史大树 1 万/10 万文件 Gate 通过；10 万文件 show/diff 深页约
+   518/513 ms，按时间建快照 786 ms，RSS 159.5 MB。
+9. **当前任务：**执行发行 Gate，再做 Windows WinFsp。
 
 DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入当前队列。PG 逐 commit PITR
 必须先由真实快照规模数据证明需要，不能提前增加长期写放大。

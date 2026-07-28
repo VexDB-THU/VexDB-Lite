@@ -28,6 +28,16 @@ set -e
 [ ! -e "$DB" ]
 
 "$VEXFS" --db "$DB" --workspace smoke setup >/dev/null
+set +e
+RUN_OUTSIDE="$("$VEXFS" --db "$DB" --workspace smoke run --snapshot-before -- \
+    /usr/bin/true --json 2>&1)"
+RUN_OUTSIDE_STATUS=$?
+set -e
+[ "$RUN_OUTSIDE_STATUS" -eq 2 ]
+printf '%s' "$RUN_OUTSIDE" | grep -q 'current directory is not inside an active mount'
+case "$RUN_OUTSIDE" in
+    \{*) echo "child --json leaked into global CLI options" >&2; exit 1 ;;
+esac
 "$VEXFS" --db "$DB" --workspace smoke mkdir /agent
 printf 'hello from cli' | "$VEXFS" --db "$DB" --workspace smoke write /agent/task.txt >/dev/null
 printf 'alpha' | "$VEXFS" --db "$DB" --workspace smoke write /agent/version.txt >/dev/null
@@ -64,6 +74,16 @@ DIFF_STATUS=$?
 set -e
 [ "$DIFF_STATUS" -eq 1 ]
 printf '%s' "$DIFF" | grep -q -- '-alpha'
+BETA_LOG="$("$VEXFS" --db "$DB" --workspace smoke --json workspace log --limit 20)"
+BETA_COMMIT="$(printf '%s' "$BETA_LOG" | /usr/bin/python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["entries"][0]["commit"])')"
+BETA_CREATED_AT="$(printf '%s' "$BETA_LOG" | /usr/bin/python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["entries"][0]["created_at"])')"
+BETA_TIME="$(/usr/bin/python3 -c \
+    'from datetime import datetime,timezone; import sys; print(datetime.fromtimestamp(int(sys.argv[1])/1000,timezone.utc).isoformat(timespec="milliseconds").replace("+00:00","Z"))' \
+    "$BETA_CREATED_AT")"
+# Commit timestamps are millisecond-precision; ensure following restore commits are later.
+sleep 0.02
 set +e
 "$VEXFS" --db "$DB" --workspace smoke diff /agent/version.txt --from 99 --to 2 >/dev/null 2>&1
 MISSING_VERSION_STATUS=$?
@@ -73,6 +93,62 @@ set -e
 [ "$("$VEXFS" --db "$DB" --workspace smoke stat /agent/version.txt | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')" = "2" ]
 [ "$("$VEXFS" --db "$DB" --workspace smoke restore /agent/version.txt --version 1)" = "3" ]
 [ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/version.txt)" = "alpha" ]
+
+HISTORICAL_CREATE="$("$VEXFS" --db "$DB" --workspace smoke --json \
+    snapshot create cli-historical-beta --commit "$BETA_COMMIT")"
+printf '%s' "$HISTORICAL_CREATE" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["commit"]==int(sys.argv[1]); assert value["consistency"]=="historical"; assert value["type"]=="manual"' \
+    "$BETA_COMMIT"
+TIME_CREATE="$("$VEXFS" --db "$DB" --workspace smoke --json \
+    snapshot create cli-time-beta --at "$BETA_TIME")"
+printf '%s' "$TIME_CREATE" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["commit"]==int(sys.argv[1]); assert value["commit_created_at"]==int(sys.argv[2]); assert value["requested_at"]==sys.argv[3]' \
+    "$BETA_COMMIT" "$BETA_CREATED_AT" "$BETA_TIME"
+set +e
+"$VEXFS" --db "$DB" --workspace smoke snapshot create cli-empty-time --at '' \
+    >/dev/null 2>&1
+EMPTY_TIME_STATUS=$?
+set -e
+[ "$EMPTY_TIME_STATUS" -eq 2 ]
+set +e
+AMBIGUOUS_TIME="$("$VEXFS" --db "$DB" --workspace smoke \
+    snapshot create cli-bad-time --at '2026-07-28T12:00:00' 2>&1)"
+AMBIGUOUS_TIME_STATUS=$?
+set -e
+[ "$AMBIGUOUS_TIME_STATUS" -eq 2 ]
+printf '%s' "$AMBIGUOUS_TIME" | grep -q 'explicit Z or +HH:MM timezone'
+HISTORICAL_TREE="$("$VEXFS" --db "$DB" --workspace smoke --json \
+    workspace show --commit "$BETA_COMMIT" --limit 2)"
+printf '%s' "$HISTORICAL_TREE" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["commit"]==int(sys.argv[1]); assert len(value["entries"])==2; assert value["entries"][0]["path"]=="/"; assert value["next_after"]==value["entries"][-1]["path"]' \
+    "$BETA_COMMIT"
+HISTORICAL_NEXT="$(printf '%s' "$HISTORICAL_TREE" | /usr/bin/python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["next_after"])')"
+"$VEXFS" --db "$DB" --workspace smoke --json workspace show --commit "$BETA_COMMIT" \
+    --limit 100 --after "$HISTORICAL_NEXT" | /usr/bin/python3 -c \
+    'import json,sys; assert any(row["path"]=="/agent/version.txt" for row in json.load(sys.stdin)["entries"])'
+set +e
+HISTORICAL_WORKSPACE_DIFF="$("$VEXFS" --db "$DB" --workspace smoke --json \
+    workspace diff --from "$BETA_COMMIT")"
+HISTORICAL_WORKSPACE_DIFF_STATUS=$?
+set -e
+[ "$HISTORICAL_WORKSPACE_DIFF_STATUS" -eq 1 ]
+printf '%s' "$HISTORICAL_WORKSPACE_DIFF" | /usr/bin/python3 -c \
+    'import json,sys; value=json.load(sys.stdin); assert value["from_commit"]==int(sys.argv[1]); assert any(row["path"]=="/agent/version.txt" and row["change"]=="modify" for row in value["changes"])' \
+    "$BETA_COMMIT"
+"$VEXFS" --db "$DB" --workspace smoke workspace show --commit "$BETA_COMMIT" --limit 2 | \
+    grep -q '^/'
+set +e
+"$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-historical-beta >/dev/null
+HISTORICAL_DIFF_STATUS=$?
+set -e
+[ "$HISTORICAL_DIFF_STATUS" -eq 1 ]
+"$VEXFS" --db "$DB" --workspace smoke snapshot restore cli-historical-beta >/dev/null
+[ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/version.txt)" = "beta" ]
+"$VEXFS" --db "$DB" --workspace smoke restore /agent/version.txt --version 1 >/dev/null
+[ "$("$VEXFS" --db "$DB" --workspace smoke cat /agent/version.txt)" = "alpha" ]
+"$VEXFS" --db "$DB" --workspace smoke snapshot drop cli-historical-beta
+"$VEXFS" --db "$DB" --workspace smoke snapshot drop cli-time-beta
 
 SNAPSHOT_COMMIT="$("$VEXFS" --db "$DB" --workspace smoke snapshot create cli-baseline)"
 [ "$SNAPSHOT_COMMIT" -gt 0 ]
@@ -86,6 +162,15 @@ WORKSPACE_NEXT="$(printf '%s' "$WORKSPACE_LOG" | /usr/bin/python3 -c \
     'import json,sys; rows=json.load(sys.stdin)["entries"]; assert rows and all(row["commit"] < int(sys.argv[1]) for row in rows)' "$WORKSPACE_NEXT"
 "$VEXFS" --db "$DB" --workspace smoke workspace log --limit 1 | grep -q '^COMMIT'
 printf 'changed after snapshot' | "$VEXFS" --db "$DB" --workspace smoke write /agent/task.txt >/dev/null
+printf 'extra after snapshot' | "$VEXFS" --db "$DB" --workspace smoke write /agent/extra.txt >/dev/null
+set +e
+WORKSPACE_PLAIN_DIFF="$("$VEXFS" --db "$DB" --workspace smoke \
+    workspace diff --from "$SNAPSHOT_COMMIT" --limit 100)"
+WORKSPACE_PLAIN_DIFF_STATUS=$?
+set -e
+[ "$WORKSPACE_PLAIN_DIFF_STATUS" -eq 1 ]
+printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep -q $'^add\t/agent/extra.txt$'
+printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep -q $'^modify\t/agent/task.txt$'
 set +e
 SNAPSHOT_DIFF="$("$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-baseline)"
 SNAPSHOT_DIFF_STATUS=$?

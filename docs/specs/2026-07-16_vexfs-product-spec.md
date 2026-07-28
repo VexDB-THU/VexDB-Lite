@@ -979,6 +979,23 @@ SELECT vexfs_snapshot_diff('workspace', 'before-change', 'HEAD');
 SELECT vexfs_snapshot_restore('workspace', 'before-change', :expected_head);
 ```
 
+SQLite 还公开仍在 history floor 内的 commit 级查看和固定入口：
+
+```sql
+SELECT vexfs_workspace_log('workspace', 100, 0);
+SELECT vexfs_workspace_show_commit('workspace', 123, '', 100);
+SELECT vexfs_workspace_diff_commits('workspace', 123, NULL, '', 100);
+SELECT vexfs_snapshot_create_at_commit('workspace', 'before-bug', 123, 'manual');
+SELECT vexfs_snapshot_create_at_time(
+  'workspace', 'before-noon', '2026-07-28T12:00:00+08:00', 'manual');
+```
+
+历史树和差异页默认由 CLI 请求 100 条、单页最多 1000 条，路径游标排他。按时间创建只接受
+带 `Z` 或 `+HH:MM` 的 RFC3339 时间，并返回实际选中的 commit 和毫秒时间；它不能恢复到两个
+commit 之间。创建前必须验证 workspace、history floor、配额、版本引用、manifest、chunk 和
+完整内容哈希。PostgreSQL 当前没有逐 commit 完整树，这些接口返回明确的不支持，继续使用
+Agent 运行前命名快照。
+
 ### 12.5 权限和审计
 
 ```sql

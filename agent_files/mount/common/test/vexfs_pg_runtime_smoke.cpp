@@ -536,6 +536,29 @@ int main(int argc, char **argv) {
             session, &bytes, &error), error) ||
         !Expect(Take(&bytes).find("\"name\":\"baseline\"") != std::string::npos,
                 "snapshot list content")) return 1;
+    int64_t unsupported_historical = 0;
+    if (vexfs_mount_snapshot_create_at_commit(
+            session, "unsupported-history", "manual", snapshot_commit,
+            &unsupported_historical, &error) != VEXFS_MOUNT_UNSUPPORTED ||
+        std::strstr(error.message, "supported only by SQLite") == nullptr)
+        return Fail("PG historical snapshot boundary", &error);
+    ++checks;
+    vexfs_mount_bytes unsupported_tree{};
+    if (vexfs_mount_workspace_show_commit_page(
+            session, snapshot_commit, "", 10, &unsupported_tree, &error) !=
+            VEXFS_MOUNT_UNSUPPORTED ||
+        std::strstr(error.message, "supported only by SQLite") == nullptr)
+        return Fail("PG historical tree boundary", &error);
+    ++checks;
+    int64_t unsupported_time_commit = 0;
+    int64_t unsupported_time_created_at = 0;
+    if (vexfs_mount_snapshot_create_at_time(
+            session, "unsupported-time", "manual", "2099-01-01T00:00:00Z",
+            &unsupported_time_commit, &unsupported_time_created_at, &error) !=
+            VEXFS_MOUNT_UNSUPPORTED ||
+        std::strstr(error.message, "supported only by SQLite") == nullptr)
+        return Fail("PG historical time boundary", &error);
+    ++checks;
     if (!CheckStatus("mutate after snapshot", vexfs_mount_write_file(
             session, "/project/main.txt", "changed\n", 8, &version, &error), error)) return 1;
     int64_t head = 0;

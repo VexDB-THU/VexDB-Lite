@@ -77,8 +77,13 @@ vexdb fs ls /
 vexdb fs grep -n hello /
 vexdb fs index enable       # 可选的 FTS5 trigram 文本索引
 vexdb fs history /hello.txt
+vexdb fs workspace log --limit 50
+vexdb fs workspace show --commit 123 --limit 100
+vexdb fs workspace diff --from 123 --to HEAD --limit 100
 vexdb fs snapshot create before-agent
 vexdb fs snapshot create task-start --type agent
+vexdb fs snapshot create before-bug --commit 123
+vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 vexdb fs snapshot diff before-agent
 vexdb fs snapshot restore before-agent --dry-run
 vexdb fs snapshot restore before-agent
@@ -86,6 +91,9 @@ vexdb fs snapshot policy show
 vexdb fs snapshot policy set --agent-keep 20 --safety-keep 10 --days 30
 vexdb fs snapshot prune --dry-run
 vexdb fs snapshot prune
+cd ~/VexDB/my-project
+vexdb fs run --snapshot-before -- opencode run "完成当前任务"
+vexdb fs run --snapshot-before --snapshot-after-success -- npm test
 vexdb fs check              # 深度检查结构、历史和内容 SHA-256
 vexdb fs check --quick      # 只检查结构和引用
 vexdb fs quota show         # 查看 live 文件数、字节和上限
@@ -100,6 +108,15 @@ vexdb fs archive verify workspace.vexfs
 
 手工快照类型是 `manual`，不会被自动清理；Agent checkpoint 使用 `agent`，恢复前自动生成的是
 `safety`。prune 只删除过期快照引用，不直接删除文件版本；随后仍由 `gc --batch` 分批回收。
+
+`workspace show/diff`、`snapshot create --commit` 和 `--at` 当前只用于 SQLite。它们只选择仍在
+保留范围内的 commit；`--at` 必须带 `Z` 或 `+HH:MM` 时区，并会显示真正选中的 commit 和时间。
+输出通过 `--limit` 和排他的 `--after` 路径游标分页。PostgreSQL 会明确返回“不支持”，PG 继续
+使用运行前命名快照恢复。
+
+`fs run` 只能在这个 workspace 的真实挂载目录内执行。它会先等待挂载端发布写入并创建
+`agent` 快照，再直接启动 `--` 后面的程序，不经过 shell，参数、终端输入输出和退出码保持不变。
+恢复命令会在子进程启动前写到 stderr；PG 恢复命令只引用 `VEXDB_PG_DSN`，不会打印 DSN。
 
 NFS gateway 异常退出后，底层 mountpoint 会保持不可写，避免 Bash 把文件误写进普通本机
 目录。此时先运行 `vexdb fs unmount --force MOUNTPOINT` 清理，再重新挂载。PostgreSQL 网络中断时，

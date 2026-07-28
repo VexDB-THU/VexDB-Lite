@@ -10,6 +10,7 @@ if [ -z "$VEXDB" ]; then
     VEXDB="$REPO_ROOT/vexdb_sqlite/build-nfs-dev/vexdb"
 fi
 [ -x "$VEXDB" ] || { echo "找不到 vexdb：$VEXDB" >&2; exit 1; }
+VEXDB="$(cd "$(dirname "$VEXDB")" && pwd)/$(basename "$VEXDB")"
 
 FILE_COUNT="${VEXDB_NFS_FILE_COUNT:-1000}"
 case "$FILE_COUNT" in
@@ -27,11 +28,19 @@ MOUNT_POINT="$ROOT/mnt"
 WORKSPACE=nfs-real
 MOUNTED=0
 CHECKS=0
+XATTR_SUPPORTED=0
 
 mkdir -p "$TEST_HOME" "$MOUNT_POINT"
 
 fs() {
     HOME="$TEST_HOME" "$VEXDB" fs --db "$DB" --workspace "$WORKSPACE" "$@"
+}
+
+run_in_project() {
+    (
+        cd "$MOUNT_POINT/project"
+        HOME="$TEST_HOME" "$VEXDB" fs --db "$DB" --workspace "$WORKSPACE" "$@"
+    )
 }
 
 check() {
@@ -94,9 +103,12 @@ printf '#!/bin/sh\nprintf "nfs-ok\\n"\n' > "$MOUNT_POINT/project/run.sh"
 chmod 0755 "$MOUNT_POINT/project/run.sh"
 equal nfs-ok "$($MOUNT_POINT/project/run.sh)" "可执行权限"
 
-/usr/bin/xattr -w user.vexdb.nfs-eval yes "$MOUNT_POINT/project/src/data.txt"
-equal yes "$(/usr/bin/xattr -p user.vexdb.nfs-eval "$MOUNT_POINT/project/src/data.txt")" \
-    "扩展属性"
+if /usr/bin/xattr -w user.vexdb.nfs-eval yes \
+        "$MOUNT_POINT/project/src/data.txt" 2>/dev/null; then
+    XATTR_SUPPORTED=1
+    equal yes "$(/usr/bin/xattr -p user.vexdb.nfs-eval "$MOUNT_POINT/project/src/data.txt")" \
+        "扩展属性"
+fi
 
 /usr/bin/python3 - "$MOUNT_POINT/project/process.lock" <<'PY'
 import fcntl
@@ -181,6 +193,120 @@ git -C "$MOUNT_POINT/project" add .
 git -C "$MOUNT_POINT/project" commit -qm baseline
 equal '' "$(git -C "$MOUNT_POINT/project" status --porcelain)" "Git 工作区"
 
+# Agent 命令包装器必须先创建一致快照，原样传递参数和环境，并能用运行前
+# 快照恢复。生命周期事件写 stderr，不能污染子进程 stdout。
+RUN_SUCCESS_OUT="$ROOT/run-success.out"
+RUN_SUCCESS_ERR="$ROOT/run-success.err"
+set +e
+run_in_project --json run --snapshot-before --snapshot-after-success -- \
+    /bin/sh -c \
+    '[ -n "$VEXFS_RUN_ID" ] && [ -n "$VEXFS_SNAPSHOT_BEFORE" ] && [ "$1" = "--json" ] && printf "agent-success\n" > agent-run.txt && printf "child-stdout\n"' \
+    vexfs-child --json >"$RUN_SUCCESS_OUT" 2>"$RUN_SUCCESS_ERR"
+RUN_SUCCESS_STATUS=$?
+set -e
+equal 0 "$RUN_SUCCESS_STATUS" "Agent 成功命令退出码"
+equal child-stdout "$(cat "$RUN_SUCCESS_OUT")" "Agent 子进程 stdout"
+equal agent-success "$(cat "$MOUNT_POINT/project/agent-run.txt")" "Agent 子进程写入"
+RUN_SUCCESS_META="$(/usr/bin/python3 - "$RUN_SUCCESS_ERR" <<'PY'
+import json
+import sys
+
+events = []
+for line in open(sys.argv[1], encoding="utf-8"):
+    if line.startswith("{"):
+        events.append(json.loads(line))
+before = next(event for event in events if event["event"] == "snapshot_before")
+after = next(event for event in events if event["event"] == "snapshot_after")
+finished = next(event for event in events if event["event"] == "run_exit")
+assert before["run_id"] == after["run_id"] == finished["run_id"]
+assert before["command"] == "sh"
+assert before["snapshot"].endswith("-before")
+assert after["snapshot"].endswith("-after")
+assert finished["exit_code"] == 0
+assert "agent-run.txt" not in before["restore_command"]
+print(before["snapshot"], after["snapshot"])
+PY
+)"
+RUN_SUCCESS_BEFORE="${RUN_SUCCESS_META%% *}"
+RUN_SUCCESS_AFTER="${RUN_SUCCESS_META#* }"
+SNAPSHOT_LIST="$(fs --json snapshot list)"
+printf '%s' "$SNAPSHOT_LIST" | /usr/bin/python3 -c \
+    'import json,sys; rows={row["name"]:row for row in json.load(sys.stdin)}; assert all(rows[name]["type"]=="agent" for name in sys.argv[1:])' \
+    "$RUN_SUCCESS_BEFORE" "$RUN_SUCCESS_AFTER"
+CHECKS=$((CHECKS + 9))
+
+fs snapshot restore "$RUN_SUCCESS_BEFORE" >/dev/null
+check test ! -e "$MOUNT_POINT/project/agent-run.txt"
+equal '' "$(git -C "$MOUNT_POINT/project" status --porcelain)" "Agent 成功任务恢复"
+
+# 非零退出码必须原样返回，且不能创建 after-success 快照；运行前快照仍可恢复。
+RUN_FAILURE_ERR="$ROOT/run-failure.err"
+set +e
+run_in_project --json run --snapshot-before --snapshot-after-success -- \
+    /bin/sh -c 'printf "failed-change\n" > failed-run.txt; exit 23' \
+    >"$ROOT/run-failure.out" 2>"$RUN_FAILURE_ERR"
+RUN_FAILURE_STATUS=$?
+set -e
+equal 23 "$RUN_FAILURE_STATUS" "Agent 失败命令退出码"
+equal failed-change "$(cat "$MOUNT_POINT/project/failed-run.txt")" "Agent 失败命令写入"
+RUN_FAILURE_BEFORE="$(/usr/bin/python3 - "$RUN_FAILURE_ERR" <<'PY'
+import json
+import sys
+
+events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
+          if line.startswith("{")]
+before = next(event for event in events if event["event"] == "snapshot_before")
+assert not any(event["event"] == "snapshot_after" for event in events)
+assert next(event for event in events if event["event"] == "run_exit")["exit_code"] == 23
+print(before["snapshot"])
+PY
+)"
+fs snapshot restore "$RUN_FAILURE_BEFORE" >/dev/null
+check test ! -e "$MOUNT_POINT/project/failed-run.txt"
+CHECKS=$((CHECKS + 3))
+
+# Ctrl-C 由包装器转发给子进程，返回 shell 通用的 130；before 快照先于
+# 子进程启动，因此中断不会丢掉恢复点。
+RUN_SIGNAL_ERR="$ROOT/run-signal.err"
+(
+    cd "$MOUNT_POINT/project"
+    exec env HOME="$TEST_HOME" "$VEXDB" fs --db "$DB" --workspace "$WORKSPACE" \
+        --json run --snapshot-before -- /bin/sleep 30
+) >"$ROOT/run-signal.out" 2>"$RUN_SIGNAL_ERR" &
+RUN_SIGNAL_PID=$!
+for _ in $(seq 1 200); do
+    if grep -q '"event":"snapshot_before"' "$RUN_SIGNAL_ERR" 2>/dev/null; then break; fi
+    sleep 0.025
+done
+check grep -q '"event":"snapshot_before"' "$RUN_SIGNAL_ERR"
+kill -INT "$RUN_SIGNAL_PID"
+set +e
+wait "$RUN_SIGNAL_PID"
+RUN_SIGNAL_STATUS=$?
+set -e
+equal 130 "$RUN_SIGNAL_STATUS" "Agent Ctrl-C 退出码"
+/usr/bin/python3 - "$RUN_SIGNAL_ERR" <<'PY'
+import json
+import sys
+
+events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
+          if line.startswith("{")]
+assert next(event for event in events if event["event"] == "run_exit")["exit_code"] == 130
+assert any(event["event"] == "snapshot_before" for event in events)
+PY
+CHECKS=$((CHECKS + 2))
+
+AGENT_START_MS="$(/usr/bin/python3 -c 'import time; print(int(time.time()*1000))')"
+run_in_project --json run --snapshot-before -- /usr/bin/true \
+    >"$ROOT/run-startup.out" 2>"$ROOT/run-startup.err"
+AGENT_END_MS="$(/usr/bin/python3 -c 'import time; print(int(time.time()*1000))')"
+AGENT_STARTUP_MS=$((AGENT_END_MS - AGENT_START_MS))
+[ "$AGENT_STARTUP_MS" -le 5000 ] || {
+    echo "Agent 运行前 checkpoint 超过 5 秒：${AGENT_STARTUP_MS}ms" >&2
+    exit 1
+}
+CHECKS=$((CHECKS + 1))
+
 PERF_JSON="$(/usr/bin/python3 - "$MOUNT_POINT/perf" "$FILE_COUNT" <<'PY'
 import json
 import pathlib
@@ -220,8 +346,10 @@ MOUNTED=1
 equal "$(stat -f %i "$MOUNT_POINT/project/src/data.txt")" \
     "$(stat -f %i "$MOUNT_POINT/project/src/data-hard.txt")" "重挂载 hardlink inode"
 equal 2 "$(stat -f %l "$MOUNT_POINT/project/src/data.txt")" "重挂载 hardlink 数量"
-equal yes "$(/usr/bin/xattr -p user.vexdb.nfs-eval "$MOUNT_POINT/project/src/data.txt")" \
-    "重挂载扩展属性"
+if [ "$XATTR_SUPPORTED" = 1 ]; then
+    equal yes "$(/usr/bin/xattr -p user.vexdb.nfs-eval "$MOUNT_POINT/project/src/data.txt")" \
+        "重挂载扩展属性"
+fi
 equal '' "$(git -C "$MOUNT_POINT/project" status --porcelain)" "重挂载 Git 工作区"
 printf 'changed\n' > "$MOUNT_POINT/project/src/data.txt"
 printf 'temporary\n' > "$MOUNT_POINT/project/temporary.txt"
@@ -281,3 +409,7 @@ CHECKS=$((CHECKS + 3))
 
 echo "VEXDB MACOS NFS REAL MOUNT: PASS ($CHECKS checks)"
 echo "small_file_metrics=$PERF_JSON"
+echo "agent_snapshot_before_ms=$AGENT_STARTUP_MS"
+if [ "$XATTR_SUPPORTED" = 0 ]; then
+    echo 'limitations=["macos-nfsv3-mounted-xattr"]'
+fi

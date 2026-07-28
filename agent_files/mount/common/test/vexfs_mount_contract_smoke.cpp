@@ -645,6 +645,33 @@ int main(int argc, char **argv) {
     if (vexfs_mount_xattr_set(session, task_inode, "com.vexfs.test", "gamma", 5,
                               VEXFS_MOUNT_XATTR_MUST_REPLACE, &error) != VEXFS_MOUNT_OK)
         return Fail("snapshot mutation xattr", error);
+    int64_t historical_commit = 0;
+    if (vexfs_mount_snapshot_create_at_commit(
+            session, "historical-before-change", "manual", snapshot_commit,
+            &historical_commit, &error) != VEXFS_MOUNT_OK ||
+        historical_commit != snapshot_commit)
+        return Fail("historical snapshot create", error);
+    int64_t time_commit = 0;
+    int64_t time_commit_created_at = 0;
+    if (vexfs_mount_snapshot_create_at_time(
+            session, "historical-by-time", "manual", "2099-01-01T00:00:00Z",
+            &time_commit, &time_commit_created_at, &error) != VEXFS_MOUNT_OK ||
+        time_commit <= snapshot_commit || time_commit_created_at <= 0)
+        return Fail("historical time snapshot create", error);
+    vexfs_mount_bytes historical_tree{};
+    if (vexfs_mount_workspace_show_commit_page(
+            session, snapshot_commit, "", 2, &historical_tree, &error) != VEXFS_MOUNT_OK ||
+        !Contains(historical_tree, "\"commit\":") ||
+        !Contains(historical_tree, "\"next_after\":\""))
+        return Fail("historical tree page", error);
+    vexfs_mount_free(historical_tree.data);
+    vexfs_mount_bytes historical_diff{};
+    if (vexfs_mount_workspace_diff_commits_page(
+            session, snapshot_commit, 0, "", 100, &historical_diff, &error) !=
+            VEXFS_MOUNT_OK || !Contains(historical_diff, "/agent/task.txt") ||
+        !Contains(historical_diff, "\"change_count\":"))
+        return Fail("historical diff page", error);
+    vexfs_mount_free(historical_diff.data);
     vexfs_mount_bytes snapshot_diff{};
     if (vexfs_mount_snapshot_diff(session, "before-change", "HEAD", &snapshot_diff, &error) !=
             VEXFS_MOUNT_OK || !Contains(snapshot_diff, "\"changes\":[{") ||
@@ -655,6 +682,12 @@ int main(int argc, char **argv) {
     if (vexfs_mount_snapshot_show(session, "before-change", &snapshot_show, &error) !=
             VEXFS_MOUNT_OK || !Contains(snapshot_show, "/agent/task.txt"))
         return Fail("snapshot show", error);
+    vexfs_mount_free(snapshot_show.data);
+    snapshot_show = {};
+    if (vexfs_mount_snapshot_show(session, "historical-before-change", &snapshot_show,
+                                  &error) != VEXFS_MOUNT_OK ||
+        !Contains(snapshot_show, "/agent/task.txt"))
+        return Fail("historical snapshot show", error);
     vexfs_mount_free(snapshot_show.data);
     int64_t head_commit = 0;
     if (vexfs_mount_workspace_head(session, &head_commit, &error) != VEXFS_MOUNT_OK ||

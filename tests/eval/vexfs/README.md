@@ -121,6 +121,11 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
   bash tests/eval/vexfs/run_pg_snapshot_checkpoint_performance.sh
 
+# SQLite commit PITR：默认 1 万文件，验证历史树头页/深页、commit diff、
+# 按时间固定快照、5 秒查询预算、20 秒快照预算和 512 MiB RSS 上限。
+# 可显式设置 VEXFS_COMMIT_PITR_FILES=100000 跑十万文件 Gate。
+bash tests/eval/vexfs/run_sqlite_commit_pitr_performance.sh
+
 # SQLite 与 PG 同时运行 8 个 typed snapshot create 和 4 个 prune，最后必须只保留
 # 1 个 manual、5 个 agent、5 个 safety，且 deep check 通过。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
@@ -136,6 +141,10 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXDB_PG_DATABASE=test \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
 VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
   bash tests/eval/vexfs/run_pg_runtime.sh
+
+# 通用 Agent checkpoint：真实挂载、成功/失败恢复、参数透传和 DSN 脱敏
+VEXDB_PG_DSN=postgresql://postgres@127.0.0.1:5434/test \
+  bash tests/eval/vexfs/run_pg_agent_checkpoint.sh
 
 # 数据库停止和重启后的句柄、锁、缓存和内容恢复
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \

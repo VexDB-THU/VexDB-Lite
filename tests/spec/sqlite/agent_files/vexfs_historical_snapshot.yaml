@@ -1,0 +1,101 @@
+name: sqlite__vexfs_historical_snapshot
+tags: [vexfs, sqlite, snapshot, history, recovery]
+description: SQLite 可以把仍可恢复的历史 commit 固定成命名快照
+steps:
+- query: SELECT vexfs_init();
+  expect:
+  - - 1
+- query: SELECT vexfs_workspace_create('history-pin');
+  expect:
+  - - 1
+- query: SELECT vexfs_mkdir('history-pin', '/src');
+  expect:
+  - - 2
+- query: SELECT vexfs_write('history-pin', '/src/main.txt', 'one');
+  expect:
+  - - 1
+- query: SELECT vexfs_write('history-pin', '/src/main.txt', 'two');
+  expect:
+  - - 2
+- statement: UPDATE _vexfs_commits SET created_at=1700000000000+id*1000 WHERE workspace_id=(SELECT id FROM _vexfs_workspaces WHERE name='history-pin')
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'before-two', 3, 'manual');
+  expect:
+  - - 3
+- query: SELECT json_extract(vexfs_snapshot_create_at_time('history-pin', 'before-two-time', '2023-11-14T22:13:23.500Z', 'manual'), '$.commit'), json_extract(vexfs_snapshot_show('history-pin', 'before-two-time'), '$.commit');
+  expect:
+  - - 3
+    - 3
+- query: SELECT json_extract(vexfs_snapshot_create_at_time('history-pin', 'before-two-offset', '2023-11-15T06:13:23.500+08:00'), '$.commit_created_at');
+  expect:
+  - - 1700000003000
+- query: SELECT vexfs_snapshot_create_at_time('history-pin', 'ambiguous-time', '2023-11-14T22:13:23');
+  expect_error: explicit Z or +HH:MM timezone
+- query: SELECT vexfs_snapshot_create_at_time('history-pin', 'before-history', '2023-11-14T22:13:20Z');
+  expect_error: no restorable workspace commit
+- query: SELECT json_extract(vexfs_workspace_show_commit('history-pin', 3, '', 2), '$.entries[0].path'), json_extract(vexfs_workspace_show_commit('history-pin', 3, '', 2), '$.entries[1].path'), json_extract(vexfs_workspace_show_commit('history-pin', 3, '', 2), '$.next_after');
+  expect:
+  - - /
+    - /src
+    - /src
+- query: SELECT json_extract(vexfs_workspace_show_commit('history-pin', 3, '/src', 2), '$.entries[0].path'), json_extract(vexfs_workspace_show_commit('history-pin', 3, '/src', 2), '$.next_after');
+  expect:
+  - - /src/main.txt
+    - null
+- query: SELECT json_extract(vexfs_workspace_diff_commits('history-pin', 3, 4, '', 100), '$.changes[0].path'), json_extract(vexfs_workspace_diff_commits('history-pin', 3, 4, '', 100), '$.changes[0].change'), json_extract(vexfs_workspace_diff_commits('history-pin', 3, 4, '', 100), '$.next_after');
+  expect:
+  - - /src/main.txt
+    - modify
+    - null
+- query: SELECT json_extract(vexfs_workspace_diff_commits('history-pin', 3, NULL, '', 100), '$.to_commit'), json_extract(vexfs_workspace_diff_commits('history-pin', 3, NULL, '', 100), '$.change_count');
+  expect:
+  - - 4
+    - 1
+- query: SELECT vexfs_workspace_show_commit('history-pin', 3, 'relative', 10);
+  expect_error: absolute path
+- query: SELECT vexfs_workspace_diff_commits('history-pin', 3, 4, '', 1001);
+  expect_error: at most 1000
+- query: SELECT json_extract(vexfs_snapshot_show('history-pin', 'before-two'), '$.commit'), json_extract(vexfs_snapshot_show('history-pin', 'before-two'), '$.type');
+  expect:
+  - - 3
+    - manual
+- query: SELECT json_extract(vexfs_snapshot_diff('history-pin', 'before-two', 'HEAD'), '$.changes[0].path'), json_extract(vexfs_snapshot_diff('history-pin', 'before-two', 'HEAD'), '$.changes[0].change');
+  expect:
+  - - /src/main.txt
+    - modify
+- query: SELECT json_extract(vexfs_retention_set('history-pin', 1, 0), '$.reclaimable_versions');
+  expect:
+  - - 0
+- query: SELECT json_extract(vexfs_gc('history-pin', 1000), '$.deleted_versions');
+  expect:
+  - - 0
+- query: SELECT vexfs_workspace_create('foreign-history');
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'foreign', (SELECT head_commit FROM _vexfs_workspaces WHERE name='foreign-history'));
+  expect_error: workspace commit not found
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'bad-zero', 0);
+  expect_error: positive integer
+- query: SELECT vexfs_snapshot_restore('history-pin', 'before-two', (SELECT head_commit FROM _vexfs_workspaces WHERE name='history-pin')) > 0;
+  expect:
+  - - 1
+- query: SELECT CAST(vexfs_read('history-pin', '/src/main.txt') AS TEXT);
+  expect:
+  - - one
+- query: SELECT vexfs_write('history-pin', '/src/main.txt', 'x');
+  expect:
+  - - 4
+- query: SELECT json_extract(vexfs_quota_set('history-pin', 1, NULL, NULL), '$.max_bytes');
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'quota-blocked', 3);
+  expect_error: workspace byte quota exceeded
+- query: SELECT json_extract(vexfs_quota_set('history-pin', NULL, NULL, NULL), '$.max_bytes');
+  expect:
+  - - null
+- statement: UPDATE _vexfs_workspaces SET live_files=live_files+1 WHERE name='history-pin'
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'bad-live-counter', 3);
+  expect_error: live quota counters are corrupt
+- statement: UPDATE _vexfs_workspaces SET live_files=live_files-1 WHERE name='history-pin'
+- query: UPDATE _vexfs_chunks SET content=X'00' WHERE id=(SELECT chunk.id FROM _vexfs_file_versions version JOIN _vexfs_manifest_chunks entry ON entry.manifest_id=version.manifest_id JOIN _vexfs_chunks chunk ON chunk.id=entry.chunk_id WHERE version.inode_id=(SELECT id FROM _vexfs_inodes WHERE workspace_id=(SELECT id FROM _vexfs_workspaces WHERE name='history-pin') AND kind='file') AND version.version_no=1 LIMIT 1);
+- query: SELECT vexfs_snapshot_create_at_commit('history-pin', 'corrupt-blocked', 3);
+  expect_error: corrupt

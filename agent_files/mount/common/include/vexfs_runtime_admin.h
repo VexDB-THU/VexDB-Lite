@@ -45,6 +45,15 @@ vexfs_mount_status vexfs_mount_history_page(vexfs_mount_session *session, const 
 vexfs_mount_status vexfs_mount_workspace_log_page(
     vexfs_mount_session *session, uint32_t limit, int64_t before_commit,
     vexfs_mount_bytes *json, vexfs_mount_error *error);
+// SQLite-only bounded historical tree and diff pages. Empty after_path starts
+// from the first binary path; to_commit=0 means current HEAD.
+vexfs_mount_status vexfs_mount_workspace_show_commit_page(
+    vexfs_mount_session *session, int64_t commit, const char *after_path,
+    uint32_t limit, vexfs_mount_bytes *json, vexfs_mount_error *error);
+vexfs_mount_status vexfs_mount_workspace_diff_commits_page(
+    vexfs_mount_session *session, int64_t from_commit, int64_t to_commit,
+    const char *after_path, uint32_t limit, vexfs_mount_bytes *json,
+    vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_read_version(vexfs_mount_session *session, const char *path,
                                             int64_t version,
                                             vexfs_mount_bytes *content,
@@ -70,6 +79,17 @@ vexfs_mount_status vexfs_mount_snapshot_create(vexfs_mount_session *session,
 vexfs_mount_status vexfs_mount_snapshot_create_typed(
     vexfs_mount_session *session, const char *name, const char *snapshot_type,
     uint32_t flags, int64_t *commit, vexfs_mount_error *error);
+// SQLite-only: pins an already committed, still-restorable workspace commit as
+// a named snapshot. It does not publish current handles or change workspace HEAD.
+vexfs_mount_status vexfs_mount_snapshot_create_at_commit(
+    vexfs_mount_session *session, const char *name, const char *snapshot_type,
+    int64_t source_commit, int64_t *commit, vexfs_mount_error *error);
+// SQLite-only: resolves the newest restorable commit at or before an RFC3339
+// time with an explicit timezone, then pins it as a named snapshot.
+vexfs_mount_status vexfs_mount_snapshot_create_at_time(
+    vexfs_mount_session *session, const char *name, const char *snapshot_type,
+    const char *requested_at, int64_t *commit, int64_t *commit_created_at,
+    vexfs_mount_error *error);
 vexfs_mount_status vexfs_mount_snapshot_list(vexfs_mount_session *session,
                                              vexfs_mount_bytes *json,
                                              vexfs_mount_error *error);
