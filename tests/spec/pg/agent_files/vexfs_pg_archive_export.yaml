@@ -58,11 +58,11 @@ steps:
   - - dentries
     - 3
   - - dentry_states
-    - 8
+    - 5
   - - file_versions
     - 3
   - - inode_states
-    - 8
+    - 6
   - - inodes
     - 4
   - - manifest

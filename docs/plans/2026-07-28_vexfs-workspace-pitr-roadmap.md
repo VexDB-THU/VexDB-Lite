@@ -3,7 +3,8 @@
 日期：2026-07-28
 
 当前状态：批次 A 的数据库合同、CLI 和自动测试已完成。批次 B 的统一 `workspace log`，以及
-快照分类、保留规则和 `snapshot prune --dry-run` 均已完成。全部 PG VexFS spec 为 14/14、
+快照分类、保留规则和 `snapshot prune --dry-run` 均已完成。PG 快照已经改为基线加增量状态，
+metadata GC、真实 history floor 和多快照 format v2 已完成；全部 PG VexFS spec 为 15/15，
 SQLite spec 为 32/32。下一项固定为 `vexdb fs run --snapshot-before -- <command>`。正式发布前仍需
 在最终 macOS NFS 包和 Linux FUSE 包上复跑真实挂载 Gate；这不是当前数据库实现缺口。
 
@@ -178,6 +179,11 @@ vexdb fs snapshot prune
 
 ### P1-3：Agent 运行前自动 checkpoint
 
+状态：**存储与性能前置 Gate 已完成；用户命令待实现**。
+
+前置证据：10,000 文件、30 快照时，基线快照 104.662 ms、增量快照 P95 3.522 ms、format v2
+记录流 434 ms、最老快照恢复 1,043 ms；1 GiB 容器无 OOM。PG 不再为每个 Agent 快照复制整树。
+
 增加通用命令，不绑定某一个 Agent：
 
 ```bash
@@ -251,6 +257,8 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 
 ### P3-1：先评估命名快照是否够用
 
+状态：**首轮规模 Gate 已完成；自动 checkpoint 上线后的长期数据仍需继续观察**。
+
 完成 Agent 自动 checkpoint 后，先测：
 
 - 1 千、1 万和长期 workspace 的快照时间。
@@ -289,6 +297,7 @@ vexdb fs snapshot create before-noon --at '2026-07-28T12:00:00+08:00'
 | 3 | 统一恢复正确性 Gate | P0 | SQLite、PG、macOS、Linux 不会各自漂移 |
 | 4 | workspace log（已完成） | P1 | 用户能找到和理解历史版本 |
 | 5 | 快照分类、保留和 prune（已完成） | P1 | 自动快照不会无限增长 |
+| 5.5 | PG 增量 checkpoint、metadata GC、真实 floor 和多快照 Gate（已完成） | P0 | 自动 checkpoint 不再隐藏整树写放大 |
 | 6 | `vexdb fs run --snapshot-before` | P1 | Agent 任务前自动留下恢复点 |
 | 7 | SQLite `snapshot create --commit` | P2 | 可以固定任意仍被保留的 SQLite commit |
 | 8 | commit show/diff | P2 | 先看清差异再选择恢复点 |

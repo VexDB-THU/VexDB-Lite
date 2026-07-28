@@ -1,0 +1,93 @@
+name: pg__vexfs_metadata_checkpoint
+tags: [vexfs, pg, snapshot, checkpoint, gc]
+description: PostgreSQL 快照只保存 commit 引用，元数据基线与增量可在 GC 压缩后继续恢复
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-checkpoint') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-checkpoint', '/value.txt', convert_to('one', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('pg-checkpoint', 'old');
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('pg-checkpoint', 'same-head');
+  expect:
+  - - 2
+- query: SELECT vexfs_write('pg-checkpoint', '/value.txt', convert_to('two', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('pg-checkpoint', 'new');
+  expect:
+  - - 3
+- query: SELECT checkpoint.commit_no, checkpoint.inode_changes, checkpoint.dentry_changes FROM _vexfs.metadata_checkpoints AS checkpoint JOIN _vexfs.workspaces AS workspace USING(workspace_id) WHERE workspace.name='pg-checkpoint' ORDER BY checkpoint.commit_no;
+  expect:
+  - - 2
+    - 2
+    - 1
+  - - 3
+    - 2
+    - 0
+- query: SELECT (result->>'metadata_floor_commit')::bigint FROM (SELECT vexfs_gc('pg-checkpoint', 100) AS result) AS gc;
+  expect:
+  - - 2
+- query: SELECT history_floor_commit, EXISTS(SELECT 1 FROM _vexfs.inode_states AS state WHERE state.workspace_id=workspace.workspace_id AND state.commit_no < workspace.history_floor_commit) FROM _vexfs.workspaces AS workspace WHERE workspace.name='pg-checkpoint';
+  expect:
+  - - 2
+    - false
+- query: SELECT vexfs_snapshot_restore('pg-checkpoint', 'old', 3);
+  expect:
+  - - 4
+- query: SELECT convert_from(vexfs_read('pg-checkpoint', '/value.txt'), 'UTF8');
+  expect:
+  - - one
+- query: SELECT vexfs_snapshot_restore('pg-checkpoint', 'new', 4);
+  expect:
+  - - 5
+- query: SELECT convert_from(vexfs_read('pg-checkpoint', '/value.txt'), 'UTF8');
+  expect:
+  - - two
+- query: SELECT vexfs_snapshot_drop('pg-checkpoint', 'old');
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_drop('pg-checkpoint', 'same-head');
+  expect:
+  - - 1
+- query: SELECT (result->>'metadata_floor_commit')::bigint FROM (SELECT vexfs_gc('pg-checkpoint', 100) AS result) AS gc;
+  expect:
+  - - 3
+- query: SELECT count(*) FROM _vexfs.inode_states AS state JOIN _vexfs.workspaces AS workspace USING(workspace_id) WHERE workspace.name='pg-checkpoint' AND state.commit_no < 3;
+  expect:
+  - - 0
+- query: SELECT (vexfs_check('pg-checkpoint', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_workspace_drop('pg-checkpoint');
+  expect:
+  - - 1
+
+- query: SELECT vexfs_workspace_create('pg-first-gc') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-first-gc', '/value.txt', convert_to('one', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_write('pg-first-gc', '/value.txt', convert_to('two', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT (result->>'metadata_floor_commit')::bigint, (result->>'metadata_compacted')::boolean, (result->>'metadata_deleted_checkpoints')::bigint, (result->>'metadata_deleted_state_rows')::bigint FROM (SELECT vexfs_gc('pg-first-gc', 100) AS result) AS gc;
+  expect:
+  - - 3
+    - false
+    - 0
+    - 0
+- query: SELECT checkpoint.commit_no, checkpoint.inode_changes, checkpoint.dentry_changes, (vexfs_check('pg-first-gc', 1)->>'ok')::boolean FROM _vexfs.metadata_checkpoints AS checkpoint JOIN _vexfs.workspaces AS workspace USING(workspace_id) WHERE workspace.name='pg-first-gc';
+  expect:
+  - - 3
+    - 2
+    - 1
+    - true
+- query: SELECT vexfs_workspace_drop('pg-first-gc');
+  expect:
+  - - 1

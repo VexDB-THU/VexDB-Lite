@@ -682,6 +682,7 @@ xattr、ACL、单文件恢复、workspace 恢复和 format v2 导入等变更写
 | FR-QT-006 | P1 | GC 只能删除没有活动版本、快照或导出任务引用的对象。 |
 | FR-QT-007 | P1 | GC 必须分批执行，避免不可控长事务。 |
 | FR-QT-008 | P1 | 工作区冻结和备份验证期间可以暂停 GC。 |
+| FR-QT-009 | P0 | 元数据 GC 必须先在新 floor 建立完整基线，再原子推进 `history_floor_commit`；仍被 snapshot 引用的 commit 不能越过。 |
 
 ### 10.9 数据保护、备份和恢复
 
@@ -697,7 +698,7 @@ VexFS 使用四层数据保护：
 | FR-BK-001 | P0 | 数据库原生备份必须包含全部 VexFS 元数据、内容块、版本、快照、ACL 和审计。 |
 | FR-BK-002 | P0 | 数据库恢复后，VexFS 和普通业务表必须处于同一恢复点。 |
 | FR-BK-003 | P0 | VexFS 不得自己调度或冒充数据库物理备份。 |
-| FR-BK-004 | P0 | 必须提供备份后完整性验证入口。 |
+| FR-BK-004 | P0 | 必须按对象提供明确校验：workspace 用 deep check，format v2 用 archive verify，数据库原生备份用数据库校验工具和真实恢复演练。 |
 | FR-BK-005 | P0 | 快照和文件版本不能被描述为灾难恢复备份。 |
 | FR-BK-006 | P1 | 支持从固定快照导出单个工作区。 |
 | FR-BK-007 | P1 | 逻辑导出必须携带格式版本、记录 checksum、内容 checksum 和源 commit。 |
@@ -1154,9 +1155,12 @@ expected-head/version、chunk/manifest、SHA-256、quick/deep check、quota、re
 分批 GC、ACL、完整变更审计、format v2 和 libpq 远程 mount。`pg_dump/pg_restore` 与
 `pg_basebackup` 已通过恢复测试，恢复后文件、历史、快照、设置、权限、审计和业务表保持一致。
 16 MiB 有界性能 Gate 已验证克隆可启动、`pg_verifybackup`、format v2 导入导出、CLI
-峰值 RSS、容器 `memory.max=1 GiB`，且运行前后 `oom_kill=0`。当前审计实现下，逻辑
-dump/restore 为 173.913/175.824 MiB/s，format v2 导出/导入为 72.727/106.667 MiB/s；
-这些是 2026-07-24 本机有界样本，不是所有机器的固定承诺。
+峰值 RSS、容器 `memory.max=1 GiB`，且运行前后 `oom_kill=0`。2026-07-28 本机结果：逻辑
+dump/restore 为 139.130/128.000 MiB/s，物理备份为 28.902 MiB/s，format v2 导出/导入为
+55.172/21.333 MiB/s。10,000 文件、30 快照、每次单文件修改的 Gate 中，基线快照 115.698 ms、
+增量快照 P95 3.317 ms、format v2 记录流 454 ms、最老快照恢复 992 ms、删除 29 个快照后的
+元数据压实 426 ms；这些是有界样本，
+不是所有机器的固定承诺。
 
 ### 15.3 SQLite
 
@@ -1174,7 +1178,7 @@ dump/restore 为 173.913/175.824 MiB/s，format v2 导出/导入为 72.727/106.6
 
 ### 15.5 逻辑导出格式
 
-SQLite `0.9.0` 已实现 `.vexfs` format v2。它使用独立 SQLite 文件作为逻辑记录容器，
+SQLite 与 PostgreSQL 已实现 `.vexfs` format v2。它使用独立 SQLite 文件作为逻辑记录容器，
 不复制源数据库的业务表、连接信息、密码、WAL 或内部运行句柄。当前命令：
 
 ```bash
@@ -1253,6 +1257,10 @@ role，并保留可移植 ACL 信息，不能自动扩大权限。DuckDB 后续�
 
 快照只保存名称、workspace、commit、创建人和创建时间。
 
+PostgreSQL 与 SQLite 都必须使用“完整基线 + 增量状态”重建树，不能为每个快照物理复制全部
+inode、dentry、xattr 或 ACL。多个名称指向同一 commit 时必须共享同一份状态。GC 只能在新
+floor 写好完整基线后删除旧增量。
+
 ### 17.6 ACL 与审计
 
 ACL 必须绑定 workspace/inode/principal；审计必须绑定 workspace/commit/sequence/principal/operation/before/after。
@@ -1277,7 +1285,7 @@ ACL 必须绑定 workspace/inode/principal；审计必须绑定 workspace/commit
 |---|---|
 | NFR-REL-001 | 提交结果不确定时，CLI 必须通过 request id 或 commit 查询确认，不能盲目重试。 |
 | NFR-REL-002 | 数据库连接中断不能导致本地未提交内容丢失。 |
-| NFR-REL-003 | GC、check、export 和 backup verify 必须可中断并安全重试。 |
+| NFR-REL-003 | GC、check、export、archive verify 和数据库备份恢复演练必须可中断并安全重试。 |
 | NFR-REL-004 | 恢复和 repair 也必须生成版本和审计记录。 |
 | NFR-REL-005 | mount gateway 可重启、可重新挂载，不能成为已提交数据恢复的前置条件。 |
 | NFR-REL-006 | 数据库重启后 gateway 必须明确断开旧 handle，并在重新连接后恢复新操作。 |
@@ -1353,7 +1361,7 @@ FSKit 创建 1 万文件为 114.828 秒，遍历为 0.462 秒，`rg` 为 23.895 
 - 提供扩展版本、能力、schema 版本和初始化状态；
 - 提供 mount 列表、连接状态、principal、workspace、缓存和未发布 handle 数量；
 - 提供 workspace usage、quota、retention 和 GC 状态；
-- 提供只读 check 和 backup verify；
+- 提供只读 deep check 和 format v2 archive verify；数据库原生备份使用数据库自己的校验工具；
 - 错误消息使用通俗语言，并保留底层数据库诊断；
 - 日志不能包含密码或文件正文；
 - 升级、备份、恢复、迁移和故障处理必须有独立文档。

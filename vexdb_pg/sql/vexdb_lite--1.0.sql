@@ -608,9 +608,27 @@ CREATE INDEX vexfs_snapshots_policy_idx
     ON _vexfs.snapshots(
         workspace_id, snapshot_type, created_at DESC, snapshot_id DESC);
 
-CREATE TABLE _vexfs.snapshot_inodes (
-    snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
+-- A snapshot is a commit reference.  PostgreSQL stores one metadata baseline
+-- followed by changed rows at later snapshot boundaries instead of copying the
+-- whole tree for every snapshot.  These checkpoint rows are independent from
+-- snapshot names because a later overlay still depends on an older checkpoint
+-- after that older name is pruned.
+CREATE TABLE _vexfs.metadata_checkpoints (
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
+    commit_no bigint NOT NULL CHECK (commit_no > 0),
+    inode_changes bigint NOT NULL DEFAULT 0 CHECK (inode_changes >= 0),
+    dentry_changes bigint NOT NULL DEFAULT 0 CHECK (dentry_changes >= 0),
+    xattr_changes bigint NOT NULL DEFAULT 0 CHECK (xattr_changes >= 0),
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (workspace_id, commit_no),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.commits(workspace_id, commit_no) ON DELETE RESTRICT
+);
+
+CREATE TABLE _vexfs.inode_states (
+    workspace_id bigint NOT NULL,
     inode_id bigint NOT NULL,
+    commit_no bigint NOT NULL,
     kind text NOT NULL CHECK (kind IN ('file', 'directory', 'symlink')),
     mode integer NOT NULL CHECK (mode BETWEEN 0 AND 4095),
     owner_oid oid NOT NULL,
@@ -621,32 +639,502 @@ CREATE TABLE _vexfs.snapshot_inodes (
     acl_set_id bigint REFERENCES _vexfs.acl_sets(acl_set_id) ON DELETE SET NULL,
     current_version bigint NOT NULL CHECK (current_version >= 0),
     size_bytes bigint NOT NULL CHECK (size_bytes >= 0),
+    live boolean NOT NULL,
     created_at timestamptz NOT NULL,
     accessed_at timestamptz NOT NULL,
     modified_at timestamptz NOT NULL,
     changed_at timestamptz NOT NULL,
-    PRIMARY KEY (snapshot_id, inode_id)
+    PRIMARY KEY (workspace_id, inode_id, commit_no),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.metadata_checkpoints(workspace_id, commit_no) ON DELETE CASCADE
 );
 
-CREATE INDEX vexfs_snapshot_inodes_acl_set_fk_idx
-    ON _vexfs.snapshot_inodes(acl_set_id) WHERE acl_set_id IS NOT NULL;
+CREATE INDEX vexfs_inode_states_at_commit_idx
+    ON _vexfs.inode_states(workspace_id, inode_id, commit_no DESC);
+CREATE INDEX vexfs_inode_states_acl_set_fk_idx
+    ON _vexfs.inode_states(acl_set_id) WHERE acl_set_id IS NOT NULL;
 
-CREATE TABLE _vexfs.snapshot_dentries (
-    snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
+CREATE TABLE _vexfs.dentry_states (
+    workspace_id bigint NOT NULL,
+    parent_inode bigint NOT NULL,
+    name text NOT NULL,
+    commit_no bigint NOT NULL,
+    inode_id bigint NOT NULL,
+    deleted boolean NOT NULL,
+    PRIMARY KEY (workspace_id, parent_inode, name, commit_no),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.metadata_checkpoints(workspace_id, commit_no) ON DELETE CASCADE
+);
+
+CREATE INDEX vexfs_dentry_states_at_commit_idx
+    ON _vexfs.dentry_states(workspace_id, parent_inode, name, commit_no DESC);
+
+CREATE TABLE _vexfs.xattr_states (
+    workspace_id bigint NOT NULL,
+    inode_id bigint NOT NULL,
+    name text NOT NULL,
+    commit_no bigint NOT NULL,
+    value bytea NOT NULL,
+    deleted boolean NOT NULL,
+    updated_at timestamptz NOT NULL,
+    PRIMARY KEY (workspace_id, inode_id, name, commit_no),
+    FOREIGN KEY (workspace_id, commit_no)
+        REFERENCES _vexfs.metadata_checkpoints(workspace_id, commit_no) ON DELETE CASCADE
+);
+
+CREATE INDEX vexfs_xattr_states_at_commit_idx
+    ON _vexfs.xattr_states(workspace_id, inode_id, name, commit_no DESC);
+
+-- Transactional dirty-key tables make snapshot creation proportional to the
+-- changes since the previous checkpoint.  They are derived state: pg_dump
+-- restore repopulates them through the triggers below while loading live rows.
+CREATE TABLE _vexfs.dirty_inodes (
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
+    inode_id bigint NOT NULL,
+    PRIMARY KEY (workspace_id, inode_id)
+);
+
+CREATE TABLE _vexfs.dirty_dentries (
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
     parent_inode bigint NOT NULL,
     name text NOT NULL,
     inode_id bigint NOT NULL,
-    PRIMARY KEY (snapshot_id, parent_inode, name)
+    PRIMARY KEY (workspace_id, parent_inode, name)
 );
 
-CREATE TABLE _vexfs.snapshot_xattrs (
-    snapshot_id bigint NOT NULL REFERENCES _vexfs.snapshots(snapshot_id) ON DELETE CASCADE,
+CREATE TABLE _vexfs.dirty_xattrs (
+    workspace_id bigint NOT NULL REFERENCES _vexfs.workspaces(workspace_id) ON DELETE CASCADE,
     inode_id bigint NOT NULL,
     name text NOT NULL,
     value bytea NOT NULL,
     updated_at timestamptz NOT NULL,
-    PRIMARY KEY (snapshot_id, inode_id, name)
+    PRIMARY KEY (workspace_id, inode_id, name)
 );
+
+CREATE FUNCTION _vexfs.track_inode_state_dirty()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+BEGIN
+    -- A workspace delete cascades into this table after the parent row is no
+    -- longer visible.  There is no future snapshot to capture in that case.
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.workspaces AS workspace
+         WHERE workspace.workspace_id =
+               coalesce(NEW.workspace_id, OLD.workspace_id)) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    INSERT INTO _vexfs.dirty_inodes(workspace_id, inode_id)
+    VALUES (coalesce(NEW.workspace_id, OLD.workspace_id),
+            coalesce(NEW.inode_id, OLD.inode_id))
+    ON CONFLICT (workspace_id, inode_id) DO NOTHING;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER vexfs_track_inode_state_dirty
+AFTER INSERT OR UPDATE OR DELETE ON _vexfs.inodes
+FOR EACH ROW EXECUTE FUNCTION _vexfs.track_inode_state_dirty();
+
+CREATE FUNCTION _vexfs.track_dentry_state_dirty()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.workspaces AS workspace
+         WHERE workspace.workspace_id =
+               coalesce(NEW.workspace_id, OLD.workspace_id)) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        INSERT INTO _vexfs.dirty_dentries(
+            workspace_id, parent_inode, name, inode_id)
+        VALUES (OLD.workspace_id, OLD.parent_inode, OLD.name, OLD.inode_id)
+        ON CONFLICT (workspace_id, parent_inode, name) DO UPDATE
+        SET inode_id = EXCLUDED.inode_id;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        INSERT INTO _vexfs.dirty_dentries(
+            workspace_id, parent_inode, name, inode_id)
+        VALUES (NEW.workspace_id, NEW.parent_inode, NEW.name, NEW.inode_id)
+        ON CONFLICT (workspace_id, parent_inode, name) DO UPDATE
+        SET inode_id = EXCLUDED.inode_id;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER vexfs_track_dentry_state_dirty
+AFTER INSERT OR UPDATE OR DELETE ON _vexfs.dentries
+FOR EACH ROW EXECUTE FUNCTION _vexfs.track_dentry_state_dirty();
+
+CREATE FUNCTION _vexfs.track_xattr_state_dirty()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, _vexfs
+AS $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.workspaces AS workspace
+         WHERE workspace.workspace_id =
+               coalesce(NEW.workspace_id, OLD.workspace_id)) THEN
+        IF TG_OP = 'DELETE' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF TG_OP IN ('UPDATE', 'DELETE') THEN
+        INSERT INTO _vexfs.dirty_xattrs(
+            workspace_id, inode_id, name, value, updated_at)
+        VALUES (OLD.workspace_id, OLD.inode_id, OLD.name, OLD.value, OLD.updated_at)
+        ON CONFLICT (workspace_id, inode_id, name) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at;
+    END IF;
+    IF TG_OP IN ('INSERT', 'UPDATE') THEN
+        INSERT INTO _vexfs.dirty_xattrs(
+            workspace_id, inode_id, name, value, updated_at)
+        VALUES (NEW.workspace_id, NEW.inode_id, NEW.name, NEW.value, NEW.updated_at)
+        ON CONFLICT (workspace_id, inode_id, name) DO UPDATE
+        SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at;
+    END IF;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER vexfs_track_xattr_state_dirty
+AFTER INSERT OR UPDATE OR DELETE ON _vexfs.xattrs
+FOR EACH ROW EXECUTE FUNCTION _vexfs.track_xattr_state_dirty();
+
+CREATE FUNCTION _vexfs.capture_metadata_checkpoint(
+    p_workspace_id bigint,
+    p_commit_no bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_inodes bigint;
+    v_dentries bigint;
+    v_xattrs bigint;
+    v_had_checkpoint boolean;
+BEGIN
+    SELECT EXISTS (
+        SELECT 1 FROM _vexfs.metadata_checkpoints AS checkpoint
+         WHERE checkpoint.workspace_id = p_workspace_id)
+      INTO v_had_checkpoint;
+    INSERT INTO _vexfs.metadata_checkpoints(workspace_id, commit_no)
+    VALUES (p_workspace_id, p_commit_no)
+    ON CONFLICT (workspace_id, commit_no) DO NOTHING;
+
+    INSERT INTO _vexfs.inode_states(
+        workspace_id, inode_id, commit_no, kind, mode, owner_oid, owner_role,
+        owner_principal, uid, gid, acl_set_id, current_version, size_bytes,
+        live, created_at, accessed_at, modified_at, changed_at)
+    SELECT inode.workspace_id, inode.inode_id, p_commit_no, inode.kind,
+           inode.mode, inode.owner_oid, inode.owner_role,
+           inode.owner_principal, inode.uid, inode.gid, inode.acl_set_id,
+           inode.current_version, inode.size_bytes, inode.live,
+           inode.created_at, inode.accessed_at, inode.modified_at,
+           inode.changed_at
+      FROM _vexfs.dirty_inodes AS dirty
+      JOIN _vexfs.inodes AS inode
+        ON inode.workspace_id = dirty.workspace_id
+       AND inode.inode_id = dirty.inode_id
+     WHERE dirty.workspace_id = p_workspace_id
+    ON CONFLICT (workspace_id, inode_id, commit_no) DO UPDATE
+    SET kind = EXCLUDED.kind,
+        mode = EXCLUDED.mode,
+        owner_oid = EXCLUDED.owner_oid,
+        owner_role = EXCLUDED.owner_role,
+        owner_principal = EXCLUDED.owner_principal,
+        uid = EXCLUDED.uid,
+        gid = EXCLUDED.gid,
+        acl_set_id = EXCLUDED.acl_set_id,
+        current_version = EXCLUDED.current_version,
+        size_bytes = EXCLUDED.size_bytes,
+        live = EXCLUDED.live,
+        created_at = EXCLUDED.created_at,
+        accessed_at = EXCLUDED.accessed_at,
+        modified_at = EXCLUDED.modified_at,
+        changed_at = EXCLUDED.changed_at;
+    GET DIAGNOSTICS v_inodes = ROW_COUNT;
+
+    INSERT INTO _vexfs.dentry_states(
+        workspace_id, parent_inode, name, commit_no, inode_id, deleted)
+    SELECT dirty.workspace_id, dirty.parent_inode, dirty.name, p_commit_no,
+           coalesce(current_entry.inode_id, dirty.inode_id),
+           current_entry.inode_id IS NULL
+      FROM _vexfs.dirty_dentries AS dirty
+      LEFT JOIN _vexfs.dentries AS current_entry
+        ON current_entry.workspace_id = dirty.workspace_id
+       AND current_entry.parent_inode = dirty.parent_inode
+       AND current_entry.name = dirty.name
+     WHERE dirty.workspace_id = p_workspace_id
+    ON CONFLICT (workspace_id, parent_inode, name, commit_no) DO UPDATE
+    SET inode_id = EXCLUDED.inode_id,
+        deleted = EXCLUDED.deleted;
+    GET DIAGNOSTICS v_dentries = ROW_COUNT;
+
+    INSERT INTO _vexfs.xattr_states(
+        workspace_id, inode_id, name, commit_no, value, deleted, updated_at)
+    SELECT dirty.workspace_id, dirty.inode_id, dirty.name, p_commit_no,
+           coalesce(current_xattr.value, dirty.value),
+           current_xattr.inode_id IS NULL,
+           coalesce(current_xattr.updated_at, dirty.updated_at)
+      FROM _vexfs.dirty_xattrs AS dirty
+      LEFT JOIN _vexfs.xattrs AS current_xattr
+        ON current_xattr.workspace_id = dirty.workspace_id
+       AND current_xattr.inode_id = dirty.inode_id
+       AND current_xattr.name = dirty.name
+     WHERE dirty.workspace_id = p_workspace_id
+    ON CONFLICT (workspace_id, inode_id, name, commit_no) DO UPDATE
+    SET value = EXCLUDED.value,
+        deleted = EXCLUDED.deleted,
+        updated_at = EXCLUDED.updated_at;
+    GET DIAGNOSTICS v_xattrs = ROW_COUNT;
+
+    DELETE FROM _vexfs.dirty_inodes WHERE workspace_id = p_workspace_id;
+    DELETE FROM _vexfs.dirty_dentries WHERE workspace_id = p_workspace_id;
+    DELETE FROM _vexfs.dirty_xattrs WHERE workspace_id = p_workspace_id;
+
+    UPDATE _vexfs.metadata_checkpoints
+       SET inode_changes = (
+               SELECT count(*) FROM _vexfs.inode_states
+                WHERE workspace_id = p_workspace_id AND commit_no = p_commit_no),
+           dentry_changes = (
+               SELECT count(*) FROM _vexfs.dentry_states
+                WHERE workspace_id = p_workspace_id AND commit_no = p_commit_no),
+           xattr_changes = (
+               SELECT count(*) FROM _vexfs.xattr_states
+                WHERE workspace_id = p_workspace_id AND commit_no = p_commit_no)
+     WHERE workspace_id = p_workspace_id AND commit_no = p_commit_no;
+    IF NOT v_had_checkpoint THEN
+        UPDATE _vexfs.workspaces
+           SET history_floor_commit = p_commit_no
+         WHERE workspace_id = p_workspace_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+        'commit', p_commit_no,
+        'inode_changes', v_inodes,
+        'dentry_changes', v_dentries,
+        'xattr_changes', v_xattrs);
+END;
+$$;
+
+CREATE FUNCTION _vexfs.compact_metadata_history(
+    p_workspace_id bigint,
+    p_floor_commit bigint)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+VOLATILE
+SET search_path = pg_catalog, _vexfs
+AS $$
+DECLARE
+    v_old_checkpoints bigint;
+    v_old_inode_states bigint;
+    v_old_dentry_states bigint;
+    v_old_xattr_states bigint;
+    v_inode_states bigint;
+    v_dentry_states bigint;
+    v_xattr_states bigint;
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM _vexfs.metadata_checkpoints AS checkpoint
+         WHERE checkpoint.workspace_id = p_workspace_id
+           AND checkpoint.commit_no = p_floor_commit) THEN
+        RAISE EXCEPTION 'VEXFS_METADATA_CHECKPOINT_NOT_FOUND: %', p_floor_commit
+            USING ERRCODE = 'XX001';
+    END IF;
+
+    IF pg_catalog.pg_my_temp_schema() <> 0 THEN
+        DROP TABLE IF EXISTS pg_temp.vexfs_compact_inodes;
+        DROP TABLE IF EXISTS pg_temp.vexfs_compact_dentries;
+        DROP TABLE IF EXISTS pg_temp.vexfs_compact_xattrs;
+    END IF;
+    CREATE TEMP TABLE pg_temp.vexfs_compact_inodes
+    ON COMMIT DROP AS
+    SELECT latest.*
+      FROM (
+          SELECT DISTINCT ON (state.inode_id) state.*
+            FROM _vexfs.inode_states AS state
+           WHERE state.workspace_id = p_workspace_id
+             AND state.commit_no <= p_floor_commit
+           ORDER BY state.inode_id, state.commit_no DESC) AS latest
+     WHERE latest.live;
+    CREATE TEMP TABLE pg_temp.vexfs_compact_dentries
+    ON COMMIT DROP AS
+    SELECT latest.*
+      FROM (
+          SELECT DISTINCT ON (state.parent_inode, state.name) state.*
+            FROM _vexfs.dentry_states AS state
+           WHERE state.workspace_id = p_workspace_id
+             AND state.commit_no <= p_floor_commit
+           ORDER BY state.parent_inode, state.name, state.commit_no DESC) AS latest
+     WHERE NOT latest.deleted;
+    CREATE TEMP TABLE pg_temp.vexfs_compact_xattrs
+    ON COMMIT DROP AS
+    SELECT latest.*
+      FROM (
+          SELECT DISTINCT ON (state.inode_id, state.name) state.*
+            FROM _vexfs.xattr_states AS state
+           WHERE state.workspace_id = p_workspace_id
+             AND state.commit_no <= p_floor_commit
+           ORDER BY state.inode_id, state.name, state.commit_no DESC) AS latest
+     WHERE NOT latest.deleted;
+
+    SELECT count(*) INTO v_old_checkpoints
+      FROM _vexfs.metadata_checkpoints AS checkpoint
+     WHERE checkpoint.workspace_id = p_workspace_id
+       AND checkpoint.commit_no < p_floor_commit;
+    SELECT count(*) INTO v_old_inode_states
+      FROM _vexfs.inode_states AS state
+     WHERE state.workspace_id = p_workspace_id
+       AND state.commit_no <= p_floor_commit;
+    SELECT count(*) INTO v_old_dentry_states
+      FROM _vexfs.dentry_states AS state
+     WHERE state.workspace_id = p_workspace_id
+       AND state.commit_no <= p_floor_commit;
+    SELECT count(*) INTO v_old_xattr_states
+      FROM _vexfs.xattr_states AS state
+     WHERE state.workspace_id = p_workspace_id
+       AND state.commit_no <= p_floor_commit;
+
+    DELETE FROM _vexfs.inode_states
+     WHERE workspace_id = p_workspace_id AND commit_no <= p_floor_commit;
+    DELETE FROM _vexfs.dentry_states
+     WHERE workspace_id = p_workspace_id AND commit_no <= p_floor_commit;
+    DELETE FROM _vexfs.xattr_states
+     WHERE workspace_id = p_workspace_id AND commit_no <= p_floor_commit;
+
+    INSERT INTO _vexfs.inode_states(
+        workspace_id, inode_id, commit_no, kind, mode, owner_oid, owner_role,
+        owner_principal, uid, gid, acl_set_id, current_version, size_bytes,
+        live, created_at, accessed_at, modified_at, changed_at)
+    SELECT state.workspace_id, state.inode_id, p_floor_commit, state.kind,
+           state.mode, state.owner_oid, state.owner_role,
+           state.owner_principal, state.uid, state.gid, state.acl_set_id,
+           state.current_version, state.size_bytes, true, state.created_at,
+           state.accessed_at, state.modified_at, state.changed_at
+      FROM pg_temp.vexfs_compact_inodes AS state;
+    GET DIAGNOSTICS v_inode_states = ROW_COUNT;
+
+    INSERT INTO _vexfs.dentry_states(
+        workspace_id, parent_inode, name, commit_no, inode_id, deleted)
+    SELECT state.workspace_id, state.parent_inode, state.name,
+           p_floor_commit, state.inode_id, false
+      FROM pg_temp.vexfs_compact_dentries AS state;
+    GET DIAGNOSTICS v_dentry_states = ROW_COUNT;
+
+    INSERT INTO _vexfs.xattr_states(
+        workspace_id, inode_id, name, commit_no, value, deleted, updated_at)
+    SELECT state.workspace_id, state.inode_id, state.name,
+           p_floor_commit, state.value, false, state.updated_at
+      FROM pg_temp.vexfs_compact_xattrs AS state;
+    GET DIAGNOSTICS v_xattr_states = ROW_COUNT;
+
+    DELETE FROM _vexfs.metadata_checkpoints
+     WHERE workspace_id = p_workspace_id AND commit_no < p_floor_commit;
+    UPDATE _vexfs.metadata_checkpoints
+       SET inode_changes = v_inode_states,
+           dentry_changes = v_dentry_states,
+           xattr_changes = v_xattr_states
+     WHERE workspace_id = p_workspace_id AND commit_no = p_floor_commit;
+    UPDATE _vexfs.workspaces
+       SET history_floor_commit = greatest(history_floor_commit, p_floor_commit)
+     WHERE workspace_id = p_workspace_id;
+
+    RETURN jsonb_build_object(
+        'floor_commit', p_floor_commit,
+        'deleted_checkpoints', v_old_checkpoints,
+        'deleted_state_rows',
+            v_old_inode_states + v_old_dentry_states + v_old_xattr_states,
+        'baseline_inode_states', v_inode_states,
+        'baseline_dentry_states', v_dentry_states,
+        'baseline_xattr_states', v_xattr_states);
+END;
+$$;
+
+-- Compatibility views preserve the old internal read shape while resolving a
+-- snapshot from the latest state for each key at or before its commit.
+CREATE VIEW _vexfs.snapshot_inodes AS
+SELECT snapshot.snapshot_id,
+       state.inode_id,
+       state.kind,
+       state.mode,
+       state.owner_oid,
+       state.owner_role,
+       state.owner_principal,
+       state.uid,
+       state.gid,
+       state.acl_set_id,
+       state.current_version,
+       state.size_bytes,
+       state.created_at,
+       state.accessed_at,
+       state.modified_at,
+       state.changed_at
+  FROM _vexfs.snapshots AS snapshot
+  JOIN LATERAL (
+      SELECT DISTINCT ON (history.inode_id) history.*
+        FROM _vexfs.inode_states AS history
+       WHERE history.workspace_id = snapshot.workspace_id
+         AND history.commit_no <= snapshot.head_commit
+       ORDER BY history.inode_id, history.commit_no DESC) AS state
+    ON state.live;
+
+CREATE VIEW _vexfs.snapshot_dentries AS
+SELECT snapshot.snapshot_id,
+       state.parent_inode,
+       state.name,
+       state.inode_id
+  FROM _vexfs.snapshots AS snapshot
+  JOIN LATERAL (
+      SELECT DISTINCT ON (history.parent_inode, history.name) history.*
+        FROM _vexfs.dentry_states AS history
+       WHERE history.workspace_id = snapshot.workspace_id
+         AND history.commit_no <= snapshot.head_commit
+       ORDER BY history.parent_inode, history.name, history.commit_no DESC) AS state
+    ON NOT state.deleted;
+
+CREATE VIEW _vexfs.snapshot_xattrs AS
+SELECT snapshot.snapshot_id,
+       state.inode_id,
+       state.name,
+       state.value,
+       state.updated_at
+  FROM _vexfs.snapshots AS snapshot
+  JOIN LATERAL (
+      SELECT DISTINCT ON (history.inode_id, history.name) history.*
+        FROM _vexfs.xattr_states AS history
+       WHERE history.workspace_id = snapshot.workspace_id
+         AND history.commit_no <= snapshot.head_commit
+       ORDER BY history.inode_id, history.name, history.commit_no DESC) AS state
+    ON NOT state.deleted;
 
 CREATE VIEW _vexfs.snapshot_acl_entries AS
 SELECT inode.snapshot_id,
@@ -822,9 +1310,10 @@ SELECT pg_catalog.pg_extension_config_dump('_vexfs.manifest_chunks', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.file_versions', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.xattrs', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshots', '');
-SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_inodes', '');
-SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_dentries', '');
-SELECT pg_catalog.pg_extension_config_dump('_vexfs.snapshot_xattrs', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.metadata_checkpoints', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.inode_states', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.dentry_states', '');
+SELECT pg_catalog.pg_extension_config_dump('_vexfs.xattr_states', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.audit_events', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.workspaces_workspace_id_seq', '');
 SELECT pg_catalog.pg_extension_config_dump('_vexfs.acl_sets_acl_set_id_seq', '');
@@ -6569,6 +7058,8 @@ DECLARE
     v_retained bigint;
     v_staging_bytes bigint;
     v_snapshot_count bigint;
+    v_metadata_checkpoint_count bigint;
+    v_metadata_history_bytes bigint;
     v_oldest_recovery_commit bigint;
     v_oldest_recovery_created_at bigint;
     v_retention jsonb;
@@ -6586,6 +7077,27 @@ BEGIN
     SELECT count(*) INTO v_snapshot_count
       FROM _vexfs.snapshots AS snapshot
      WHERE snapshot.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_metadata_checkpoint_count
+      FROM _vexfs.metadata_checkpoints AS checkpoint
+     WHERE checkpoint.workspace_id = v_workspace.workspace_id;
+    SELECT coalesce(sum(history.row_bytes), 0)
+      INTO v_metadata_history_bytes
+      FROM (
+          SELECT pg_column_size(checkpoint)::bigint AS row_bytes
+            FROM _vexfs.metadata_checkpoints AS checkpoint
+           WHERE checkpoint.workspace_id = v_workspace.workspace_id
+          UNION ALL
+          SELECT pg_column_size(state)::bigint
+            FROM _vexfs.inode_states AS state
+           WHERE state.workspace_id = v_workspace.workspace_id
+          UNION ALL
+          SELECT pg_column_size(state)::bigint
+            FROM _vexfs.dentry_states AS state
+           WHERE state.workspace_id = v_workspace.workspace_id
+          UNION ALL
+          SELECT pg_column_size(state)::bigint
+            FROM _vexfs.xattr_states AS state
+           WHERE state.workspace_id = v_workspace.workspace_id) AS history;
     SELECT snapshot.head_commit,
            (extract(epoch FROM snapshot.created_at) * 1000)::bigint
       INTO v_oldest_recovery_commit,v_oldest_recovery_created_at
@@ -6614,9 +7126,16 @@ BEGIN
         'staging_bytes', v_staging_bytes,
         'recovery', jsonb_build_object(
             'snapshot_count', v_snapshot_count,
-            'protected_history_bytes', greatest(
+            'metadata_checkpoint_count', v_metadata_checkpoint_count,
+            'history_floor_commit', v_workspace.history_floor_commit,
+            'metadata_history_bytes', v_metadata_history_bytes,
+            'content_history_bytes', greatest(
                 (v_retention->>'retained_history_bytes')::bigint -
                 (v_retention->>'reclaimable_bytes')::bigint, 0),
+            'protected_history_bytes', greatest(
+                (v_retention->>'retained_history_bytes')::bigint -
+                (v_retention->>'reclaimable_bytes')::bigint, 0) +
+                v_metadata_history_bytes,
             'reclaimable_bytes', (v_retention->>'reclaimable_bytes')::bigint,
             'oldest_recovery_commit', v_oldest_recovery_commit,
             'oldest_recovery_created_at', v_oldest_recovery_created_at));
@@ -8577,61 +9096,16 @@ BEGIN
     END IF;
     SELECT r.oid INTO STRICT v_principal_oid
       FROM pg_catalog.pg_roles AS r WHERE r.rolname = session_user;
+    -- Flush only keys changed since the previous snapshot boundary.  The
+    -- snapshot row below remains a small immutable commit reference.
+    PERFORM _vexfs.capture_metadata_checkpoint(
+        v_workspace.workspace_id, v_head);
     INSERT INTO _vexfs.snapshots(
         workspace_id, name, snapshot_type, head_commit, created_by_oid, created_by)
     VALUES (
         v_workspace.workspace_id, p_name, p_snapshot_type, v_head,
         v_principal_oid, session_user)
     RETURNING snapshot_id INTO v_snapshot_id;
-
-    WITH RECURSIVE reachable(inode_id) AS (
-        SELECT v_workspace.root_inode
-        UNION
-        SELECT d.inode_id
-          FROM _vexfs.dentries AS d
-          JOIN reachable AS r ON d.parent_inode = r.inode_id
-         WHERE d.workspace_id = v_workspace.workspace_id
-    )
-    INSERT INTO _vexfs.snapshot_inodes(
-        snapshot_id, inode_id, kind, mode, owner_oid, owner_role, owner_principal,
-        uid, gid, acl_set_id, current_version, size_bytes, created_at, accessed_at,
-        modified_at, changed_at)
-    SELECT v_snapshot_id,
-           i.inode_id,
-           i.kind,
-           i.mode,
-           i.owner_oid,
-           i.owner_role,
-           i.owner_principal,
-           i.uid,
-           i.gid,
-           i.acl_set_id,
-           i.current_version,
-           i.size_bytes,
-           i.created_at,
-           i.accessed_at,
-           i.modified_at,
-           i.changed_at
-      FROM reachable AS x
-      JOIN _vexfs.inodes AS i ON i.inode_id = x.inode_id;
-
-    INSERT INTO _vexfs.snapshot_dentries(
-        snapshot_id, parent_inode, name, inode_id)
-    SELECT v_snapshot_id, d.parent_inode, d.name, d.inode_id
-      FROM _vexfs.dentries AS d
-      JOIN _vexfs.snapshot_inodes AS p
-        ON p.snapshot_id = v_snapshot_id AND p.inode_id = d.parent_inode
-      JOIN _vexfs.snapshot_inodes AS c
-        ON c.snapshot_id = v_snapshot_id AND c.inode_id = d.inode_id
-     WHERE d.workspace_id = v_workspace.workspace_id;
-
-    INSERT INTO _vexfs.snapshot_xattrs(
-        snapshot_id, inode_id, name, value, updated_at)
-    SELECT v_snapshot_id, x.inode_id, x.name, x.value, x.updated_at
-      FROM _vexfs.xattrs AS x
-      JOIN _vexfs.snapshot_inodes AS i
-        ON i.snapshot_id = v_snapshot_id AND i.inode_id = x.inode_id
-     WHERE x.workspace_id = v_workspace.workspace_id;
 
     PERFORM _vexfs.audit(
         v_workspace.workspace_id, v_head, 'snapshot_create',
@@ -9318,9 +9792,54 @@ BEGIN
             USING ERRCODE = '22000';
     END IF;
 
+    -- Resolve the overlay chain once.  The restore path reads the target tree
+    -- several times for integrity, equality, content aliases, ACLs and the
+    -- final replacement.  Re-expanding the same large snapshot view at every
+    -- step made a 10k-file restore take close to a minute.
+    IF pg_catalog.pg_my_temp_schema() <> 0 THEN
+        DROP TABLE IF EXISTS pg_temp.vexfs_restore_inodes;
+        DROP TABLE IF EXISTS pg_temp.vexfs_restore_dentries;
+        DROP TABLE IF EXISTS pg_temp.vexfs_restore_xattrs;
+        DROP TABLE IF EXISTS pg_temp.vexfs_restore_acl_entries;
+    END IF;
+    CREATE TEMP TABLE pg_temp.vexfs_restore_inodes
+    ON COMMIT DROP AS
+    SELECT * FROM _vexfs.snapshot_inodes AS inode
+     WHERE inode.snapshot_id = v_snapshot_id;
+    CREATE UNIQUE INDEX vexfs_restore_inodes_key
+        ON pg_temp.vexfs_restore_inodes(inode_id);
+    CREATE TEMP TABLE pg_temp.vexfs_restore_dentries
+    ON COMMIT DROP AS
+    SELECT * FROM _vexfs.snapshot_dentries AS dentry
+     WHERE dentry.snapshot_id = v_snapshot_id;
+    CREATE UNIQUE INDEX vexfs_restore_dentries_key
+        ON pg_temp.vexfs_restore_dentries(parent_inode, name);
+    CREATE INDEX vexfs_restore_dentries_inode
+        ON pg_temp.vexfs_restore_dentries(inode_id);
+    CREATE TEMP TABLE pg_temp.vexfs_restore_xattrs
+    ON COMMIT DROP AS
+    SELECT * FROM _vexfs.snapshot_xattrs AS xattr
+     WHERE xattr.snapshot_id = v_snapshot_id;
+    CREATE UNIQUE INDEX vexfs_restore_xattrs_key
+        ON pg_temp.vexfs_restore_xattrs(inode_id, name);
+    CREATE TEMP TABLE pg_temp.vexfs_restore_acl_entries
+    ON COMMIT DROP AS
+    SELECT inode.snapshot_id,
+           inode.inode_id,
+           entry.principal,
+           entry.effect,
+           entry.permissions,
+           entry.inherit_flags,
+           entry.created_at,
+           entry.updated_at
+      FROM pg_temp.vexfs_restore_inodes AS inode
+      JOIN _vexfs.acl_set_entries AS entry
+        ON entry.acl_set_id = inode.acl_set_id;
+    CREATE INDEX vexfs_restore_acl_entries_key
+        ON pg_temp.vexfs_restore_acl_entries(inode_id, principal, effect);
     IF EXISTS (
         SELECT 1
-          FROM _vexfs.snapshot_inodes AS s
+          FROM pg_temp.vexfs_restore_inodes AS s
           LEFT JOIN _vexfs.file_versions AS source
             ON source.workspace_id = v_workspace.workspace_id
            AND source.inode_id = s.inode_id
@@ -9339,11 +9858,11 @@ BEGIN
               WHERE d.workspace_id = v_workspace.workspace_id)
             EXCEPT
             (SELECT d.parent_inode, d.name, d.inode_id
-               FROM _vexfs.snapshot_dentries AS d
+               FROM pg_temp.vexfs_restore_dentries AS d
               WHERE d.snapshot_id = v_snapshot_id))
         AND NOT EXISTS (
             (SELECT d.parent_inode, d.name, d.inode_id
-               FROM _vexfs.snapshot_dentries AS d
+               FROM pg_temp.vexfs_restore_dentries AS d
               WHERE d.snapshot_id = v_snapshot_id)
             EXCEPT
             (SELECT d.parent_inode, d.name, d.inode_id
@@ -9351,7 +9870,7 @@ BEGIN
               WHERE d.workspace_id = v_workspace.workspace_id))
         AND NOT EXISTS (
             SELECT 1
-              FROM _vexfs.snapshot_inodes AS s
+              FROM pg_temp.vexfs_restore_inodes AS s
               LEFT JOIN _vexfs.inodes AS i
                 ON i.workspace_id = v_workspace.workspace_id
                AND i.inode_id = s.inode_id
@@ -9385,11 +9904,11 @@ BEGIN
               WHERE x.workspace_id = v_workspace.workspace_id)
             EXCEPT
             (SELECT x.inode_id, x.name, x.value
-               FROM _vexfs.snapshot_xattrs AS x
+               FROM pg_temp.vexfs_restore_xattrs AS x
               WHERE x.snapshot_id = v_snapshot_id))
         AND NOT EXISTS (
             (SELECT x.inode_id, x.name, x.value
-               FROM _vexfs.snapshot_xattrs AS x
+               FROM pg_temp.vexfs_restore_xattrs AS x
               WHERE x.snapshot_id = v_snapshot_id)
             EXCEPT
             (SELECT x.inode_id, x.name, x.value
@@ -9403,12 +9922,12 @@ BEGIN
             EXCEPT
             (SELECT acl.inode_id, acl.principal, acl.effect,
                     acl.permissions, acl.inherit_flags
-               FROM _vexfs.snapshot_acl_entries AS acl
+               FROM pg_temp.vexfs_restore_acl_entries AS acl
               WHERE acl.snapshot_id = v_snapshot_id))
         AND NOT EXISTS (
             (SELECT acl.inode_id, acl.principal, acl.effect,
                     acl.permissions, acl.inherit_flags
-               FROM _vexfs.snapshot_acl_entries AS acl
+               FROM pg_temp.vexfs_restore_acl_entries AS acl
               WHERE acl.snapshot_id = v_snapshot_id)
             EXCEPT
             (SELECT acl.inode_id, acl.principal, acl.effect,
@@ -9441,7 +9960,7 @@ BEGIN
      WHERE workspace_id = v_workspace.workspace_id;
     INSERT INTO _vexfs.dentries(workspace_id, parent_inode, name, inode_id)
     SELECT v_workspace.workspace_id, d.parent_inode, d.name, d.inode_id
-      FROM _vexfs.snapshot_dentries AS d
+      FROM pg_temp.vexfs_restore_dentries AS d
      WHERE d.snapshot_id = v_snapshot_id;
     UPDATE _vexfs.inodes
        SET live = false
@@ -9462,7 +9981,7 @@ BEGIN
            accessed_at = s.accessed_at,
            modified_at = s.modified_at,
            changed_at = s.changed_at
-      FROM _vexfs.snapshot_inodes AS s
+      FROM pg_temp.vexfs_restore_inodes AS s
      WHERE s.snapshot_id = v_snapshot_id
        AND i.workspace_id = v_workspace.workspace_id
        AND i.inode_id = s.inode_id;
@@ -9483,7 +10002,7 @@ BEGIN
                (SELECT r.oid FROM pg_catalog.pg_roles AS r
                  WHERE r.rolname = session_user),
                session_user
-          FROM _vexfs.snapshot_inodes AS s
+          FROM pg_temp.vexfs_restore_inodes AS s
           JOIN _vexfs.inodes AS current_inode
             ON current_inode.workspace_id = v_workspace.workspace_id
            AND current_inode.inode_id = s.inode_id
@@ -9512,9 +10031,14 @@ BEGIN
     INSERT INTO _vexfs.xattrs(
         workspace_id, inode_id, name, value, updated_at)
     SELECT v_workspace.workspace_id, x.inode_id, x.name, x.value, x.updated_at
-      FROM _vexfs.snapshot_xattrs AS x
+      FROM pg_temp.vexfs_restore_xattrs AS x
      WHERE x.snapshot_id = v_snapshot_id;
 
+    -- The restore commit was allocated before replacing the live tree so file
+    -- versions could reference it.  Capture the final metadata now, after all
+    -- restore triggers have populated the dirty-key tables.
+    PERFORM _vexfs.capture_metadata_checkpoint(
+        v_workspace.workspace_id, v_commit);
     RETURN v_commit;
 END;
 $$;
@@ -9644,6 +10168,10 @@ DECLARE
     v_manifests bigint[];
     v_deleted_versions bigint := 0;
     v_reclaimed_bytes bigint := 0;
+    v_metadata_floor bigint;
+    v_metadata_history_floor bigint;
+    v_metadata_compaction jsonb;
+    v_did_metadata_compact boolean := false;
     v_remaining jsonb;
 BEGIN
     IF p_batch IS NULL OR p_batch < 1 OR p_batch > 10000 THEN
@@ -9651,10 +10179,11 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
     v_workspace := _vexfs.require_workspace(p_workspace, 'admin');
-    SELECT w.gc_paused INTO v_gc_paused
+    SELECT w.* INTO v_workspace
       FROM _vexfs.workspaces AS w
      WHERE w.workspace_id = v_workspace.workspace_id
      FOR UPDATE;
+    v_gc_paused := v_workspace.gc_paused;
     IF v_gc_paused THEN
         RAISE EXCEPTION 'VEXFS_GC_PAUSED: workspace GC is paused'
             USING ERRCODE = '55006';
@@ -9721,6 +10250,37 @@ BEGIN
           FROM removed;
     END IF;
 
+    -- Capture HEAD before choosing a floor so a workspace without retained
+    -- snapshot names still has one exact baseline.  With snapshots, the oldest
+    -- retained commit is the earliest tree users can still restore.
+    PERFORM _vexfs.capture_metadata_checkpoint(
+        v_workspace.workspace_id, v_workspace.head_commit);
+    -- The first capture advances history_floor_commit itself.  Read the value
+    -- back instead of comparing with the stale row captured before the call;
+    -- otherwise the first GC of a snapshot-free workspace rewrites the new
+    -- full HEAD baseline a second time.
+    SELECT workspace.history_floor_commit
+      INTO v_metadata_history_floor
+      FROM _vexfs.workspaces AS workspace
+     WHERE workspace.workspace_id = v_workspace.workspace_id;
+    SELECT coalesce(min(snapshot.head_commit), v_workspace.head_commit)
+      INTO v_metadata_floor
+      FROM _vexfs.snapshots AS snapshot
+     WHERE snapshot.workspace_id = v_workspace.workspace_id;
+    IF v_metadata_floor > v_metadata_history_floor THEN
+        v_metadata_compaction := _vexfs.compact_metadata_history(
+            v_workspace.workspace_id, v_metadata_floor);
+        v_did_metadata_compact := true;
+    ELSE
+        v_metadata_compaction := jsonb_build_object(
+            'floor_commit', v_metadata_history_floor,
+            'deleted_checkpoints', 0,
+            'deleted_state_rows', 0,
+            'baseline_inode_states', 0,
+            'baseline_dentry_states', 0,
+            'baseline_xattr_states', 0);
+    END IF;
+
     v_remaining := _vexfs.retention_status(
         v_workspace.workspace_id, p_workspace);
     RETURN jsonb_build_object(
@@ -9728,6 +10288,13 @@ BEGIN
         'batch', p_batch,
         'deleted_versions', v_deleted_versions,
         'reclaimed_bytes', v_reclaimed_bytes,
+        'metadata_floor_commit',
+            (v_metadata_compaction->>'floor_commit')::bigint,
+        'metadata_deleted_checkpoints',
+            (v_metadata_compaction->>'deleted_checkpoints')::bigint,
+        'metadata_deleted_state_rows',
+            (v_metadata_compaction->>'deleted_state_rows')::bigint,
+        'metadata_compacted', v_did_metadata_compact,
         'remaining_versions', (v_remaining->>'stored_versions')::bigint,
         'remaining_reclaimable_versions',
             (v_remaining->>'reclaimable_versions')::bigint,
@@ -9763,6 +10330,10 @@ DECLARE
     v_xattr_count bigint;
     v_audit_count bigint;
     v_handle_count bigint;
+    v_checkpoint_count bigint;
+    v_inode_state_count bigint;
+    v_dentry_state_count bigint;
+    v_xattr_state_count bigint;
     v_checked_versions bigint := 0;
     v_content_bytes bigint := 0;
     v_started timestamptz := clock_timestamp();
@@ -9829,6 +10400,18 @@ BEGIN
     SELECT count(*) INTO v_handle_count
       FROM _vexfs.handles AS handle
      WHERE handle.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_checkpoint_count
+      FROM _vexfs.metadata_checkpoints AS checkpoint
+     WHERE checkpoint.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_inode_state_count
+      FROM _vexfs.inode_states AS state
+     WHERE state.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_dentry_state_count
+      FROM _vexfs.dentry_states AS state
+     WHERE state.workspace_id = v_workspace.workspace_id;
+    SELECT count(*) INTO v_xattr_state_count
+      FROM _vexfs.xattr_states AS state
+     WHERE state.workspace_id = v_workspace.workspace_id;
     SELECT coalesce(sum(c.size_bytes), 0) INTO v_content_bytes
       FROM _vexfs.chunks AS c
      WHERE c.workspace_id = v_workspace.workspace_id;
@@ -9983,6 +10566,42 @@ BEGIN
         v_issues := v_issues || jsonb_build_array(jsonb_build_object(
             'code', 'commit_changes', 'count', v_bad,
             'message', 'commit change ordinals are missing or discontinuous'));
+    END IF;
+
+    SELECT count(*) INTO v_bad
+      FROM _vexfs.metadata_checkpoints AS checkpoint
+     WHERE checkpoint.workspace_id = v_workspace.workspace_id
+       AND (checkpoint.commit_no < v_workspace.history_floor_commit
+            OR checkpoint.commit_no > v_workspace.head_commit
+            OR checkpoint.inode_changes <> (
+                SELECT count(*) FROM _vexfs.inode_states AS state
+                 WHERE state.workspace_id = checkpoint.workspace_id
+                   AND state.commit_no = checkpoint.commit_no)
+            OR checkpoint.dentry_changes <> (
+                SELECT count(*) FROM _vexfs.dentry_states AS state
+                 WHERE state.workspace_id = checkpoint.workspace_id
+                   AND state.commit_no = checkpoint.commit_no)
+            OR checkpoint.xattr_changes <> (
+                SELECT count(*) FROM _vexfs.xattr_states AS state
+                 WHERE state.workspace_id = checkpoint.workspace_id
+                   AND state.commit_no = checkpoint.commit_no));
+    IF v_checkpoint_count > 0 AND (
+        v_workspace.history_floor_commit < 1
+        OR v_workspace.history_floor_commit > v_workspace.head_commit
+        OR NOT EXISTS (
+            SELECT 1 FROM _vexfs.metadata_checkpoints AS checkpoint
+             WHERE checkpoint.workspace_id = v_workspace.workspace_id
+               AND checkpoint.commit_no = v_workspace.history_floor_commit)
+        OR EXISTS (
+            SELECT 1 FROM _vexfs.snapshots AS snapshot
+             WHERE snapshot.workspace_id = v_workspace.workspace_id
+               AND snapshot.head_commit < v_workspace.history_floor_commit)) THEN
+        v_bad := v_bad + 1;
+    END IF;
+    IF v_bad <> 0 THEN
+        v_issues := v_issues || jsonb_build_array(jsonb_build_object(
+            'code', 'metadata_history', 'count', v_bad,
+            'message', 'metadata checkpoint counts or history floor are invalid'));
     END IF;
 
     SELECT count(*) INTO v_bad
@@ -10292,13 +10911,17 @@ BEGIN
             'xattrs', v_xattr_count,
             'audit_events', v_audit_count,
             'handles', v_handle_count,
+            'metadata_checkpoints', v_checkpoint_count,
+            'inode_states', v_inode_state_count,
+            'dentry_states', v_dentry_state_count,
+            'xattr_states', v_xattr_state_count,
             'canonical_versions', v_checked_versions));
 END;
 $$;
 
 -- format v2 的 PostgreSQL 生产端。CLI 只读取这个公开、带权限检查的记录流，
--- 不需要也不允许直接读取 _vexfs 私有表。临时表把一次导出固定在当前数据库
--- 事务快照中，并把 PG 的完整 snapshot 表转换成 format v2 的状态变更记录。
+-- 不需要也不允许直接读取 _vexfs 私有表。临时表只解析一次导出目标树；历史
+-- 记录直接来自增量状态表，不再按 snapshot 数量重复展开整棵树。
 CREATE FUNCTION public.vexfs_archive_export_records(
     p_workspace text,
     p_snapshot text DEFAULT NULL)
@@ -10339,41 +10962,25 @@ BEGIN
         RAISE EXCEPTION 'VEXFS_ARCHIVE_EMPTY: workspace has no committed state'
             USING ERRCODE = '55000';
     END IF;
+    IF v_selected_snapshot IS NULL THEN
+        -- Freeze HEAD and turn any live dirty keys into one export checkpoint.
+        -- This also means the archive state stream can be read directly from
+        -- the incremental tables below.
+        SELECT workspace.* INTO v_workspace
+          FROM _vexfs.workspaces AS workspace
+         WHERE workspace.workspace_id = v_workspace.workspace_id
+         FOR UPDATE;
+        v_source_commit := v_workspace.head_commit;
+        PERFORM _vexfs.capture_metadata_checkpoint(
+            v_workspace.workspace_id, v_source_commit);
+    END IF;
 
-    DROP TABLE IF EXISTS pg_temp.vexfs_export_checkpoints;
-    DROP TABLE IF EXISTS pg_temp.vexfs_export_inodes;
-    DROP TABLE IF EXISTS pg_temp.vexfs_export_dentries;
-    DROP TABLE IF EXISTS pg_temp.vexfs_export_xattrs;
-    DROP TABLE IF EXISTS pg_temp.vexfs_export_acls;
-
-    CREATE TEMP TABLE vexfs_export_checkpoints(
-        commit_no bigint PRIMARY KEY,
-        snapshot_id bigint,
-        created_at_ms bigint NOT NULL,
-        selected boolean NOT NULL DEFAULT false)
-        ON COMMIT DROP;
-    INSERT INTO pg_temp.vexfs_export_checkpoints(
-        commit_no, snapshot_id, created_at_ms)
-    SELECT s.head_commit,
-           min(s.snapshot_id),
-           floor(extract(epoch FROM min(s.created_at)) * 1000)::bigint
-      FROM _vexfs.snapshots AS s
-     WHERE s.workspace_id = v_workspace.workspace_id
-       AND s.head_commit <= v_source_commit
-     GROUP BY s.head_commit;
-    INSERT INTO pg_temp.vexfs_export_checkpoints(
-        commit_no, snapshot_id, created_at_ms, selected)
-    VALUES (
-        v_source_commit,
-        v_selected_snapshot,
-        coalesce((SELECT floor(extract(epoch FROM s.created_at) * 1000)::bigint
-                    FROM _vexfs.snapshots AS s
-                   WHERE s.snapshot_id = v_selected_snapshot), v_created_at),
-        true)
-    ON CONFLICT (commit_no) DO UPDATE
-      SET snapshot_id = EXCLUDED.snapshot_id,
-          created_at_ms = EXCLUDED.created_at_ms,
-          selected = true;
+    IF pg_catalog.pg_my_temp_schema() <> 0 THEN
+        DROP TABLE IF EXISTS pg_temp.vexfs_export_inodes;
+        DROP TABLE IF EXISTS pg_temp.vexfs_export_dentries;
+        DROP TABLE IF EXISTS pg_temp.vexfs_export_xattrs;
+        DROP TABLE IF EXISTS pg_temp.vexfs_export_acls;
+    END IF;
 
     CREATE TEMP TABLE vexfs_export_inodes(
         commit_no bigint NOT NULL,
@@ -10390,8 +10997,9 @@ BEGIN
         updated_at_ms bigint NOT NULL,
         changed_at_ms bigint NOT NULL,
         PRIMARY KEY (commit_no, inode_id)) ON COMMIT DROP;
-    INSERT INTO pg_temp.vexfs_export_inodes
-    SELECT cp.commit_no,
+    IF v_selected_snapshot IS NOT NULL THEN
+        INSERT INTO pg_temp.vexfs_export_inodes
+        SELECT v_source_commit,
            i.inode_id,
            i.kind,
            i.mode,
@@ -10404,11 +11012,11 @@ BEGIN
            floor(extract(epoch FROM i.accessed_at) * 1000)::bigint,
            floor(extract(epoch FROM i.modified_at) * 1000)::bigint,
            floor(extract(epoch FROM i.changed_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.snapshot_inodes AS i ON i.snapshot_id = cp.snapshot_id
-     WHERE cp.snapshot_id IS NOT NULL;
-    INSERT INTO pg_temp.vexfs_export_inodes
-    SELECT cp.commit_no,
+          FROM _vexfs.snapshot_inodes AS i
+         WHERE i.snapshot_id = v_selected_snapshot;
+    ELSE
+        INSERT INTO pg_temp.vexfs_export_inodes
+        SELECT v_source_commit,
            i.inode_id,
            i.kind,
            i.mode,
@@ -10421,22 +11029,9 @@ BEGIN
            floor(extract(epoch FROM i.accessed_at) * 1000)::bigint,
            floor(extract(epoch FROM i.modified_at) * 1000)::bigint,
            floor(extract(epoch FROM i.changed_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.inodes AS i
-        ON i.workspace_id = v_workspace.workspace_id AND i.live
-     WHERE cp.selected AND cp.snapshot_id IS NULL
-    ON CONFLICT (commit_no, inode_id) DO UPDATE SET
-        kind = EXCLUDED.kind,
-        mode = EXCLUDED.mode,
-        owner_principal = EXCLUDED.owner_principal,
-        uid = EXCLUDED.uid,
-        gid = EXCLUDED.gid,
-        size_bytes = EXCLUDED.size_bytes,
-        current_version = EXCLUDED.current_version,
-        created_at_ms = EXCLUDED.created_at_ms,
-        accessed_at_ms = EXCLUDED.accessed_at_ms,
-        updated_at_ms = EXCLUDED.updated_at_ms,
-        changed_at_ms = EXCLUDED.changed_at_ms;
+          FROM _vexfs.inodes AS i
+         WHERE i.workspace_id = v_workspace.workspace_id AND i.live;
+    END IF;
 
     CREATE TEMP TABLE vexfs_export_dentries(
         commit_no bigint NOT NULL,
@@ -10444,18 +11039,17 @@ BEGIN
         name text NOT NULL,
         inode_id bigint NOT NULL,
         PRIMARY KEY (commit_no, parent_inode, name)) ON COMMIT DROP;
-    INSERT INTO pg_temp.vexfs_export_dentries
-    SELECT cp.commit_no, d.parent_inode, d.name, d.inode_id
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.snapshot_dentries AS d ON d.snapshot_id = cp.snapshot_id
-     WHERE cp.snapshot_id IS NOT NULL;
-    INSERT INTO pg_temp.vexfs_export_dentries
-    SELECT cp.commit_no, d.parent_inode, d.name, d.inode_id
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.dentries AS d ON d.workspace_id = v_workspace.workspace_id
-     WHERE cp.selected AND cp.snapshot_id IS NULL
-    ON CONFLICT (commit_no, parent_inode, name) DO UPDATE
-      SET inode_id = EXCLUDED.inode_id;
+    IF v_selected_snapshot IS NOT NULL THEN
+        INSERT INTO pg_temp.vexfs_export_dentries
+        SELECT v_source_commit, d.parent_inode, d.name, d.inode_id
+          FROM _vexfs.snapshot_dentries AS d
+         WHERE d.snapshot_id = v_selected_snapshot;
+    ELSE
+        INSERT INTO pg_temp.vexfs_export_dentries
+        SELECT v_source_commit, d.parent_inode, d.name, d.inode_id
+          FROM _vexfs.dentries AS d
+         WHERE d.workspace_id = v_workspace.workspace_id;
+    END IF;
 
     CREATE TEMP TABLE vexfs_export_xattrs(
         commit_no bigint NOT NULL,
@@ -10464,26 +11058,25 @@ BEGIN
         value bytea NOT NULL,
         updated_at_ms bigint NOT NULL,
         PRIMARY KEY (commit_no, inode_id, name)) ON COMMIT DROP;
-    INSERT INTO pg_temp.vexfs_export_xattrs
-    SELECT cp.commit_no,
+    IF v_selected_snapshot IS NOT NULL THEN
+        INSERT INTO pg_temp.vexfs_export_xattrs
+        SELECT v_source_commit,
            x.inode_id,
            x.name,
            x.value,
            floor(extract(epoch FROM x.updated_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.snapshot_xattrs AS x ON x.snapshot_id = cp.snapshot_id
-     WHERE cp.snapshot_id IS NOT NULL;
-    INSERT INTO pg_temp.vexfs_export_xattrs
-    SELECT cp.commit_no,
+          FROM _vexfs.snapshot_xattrs AS x
+         WHERE x.snapshot_id = v_selected_snapshot;
+    ELSE
+        INSERT INTO pg_temp.vexfs_export_xattrs
+        SELECT v_source_commit,
            x.inode_id,
            x.name,
            x.value,
            floor(extract(epoch FROM x.updated_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.xattrs AS x ON x.workspace_id = v_workspace.workspace_id
-     WHERE cp.selected AND cp.snapshot_id IS NULL
-    ON CONFLICT (commit_no, inode_id, name) DO UPDATE
-      SET value = EXCLUDED.value, updated_at_ms = EXCLUDED.updated_at_ms;
+          FROM _vexfs.xattrs AS x
+         WHERE x.workspace_id = v_workspace.workspace_id;
+    END IF;
 
     CREATE TEMP TABLE vexfs_export_acls(
         commit_no bigint NOT NULL,
@@ -10495,8 +11088,9 @@ BEGIN
         created_at_ms bigint NOT NULL,
         updated_at_ms bigint NOT NULL,
         PRIMARY KEY (commit_no, inode_id, principal, effect)) ON COMMIT DROP;
-    INSERT INTO pg_temp.vexfs_export_acls
-    SELECT cp.commit_no,
+    IF v_selected_snapshot IS NOT NULL THEN
+        INSERT INTO pg_temp.vexfs_export_acls
+        SELECT v_source_commit,
            acl.inode_id,
            acl.principal,
            acl.effect,
@@ -10504,11 +11098,11 @@ BEGIN
            acl.inherit_flags,
            floor(extract(epoch FROM acl.created_at) * 1000)::bigint,
            floor(extract(epoch FROM acl.updated_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.snapshot_acl_entries AS acl ON acl.snapshot_id = cp.snapshot_id
-     WHERE cp.snapshot_id IS NOT NULL;
-    INSERT INTO pg_temp.vexfs_export_acls
-    SELECT cp.commit_no,
+          FROM _vexfs.snapshot_acl_entries AS acl
+         WHERE acl.snapshot_id = v_selected_snapshot;
+    ELSE
+        INSERT INTO pg_temp.vexfs_export_acls
+        SELECT v_source_commit,
            acl.inode_id,
            acl.principal,
            acl.effect,
@@ -10516,14 +11110,9 @@ BEGIN
            acl.inherit_flags,
            floor(extract(epoch FROM acl.created_at) * 1000)::bigint,
            floor(extract(epoch FROM acl.updated_at) * 1000)::bigint
-      FROM pg_temp.vexfs_export_checkpoints AS cp
-      JOIN _vexfs.acl_entries AS acl ON acl.workspace_id = v_workspace.workspace_id
-     WHERE cp.selected AND cp.snapshot_id IS NULL
-    ON CONFLICT (commit_no, inode_id, principal, effect) DO UPDATE SET
-        permissions = EXCLUDED.permissions,
-        inherit_flags = EXCLUDED.inherit_flags,
-        created_at_ms = EXCLUDED.created_at_ms,
-        updated_at_ms = EXCLUDED.updated_at_ms;
+          FROM _vexfs.acl_entries AS acl
+         WHERE acl.workspace_id = v_workspace.workspace_id;
+    END IF;
 
     record_type := 'manifest';
     record_key := 'manifest';
@@ -10700,195 +11289,125 @@ BEGIN
      ORDER BY entry.manifest_id, entry.chunk_no;
 
     RETURN QUERY
-    WITH inode_keys AS (
-        SELECT DISTINCT state.inode_id FROM pg_temp.vexfs_export_inodes AS state),
-    grid AS (
-        SELECT cp.commit_no,
-               cp.created_at_ms AS checkpoint_created_at,
-               key.inode_id,
-               (state.inode_id IS NOT NULL) AS present,
-               lag(state.inode_id IS NOT NULL) OVER (
-                   PARTITION BY key.inode_id ORDER BY cp.commit_no) AS was_present
-          FROM pg_temp.vexfs_export_checkpoints AS cp
-          CROSS JOIN inode_keys AS key
-          LEFT JOIN pg_temp.vexfs_export_inodes AS state
-            ON state.commit_no = cp.commit_no AND state.inode_id = key.inode_id),
-    emitted AS (
-        SELECT grid.commit_no,
-               grid.checkpoint_created_at,
-               coalesce(current_state.inode_id, previous_state.inode_id) AS inode_id,
-               coalesce(current_state.kind, previous_state.kind) AS kind,
-               coalesce(current_state.mode, previous_state.mode) AS mode,
-               coalesce(current_state.owner_principal, previous_state.owner_principal) AS owner_principal,
-               coalesce(current_state.uid, previous_state.uid) AS uid,
-               coalesce(current_state.gid, previous_state.gid) AS gid,
-               coalesce(current_state.size_bytes, previous_state.size_bytes) AS size_bytes,
-               coalesce(current_state.current_version, previous_state.current_version) AS current_version,
-               coalesce(current_state.created_at_ms, previous_state.created_at_ms) AS created_at_ms,
-               coalesce(current_state.accessed_at_ms, previous_state.accessed_at_ms) AS accessed_at_ms,
-               coalesce(current_state.updated_at_ms, previous_state.updated_at_ms) AS updated_at_ms,
-               coalesce(current_state.changed_at_ms, previous_state.changed_at_ms) AS changed_at_ms,
-               grid.present
-          FROM grid
-          LEFT JOIN pg_temp.vexfs_export_inodes AS current_state
-            ON current_state.commit_no = grid.commit_no
-           AND current_state.inode_id = grid.inode_id
-          LEFT JOIN LATERAL (
-              SELECT state.*
-                FROM pg_temp.vexfs_export_inodes AS state
-               WHERE state.inode_id = grid.inode_id
-                 AND state.commit_no < grid.commit_no
-               ORDER BY state.commit_no DESC LIMIT 1) AS previous_state ON true
-         WHERE grid.present OR (grid.was_present AND NOT grid.present))
     SELECT 'inode_states'::text,
-           lpad(emitted.inode_id::text, 20, '0') || ':' ||
-               lpad(emitted.commit_no::text, 20, '0'),
+           lpad(state.inode_id::text, 20, '0') || ':' ||
+               lpad(state.commit_no::text, 20, '0'),
            jsonb_build_object(
-               'source_inode', emitted.inode_id,
-               'source_commit', emitted.commit_no,
-               'kind', emitted.kind,
-               'mode', emitted.mode,
-               'owner_principal', emitted.owner_principal,
-               'uid', emitted.uid,
-               'gid', emitted.gid,
-               'size', emitted.size_bytes,
-               'current_version', emitted.current_version,
-               'created_at', emitted.created_at_ms,
-               'accessed_at', emitted.accessed_at_ms,
-               'updated_at', emitted.updated_at_ms,
-               'changed_at', emitted.changed_at_ms,
-               'deleted_at', CASE WHEN emitted.present THEN NULL
-                                  ELSE emitted.checkpoint_created_at END),
+               'source_inode', state.inode_id,
+               'source_commit', state.commit_no,
+               'kind', state.kind,
+               'mode', state.mode,
+               'owner_principal', state.owner_principal,
+               'uid', state.uid,
+               'gid', state.gid,
+               'size', state.size_bytes,
+               'current_version', state.current_version,
+               'created_at', floor(extract(epoch FROM state.created_at) * 1000)::bigint,
+               'accessed_at', floor(extract(epoch FROM state.accessed_at) * 1000)::bigint,
+               'updated_at', floor(extract(epoch FROM state.modified_at) * 1000)::bigint,
+               'changed_at', floor(extract(epoch FROM state.changed_at) * 1000)::bigint,
+               'deleted_at', CASE WHEN state.live THEN NULL
+                                  ELSE floor(extract(epoch FROM checkpoint.created_at) * 1000)::bigint END),
            NULL::bytea
-      FROM emitted
-     ORDER BY emitted.inode_id, emitted.commit_no;
+      FROM _vexfs.inode_states AS state
+      JOIN _vexfs.metadata_checkpoints AS checkpoint
+        ON checkpoint.workspace_id = state.workspace_id
+       AND checkpoint.commit_no = state.commit_no
+     WHERE state.workspace_id = v_workspace.workspace_id
+       AND state.commit_no <= v_source_commit
+     ORDER BY state.inode_id, state.commit_no;
 
     RETURN QUERY
-    WITH keys AS (
-        SELECT DISTINCT state.parent_inode, state.name
-          FROM pg_temp.vexfs_export_dentries AS state),
-    grid AS (
-        SELECT cp.commit_no,
-               key.parent_inode,
-               key.name,
-               state.inode_id,
-               (state.inode_id IS NOT NULL) AS present,
-               lag(state.inode_id IS NOT NULL) OVER (
-                   PARTITION BY key.parent_inode, key.name ORDER BY cp.commit_no) AS was_present
-          FROM pg_temp.vexfs_export_checkpoints AS cp
-          CROSS JOIN keys AS key
-          LEFT JOIN pg_temp.vexfs_export_dentries AS state
-            ON state.commit_no = cp.commit_no
-           AND state.parent_inode = key.parent_inode
-           AND state.name = key.name)
     SELECT 'dentry_states'::text,
-           lpad(grid.parent_inode::text, 20, '0') || ':' ||
-               encode(convert_to(grid.name, 'UTF8'), 'hex') || ':' ||
-               lpad(grid.commit_no::text, 20, '0'),
+           lpad(state.parent_inode::text, 20, '0') || ':' ||
+               encode(convert_to(state.name, 'UTF8'), 'hex') || ':' ||
+               lpad(state.commit_no::text, 20, '0'),
            jsonb_build_object(
-               'parent_source_inode', grid.parent_inode,
-               'name', grid.name,
-               'source_commit', grid.commit_no,
-               'inode_source_id', coalesce(grid.inode_id, previous.inode_id),
-               'deleted', CASE WHEN grid.present THEN 0 ELSE 1 END),
+               'parent_source_inode', state.parent_inode,
+               'name', state.name,
+               'source_commit', state.commit_no,
+               'inode_source_id', state.inode_id,
+               'deleted', CASE WHEN state.deleted THEN 1 ELSE 0 END),
            NULL::bytea
-      FROM grid
-      LEFT JOIN LATERAL (
-          SELECT state.inode_id
-            FROM pg_temp.vexfs_export_dentries AS state
-           WHERE state.parent_inode = grid.parent_inode
-             AND state.name = grid.name
-             AND state.commit_no < grid.commit_no
-           ORDER BY state.commit_no DESC LIMIT 1) AS previous ON true
-     WHERE grid.present OR (grid.was_present AND NOT grid.present)
-     ORDER BY grid.parent_inode, grid.name, grid.commit_no;
+      FROM _vexfs.dentry_states AS state
+     WHERE state.workspace_id = v_workspace.workspace_id
+       AND state.commit_no <= v_source_commit
+     ORDER BY state.parent_inode, state.name, state.commit_no;
 
     RETURN QUERY
-    WITH keys AS (
-        SELECT DISTINCT state.inode_id, state.name
-          FROM pg_temp.vexfs_export_xattrs AS state),
-    grid AS (
-        SELECT cp.commit_no,
-               key.inode_id,
-               key.name,
-               state.value,
-               (state.inode_id IS NOT NULL) AS present,
-               lag(state.inode_id IS NOT NULL) OVER (
-                   PARTITION BY key.inode_id, key.name ORDER BY cp.commit_no) AS was_present
-          FROM pg_temp.vexfs_export_checkpoints AS cp
-          CROSS JOIN keys AS key
-          LEFT JOIN pg_temp.vexfs_export_xattrs AS state
-            ON state.commit_no = cp.commit_no
-           AND state.inode_id = key.inode_id
-           AND state.name = key.name)
     SELECT 'xattr_states'::text,
-           lpad(grid.inode_id::text, 20, '0') || ':' ||
-               encode(convert_to(grid.name, 'UTF8'), 'hex') || ':' ||
-               lpad(grid.commit_no::text, 20, '0'),
+           lpad(state.inode_id::text, 20, '0') || ':' ||
+               encode(convert_to(state.name, 'UTF8'), 'hex') || ':' ||
+               lpad(state.commit_no::text, 20, '0'),
            jsonb_build_object(
-               'source_inode', grid.inode_id,
-               'name', grid.name,
-               'source_commit', grid.commit_no,
-               'value_hex', encode(coalesce(grid.value, previous.value), 'hex'),
-               'deleted', CASE WHEN grid.present THEN 0 ELSE 1 END),
+               'source_inode', state.inode_id,
+               'name', state.name,
+               'source_commit', state.commit_no,
+               'value_hex', encode(state.value, 'hex'),
+               'updated_at', floor(extract(epoch FROM state.updated_at) * 1000)::bigint,
+               'deleted', CASE WHEN state.deleted THEN 1 ELSE 0 END),
            NULL::bytea
-      FROM grid
-      LEFT JOIN LATERAL (
-          SELECT state.value
-            FROM pg_temp.vexfs_export_xattrs AS state
-           WHERE state.inode_id = grid.inode_id
-             AND state.name = grid.name
-             AND state.commit_no < grid.commit_no
-           ORDER BY state.commit_no DESC LIMIT 1) AS previous ON true
-     WHERE grid.present OR (grid.was_present AND NOT grid.present)
-     ORDER BY grid.inode_id, grid.name, grid.commit_no;
+      FROM _vexfs.xattr_states AS state
+     WHERE state.workspace_id = v_workspace.workspace_id
+       AND state.commit_no <= v_source_commit
+     ORDER BY state.inode_id, state.name, state.commit_no;
 
     RETURN QUERY
-    WITH keys AS (
-        SELECT DISTINCT state.inode_id, state.principal, state.effect
-          FROM pg_temp.vexfs_export_acls AS state),
-    grid AS (
-        SELECT cp.commit_no,
-               key.inode_id,
-               key.principal,
-               key.effect,
-               state.permissions,
-               state.inherit_flags,
-               (state.inode_id IS NOT NULL) AS present,
-               lag(state.inode_id IS NOT NULL) OVER (
-                   PARTITION BY key.inode_id, key.principal, key.effect
-                   ORDER BY cp.commit_no) AS was_present
-          FROM pg_temp.vexfs_export_checkpoints AS cp
-          CROSS JOIN keys AS key
-          LEFT JOIN pg_temp.vexfs_export_acls AS state
-            ON state.commit_no = cp.commit_no
-           AND state.inode_id = key.inode_id
-           AND state.principal = key.principal
-           AND state.effect = key.effect)
+    WITH ordered AS (
+        SELECT state.*,
+               lag(state.acl_set_id) OVER (
+                   PARTITION BY state.inode_id ORDER BY state.commit_no) AS previous_acl_set_id
+          FROM _vexfs.inode_states AS state
+         WHERE state.workspace_id = v_workspace.workspace_id
+           AND state.commit_no <= v_source_commit),
+    changed AS (
+        SELECT * FROM ordered
+         WHERE acl_set_id IS DISTINCT FROM previous_acl_set_id),
+    keys AS (
+        SELECT changed.inode_id,
+               changed.commit_no,
+               changed.acl_set_id,
+               changed.previous_acl_set_id,
+               entry.principal,
+               entry.effect
+          FROM changed
+          JOIN _vexfs.acl_set_entries AS entry
+            ON entry.acl_set_id = changed.acl_set_id
+        UNION
+        SELECT changed.inode_id,
+               changed.commit_no,
+               changed.acl_set_id,
+               changed.previous_acl_set_id,
+               entry.principal,
+               entry.effect
+          FROM changed
+          JOIN _vexfs.acl_set_entries AS entry
+            ON entry.acl_set_id = changed.previous_acl_set_id)
     SELECT 'acl_states'::text,
-           lpad(grid.inode_id::text, 20, '0') || ':' ||
-               encode(convert_to(grid.principal, 'UTF8'), 'hex') || ':' ||
-               grid.effect || ':' || lpad(grid.commit_no::text, 20, '0'),
+           lpad(key.inode_id::text, 20, '0') || ':' ||
+               encode(convert_to(key.principal, 'UTF8'), 'hex') || ':' ||
+               key.effect || ':' || lpad(key.commit_no::text, 20, '0'),
            jsonb_build_object(
-               'source_inode', grid.inode_id,
-               'principal_id', grid.principal,
-               'effect', grid.effect,
-               'source_commit', grid.commit_no,
-               'permissions', coalesce(grid.permissions, previous.permissions),
-               'inherit_flags', coalesce(grid.inherit_flags, previous.inherit_flags),
-               'deleted', CASE WHEN grid.present THEN 0 ELSE 1 END),
+               'source_inode', key.inode_id,
+               'principal_id', key.principal,
+               'effect', key.effect,
+               'source_commit', key.commit_no,
+               'permissions', coalesce(current_entry.permissions, previous_entry.permissions),
+               'inherit_flags', coalesce(current_entry.inherit_flags, previous_entry.inherit_flags),
+               'deleted', CASE WHEN current_entry.acl_set_id IS NULL THEN 1 ELSE 0 END),
            NULL::bytea
-      FROM grid
-      LEFT JOIN LATERAL (
-          SELECT state.permissions, state.inherit_flags
-            FROM pg_temp.vexfs_export_acls AS state
-           WHERE state.inode_id = grid.inode_id
-             AND state.principal = grid.principal
-             AND state.effect = grid.effect
-             AND state.commit_no < grid.commit_no
-           ORDER BY state.commit_no DESC LIMIT 1) AS previous ON true
-     WHERE grid.present OR (grid.was_present AND NOT grid.present)
-     ORDER BY grid.inode_id, grid.principal, grid.effect, grid.commit_no;
+      FROM keys AS key
+      LEFT JOIN _vexfs.acl_set_entries AS current_entry
+        ON current_entry.acl_set_id = key.acl_set_id
+       AND current_entry.principal = key.principal
+       AND current_entry.effect = key.effect
+      LEFT JOIN _vexfs.acl_set_entries AS previous_entry
+        ON previous_entry.acl_set_id = key.previous_acl_set_id
+       AND previous_entry.principal = key.principal
+       AND previous_entry.effect = key.effect
+     WHERE current_entry.permissions IS DISTINCT FROM previous_entry.permissions
+        OR current_entry.inherit_flags IS DISTINCT FROM previous_entry.inherit_flags
+     ORDER BY key.inode_id, key.principal, key.effect, key.commit_no;
 
     RETURN QUERY
     SELECT 'snapshots'::text,
@@ -10939,7 +11458,19 @@ BEGIN
         SELECT state.owner_principal AS principal
           FROM pg_temp.vexfs_export_inodes AS state
         UNION
-        SELECT state.principal FROM pg_temp.vexfs_export_acls AS state)
+        SELECT state.principal FROM pg_temp.vexfs_export_acls AS state
+        UNION
+        SELECT state.owner_principal
+          FROM _vexfs.inode_states AS state
+         WHERE state.workspace_id = v_workspace.workspace_id
+           AND state.commit_no <= v_source_commit
+        UNION
+        SELECT entry.principal
+          FROM _vexfs.inode_states AS state
+          JOIN _vexfs.acl_set_entries AS entry
+            ON entry.acl_set_id = state.acl_set_id
+         WHERE state.workspace_id = v_workspace.workspace_id
+           AND state.commit_no <= v_source_commit)
     SELECT 'principals'::text,
            encode(convert_to(principals.principal, 'UTF8'), 'hex'),
            jsonb_build_object('source_principal', principals.principal),
@@ -11510,140 +12041,199 @@ BEGIN
         ON record.job_id = p_job AND record.record_type = 'snapshots'
        AND record.record_json->>'name' = snapshot_map.name;
 
-    INSERT INTO _vexfs.snapshot_inodes(
-        snapshot_id, inode_id, kind, mode, owner_oid, owner_role, owner_principal,
-        uid, gid, current_version, size_bytes, created_at, accessed_at,
-        modified_at, changed_at)
-    SELECT snapshot_map.local_id,
+    -- Keep the archive's incremental state records incremental in PostgreSQL.
+    -- The previous implementation expanded every state at every snapshot,
+    -- multiplying storage by snapshot count times workspace size.
+    INSERT INTO _vexfs.metadata_checkpoints(workspace_id, commit_no, created_at)
+    SELECT DISTINCT v_workspace_id,
+           commit_map.local_id,
+           coalesce(snapshot.created_at, clock_timestamp())
+      FROM (
+          SELECT (record.record_json->>'source_commit')::bigint AS source_commit
+            FROM _vexfs.archive_import_records AS record
+           WHERE record.job_id = p_job
+             AND record.record_type IN (
+                 'inode_states', 'dentry_states', 'xattr_states', 'acl_states')
+          UNION
+          SELECT snapshot_map.source_commit
+            FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map) AS point
+      JOIN pg_temp.vexfs_import_commit_map AS commit_map
+        ON commit_map.source_id = point.source_commit
+      LEFT JOIN LATERAL (
+          SELECT to_timestamp(
+                     (record.record_json->>'created_at')::bigint / 1000.0) AS created_at
+            FROM _vexfs.archive_import_records AS record
+           WHERE record.job_id = p_job
+             AND record.record_type = 'snapshots'
+             AND (record.record_json->>'source_commit')::bigint = point.source_commit
+           ORDER BY record.record_json->>'name'
+           LIMIT 1) AS snapshot ON true
+    ON CONFLICT (workspace_id, commit_no) DO NOTHING;
+
+    INSERT INTO _vexfs.inode_states(
+        workspace_id, inode_id, commit_no, kind, mode, owner_oid, owner_role,
+        owner_principal, uid, gid, acl_set_id, current_version, size_bytes,
+        live, created_at, accessed_at, modified_at, changed_at)
+    SELECT v_workspace_id,
            inode_map.local_id,
-           state.kind,
-           state.mode,
+           commit_map.local_id,
+           record.record_json->>'kind',
+           (record.record_json->>'mode')::integer,
            v_actor,
            session_user,
-           state.owner_principal,
-           state.uid,
-           state.gid,
-           CASE WHEN state.kind = 'directory' THEN 0
-                ELSE state.current_version END,
-           state.size_bytes,
-           to_timestamp(state.created_at_ms / 1000.0),
-           to_timestamp(state.accessed_at_ms / 1000.0),
-           to_timestamp(state.updated_at_ms / 1000.0),
-           to_timestamp(state.changed_at_ms / 1000.0)
-      FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
-      JOIN LATERAL (
-          SELECT DISTINCT ON ((record.record_json->>'source_inode')::bigint)
-                 (record.record_json->>'source_inode')::bigint AS source_inode,
-                 record.record_json->>'kind' AS kind,
-                 (record.record_json->>'mode')::integer AS mode,
-                 record.record_json->>'owner_principal' AS owner_principal,
-                 (record.record_json->>'uid')::bigint AS uid,
-                 (record.record_json->>'gid')::bigint AS gid,
-                 (record.record_json->>'size')::bigint AS size_bytes,
-                 (record.record_json->>'current_version')::bigint AS current_version,
-                 (record.record_json->>'created_at')::bigint AS created_at_ms,
-                 (record.record_json->>'accessed_at')::bigint AS accessed_at_ms,
-                 (record.record_json->>'updated_at')::bigint AS updated_at_ms,
-                 (record.record_json->>'changed_at')::bigint AS changed_at_ms,
-                 record.record_json->>'deleted_at' AS deleted_at
-            FROM _vexfs.archive_import_records AS record
-           WHERE record.job_id = p_job AND record.record_type = 'inode_states'
-             AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
-           ORDER BY (record.record_json->>'source_inode')::bigint,
-                    (record.record_json->>'source_commit')::bigint DESC) AS state
-        ON state.deleted_at IS NULL
+           record.record_json->>'owner_principal',
+           (record.record_json->>'uid')::bigint,
+           (record.record_json->>'gid')::bigint,
+           NULL,
+           CASE WHEN record.record_json->>'kind' = 'directory' THEN 0
+                ELSE (record.record_json->>'current_version')::bigint END,
+           (record.record_json->>'size')::bigint,
+           (record.record_json->>'deleted_at') IS NULL,
+           to_timestamp((record.record_json->>'created_at')::bigint / 1000.0),
+           to_timestamp((record.record_json->>'accessed_at')::bigint / 1000.0),
+           to_timestamp((record.record_json->>'updated_at')::bigint / 1000.0),
+           to_timestamp((record.record_json->>'changed_at')::bigint / 1000.0)
+      FROM _vexfs.archive_import_records AS record
       JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = state.source_inode;
+        ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
+      JOIN pg_temp.vexfs_import_commit_map AS commit_map
+        ON commit_map.source_id = (record.record_json->>'source_commit')::bigint
+     WHERE record.job_id = p_job AND record.record_type = 'inode_states';
 
-    INSERT INTO _vexfs.snapshot_dentries(snapshot_id, parent_inode, name, inode_id)
-    SELECT snapshot_map.local_id, parent_map.local_id, state.name, child_map.local_id
-      FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
-      JOIN LATERAL (
-          SELECT DISTINCT ON (
-                     (record.record_json->>'parent_source_inode')::bigint,
-                     record.record_json->>'name')
-                 (record.record_json->>'parent_source_inode')::bigint AS parent_source,
-                 record.record_json->>'name' AS name,
-                 (record.record_json->>'inode_source_id')::bigint AS child_source,
-                 (record.record_json->>'deleted')::integer AS deleted
-            FROM _vexfs.archive_import_records AS record
-           WHERE record.job_id = p_job AND record.record_type = 'dentry_states'
-             AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
-           ORDER BY (record.record_json->>'parent_source_inode')::bigint,
-                    record.record_json->>'name',
-                    (record.record_json->>'source_commit')::bigint DESC) AS state
-        ON state.deleted = 0
+    INSERT INTO _vexfs.dentry_states(
+        workspace_id, parent_inode, name, commit_no, inode_id, deleted)
+    SELECT v_workspace_id,
+           parent_map.local_id,
+           record.record_json->>'name',
+           commit_map.local_id,
+           child_map.local_id,
+           (record.record_json->>'deleted')::integer <> 0
+      FROM _vexfs.archive_import_records AS record
       JOIN pg_temp.vexfs_import_inode_map AS parent_map
-        ON parent_map.source_id = state.parent_source
+        ON parent_map.source_id =
+           (record.record_json->>'parent_source_inode')::bigint
       JOIN pg_temp.vexfs_import_inode_map AS child_map
-        ON child_map.source_id = state.child_source;
+        ON child_map.source_id =
+           (record.record_json->>'inode_source_id')::bigint
+      JOIN pg_temp.vexfs_import_commit_map AS commit_map
+        ON commit_map.source_id = (record.record_json->>'source_commit')::bigint
+     WHERE record.job_id = p_job AND record.record_type = 'dentry_states';
 
-    INSERT INTO _vexfs.snapshot_xattrs(snapshot_id, inode_id, name, value, updated_at)
-    SELECT snapshot_map.local_id, inode_map.local_id, state.name,
-           decode(state.value_hex, 'hex'),
-           to_timestamp((snapshot_record.record_json->>'created_at')::bigint / 1000.0)
-      FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
-      JOIN _vexfs.archive_import_records AS snapshot_record
-        ON snapshot_record.job_id = p_job
-       AND snapshot_record.record_type = 'snapshots'
-       AND snapshot_record.record_json->>'name' = snapshot_map.name
-      JOIN LATERAL (
-          SELECT DISTINCT ON (
-                     (record.record_json->>'source_inode')::bigint,
-                     record.record_json->>'name')
-                 (record.record_json->>'source_inode')::bigint AS source_inode,
-                 record.record_json->>'name' AS name,
-                 record.record_json->>'value_hex' AS value_hex,
-                 (record.record_json->>'deleted')::integer AS deleted
-            FROM _vexfs.archive_import_records AS record
-           WHERE record.job_id = p_job AND record.record_type = 'xattr_states'
-             AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
-           ORDER BY (record.record_json->>'source_inode')::bigint,
-                    record.record_json->>'name',
-                    (record.record_json->>'source_commit')::bigint DESC) AS state
-        ON state.deleted = 0
+    INSERT INTO _vexfs.xattr_states(
+        workspace_id, inode_id, name, commit_no, value, deleted, updated_at)
+    SELECT v_workspace_id,
+           inode_map.local_id,
+           record.record_json->>'name',
+           commit_map.local_id,
+           decode(record.record_json->>'value_hex', 'hex'),
+           (record.record_json->>'deleted')::integer <> 0,
+           coalesce(
+               to_timestamp((record.record_json->>'updated_at')::bigint / 1000.0),
+               clock_timestamp())
+      FROM _vexfs.archive_import_records AS record
       JOIN pg_temp.vexfs_import_inode_map AS inode_map
-        ON inode_map.source_id = state.source_inode;
+        ON inode_map.source_id = (record.record_json->>'source_inode')::bigint
+      JOIN pg_temp.vexfs_import_commit_map AS commit_map
+        ON commit_map.source_id = (record.record_json->>'source_commit')::bigint
+     WHERE record.job_id = p_job AND record.record_type = 'xattr_states';
 
+    -- ACL sets stay content-addressed.  If an archive records an ACL-only
+    -- change, materialize one inode overlay at that commit and point it at the
+    -- reconstructed immutable set.
     FOR v_acl IN
-        SELECT snapshot_map.local_id AS snapshot_id,
+        WITH acl_points AS (
+            SELECT DISTINCT
+                   (record.record_json->>'source_commit')::bigint AS source_commit,
+                   (record.record_json->>'source_inode')::bigint AS source_inode
+              FROM _vexfs.archive_import_records AS record
+             WHERE record.job_id = p_job AND record.record_type = 'acl_states')
+        SELECT commit_map.local_id AS commit_no,
                inode_map.local_id AS inode_id,
-               jsonb_agg(jsonb_build_object(
+               coalesce(jsonb_agg(jsonb_build_object(
                    'principal', state.principal,
                    'effect', state.effect,
                    'permissions', state.permissions,
                    'inherit', state.inherit_flags)
-                   ORDER BY state.principal, state.effect) AS entries
-          FROM pg_temp.vexfs_import_snapshot_map AS snapshot_map
-          JOIN LATERAL (
-              SELECT DISTINCT ON (
-                         (record.record_json->>'source_inode')::bigint,
-                         record.record_json->>'principal_id',
-                         record.record_json->>'effect')
-                     (record.record_json->>'source_inode')::bigint AS source_inode,
-                     record.record_json->>'principal_id' AS principal,
-                     record.record_json->>'effect' AS effect,
-                     record.record_json->>'permissions' AS permissions,
-                     (record.record_json->>'inherit_flags')::integer AS inherit_flags,
-                     (record.record_json->>'deleted')::integer AS deleted
-                FROM _vexfs.archive_import_records AS record
-               WHERE record.job_id = p_job AND record.record_type = 'acl_states'
-                 AND (record.record_json->>'source_commit')::bigint <= snapshot_map.source_commit
-               ORDER BY (record.record_json->>'source_inode')::bigint,
-                        record.record_json->>'principal_id',
-                        record.record_json->>'effect',
-                        (record.record_json->>'source_commit')::bigint DESC) AS state
-            ON state.deleted = 0
+                   ORDER BY state.principal, state.effect)
+                   FILTER (WHERE state.principal IS NOT NULL), '[]'::jsonb) AS entries
+          FROM acl_points AS point
+          JOIN pg_temp.vexfs_import_commit_map AS commit_map
+            ON commit_map.source_id = point.source_commit
           JOIN pg_temp.vexfs_import_inode_map AS inode_map
-            ON inode_map.source_id = state.source_inode
-         GROUP BY snapshot_map.local_id, inode_map.local_id
+            ON inode_map.source_id = point.source_inode
+          LEFT JOIN LATERAL (
+              SELECT latest.principal,
+                     latest.effect,
+                     latest.permissions,
+                     latest.inherit_flags
+                FROM (
+                    SELECT DISTINCT ON (
+                               record.record_json->>'principal_id',
+                               record.record_json->>'effect')
+                           record.record_json->>'principal_id' AS principal,
+                           record.record_json->>'effect' AS effect,
+                           record.record_json->>'permissions' AS permissions,
+                           (record.record_json->>'inherit_flags')::integer AS inherit_flags,
+                           (record.record_json->>'deleted')::integer AS deleted
+                      FROM _vexfs.archive_import_records AS record
+                     WHERE record.job_id = p_job
+                       AND record.record_type = 'acl_states'
+                       AND (record.record_json->>'source_inode')::bigint =
+                           point.source_inode
+                       AND (record.record_json->>'source_commit')::bigint <=
+                           point.source_commit
+                     ORDER BY record.record_json->>'principal_id',
+                              record.record_json->>'effect',
+                              (record.record_json->>'source_commit')::bigint DESC
+                ) AS latest
+               WHERE latest.deleted = 0) AS state ON true
+         GROUP BY commit_map.local_id, inode_map.local_id
     LOOP
-        v_acl_set := _vexfs.get_or_create_acl_set(v_workspace_id, v_acl.entries);
-        UPDATE _vexfs.snapshot_inodes AS inode
+        INSERT INTO _vexfs.inode_states(
+            workspace_id, inode_id, commit_no, kind, mode, owner_oid,
+            owner_role, owner_principal, uid, gid, acl_set_id,
+            current_version, size_bytes, live, created_at, accessed_at,
+            modified_at, changed_at)
+        SELECT history.workspace_id, history.inode_id, v_acl.commit_no,
+               history.kind, history.mode, history.owner_oid,
+               history.owner_role, history.owner_principal, history.uid,
+               history.gid, history.acl_set_id, history.current_version,
+               history.size_bytes, history.live, history.created_at,
+               history.accessed_at, history.modified_at, history.changed_at
+          FROM _vexfs.inode_states AS history
+         WHERE history.workspace_id = v_workspace_id
+           AND history.inode_id = v_acl.inode_id
+           AND history.commit_no <= v_acl.commit_no
+         ORDER BY history.commit_no DESC
+         LIMIT 1
+        ON CONFLICT (workspace_id, inode_id, commit_no) DO NOTHING;
+        IF jsonb_array_length(v_acl.entries) = 0 THEN
+            v_acl_set := NULL;
+        ELSE
+            v_acl_set := _vexfs.get_or_create_acl_set(
+                v_workspace_id, v_acl.entries);
+        END IF;
+        UPDATE _vexfs.inode_states AS state
            SET acl_set_id = v_acl_set
-         WHERE inode.snapshot_id = v_acl.snapshot_id
-           AND inode.inode_id = v_acl.inode_id;
+         WHERE state.workspace_id = v_workspace_id
+           AND state.commit_no = v_acl.commit_no
+           AND state.inode_id = v_acl.inode_id;
     END LOOP;
+
+    UPDATE _vexfs.metadata_checkpoints AS checkpoint
+       SET inode_changes = (
+               SELECT count(*) FROM _vexfs.inode_states AS state
+                WHERE state.workspace_id = checkpoint.workspace_id
+                  AND state.commit_no = checkpoint.commit_no),
+           dentry_changes = (
+               SELECT count(*) FROM _vexfs.dentry_states AS state
+                WHERE state.workspace_id = checkpoint.workspace_id
+                  AND state.commit_no = checkpoint.commit_no),
+           xattr_changes = (
+               SELECT count(*) FROM _vexfs.xattr_states AS state
+                WHERE state.workspace_id = checkpoint.workspace_id
+                  AND state.commit_no = checkpoint.commit_no)
+     WHERE checkpoint.workspace_id = v_workspace_id;
 
     UPDATE _vexfs.workspaces
        SET root_inode = v_root,

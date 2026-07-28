@@ -877,6 +877,9 @@ vexfs_snapshots
 ```
 
 快照只记录 commit id，接近 O(1)。长期历史由显式版本表保证，不依赖数据库 MVCC 旧版本保留。
+内部使用一个完整元数据基线和后续 inode/dentry/xattr 增量；ACL 通过不可变 ACL set 引用。多个
+快照名称指向同一 commit 时共享状态。GC 在最老仍保留快照处写新基线，再删除旧增量并推进
+`history_floor_commit`。
 
 ### 8.6 权限和审计
 
@@ -1053,10 +1056,12 @@ vexfs snapshot list workspace
 vexfs restore workspace --snapshot before-change --path /reports
 vexfs export workspace --snapshot before-change --output workspace.vexfs
 vexfs import workspace.vexfs --workspace restored-workspace
-vexfs backup verify workspace
+vexfs check workspace
+vexfs archive verify workspace.vexfs
 ```
 
-`backup verify` 只检查当前数据库、快照和逻辑导出的完整性，不假装替数据库执行物理备份。
+当前 workspace 使用 deep check，format v2 使用 archive verify。数据库原生备份使用数据库自己的
+校验工具和真实恢复演练，不提供一个含义不清的通用 `backup verify`。
 
 实际大数据导出使用数据库自己的 COPY、结果流或应用接口。VexFS 不上传 S3、不调度定时任务、不保存密钥。备份调度、保存位置、加密和异地复制仍由数据库运维系统负责。
 
@@ -1411,8 +1416,12 @@ vexdb_lite/
 - 已验证文件与普通业务 SQL 参加同一数据库事务；
 - macOS FSKit、Linux FUSE、跨系统同一 PG、第二台 M1 Mac OpenCode 已通过；
 - pg_dump/pg_restore、pg_basebackup 和逻辑导出恢复已通过；
-- 16 MiB 有界备份性能与 RSS/OOM Gate 23 项已通过；当前审计实现下 format v2 导出/导入
-  为 72.727/106.667 MiB/s，1 GiB 容器没有 OOM；
+- 16 MiB 有界备份性能与 RSS/OOM Gate 23 项已通过；format v2 导出/导入为
+  55.172/21.333 MiB/s，1 GiB 容器没有 OOM；
+- 10,000 文件 × 30 快照 Gate 已通过：基线快照 115.698 ms、增量快照 P95 3.317 ms、
+  format v2 记录流 454 ms、最老快照恢复 992 ms、删除 29 个快照后的元数据压实 426 ms；
+  PG 快照已使用基线加增量状态，不再为
+  每个快照复制整棵元数据树；
 - 当前数据库源码的自动测试、Linux 真挂载、本机 PostgreSQL FSKit 13 组 247 项、凭据生命周期
   9 项、macOS↔Linux 跨 gateway 47 项、两台 Mac 文件/快照往返 50 项和 extension/网络/数据库
   故障恢复 25 项已完成；最后发行验收是从干净提交构建、公证并 staple `preview.38`，再在

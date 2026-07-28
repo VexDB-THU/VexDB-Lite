@@ -83,10 +83,14 @@ steps:
 - query: SELECT (vexfs_gc_pause('pg-gc', 0)->>'gc_paused')::boolean;
   expect:
   - - false
-- query: SELECT (result->>'deleted_versions')::bigint, (result->>'remaining_reclaimable_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 1) AS result) AS gc;
+- query: SELECT (result->>'deleted_versions')::bigint, (result->>'remaining_reclaimable_versions')::bigint, (result->>'metadata_floor_commit')::bigint FROM (SELECT vexfs_gc('pg-gc', 1) AS result) AS gc;
   expect:
   - - 1
     - 1
+    - 3
+- query: SELECT history_floor_commit FROM _vexfs.workspaces WHERE name='pg-gc';
+  expect:
+  - - 3
 - query: SELECT (result->>'deleted_versions')::bigint, (result->>'remaining_reclaimable_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 1) AS result) AS gc;
   expect:
   - - 1
@@ -106,10 +110,14 @@ steps:
 - query: SELECT (vexfs_retention_set('pg-gc', 1, 0)->>'reclaimable_versions')::bigint;
   expect:
   - - 1
-- query: SELECT (result->>'remaining_reclaimable_versions')::bigint, (result->>'remaining_versions')::bigint FROM (SELECT vexfs_gc('pg-gc', 10000) AS result) AS gc;
+- query: SELECT (result->>'remaining_reclaimable_versions')::bigint, (result->>'remaining_versions')::bigint, (result->>'metadata_floor_commit')::bigint FROM (SELECT vexfs_gc('pg-gc', 10000) AS result) AS gc;
   expect:
   - - 0
     - 2
+    - 6
+- query: SELECT EXISTS(SELECT 1 FROM _vexfs.inode_states AS state JOIN _vexfs.workspaces AS workspace USING(workspace_id) WHERE workspace.name='pg-gc' AND state.commit_no < 6);
+  expect:
+  - - false
 - query: SELECT (vexfs_retention_get('pg-gc')->>'stored_versions')::bigint, (vexfs_retention_get('pg-gc')->>'stored_version_bytes')::bigint;
   expect:
   - - 2

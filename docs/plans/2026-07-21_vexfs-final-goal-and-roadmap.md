@@ -337,8 +337,8 @@ SQLite 证据。当前 format v2 已支持 SQLite 和 PostgreSQL，DuckDB adapte
 - 当前审计实现已复跑 PG 16–19 共 36 项、Linux FUSE root 142 项和 uid 1000 143 项，
   均无失败、无跳过；1000 文件为 649.882 ms、1538.741 files/s，审计数和字段完整性通过；
 - 16 MiB 备份性能 Gate 23 项通过，覆盖逻辑/物理备份、克隆启动、format v2 和 RSS/OOM；
-  当前数据为逻辑 dump/restore 173.913/175.824 MiB/s、format v2 导出/导入
-  72.727/106.667 MiB/s、`memory.max=1 GiB`、`oom_kill=0`；
+  2026-07-28 数据为逻辑 dump/restore 139.130/128.000 MiB/s、物理备份 28.902 MiB/s、
+  format v2 导出/导入 55.172/21.333 MiB/s、`memory.max=1 GiB`、`oom_kill=0`；
 - format v2 与备份性能脚本会从所选容器推导本机端口，不能再把容器切到 `5434` 后误测
   固定在 `5433` 的另一套 PostgreSQL；
 - 两台 Mac 的局域网 TCP、libpq 和 runtime 已通过。直连 FSKit 的最后一步需要用户在第二台
@@ -435,10 +435,13 @@ DuckDB adapter 已由其他方向负责，不在本路线继续；本路线只�
    10 万 commit 的 SQLite 查询为 0/3 ms、PG 为 157/158 ms，1 GiB Gate 内无 OOM。
 3. **已完成：**增加 manual/agent/safety 快照分类、独立保留规则、`prune --dry-run`、
    `doctor` 恢复指标，以及十万快照性能和并发 Gate。
-4. **当前任务：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，并给出恢复命令。
-5. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
+4. **已完成：**PG 快照改为基线加增量状态，补 metadata GC、真实 history floor、直接增量
+   format v2 和 10,000 文件 × 30 快照 Gate；增量快照 P95 3.317 ms，最老快照恢复 992 ms，
+   删除 29 个快照后的元数据压实 426 ms。
+5. **当前任务：**实现 `vexdb fs run --snapshot-before -- <command>`，原样传递终端和退出码，并给出恢复命令。
+6. **发行 Gate：**从干净提交生成签名公证包，在干净 Mac 和第二台 Mac 上按默认 NFS 复跑；补
    sleep/wake、跨机器锁和长时间 Agent 工作区。
-6. **后续：**按 PITR 路线图做 SQLite commit 固定快照、show/diff 和按时间选择；随后再做 Windows WinFsp。
+7. **后续：**按 PITR 路线图做 SQLite commit 固定快照、show/diff 和按时间选择；随后再做 Windows WinFsp。
 
 DuckDB adapter、语义层、自动合并两个 Agent 和默认 FSKit 不进入当前队列。PG 逐 commit PITR
 必须先由真实快照规模数据证明需要，不能提前增加长期写放大。

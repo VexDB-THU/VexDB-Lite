@@ -114,6 +114,13 @@ VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev VEXFS_SNAPSHOT_POLICY_COUNT=10000 \
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
   bash tests/eval/vexfs/run_snapshot_policy_performance.sh
 
+# 真实大树 checkpoint Gate：默认 1 万文件、30 个快照、每次单文件修改。
+# 验证基线/增量快照、状态行不按“树 × 快照”膨胀、format v2 直接输出增量、
+# 最老快照恢复、删除旧快照后的 metadata floor/GC、压实后恢复、1 GiB
+# memory.max 和 oom_kill。容器没有有限内存上限时主动拒绝。
+VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
+  bash tests/eval/vexfs/run_pg_snapshot_checkpoint_performance.sh
+
 # SQLite 与 PG 同时运行 8 个 typed snapshot create 和 4 个 prune，最后必须只保留
 # 1 个 manual、5 个 agent、5 个 safety，且 deep check 通过。
 VEXDB_PG_CONTAINER=vexdb_pg19-vexfs-dev \
