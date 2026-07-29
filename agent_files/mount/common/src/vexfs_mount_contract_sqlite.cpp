@@ -1436,6 +1436,11 @@ extern "C" void vexfs_mount_session_close(vexfs_mount_session *session) {
     delete session;
 }
 
+extern "C" vexfs_mount_status vexfs_mount_session_keepalive(
+    vexfs_mount_session *session, vexfs_mount_error *error) {
+    return Guard(session, error, [&] { RequireSession(session); });
+}
+
 extern "C" vexfs_mount_status vexfs_mount_diagnostics(vexfs_mount_session *session,
                                                          vexfs_mount_bytes *json,
                                                          vexfs_mount_error *error) {

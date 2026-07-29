@@ -174,6 +174,8 @@ int main(int argc, char **argv) {
     vexfs_mount_session *session = nullptr;
     if (!CheckStatus("open", vexfs_mount_session_open(&config, &session, &error), error))
         return 1;
+    if (!CheckStatus("keepalive", vexfs_mount_session_keepalive(session, &error), error))
+        return 1;
 
     vexfs_mount_bytes bytes{};
     if (!CheckStatus("diagnostics", vexfs_mount_diagnostics(session, &bytes, &error), error))

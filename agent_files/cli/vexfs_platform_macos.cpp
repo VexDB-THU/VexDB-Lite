@@ -1149,8 +1149,10 @@ int VexFSPlatformMount(const std::string &backend, const std::string &connection
             // Keep I/O bounded if the per-mount gateway exits. Keep the normal
             // adaptive RTT estimator: dumbtimer makes sparse fsync workloads
             // wait one fixed timeout for every dirty NFS block on macOS.
+            // Reads should not create workspace commits merely by changing atime.
+            // Explicit utimens still persists atime through SETATTR.
             const std::string options =
-                "vers=3,tcp,locallocks,soft,timeo=10,retrans=4,"
+                "vers=3,tcp,locallocks,soft,noatime,timeo=10,retrans=4,"
                 "rsize=1048576,wsize=1048576,"
                 "deadtimeout=60,actimeo=1,port=" +
                 std::to_string(gateway.port) + ",mountport=" +

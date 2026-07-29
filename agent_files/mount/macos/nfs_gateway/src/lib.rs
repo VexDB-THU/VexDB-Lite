@@ -33,10 +33,20 @@ const DEFERRED_PUBLISH_MAX_AGE_MS: i64 = 30_000;
 const DEFERRED_PUBLISH_DIRTY_BYTES: u64 = 4 * 1024 * 1024;
 const DEFERRED_PUBLISH_BATCH_BYTES: u64 = 8 * 1024 * 1024;
 const DEFERRED_PUBLISH_FILE_THRESHOLD: usize = 1_024;
+const DEFERRED_PUBLISH_RETRY_INITIAL_MS: i64 = 250;
+const DEFERRED_PUBLISH_RETRY_MAX_MS: i64 = 5_000;
+const MOUNT_SESSION_KEEPALIVE_INTERVAL_MS: u64 = 5_000;
 // Remote PostgreSQL may spend tens of milliseconds publishing one version.
 // Keep one background lock hold below the macOS NFS retransmit window; a large
 // batch makes unrelated foreground reads look like a dead server.
 const DEFERRED_PUBLISH_BATCH_SIZE: i64 = 8;
+
+fn deferred_publish_retry_delay_ms(consecutive_failures: u32) -> i64 {
+    let shift = consecutive_failures.saturating_sub(1).min(5);
+    DEFERRED_PUBLISH_RETRY_INITIAL_MS
+        .saturating_mul(1_i64 << shift)
+        .min(DEFERRED_PUBLISH_RETRY_MAX_MS)
+}
 
 #[repr(C)]
 pub struct VexfsNfsGatewayConfig {
@@ -89,6 +99,10 @@ extern "C" {
     fn vexfs_mount_session_open(
         config: *const RuntimeConfig,
         session: *mut *mut RuntimeSessionOpaque,
+        error: *mut RuntimeError,
+    ) -> RuntimeStatus;
+    fn vexfs_mount_session_keepalive(
+        session: *mut RuntimeSessionOpaque,
         error: *mut RuntimeError,
     ) -> RuntimeStatus;
     fn vexfs_mount_session_close(session: *mut RuntimeSessionOpaque);
@@ -2052,12 +2066,57 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
         .build()
         .map_err(|error| error.to_string())?;
     runtime.block_on(async move {
+        if postgresql_backend {
+            let keepalive_state = Arc::clone(&shared_state);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_millis(
+                    MOUNT_SESSION_KEEPALIVE_INTERVAL_MS,
+                ));
+                // interval's first tick is immediate; the session was just opened,
+                // so wait for one full period before checking whether renewal is due.
+                interval.tick().await;
+                let mut failing = false;
+                loop {
+                    interval.tick().await;
+                    let session = {
+                        let Ok(state) = keepalive_state.lock() else {
+                            return;
+                        };
+                        state.session as usize
+                    };
+                    let mut error = empty_error();
+                    let status = unsafe {
+                        vexfs_mount_session_keepalive(
+                            session as *mut RuntimeSessionOpaque,
+                            &mut error,
+                        )
+                    };
+                    if status == 0 {
+                        if failing {
+                            eprintln!("vexfs-nfs-gateway: mount session keepalive recovered");
+                        }
+                        failing = false;
+                    } else if !failing {
+                        eprintln!(
+                            "vexfs-nfs-gateway: mount session keepalive failed: {}",
+                            runtime_error_message(&error)
+                        );
+                        failing = true;
+                    }
+                }
+            });
+        }
         let publish_state = Arc::clone(&shared_state);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(25));
+            let mut consecutive_failures = 0_u32;
+            let mut next_publish_attempt_at_ms = 0_i64;
             loop {
                 interval.tick().await;
                 let now = now_ms();
+                if now < next_publish_attempt_at_ms {
+                    continue;
+                }
                 let publish_job = {
                     let Ok(mut state) = publish_state.lock() else {
                         return;
@@ -2097,12 +2156,23 @@ fn run_gateway(config: &VexfsNfsGatewayConfig) -> Result<(), String> {
                 let Ok(mut state) = publish_state.lock() else {
                     return;
                 };
+                let mut publish_failed = false;
                 if let Err(status) = state.complete_publish_claims(&candidates, &outcome.published)
                 {
                     eprintln!("vexfs-nfs-gateway: deferred publish result mismatch: {status:?}");
+                    publish_failed = true;
                 }
                 if let Some(status) = outcome.failure {
                     eprintln!("vexfs-nfs-gateway: deferred claimed publish failed: {status:?}");
+                    publish_failed = true;
+                }
+                if publish_failed {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    let retry_delay = deferred_publish_retry_delay_ms(consecutive_failures);
+                    next_publish_attempt_at_ms = now_ms().saturating_add(retry_delay);
+                } else {
+                    consecutive_failures = 0;
+                    next_publish_attempt_at_ms = 0;
                 }
             }
         });
@@ -2186,6 +2256,15 @@ pub unsafe extern "C" fn vexfs_nfs_gateway_run(
 extern "C" fn test_vexfs_mount_session_close(_session: *mut RuntimeSessionOpaque) {}
 
 #[cfg(test)]
+#[export_name = "vexfs_mount_session_keepalive"]
+extern "C" fn test_vexfs_mount_session_keepalive(
+    _session: *mut RuntimeSessionOpaque,
+    _error: *mut RuntimeError,
+) -> RuntimeStatus {
+    0
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2249,6 +2328,16 @@ mod tests {
 
         let claimed = state.claim_deferred_publish_batch(now + DEFERRED_PUBLISH_IDLE_MS);
         assert_eq!(claimed.len(), 2);
+    }
+
+    #[test]
+    fn deferred_publish_failures_back_off_and_cap() {
+        assert_eq!(deferred_publish_retry_delay_ms(1), 250);
+        assert_eq!(deferred_publish_retry_delay_ms(2), 500);
+        assert_eq!(deferred_publish_retry_delay_ms(3), 1_000);
+        assert_eq!(deferred_publish_retry_delay_ms(5), 4_000);
+        assert_eq!(deferred_publish_retry_delay_ms(6), 5_000);
+        assert_eq!(deferred_publish_retry_delay_ms(100), 5_000);
     }
 
     #[test]

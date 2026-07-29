@@ -4549,10 +4549,11 @@ BEGIN
            version_no = EXCLUDED.version_no,
            content = EXCLUDED.content,
            indexed_at = clock_timestamp();
-EXCEPTION WHEN OTHERS THEN
-    UPDATE _vexfs.workspaces
-       SET grep_index_dirty = true
-     WHERE workspace_id = p_workspace_id;
+    -- Do not add a PL/pgSQL EXCEPTION block here. PostgreSQL 19 assigns the
+    -- trigger's relation references to the surrounding Portal; the implicit
+    -- subtransaction created by EXCEPTION releases them under the wrong
+    -- resource owner and aborts the authoritative file write. Expected
+    -- non-indexable inputs are handled explicitly above.
 END;
 $$;
 

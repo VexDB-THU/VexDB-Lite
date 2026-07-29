@@ -80,6 +80,27 @@ steps:
   expect:
   - - false
     - 2
+- query: SELECT vexfs_mount_session_start('pg-grep', 'grep-gateway');
+  expect:
+  - - 1
+- statement: CREATE TEMP TABLE pg_grep_handle(handle text NOT NULL);
+- statement: INSERT INTO pg_grep_handle VALUES (vexfs_handle_open('pg-grep', '/src/b.txt', 'rw', 'grep-open', 'grep-gateway'));
+- query: SELECT vexfs_handle_stage_write((SELECT handle FROM pg_grep_handle), 0, convert_to('ordinary-v2', 'UTF8'), 'grep-stage');
+  expect:
+  - - 1
+- query: SELECT vexfs_handle_truncate((SELECT handle FROM pg_grep_handle), octet_length('ordinary-v2'), 'grep-truncate');
+  expect:
+  - - 2
+- query: SELECT vexfs_handle_publish_close((SELECT handle FROM pg_grep_handle), 2, 'full');
+  expect:
+  - - 2
+- query: SELECT (vexfs_grep('pg-grep', '/src', 'ordinary-v2', 0, 100)->>'index_used')::boolean, (vexfs_grep('pg-grep', '/src', 'ordinary-v2', 0, 100)->>'match_count')::integer;
+  expect:
+  - - true
+    - 1
+- query: SELECT vexfs_mount_session_end('pg-grep', 'grep-gateway');
+  expect:
+  - - 1
 - query: SELECT vexfs_remove('pg-grep', '/src/a.txt', false);
   expect:
   - - 1

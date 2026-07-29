@@ -1497,7 +1497,7 @@ def integrity_checksum_and_aliases(ctx: Context) -> dict[str, Any]:
         deep = db.json("SELECT vexfs_check('default',1)")
         quick = db.json("SELECT vexfs_check('default',0)")
         ctx.check(deep["ok"] and quick["ok"], "干净 workspace 深度和快速检查通过")
-        ctx.equal(deep["content_model"], "chunked-v1", "检查明确当前内容模型")
+        ctx.equal(deep["content_model"], "chunked-manifest-v1", "检查明确当前内容模型")
         ctx.equal(deep["checked"]["snapshots"], 1, "检查覆盖快照引用")
 
         db.connection.execute(
@@ -4351,6 +4351,10 @@ def mount_timestamps(ctx: Context) -> dict[str, Any]:
             ctx.check(abs(updated.st_mtime_ns - requested_mtime) <= 1_000_000,
                       "utimens modify time 必须达到毫秒精度: "
                       f"requested={requested_mtime}, actual={updated.st_mtime_ns}")
+            ctx.equal(file.read_bytes(), b"before", "noatime 挂载读取内容")
+            after_read = file.stat()
+            ctx.check(abs(after_read.st_atime_ns - updated.st_atime_ns) <= 1_000_000,
+                      "普通读取不能只因 atime 产生 workspace 元数据变化")
 
             before_write = file.stat()
             time.sleep(0.01)
@@ -4374,6 +4378,7 @@ def mount_timestamps(ctx: Context) -> dict[str, Any]:
                 "adapter": adapter.name,
                 "requested_atime_ns": requested_atime,
                 "actual_atime_ns": updated.st_atime_ns,
+                "read_atime_delta_ns": after_read.st_atime_ns - updated.st_atime_ns,
                 "requested_mtime_ns": requested_mtime,
                 "actual_mtime_ns": updated.st_mtime_ns,
                 "write_mtime_delta_ns": after_write.st_mtime_ns - before_write.st_mtime_ns,
@@ -4628,6 +4633,51 @@ def mount_force_unmount(ctx: Context) -> dict[str, Any]:
             return {"adapter": adapter.name}
         finally:
             mount_adapter_unmount(ctx, adapter, "强制卸载重挂载")
+
+
+@case("mount.pg-idle-reconnect", "mount",
+      "macOS 远程 PG 挂载空闲后仍可重新读写，不会变成 stale NFS mount")
+def mount_pg_idle_reconnect(ctx: Context) -> dict[str, Any]:
+    if platform.system() != "Darwin":
+        raise EvalSkip("PG 空闲重连当前验证 macOS NFS 客户端")
+    with tempfile.TemporaryDirectory(prefix="vexfs-mount-pg-idle-") as directory:
+        adapter = prepare_real_mount_adapter(ctx, Path(directory), "pg-idle")
+        if adapter.backend != "postgresql":
+            raise EvalSkip("PG 空闲重连需要 VEXFS_MOUNT_BACKEND=postgresql")
+        idle_seconds = float(os.environ.get("VEXFS_EVAL_IDLE_SECONDS", "240"))
+        if idle_seconds < 0:
+            raise EvalFailure("VEXFS_EVAL_IDLE_SECONDS 不能小于 0")
+        mount_adapter_mount(ctx, adapter)
+        try:
+            target = adapter.mount_point / "idle-reconnect.txt"
+            target.write_bytes(b"before-idle\n")
+            with target.open("rb") as stream:
+                os.fsync(stream.fileno())
+            time.sleep(idle_seconds)
+            ctx.equal(target.read_bytes(), b"before-idle\n", "空闲后首次读取")
+            with target.open("ab") as stream:
+                stream.write(b"after-idle\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            expected = b"before-idle\nafter-idle\n"
+            ctx.equal(target.read_bytes(), expected, "空闲后继续写入")
+            publish_started = time.monotonic()
+            published = b""
+            deadline = publish_started + 5.0
+            while time.monotonic() < deadline:
+                published = run_process(
+                    adapter.prefix + ["cat", "/idle-reconnect.txt"]).stdout
+                if published == expected:
+                    break
+                time.sleep(0.1)
+            ctx.equal(published, expected, "空闲后写入已发布到 PostgreSQL")
+            return {
+                "adapter": adapter.name,
+                "idle_seconds": idle_seconds,
+                "publish_seconds": round(time.monotonic() - publish_started, 6),
+            }
+        finally:
+            mount_adapter_unmount(ctx, adapter, "PG 空闲重连")
 
 
 @case("mount.helper-crash-recovery", "mount",

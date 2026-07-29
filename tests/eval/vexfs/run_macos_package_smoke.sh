@@ -38,6 +38,22 @@ check_file() {
     CHECKS=$((CHECKS + 1))
 }
 
+wait_for_publish() {
+    local attempt state
+    attempt=0
+    while [ "$attempt" -lt 100 ]; do
+        state="$(fs --json doctor)"
+        if printf '%s' "$state" | /usr/bin/python3 -c \
+                'import json,sys; value=json.load(sys.stdin)["database"]; raise SystemExit(not (value["pending_handles"] == 0 and value["staging_bytes"] == 0))'; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 0.1
+    done
+    echo "等待 NFS 后台发布超时：$state" >&2
+    return 1
+}
+
 cleanup() {
     if [ "$MOUNTED" = 1 ]; then
         fs unmount --force "$MOUNT_POINT" >/dev/null 2>&1 || true
@@ -64,6 +80,8 @@ fs setup >/dev/null
 DOCTOR="$(fs --json doctor)"
 printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["mount_ready"] is True; assert value["mount_driver"] == "NFSv3"; assert value["database"]["schema_version"] == "0.9.0"'
+MOUNT_DRIVER="$(printf '%s' "$DOCTOR" | /usr/bin/python3 -c \
+    'import json,sys; print(json.load(sys.stdin)["mount_driver"])')"
 CHECKS=$((CHECKS + 3))
 
 fs mount "$MOUNT_POINT"
@@ -91,8 +109,31 @@ check_equal agent "$($MOUNT_POINT/project/run.sh)" "可执行权限错误"
     "$MOUNT_POINT/project/result.json"
 check_equal True "$(/usr/bin/python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["ok"])' "$MOUNT_POINT/project/result.json")" "Python 文件读写错误"
 
-/usr/bin/xattr -w user.vexdb.package-smoke yes "$MOUNT_POINT/project/src/message.txt"
-check_equal yes "$(/usr/bin/xattr -p user.vexdb.package-smoke "$MOUNT_POINT/project/src/message.txt")" "xattr 错误"
+if [ "$MOUNT_DRIVER" = NFSv3 ]; then
+    set +e
+    XATTR_ERROR="$(/usr/bin/xattr -w user.vexdb.package-smoke yes \
+        "$MOUNT_POINT/project/src/message.txt" 2>&1)"
+    XATTR_STATUS=$?
+    set -e
+    [ "$XATTR_STATUS" -ne 0 ] || {
+        echo "NFSv3 不应伪装支持 xattr" >&2
+        exit 1
+    }
+    case "$XATTR_ERROR" in
+        *'Operation not supported'*|*'Operation not permitted'*) ;;
+        *) echo "NFSv3 xattr 错误不稳定：$XATTR_ERROR" >&2; exit 1 ;;
+    esac
+    CHECKS=$((CHECKS + 1))
+    [ ! -e "$MOUNT_POINT/project/src/._message.txt" ] || {
+        echo "NFSv3 xattr 失败后生成了 AppleDouble 文件" >&2
+        exit 1
+    }
+    CHECKS=$((CHECKS + 1))
+else
+    /usr/bin/xattr -w user.vexdb.package-smoke yes "$MOUNT_POINT/project/src/message.txt"
+    check_equal yes "$(/usr/bin/xattr -p user.vexdb.package-smoke \
+        "$MOUNT_POINT/project/src/message.txt")" "xattr 错误"
+fi
 
 git -C "$MOUNT_POINT/project" init -q
 git -C "$MOUNT_POINT/project" config user.name VexDB-Test
@@ -101,6 +142,7 @@ git -C "$MOUNT_POINT/project" add .
 git -C "$MOUNT_POINT/project" commit -qm baseline
 check_equal '' "$(git -C "$MOUNT_POINT/project" status --porcelain)" "Git 初始工作区不干净"
 
+wait_for_publish
 fs snapshot create remote-baseline >/dev/null
 printf 'changed\n' > "$MOUNT_POINT/project/src/message.txt"
 printf 'temporary\n' > "$MOUNT_POINT/project/temporary.txt"
@@ -125,7 +167,7 @@ check_equal '[]' "$MOUNT_STATUS" "卸载后仍有 mount session"
 
 CHECK="$(fs --json check)"
 printf '%s' "$CHECK" | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["content_model"] == "chunked-v1"; assert value["issue_count"] == 0'
+    'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["content_model"] == "chunked-manifest-v1"; assert value["issue_count"] == 0'
 CHECKS=$((CHECKS + 3))
 
 fs export --snapshot remote-baseline --output "$ARCHIVE" >/dev/null
@@ -137,7 +179,7 @@ check_equal "$PAYLOAD" \
     "$("$VEXDB" fs --db "$RESTORED_DB" --workspace restored cat /project/src/message.txt)" \
     "归档恢复内容错误"
 "$VEXDB" fs --db "$RESTORED_DB" --workspace restored --json check | /usr/bin/python3 -c \
-    'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["content_model"] == "chunked-v1"'
+    'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["content_model"] == "chunked-manifest-v1"'
 CHECKS=$((CHECKS + 2))
 
 COUNTS="$($VEXDB "$DB" 'SELECT (SELECT count(*) FROM _vexfs_manifests) || "|" || (SELECT count(*) FROM _vexfs_chunks);')"

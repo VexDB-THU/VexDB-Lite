@@ -11,6 +11,11 @@ extern "C" {
 vexfs_mount_status vexfs_mount_session_open(const vexfs_mount_config *config,
                                              vexfs_mount_session **session,
                                              vexfs_mount_error *error);
+// Refreshes the database-backed mount lease when it is due. Platform gateways
+// call this while idle so a live mount never expires merely because no files
+// were accessed during the lease window.
+vexfs_mount_status vexfs_mount_session_keepalive(vexfs_mount_session *session,
+                                                 vexfs_mount_error *error);
 void vexfs_mount_session_close(vexfs_mount_session *session);
 
 vexfs_mount_status vexfs_mount_mkdir(vexfs_mount_session *session, const char *path,
