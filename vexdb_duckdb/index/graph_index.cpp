@@ -345,6 +345,15 @@ static auto RunWithDuckAlgo(VexMetric metric, idx_t dim, int ef_construction, in
         });
 }
 
+template <typename Fn>
+static auto RunWithDuckDistancer(VexMetric metric, idx_t dim, Fn &&fn) {
+    return DispatchRunner<false, DuckMetricList, DuckDTypeList, DispatcherMode::NO_QUANT>::call(
+        ToDuckMetric(metric), DistPrecisionType::FLOAT, static_cast<uint16>(dim), QuantizerType::NONE,
+        [&](auto &distancer) -> decltype(auto) {
+            return fn(distancer);
+        });
+}
+
 static uint64_t MixCoverage64(uint64_t x) {
     x ^= x >> 30;
     x *= 0xbf58476d1ce4e5b9ULL;
@@ -376,6 +385,24 @@ static uint64_t HashCoverageRowBytes(row_t row_id, const_data_ptr_t bytes, idx_t
 static uint64_t HashCoverageRowVector(row_t row_id, const float *vec, idx_t dim) {
     auto bytes = const_data_ptr_cast(reinterpret_cast<const char *>(vec));
     return HashCoverageRowBytes(row_id, bytes, dim * sizeof(float));
+}
+
+static uint64_t HashRaBitQCoverageCode(row_t row_id, const uint8_t *code, idx_t dim) {
+    const idx_t padded_dim = RABITQ_PADDED_DIM(dim);
+    const idx_t bin_code_size = RABITQ_BIN_CODE_SIZE(padded_dim);
+    const idx_t bin_data_size = RABITQ_BIN_DATA_SIZE(padded_dim);
+    const idx_t ext_code_size = RABITQ_EXT_CODE_SIZE(padded_dim);
+
+    uint64_t h = HashCoverageRowId(row_id);
+    auto mix_part = [&](const uint8_t *bytes, idx_t size) {
+        h ^= HashCoverageBytes(const_data_ptr_cast(reinterpret_cast<const char *>(bytes)), size) +
+             0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h = MixCoverage64(h);
+    };
+    mix_part(code, ::rabitq::kCodeHeaderSize);
+    mix_part(code + ::rabitq::kCodeHeaderSize, bin_code_size);
+    mix_part(code + ::rabitq::kCodeHeaderSize + bin_data_size, ext_code_size);
+    return h;
 }
 
 } // namespace
@@ -1755,6 +1782,37 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     }
     PointExtensionContext point_ctx;
 
+    auto do_full_scan = [&](auto &store, bool has_deleted) {
+        std::vector<std::pair<float, row_t>> candidates;
+        candidates.reserve(store.elems.size());
+        RunWithDuckDistancer(metric_, dimension_, [&](auto &distancer) {
+            for (idx_t node_id = 0; node_id < store.elems.size(); node_id++) {
+                const auto *raw = store.get_data(static_cast<uint32>(node_id));
+                if (!raw) {
+                    continue;
+                }
+                const float distance = distancer.get_distance_single(
+                    query_vec, raw, static_cast<uint16>(dimension_));
+                for (const auto &tid : store.elems[node_id].tids) {
+                    if (has_deleted && deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
+                        continue;
+                    }
+                    candidates.emplace_back(distance, tid.row_id);
+                }
+            }
+        });
+        std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
+            return a.first < b.first || (a.first == b.first && a.second < b.second);
+        });
+        const size_t out = std::min<size_t>(k, candidates.size());
+        row_ids.reserve(out);
+        distances.reserve(out);
+        for (size_t i = 0; i < out; i++) {
+            row_ids.push_back(candidates[i].second);
+            distances.push_back(candidates[i].first);
+        }
+    };
+
     // The actual HNSW walk + deleted-row filtering. MUST be called with
     // graph_rwlock_ held shared (reads store + deleted_rids_, both mutated by
     // writers under the exclusive lock). Factored out so the common path can run
@@ -1799,6 +1857,10 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
         idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
         if (has_deleted) {
             needed += deleted_rids_.size();
+        }
+        if (needed >= store.elems.size()) {
+            do_full_scan(store, has_deleted);
+            return;
         }
         // If the graph entry node has been deleted, search starting from it can wander
         // into a stale subgraph (its neighbor links may all point to other deleted
@@ -1859,6 +1921,10 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
         idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
         if (has_deleted) {
             needed += deleted_rids_.size();
+        }
+        if (needed >= store.elems.size()) {
+            do_full_scan(store, has_deleted);
+            return;
         }
         auto search_k = uint_fast16_t(std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
         do_search(store, search_k, has_deleted);
@@ -2613,8 +2679,7 @@ GraphIndexRowIdCoverage GraphIndex::GetRowIdCoverage() const {
                     coverage.rowid_upper_bound =
                         std::max<idx_t>(coverage.rowid_upper_bound, static_cast<idx_t>(rid) + 1);
                     coverage.rowid_checksum += HashCoverageRowId(rid);
-                    coverage.vector_checksum += HashCoverageRowBytes(
-                        rid, const_data_ptr_cast(reinterpret_cast<const char *>(code)), code_size);
+                    coverage.vector_checksum += HashRaBitQCoverageCode(rid, code, dimension_);
                     coverage.has_vector_checksum = true;
                 }
             }
@@ -2686,9 +2751,7 @@ uint64_t GraphIndex::HashRaBitQVectorForCoverage(row_t row_id, const float *vec)
     }
     std::vector<uint8_t> code(::rabitq::CodeSize(static_cast<int>(dimension_)));
     ::rabitq::EncodeCode(*rabitq_quantizer_, static_cast<int>(dimension_), vec, code.data());
-    return HashCoverageRowBytes(row_id,
-                                const_data_ptr_cast(reinterpret_cast<const char *>(code.data())),
-                                static_cast<idx_t>(code.size()));
+    return HashRaBitQCoverageCode(row_id, code.data(), dimension_);
 }
 
 idx_t GraphIndex::GetInMemorySize(IndexLock &state) {

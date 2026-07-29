@@ -55,6 +55,17 @@ def fmt_cell(v) -> str:
     return str(v)
 
 
+def normalize_result_row(stmt: str, row: tuple) -> tuple:
+    """Normalize SQLite-owned fields that are not part of our query-plan contract."""
+    if stmt.lstrip().upper().startswith("EXPLAIN QUERY PLAN") and len(row) >= 4:
+        # SQLite 3.50+ uses the third EQP column for an estimated row-count
+        # exponent; older supported versions return 0. The VexDB contract is
+        # the selected virtual-table index and absence of a temp sort, so keep
+        # that stable while ignoring SQLite's version-dependent estimate.
+        return (*row[:2], 0, *row[3:])
+    return row
+
+
 def run_spec(sql_path: Path, ext_path: str, actual_path: Path) -> bool:
     segments = parse_sql(sql_path.read_text())
     db_path = tempfile.mktemp(suffix=".db", prefix="vexspec_")
@@ -75,7 +86,10 @@ def run_spec(sql_path: Path, ext_path: str, actual_path: Path) -> bool:
                         rows_out.append(f"@EXPECTED-ERROR-BUT-SUCCEEDED: {stmt[:120]}")
                         ok = False
                     else:
-                        lines = ["|".join(fmt_cell(c) for c in r) for r in rows]
+                        lines = [
+                            "|".join(fmt_cell(c) for c in normalize_result_row(stmt, r))
+                            for r in rows
+                        ]
                         if sort:
                             lines.sort()
                         rows_out.extend(lines)

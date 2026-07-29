@@ -28,9 +28,13 @@ inline void *repalloc(void *ptr, size_t size) {
     return new_ptr;
 }
 inline void pfree(void *ptr) { std::free(ptr); }
-/* MemoryContextAlloc 由 vexdb-duck/include/duck_pg_shim.hpp:56 提供 (避免重定义).
- * 这里补 MemoryContextAllocZero — b042c2c827 引入, duck_pg_shim.hpp 未提供, 否则
- * 编 graph_index_algorithm.h:148 的 Vector<ItemPointerData> temp 时找不到. */
+/* DuckDB 的 MemoryContextAlloc 由 duck_pg_shim.hpp 提供，避免重定义。
+ * SQLite 没有这层 shim，需要在 allocator 自己补齐；GCC 会在模板定义处
+ * 立即检查这个非依赖名字，不能依赖后续头文件再声明。 */
+#if defined(PG_VEXDB_TARGET_SQLITE)
+inline void *MemoryContextAlloc(MemoryContext /*ctx*/, size_t size) { return palloc(size); }
+#endif
+/* MemoryContextAllocZero 是两侧共用的补充。 */
 inline void *MemoryContextAllocZero(MemoryContext /*ctx*/, size_t size) { return palloc0(size); }
 inline void *palloc_aligned(size_t size, size_t align, int /*flags*/) {
     void *ptr = nullptr;

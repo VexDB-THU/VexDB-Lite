@@ -6,13 +6,14 @@
 #   bash scripts/release.sh package                  # 把 dist/<arch>/ 打成 tarball + SHA256SUMS
 #   bash scripts/release.sh upload <tag>             # 上传 tarballs 到 GitHub Release
 #
-#   build target: duck | pg | all (default: all)
+#   build target: duck | pg | sqlite | all (default: all)
 #   build arch:   x86 | arm | all (default: all)
 #
 #   示例:
-#     bash scripts/release.sh                          # build 全量 (4 个产物)
+#     bash scripts/release.sh                          # build DuckDB + PG + SQLite 全量产物
 #     bash scripts/release.sh build duck arm           # 只 build ARM DuckDB
-#     bash scripts/release.sh package                  # 4 个 tarball 进 dist/release/
+#     bash scripts/release.sh build sqlite all         # 只 build Linux SQLite（双架构）
+#     bash scripts/release.sh package                  # 所有 Linux 产物进 dist/release/
 #     bash scripts/release.sh upload v0.1.0            # 推送到 GitHub Release
 #
 # 凭证: 通过 SERVERS_FILE 环境变量指定凭证文件，或直接覆盖以下 *_HOST/*_USER/*_PASS。
@@ -118,6 +119,7 @@ load_credentials() {
 
 # 通用 SSH/SCP helper — 第一个参数 x86/arm，复用 ControlMaster 大幅减少建连开销
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new
+          -C
           -o ControlMaster=auto
           -o ControlPersist=600
           -o ControlPath=/tmp/ssh-vexdb-release-%r@%h:%p)
@@ -191,7 +193,7 @@ prepare_local() {
 
 # 这些 rsync exclude 与之前的 tar exclude 等价。--delete 让远程跟本地严格一致。
 VEXDB_RSYNC_EXCLUDES=(
-    --exclude='build/'      --exclude='.git/'        --exclude='dist/'
+    --exclude='build*/'     --exclude='.git/'        --exclude='dist/'
     --exclude='.claude/'    --exclude='.specstory/'  --exclude='.local/'
     --exclude='.env'        --exclude='.env.*'       --exclude='credentials.json'
     --exclude='*.duckdb_extension'  --exclude='*.unstripped'
@@ -531,13 +533,11 @@ build_pg() {
             $image \
             bash -c 'set -e
                 export PATH=/opt/python/cp310-cp310/bin:\$PATH
-                # ccache: 跨 --rm 持久缓存在 host \$HOME/.ccache_vexdb(挂到 /ccache)。
-                # 镜像若没自带就装(幂等, 已装则秒过); vexdb_pg/CMakeLists 的
-                # find_program(ccache) 据此设 CMAKE_CXX_COMPILER_LAUNCHER。CLEAN_BUILD
-                # 清的是 build 目录, ccache 按内容哈希命中, 全量重编也能秒级复用。
-                command -v ccache >/dev/null 2>&1 || yum install -y ccache >/dev/null 2>&1 || true
+                # ccache: 镜像已内置时由 CMake 自动使用。临时容器禁止现场
+                # yum install：远程源抖动曾让发版在编译前无输出卡住数分钟。
                 ${CLEAN_BUILD:+rm -rf build/pg-ml-$PG_VERSION;} mkdir -p build/pg-ml-$PG_VERSION && cd build/pg-ml-$PG_VERSION
-                PG_CONFIG=$pgc cmake ../../vexdb_pg -DCMAKE_BUILD_TYPE=Release -DBOOST_FALLBACK_INC=/opt/boost
+                PG_CONFIG=$pgc cmake ../../vexdb_pg -DCMAKE_BUILD_TYPE=Release \
+                  -DBOOST_FALLBACK_INC=/opt/boost -DVEXDB_USE_CCACHE=OFF
                 # 并行度 \$pg_jobs 由外层按本机核数+可用内存算(见 build_pg 注释), 避免
                 # AVX-512/annkmeans 重模板并行编时峰值内存撞 OOM。
                 cmake --build . -j$pg_jobs
@@ -582,6 +582,80 @@ build_pg() {
     # 让已有 1.0 数据库可以通过 ALTER EXTENSION UPDATE 升级。
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0.sql" "$outdir/vexdb_lite--1.1.sql"
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0--1.1.sql" "$outdir/"
+    ok "$arch $PG_VERSION vexdb_lite.so: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
+}
+
+# build_sqlite_linux <arch>：在与 PG/DuckDB 相同的 manylinux_2_28
+# 环境里构建 SQLite loadable 扩展和静态库。两种形态都是对外产物，
+# 公共头文件与 README 一起打包。
+build_sqlite_linux() {
+    local arch=$1 outdir image boost docker_pfx host_uid host_gid
+    [[ "$arch" == "x86" ]] && {
+        outdir="$DIST_DIR/x86_64-linux/sqlite"
+        image="vexdb-pg-manylinux:x86_64"
+        boost="$X86_BOOST"
+        docker_pfx="echo '$X86_PASS' | sudo -S docker"
+    } || {
+        outdir="$DIST_DIR/aarch64-linux/sqlite"
+        image="vexdb-pg-manylinux:aarch64"
+        boost="$ARM_BOOST"
+        docker_pfx="docker"
+    }
+
+    section "$arch build SQLite (manylinux 容器)"
+    rssh "$arch" "$docker_pfx image inspect $image >/dev/null 2>&1" \
+        || fail "$arch manylinux 镜像 $image 不在；先 docker build -f scripts/docker/Dockerfile.pg-manylinux"
+    host_uid=$(rssh "$arch" 'id -u')
+    host_gid=$(rssh "$arch" 'id -g')
+
+    rssh "$arch" "$docker_pfx run --rm \
+        -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
+        -v $boost:/opt/boost:ro \
+        -v \$HOME/.ccache_vexdb:/ccache \
+        -e CCACHE_DIR=/ccache \
+        -w /work \
+        $image \
+        bash -c 'set -e
+            ${CLEAN_SQLITE_BUILD:+rm -rf build/sqlite-ml;} \
+              cmake -S vexdb_sqlite -B build/sqlite-ml \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DVEXDB_SQLITE_BUILD_TESTS=ON \
+                -DVEXDB_USE_CCACHE=OFF \
+                -DVEXDB_BOOST_INC=/opt/boost
+            cmake --build build/sqlite-ml -j4
+            build/sqlite-ml/m0_static_smoke
+            build/sqlite-ml/m1_distance_smoke
+            build/sqlite-ml/simd_dispatch_smoke
+            build/sqlite-ml/m2_vtab_smoke
+            build/sqlite-ml/m3_hnsw_smoke
+            build/sqlite-ml/m3p_parallel_smoke
+            cp build/sqlite-ml/vexdb_lite.so build/sqlite-ml/vexdb_lite.so.unstripped
+            objcopy --only-keep-debug build/sqlite-ml/vexdb_lite.so build/sqlite-ml/vexdb_lite.so.debug
+            strip --strip-unneeded build/sqlite-ml/vexdb_lite.so
+            objcopy --add-gnu-debuglink=vexdb_lite.so.debug build/sqlite-ml/vexdb_lite.so
+            chmod -x build/sqlite-ml/vexdb_lite.so.debug
+            chown -R $host_uid:$host_gid build/sqlite-ml
+        '" || fail "$arch SQLite manylinux build/test 失败"
+
+    local remote_so="~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so"
+    info "$arch SQLite 产物验证（ELF + 入口符号 + build-id + debuglink + GLIBCXX）"
+    rssh "$arch" "set -e
+        file $remote_so | grep -q ELF
+        nm -D $remote_so 2>/dev/null | grep -q sqlite3_vexdblite_init
+        readelf -n $remote_so 2>/dev/null | grep -q 'Build ID:'
+        readelf -S $remote_so 2>/dev/null | grep -q '.gnu_debuglink'
+        test -f ~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so.debug
+        test -f ~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/libvexdb_lite_static.a" \
+        || fail "$arch SQLite 产物验证失败"
+    _assert_glibcxx_remote "$arch" "$remote_so"
+
+    mkdir -p "$outdir"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so" "$outdir/"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so.debug" "$outdir/"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/libvexdb_lite_static.a" "$outdir/"
+    cp "$REPO_ROOT/vexdb_sqlite/include/vexdb_sqlite.h" "$outdir/"
+    cp "$REPO_ROOT/vexdb_sqlite/README.md" "$outdir/"
+    ok "$arch SQLite: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
 }
 
 # PG smoke：替换远程现成 PG 的 .so + CREATE EXTENSION + 最小 ANN 查询。
@@ -617,7 +691,6 @@ validate_pg() {
         else
             echo '(skip in-PG smoke: no write perm to \$PG_LIB; ABI 符号检查通过)'
         fi"
-    ok "$arch vexdb_lite.so: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
 }
 
 # ============================================================
@@ -630,7 +703,7 @@ ARCHES=()
 
 cmd_build() {
     info "build 目标=$TARGET 架构=${ARCHES[*]}"
-    [[ "$TARGET" =~ ^(duck|pg|all)$ ]] || fail "target 必须为 duck/pg/all"
+    [[ "$TARGET" =~ ^(duck|pg|sqlite|all)$ ]] || fail "target 必须为 duck/pg/sqlite/all"
     [[ "$ARCH"   =~ ^(x86|arm|all)$ ]] || fail "arch 必须为 x86/arm/all"
 
     prepare_local
@@ -654,9 +727,13 @@ cmd_build() {
         done
     fi
 
+    if [[ "$TARGET" == "sqlite" || "$TARGET" == "all" ]]; then
+        for arch in "${ARCHES[@]}"; do build_sqlite_linux "$arch"; done
+    fi
+
     section "build 完成"
     find "$DIST_DIR" -maxdepth 3 -type f \( -name "*.duckdb_extension" -o -name "vexdb_lite.so" \
-        -o -name "*.control" -o -name "*.sql" \) -exec ls -lh {} \;
+        -o -name "libvexdb_lite_static.a" -o -name "*.control" -o -name "*.sql" \) -exec ls -lh {} \;
 }
 
 # ============================================================
@@ -746,7 +823,69 @@ cmd_package() {
                     vexdb_lite.so.debug
             fi
         done
+
+
+        # SQLite：loadable 扩展 + 静态库 + 公共头和文档。
+        local sqlitedir="$archdir/sqlite"
+        if [[ -f "$sqlitedir/vexdb_lite.so" && -f "$sqlitedir/libvexdb_lite_static.a" ]]; then
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-linux-${arch}.tar.gz" "$sqlitedir" \
+                vexdb_lite.so libvexdb_lite_static.a vexdb_sqlite.h README.md
+        fi
+        if [[ -f "$sqlitedir/vexdb_lite.so.debug" ]]; then
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-debugsymbols-linux-${arch}.tar.gz" "$sqlitedir" \
+                vexdb_lite.so.debug
+        fi
     done
+
+    # SQLite 的 Apple/移动端/WASM 产物由 build_sqlite.sh 和
+    # examples/wasm/build.sh 在 Mac driver 上构建。这里只把已通过
+    # 各自 smoke 的当轮产物收口到同一个 release 目录。
+    local sqlite_dist="$DIST_DIR/sqlite"
+    local sqlite_stage="$sqlite_dist/.release-stage"
+    rm -rf "$sqlite_stage"
+    mkdir -p "$sqlite_stage"
+
+    for mac_arch in arm64 x86_64; do
+        local mac_pkg
+        mac_pkg=$(find "$sqlite_dist" -maxdepth 1 -type f \
+            -name "vexdb-lite-sqlite-*-macos-${mac_arch}.tar.gz" | sort | tail -1)
+        if [[ -n "$mac_pkg" ]]; then
+            cp "$mac_pkg" "$RELEASE_DIR/vexdb-lite-sqlite-macos-${mac_arch}.tar.gz"
+        fi
+    done
+
+    if [[ -d "$sqlite_dist/vexdb_lite.xcframework" ]]; then
+        mkdir -p "$sqlite_stage/ios"
+        cp -R "$sqlite_dist/vexdb_lite.xcframework" "$sqlite_stage/ios/"
+        cp "$REPO_ROOT/vexdb_sqlite/README.md" "$sqlite_stage/ios/"
+        pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-ios-xcframework.tar.gz" "$sqlite_stage/ios" \
+            vexdb_lite.xcframework README.md
+    fi
+
+    for android_abi in arm64-v8a x86_64; do
+        if [[ -f "$sqlite_dist/android/$android_abi/vexdb_lite.so" && \
+              -f "$sqlite_dist/android/$android_abi/libvexdb_lite_static.a" ]]; then
+            local android_stage="$sqlite_stage/android-$android_abi"
+            mkdir -p "$android_stage"
+            cp "$sqlite_dist/android/$android_abi/vexdb_lite.so" "$android_stage/"
+            cp "$sqlite_dist/android/$android_abi/libvexdb_lite_static.a" "$android_stage/"
+            cp "$sqlite_dist/android/vexdb_sqlite.h" "$android_stage/"
+            cp "$REPO_ROOT/vexdb_sqlite/README.md" "$android_stage/"
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-android-${android_abi}.tar.gz" "$android_stage" \
+                vexdb_lite.so libvexdb_lite_static.a vexdb_sqlite.h README.md
+        fi
+    done
+
+    if [[ -f "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.js" && \
+          -f "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.wasm" ]]; then
+        local wasm_stage="$sqlite_stage/wasm"
+        mkdir -p "$wasm_stage"
+        cp "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.js" "$wasm_stage/"
+        cp "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.wasm" "$wasm_stage/"
+        cp "$REPO_ROOT/examples/wasm/README.md" "$wasm_stage/"
+        pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-wasm.tar.gz" "$wasm_stage" \
+            vexdb-wasm.js vexdb-wasm.wasm README.md
+    fi
 
     # 防回归: 每个 tarball 都扫一遍,有 AppleDouble 直接 fail。
     # macOS BSD tar `tar -tzf` 会隐藏 `._*` (作为 xattr resource fork),

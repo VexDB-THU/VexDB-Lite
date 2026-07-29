@@ -117,7 +117,11 @@ case "$CMD" in
             cp "$BD/libvexdb_lite_static.a" "$STAGE/"
             cp "$DIR/include/vexdb_sqlite.h" "$STAGE/"
             cp "$DIR/README.md" "$STAGE/"
-            tar -C "$DIST" -czf "$DIST/$PKG.tar.gz" "$PKG"
+            # macOS bsdtar 会把 provenance/resource fork 写成隐藏的
+            # AppleDouble (`._*`) 条目。Linux 解包后这些会变成真实文件，
+            # 因此从源头禁用并保留排除规则作为双保险。
+            COPYFILE_DISABLE=1 tar --exclude='._*' --exclude='.DS_Store' \
+                -C "$DIST" -czf "$DIST/$PKG.tar.gz" "$PKG"
             rm -rf "$STAGE"
             echo "打包: $DIST/$PKG.tar.gz"
         done
