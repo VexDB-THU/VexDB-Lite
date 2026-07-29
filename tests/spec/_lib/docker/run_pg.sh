@@ -173,11 +173,12 @@ cmd_status() {
 }
 
 cmd_render() {
+    info "运行 renderer 安全回归"
+    "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/test_render_safety.py"
     info "render spec → ${SPEC_DIR#$ROOT_DIR/}"
     # The rendered file name comes from the spec's `name`, not its YAML path.
     # Recreate this engine directory so a renamed spec cannot leave an old SQL
     # file behind and make a full run report a false extra pass/failure.
-    rm -rf "$SPEC_DIR"
     "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/render.py" --engine pg --out "${ROOT_DIR}/build/spec"
 }
 

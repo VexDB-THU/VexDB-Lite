@@ -28,8 +28,9 @@ ok()   { printf '%s[duck-spec]%s %s\n' "$GRN" "$NC" "$*"; }
 fail() { printf '%s[duck-spec]%s %s\n' "$RED" "$NC" "$*" >&2; exit 1; }
 
 cmd_render() {
+    info "运行 renderer 安全回归"
+    "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/test_render_safety.py"
     info "render spec → ${SPEC_DIR#$ROOT_DIR/}"
-    rm -rf "$SPEC_DIR"
     "$PYTHON_BIN" "${ROOT_DIR}/tests/spec/_lib/render.py" --engine duckdb --out "${ROOT_DIR}/build/spec"
 }
 

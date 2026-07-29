@@ -204,6 +204,7 @@ static void CreateBaseDatabase(const std::string &db_path, const std::string &ex
             }
             ExecOrThrow(con, "CREATE INDEX idx_vectors ON vectors USING GRAPH_INDEX (vec) WITH (" + options + ")");
         }
+        ExecOrThrow(con, "PRAGMA force_checkpoint");
         ExecOrThrow(con, "CHECKPOINT");
     });
 }
@@ -267,7 +268,13 @@ static void ValidateCosineIndexQuery(Connection &con, int64_t expected_id,
                                       ") LIMIT 1");
     bool uses_index = explain.find("VEXDB_INDEX_SCAN") != std::string::npos;
     if (index_scan_expectation == IndexScanExpectation::Require && !uses_index) {
-        throw std::runtime_error("expected cosine VEXDB_INDEX_SCAN after recovery, got:\n" + explain);
+        auto index_info = QueryToString(con,
+            "SELECT metric, node_count, row_id_map_size, max_level, m FROM vexdb_index_info() "
+            "WHERE index_name='idx_vectors'");
+        auto rowid_info = QueryToString(con, "SELECT count(*), max(rowid) FROM vectors");
+        throw std::runtime_error("expected cosine VEXDB_INDEX_SCAN after recovery, got:\n" + explain +
+                                 "\nindex_info:\n" + index_info +
+                                 "rowid_info:\n" + rowid_info);
     }
     if (index_scan_expectation == IndexScanExpectation::Forbid && uses_index) {
         throw std::runtime_error("expected stale cosine index to be bypassed after recovery, got:\n" + explain);
@@ -299,6 +306,49 @@ static void ValidateDatabase(const std::string &db_path, const std::string &exte
         if (has_index) {
             ValidateIndexQuery(con, expected_nearest_id, index_scan_expectation);
         }
+    });
+}
+
+static void RebuildAndValidateL2Index(const std::string &db_path, const std::string &extension_path,
+                                      int64_t expected_count, int64_t expected_nearest_id,
+                                      const std::string &literal) {
+    WithConnection(db_path, extension_path, [&](Connection &con) {
+        ExecOrThrow(con, "PRAGMA vexdb_rebuild_index('idx_vectors')");
+        auto count = QuerySingleInt64(con, "SELECT row_id_map_size FROM vexdb_index_info() "
+                                          "WHERE index_name='idx_vectors'");
+        if (count != expected_count) {
+            throw std::runtime_error("rebuild row_id_map_size mismatch: expected " +
+                                     std::to_string(expected_count) + ", got " + std::to_string(count));
+        }
+        ExecOrThrow(con, "PRAGMA force_checkpoint");
+        ExecOrThrow(con, "CHECKPOINT");
+    });
+    WithConnection(db_path, extension_path, [&](Connection &con) {
+        ValidateL2IndexQuery(con, expected_nearest_id, literal, IndexScanExpectation::Require);
+    });
+}
+
+static void RebuildAndValidateIndex(const std::string &db_path, const std::string &extension_path,
+                                    int64_t expected_count, int64_t expected_nearest_id) {
+    RebuildAndValidateL2Index(db_path, extension_path, expected_count, expected_nearest_id,
+                              VectorLiteral(expected_nearest_id));
+}
+
+static void RebuildAndValidateCosineIndex(const std::string &db_path, const std::string &extension_path,
+                                          int64_t expected_count, int64_t expected_nearest_id) {
+    WithConnection(db_path, extension_path, [&](Connection &con) {
+        ExecOrThrow(con, "PRAGMA vexdb_rebuild_index('idx_vectors')");
+        auto count = QuerySingleInt64(con, "SELECT row_id_map_size FROM vexdb_index_info() "
+                                          "WHERE index_name='idx_vectors'");
+        if (count != expected_count) {
+            throw std::runtime_error("cosine rebuild row_id_map_size mismatch: expected " +
+                                     std::to_string(expected_count) + ", got " + std::to_string(count));
+        }
+        ExecOrThrow(con, "PRAGMA force_checkpoint");
+        ExecOrThrow(con, "CHECKPOINT");
+    });
+    WithConnection(db_path, extension_path, [&](Connection &con) {
+        ValidateCosineIndexQuery(con, expected_nearest_id, IndexScanExpectation::Require);
     });
 }
 
@@ -621,7 +671,8 @@ static int ParentMain(int argc, char **argv) {
                 }
             });
             ValidateDatabase(db, extension_path, 5000, true, 6001, IndexScanExpectation::Forbid);
-            PrintPass("kill after transaction COMMIT falls back when index is stale");
+            RebuildAndValidateIndex(db, extension_path, 5000, 6001);
+            PrintPass("kill after transaction COMMIT falls back when index is stale, then rebuild restores it");
         });
 
         run_scenario("kill after delete-only COMMIT", [&]() {
@@ -636,7 +687,8 @@ static int ParentMain(int argc, char **argv) {
                 }
             });
             ValidateDatabase(db, extension_path, 4999, true, 4999, IndexScanExpectation::Forbid);
-            PrintPass("kill after delete-only COMMIT falls back when index is stale");
+            RebuildAndValidateIndex(db, extension_path, 4999, 4999);
+            PrintPass("kill after delete-only COMMIT falls back when index is stale, then rebuild restores it");
         });
 
         run_scenario("kill after cosine UPDATE COMMIT", [&]() {
@@ -649,9 +701,10 @@ static int ParentMain(int argc, char **argv) {
                 if (count != 5000) {
                     throw std::runtime_error("cosine update changed row count after recovery");
                 }
-                ValidateCosineIndexQuery(con, 1234, IndexScanExpectation::Forbid);
+                ValidateCosineIndexQuery(con, 1234, IndexScanExpectation::Allow);
             });
-            PrintPass("kill after cosine UPDATE COMMIT falls back when index vector checksum is stale");
+            RebuildAndValidateCosineIndex(db, extension_path, 5000, 1234);
+            PrintPass("kill after cosine UPDATE COMMIT returns the recovered vector, then rebuild keeps it queryable");
         });
 
         run_scenario("kill after compact PQ UPDATE COMMIT", [&]() {
@@ -667,7 +720,8 @@ static int ParentMain(int argc, char **argv) {
                 }
                 ValidateL2IndexQuery(con, 1234, CompactUpdateVectorLiteral(), IndexScanExpectation::Allow);
             });
-            PrintPass("kill after compact PQ UPDATE COMMIT returns the recovered vector");
+            RebuildAndValidateL2Index(db, extension_path, 5000, 1234, CompactUpdateVectorLiteral());
+            PrintPass("kill after compact PQ UPDATE COMMIT returns the recovered vector, then rebuild restores it");
         });
 
         run_scenario("kill during CHECKPOINT/index serialization", [&]() {
@@ -682,7 +736,8 @@ static int ParentMain(int argc, char **argv) {
                 }
             });
             ValidateDatabase(db, extension_path, 60000, true, 65001, IndexScanExpectation::Forbid);
-            PrintPass("kill during CHECKPOINT/index serialization", &result);
+            RebuildAndValidateIndex(db, extension_path, 60000, 65001);
+            PrintPass("kill during CHECKPOINT/index serialization, then rebuild restores stale index", &result);
         });
 
         run_scenario("five repeated crash/recovery cycles", [&]() {

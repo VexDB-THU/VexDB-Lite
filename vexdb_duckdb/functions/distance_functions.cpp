@@ -262,6 +262,7 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(ScalarFunction("vexdb_simd_arch", {}, LogicalType::VARCHAR,
                                            VexSimdArchFunction));
     RegisterIndexInfoFunction(loader);
+    RegisterRebuildIndexFunction(loader);
 }
 
 } // namespace duckdb

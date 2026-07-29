@@ -128,7 +128,12 @@ static Metric get_metric_from_index(Relation index)
     if (procinfo == NULL) {
         return Metric::L2;
     }
-    return get_func_metric(procinfo->fn_oid);
+    Metric metric = get_func_metric(procinfo->fn_oid);
+    if (metric == Metric::INNER_PRODUCT &&
+        graph_index_optional_proc_info(index, GRAPH_INDEX_NORM_PROC) != NULL) {
+        return Metric::FAST_COSINE;
+    }
+    return metric;
 }
 
 extern "C" PGDLLEXPORT void graph_index_parallel_build_main(dsm_segment *seg, shm_toc *toc);

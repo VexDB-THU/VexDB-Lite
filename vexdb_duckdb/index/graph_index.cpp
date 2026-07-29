@@ -7,6 +7,8 @@
 #include <atomic>
 #include <exception>
 #include <mutex>
+#include <numeric>
+#include <utility>
 #include <vector>
 
 #include "graph_index/graph_index_algorithm.h"
@@ -41,6 +43,18 @@ namespace {
 using DuckMetricList = MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>;
 using DuckDTypeList = DistPrecisionTypeList<DistPrecisionType::FLOAT>;
 constexpr uint32_t PQ_INVALID_CODE_POSITION = std::numeric_limits<uint32_t>::max();
+
+static bool ReadUInt64LE(const char *&ptr, const char *end, uint64_t &value) {
+    if (end - ptr < static_cast<ptrdiff_t>(sizeof(value))) {
+        return false;
+    }
+    value = 0;
+    for (idx_t i = 0; i < sizeof(value); i++) {
+        value |= static_cast<uint64_t>(static_cast<uint8_t>(ptr[i])) << (i * 8U);
+    }
+    ptr += sizeof(value);
+    return true;
+}
 
 template <typename T>
 class VtlDestroyGuard {
@@ -404,6 +418,11 @@ GraphIndex::~GraphIndex() {
 
 void GraphIndex::ApplyMirrorBudget() {
     auto &store = runtime_->store;
+    if (suppress_mirror_for_build_) {
+        store.mirror_limit_bytes_ = 1;
+        store.mirror_max_nodes_ = 0;
+        return;
+    }
     // Only tighten when the buffer-manager-backed copy exists: over-budget nodes skip
     // the vectors[] mirror and rely on vector_alloc_ as their sole home. Without it
     // they'd have nowhere to live, so fall back to the unlimited (full-mirror) path.
@@ -420,6 +439,47 @@ void GraphIndex::ApplyMirrorBudget() {
     // Until claimed, nothing is mirrored (mirror_max_nodes_ = 0).
     store.mirror_limit_bytes_ = static_cast<size_t>(graph_memory_limit_bytes_);
     store.mirror_max_nodes_ = 0;
+}
+
+void GraphIndex::WarmRawVectorMirror() {
+    if (!runtime_ || compact_mode_) {
+        return;
+    }
+    auto &store = runtime_->store;
+    store.ReleaseMirrorClaim();
+    size_t mirror_nodes = store.elems.size();
+    if (graph_memory_limit_bytes_ == 0) {
+        store.mirror_limit_bytes_ = 0;
+        store.mirror_max_nodes_ = SIZE_MAX;
+    } else {
+        store.mirror_limit_bytes_ = static_cast<size_t>(graph_memory_limit_bytes_);
+        mirror_nodes = store.ClaimMirrorNodes(store.elems.size());
+        store.mirror_max_nodes_ = mirror_nodes;
+    }
+    try {
+        store.ResizeMirrorSlots(store.elems.size());
+        for (size_t node_id = 0; node_id < mirror_nodes; node_id++) {
+            if (!store.vectors[node_id].empty()) {
+                continue;
+            }
+            auto *raw = store.GetVectorData(static_cast<uint32_t>(node_id));
+            if (raw) {
+                store.AssignMirrorSlot(store.vectors[node_id],
+                                       reinterpret_cast<const char *>(raw),
+                                       store.vec_size);
+            }
+        }
+    } catch (const std::bad_alloc &) {
+        store.ClearMirrorVectors();
+        store.ReleaseMirrorClaim();
+        store.mirror_max_nodes_ = 0;
+        // Buffer-managed vectors remain complete; get_data_unlocked falls back
+        // per node when a hot mirror allocation cannot be satisfied.
+    } catch (const OutOfMemoryException &) {
+        store.ClearMirrorVectors();
+        store.ReleaseMirrorClaim();
+        store.mirror_max_nodes_ = 0;
+    }
 }
 
 unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
@@ -658,19 +718,28 @@ PhysicalOperator &GraphIndex::CreatePlan(PlanIndexInput &input) {
 // stores — without this, raw input bytes never match the stored normalized bytes
 // and dedup fails for cosine metric.
 static void NormalizeInPlace(float *vec, idx_t dim) {
-    float norm2 = 0.0f;
-    for (idx_t i = 0; i < dim; i++) {
-        norm2 += vec[i] * vec[i];
-    }
-    if (norm2 > 0.0f) {
-        float inv = 1.0f / std::sqrt(norm2);
-        for (idx_t i = 0; i < dim; i++) {
-            vec[i] *= inv;
-        }
-    }
+    NormalizeDuckVectorInPlace(vec, dim);
 }
 
 void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids) {
+    if (row_ids.size() > std::numeric_limits<size_t>::max() / std::max<idx_t>(dimension_, 1) ||
+        vectors.size() != row_ids.size() * dimension_) {
+        throw InvalidInputException("GRAPH_INDEX bulk vector data does not match row-id count or dimension");
+    }
+    BuildBulk(vectors.data(), row_ids.size(), row_ids);
+}
+
+void GraphIndex::BuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                           bool vectors_are_normalized) {
+    if (vector_count != row_ids.size()) {
+        throw InvalidInputException("GRAPH_INDEX bulk vector count does not match row-id count");
+    }
+    if (vector_count > 0 && dimension_ > std::numeric_limits<size_t>::max() / vector_count) {
+        throw InvalidInputException("GRAPH_INDEX bulk vector source is too large");
+    }
+    if (vector_count > 0 && !vectors) {
+        throw InvalidInputException("GRAPH_INDEX bulk vector source is null");
+    }
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_, Allocator::Get(db));
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
     // Fresh store for the bulk build — re-apply the budget captured in Create().
@@ -684,12 +753,16 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
     std::vector<float> normalized;
     if (metric_ == VexMetric::COSINE) {
         runtime_->store.normalize_vectors_ = false;
-        normalized = vectors;
-        for (idx_t i = 0; i < row_ids.size(); i++) {
-            NormalizeInPlace(normalized.data() + i * dimension_, dimension_);
+        if (!vectors_are_normalized && vector_count > 0) {
+            normalized.assign(vectors, vectors + vector_count * dimension_);
+            for (idx_t i = 0; i < row_ids.size(); i++) {
+                NormalizeInPlace(normalized.data() + i * dimension_, dimension_);
+            }
         }
     }
-    const float *src = (metric_ == VexMetric::COSINE) ? normalized.data() : vectors.data();
+    const float *src = (metric_ == VexMetric::COSINE && !vectors_are_normalized)
+                           ? normalized.data()
+                           : vectors;
 
     // Pre-reserve outer vectors so concurrent assign_vector_id during the
     // parallel phase doesn't realloc and invalidate raw pointers held by
@@ -703,7 +776,7 @@ void GraphIndex::BuildBulk(const std::vector<float> &vectors, const std::vector<
     const size_t upper_n = base_n;
     runtime_->store.ReserveCapacity(base_n, upper_n);
 
-    const idx_t n = row_ids.size();
+    const idx_t n = vector_count;
     const int n_workers = std::clamp(build_threads_, 1, static_cast<int>(std::max<idx_t>(n, 1)));
 
     // Enable build-only locking in get_data for the parallel build span: workers mutate
@@ -931,6 +1004,77 @@ void GraphIndex::TrainAndEncodeRaBitQ() {
     rabitq_use_ = true;
 }
 
+void GraphIndex::RebuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids) {
+    if (row_ids.size() > std::numeric_limits<size_t>::max() / std::max<idx_t>(dimension_, 1) ||
+        vectors.size() != row_ids.size() * dimension_) {
+        throw InvalidInputException("GRAPH_INDEX rebuild vector data does not match row-id count or dimension");
+    }
+    RebuildBulk(vectors.data(), row_ids.size(), row_ids);
+}
+
+void GraphIndex::RebuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                             bool vectors_are_normalized, std::function<void()> release_vector_source) {
+    vex_duck::ExclusiveLockGuard _wg(graph_rwlock_);
+    if (vector_count != row_ids.size()) {
+        throw InvalidInputException("GRAPH_INDEX rebuild vector count does not match row-id count");
+    }
+    if (vector_count > 0 && dimension_ > std::numeric_limits<size_t>::max() / vector_count) {
+        throw InvalidInputException("GRAPH_INDEX rebuild vector source is too large");
+    }
+    if (vector_count > 0 && !vectors) {
+        throw InvalidInputException("GRAPH_INDEX rebuild vector source is null");
+    }
+
+    // Build into a separate GraphIndex so every allocation, graph mutation and
+    // quantizer training step can fail without touching the live index. Only
+    // noexcept swaps below publish the rebuilt state. The staged destructor then
+    // releases the previous runtime and codebooks after a successful commit.
+    {
+        GraphIndex staged(name, index_constraint_type, GetColumnIds(), table_io_manager,
+                          unbound_expressions, db, dimension_, m_, ef_construction_, metric_,
+                          vec_column_index_, pq_m_, compact_mode_, build_threads_,
+                          rabitq_requested_);
+        // Keep the staged build off the hot mirror while the live runtime still
+        // owns its share of the global budget. The authoritative vector tier is
+        // buffer-managed and the mirror is warmed only after the old runtime dies.
+        staged.suppress_mirror_for_build_ = true;
+        staged.BuildBulk(vectors, vector_count, row_ids, vectors_are_normalized);
+
+        SwapRebuildState(staged);
+    }
+    if (release_vector_source) {
+        release_vector_source();
+    }
+    WarmRawVectorMirror();
+    // The rebuild just covered the exact table snapshot protected by the table
+    // checkpoint lock. A later DML commit invalidates this flag through the
+    // normal Append/Delete path.
+    MarkRowIdCoverageChecked(false);
+}
+
+void GraphIndex::SwapRebuildState(GraphIndex &staged) noexcept {
+    runtime_.swap(staged.runtime_);
+    deleted_rids_.swap(staged.deleted_rids_);
+    std::swap(pq_use_, staged.pq_use_);
+    std::swap(pq_quantizer_, staged.pq_quantizer_);
+    pq_codes_.swap(staged.pq_codes_);
+    pq_row_id_order_.swap(staged.pq_row_id_order_);
+    pq_vector_coverage_hashes_.swap(staged.pq_vector_coverage_hashes_);
+    pq_node_code_positions_.swap(staged.pq_node_code_positions_);
+    pq_latest_code_positions_.swap(staged.pq_latest_code_positions_);
+    std::swap(rabitq_use_, staged.rabitq_use_);
+    rabitq_quantizer_.swap(staged.rabitq_quantizer_);
+    std::swap(rabitq_query_rescaling_factor_, staged.rabitq_query_rescaling_factor_);
+    rabitq_codes_.swap(staged.rabitq_codes_);
+    rowid_node_map_.swap(staged.rowid_node_map_);
+    duplicate_rowid_nodes_.swap(staged.duplicate_rowid_nodes_);
+    auto live_corruption = storage_pointer_corruption_.load(std::memory_order_relaxed);
+    storage_pointer_corruption_.store(
+        staged.storage_pointer_corruption_.load(std::memory_order_relaxed),
+        std::memory_order_release);
+    staged.storage_pointer_corruption_.store(live_corruption, std::memory_order_relaxed);
+}
+
 void GraphIndex::ReleaseRawVectors() {
     if (!runtime_) {
         return;
@@ -1081,20 +1225,33 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
     pq_use_ = true;
 
     // Index codes by ascending row_id so the layout is stable across reloads.
-    pq_row_id_order_ = row_ids;
-    std::sort(pq_row_id_order_.begin(), pq_row_id_order_.end());
-
-    std::unordered_map<row_t, idx_t> rid_to_idx;
-    rid_to_idx.reserve(row_ids.size());
-    for (idx_t i = 0; i < row_ids.size(); i++) {
-        rid_to_idx[row_ids[i]] = i;
+    const bool row_ids_are_sorted = std::is_sorted(row_ids.begin(), row_ids.end());
+    std::vector<idx_t> source_order;
+    if (row_ids_are_sorted) {
+        pq_row_id_order_ = row_ids;
+    } else {
+        // Keep only a compact source permutation. An unordered_map costs many
+        // words per row and used to amplify rebuild peak memory while old and
+        // staged indexes were both still resident.
+        source_order.resize(row_ids.size());
+        std::iota(source_order.begin(), source_order.end(), idx_t(0));
+        std::sort(source_order.begin(), source_order.end(), [&](idx_t lhs, idx_t rhs) {
+            if (row_ids[lhs] != row_ids[rhs]) {
+                return row_ids[lhs] < row_ids[rhs];
+            }
+            return lhs < rhs;
+        });
+        pq_row_id_order_.resize(row_ids.size());
+        for (idx_t i = 0; i < source_order.size(); i++) {
+            pq_row_id_order_[i] = row_ids[source_order[i]];
+        }
     }
 
     auto code_size = pq_quantizer_.code_size;
     pq_codes_.assign(pq_row_id_order_.size() * code_size, 0);
     pq_vector_coverage_hashes_.assign(pq_row_id_order_.size(), 0);
     for (idx_t i = 0; i < pq_row_id_order_.size(); i++) {
-        auto src_idx = rid_to_idx[pq_row_id_order_[i]];
+        auto src_idx = row_ids_are_sorted ? i : source_order[i];
         auto rid = pq_row_id_order_[i];
         const auto *vec = vec_data + src_idx * dimension_;
         pq_quantizer_.compute_code(vec, pq_codes_.data() + i * code_size);
@@ -1102,6 +1259,31 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
     }
     RebuildPQLatestCodePositions();
     RebuildPQNodeCodePositions();
+}
+
+void GraphIndex::TrainAndEncodePQFromStore() {
+    if (!runtime_ || runtime_->store.elems.empty()) {
+        return;
+    }
+    auto &store = runtime_->store;
+    std::vector<float> vectors;
+    std::vector<row_t> row_ids;
+    for (idx_t node_id = 0; node_id < store.elems.size(); node_id++) {
+        const auto *vector_data = reinterpret_cast<const float *>(store.get_data(node_id));
+        if (!vector_data) {
+            throw InternalException("PQ delayed training cannot read graph vector");
+        }
+        for (const auto &tid : store.elems[node_id].tids) {
+            if (deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
+                continue;
+            }
+            row_ids.push_back(tid.row_id);
+            vectors.insert(vectors.end(), vector_data, vector_data + dimension_);
+        }
+    }
+    if (!row_ids.empty()) {
+        TrainAndEncodePQ(vectors.data(), row_ids);
+    }
 }
 
 void GraphIndex::RebuildPQLatestCodePositions() {
@@ -1217,18 +1399,18 @@ void GraphIndex::RebuildPQNodeCodePositions() {
     if (pq_row_id_order_.size() >= PQ_INVALID_CODE_POSITION) {
         throw InvalidInputException("PQ code count exceeds the supported 32-bit graph mapping");
     }
-    std::unordered_map<row_t, uint32_t> code_by_row_id;
-    code_by_row_id.reserve(pq_row_id_order_.size());
-    for (idx_t position = 0; position < pq_row_id_order_.size(); position++) {
-        code_by_row_id[pq_row_id_order_[position]] = static_cast<uint32_t>(position);
+    // RebuildPQLatestCodePositions owns the duplicate-row rule and is called
+    // before this mapping. Reuse it instead of maintaining a second map.
+    if (pq_latest_code_positions_.size() > pq_row_id_order_.size()) {
+        throw InvalidInputException("PQ latest-code metadata is invalid");
     }
 
     const auto &elems = runtime_->store.elems;
     pq_node_code_positions_.assign(elems.size(), PQ_INVALID_CODE_POSITION);
     for (idx_t node_id = 0; node_id < elems.size(); node_id++) {
         for (const auto &tid : elems[node_id].tids) {
-            auto it = code_by_row_id.find(tid.row_id);
-            if (it != code_by_row_id.end()) {
+            auto it = pq_latest_code_positions_.find(tid.row_id);
+            if (it != pq_latest_code_positions_.end()) {
                 pq_node_code_positions_[node_id] = it->second;
                 break;
             }
@@ -1246,7 +1428,7 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
                           double refine_factor) const {
     row_ids.clear();
     distances.clear();
-    if (!pq_use_ || pq_codes_.empty() || !runtime_ || k == 0) {
+    if (storage_pointer_corruption_ || !pq_use_ || pq_codes_.empty() || !runtime_ || k == 0) {
         return;
     }
     vex_duck::SharedLockGuard _rg(graph_rwlock_);
@@ -1399,6 +1581,9 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
                               std::vector<float> &distances) const {
     row_ids.clear();
     distances.clear();
+    if (storage_pointer_corruption_) {
+        return;
+    }
     const size_t code_size = ::rabitq::CodeSize(static_cast<int>(dimension_));
 
     std::vector<float> normalized_query;
@@ -1565,6 +1750,9 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
                            std::vector<float> &distances) const {
     row_ids.clear();
     distances.clear();
+    if (storage_pointer_corruption_) {
+        return;
+    }
     PointExtensionContext point_ctx;
 
     // The actual HNSW walk + deleted-row filtering. MUST be called with
@@ -1687,6 +1875,11 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     // Mutates the graph: exclude all concurrent (shared) searches so the
     // lock-free search read path stays safe.
     vex_duck::ExclusiveLockGuard _wg(graph_rwlock_);
+
+    if (storage_pointer_corruption_) {
+        return ErrorData(ExceptionType::INVALID_INPUT,
+                         "GRAPH_INDEX storage is incomplete after recovery; rebuild the index before writing");
+    }
 
     if (!runtime_) {
         runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_, Allocator::Get(db));
@@ -1921,8 +2114,14 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
         }
     });
     }
+    if (pq_m_ > 0 && !pq_use_ && !runtime_->store.elems.empty()) {
+        TrainAndEncodePQFromStore();
+    }
     if (rabitq_requested_ && !rabitq_use_ && !runtime_->store.elems.empty()) {
         TrainAndEncodeRaBitQ();
+    }
+    if (compact_mode_ && (pq_use_ || rabitq_use_)) {
+        ReleaseRawVectors();
     }
     rowid_coverage_checked_.store(false, std::memory_order_release);
     rowid_coverage_stale_.store(false, std::memory_order_relaxed);
@@ -2290,37 +2489,7 @@ void GraphIndex::Vacuum(IndexLock &l) {
     // failed mirror allocation is only a cache miss: vector_alloc_ remains the
     // authoritative buffer-managed copy, so VACUUM correctness is unaffected.
     retired_runtime.reset();
-    if (!compact_mode_) {
-        auto &store = runtime_->store;
-        store.ReleaseMirrorClaim();
-        size_t mirror_nodes = store.elems.size();
-        if (graph_memory_limit_bytes_ == 0) {
-            store.mirror_limit_bytes_ = 0;
-            store.mirror_max_nodes_ = SIZE_MAX;
-        } else {
-            store.mirror_limit_bytes_ =
-                static_cast<size_t>(graph_memory_limit_bytes_);
-            mirror_nodes = store.ClaimMirrorNodes(store.elems.size());
-            store.mirror_max_nodes_ = mirror_nodes;
-        }
-        try {
-            store.ResizeMirrorSlots(store.elems.size());
-            for (size_t node_id = 0; node_id < mirror_nodes; node_id++) {
-                if (!store.vectors[node_id].empty()) {
-                    continue;
-                }
-                auto *raw = store.GetVectorData(static_cast<uint32_t>(node_id));
-                if (raw) {
-                    store.AssignMirrorSlot(
-                        store.vectors[node_id], reinterpret_cast<const char *>(raw),
-                        store.vec_size);
-                }
-            }
-        } catch (...) {
-            // Buffer-managed vectors remain complete; an incomplete hot mirror
-            // is safe because get_data_unlocked falls back per node.
-        }
-    }
+    WarmRawVectorMirror();
 }
 
 int GraphIndex::GetMaxLevel() const {
@@ -2772,6 +2941,20 @@ void GraphIndex::DeserializePQAndModeFromStorage(const IndexStorageInfo &info) {
             // Compatibility with indexes written before the explicit node map.
             RebuildPQNodeCodePositions();
         }
+
+        // UPDATE appends a new physical row/code slot, while the graph may
+        // reuse an existing node. Reconcile the persisted node map with the
+        // row-order metadata so a reused node cannot keep pointing at an old
+        // code slot after reload.
+        for (idx_t node_id = 0; node_id < runtime_->store.elems.size(); node_id++) {
+            for (const auto &tid : runtime_->store.elems[node_id].tids) {
+                auto it = pq_latest_code_positions_.find(tid.row_id);
+                if (it != pq_latest_code_positions_.end()) {
+                    pq_node_code_positions_[node_id] = it->second;
+                    break;
+                }
+            }
+        }
     }
 
     auto quantizer_it = info.options.find("quantizer");
@@ -2902,6 +3085,13 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
     }
 
     auto &store = runtime_->store;
+    storage_pointer_corruption_ = false;
+
+    auto metric_it = info.options.find("metric");
+    if (metric_it != info.options.end()) {
+        metric_ = ParseMetric(metric_it->second.GetValue<string>());
+        store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
+    }
 
     // compact_mode 模式下 vector_alloc_ 被 Reset，但 header->vector_ptr 仍是旧
     // buffer_id；先识别 compact 标志，后续跳过 vectors mirror 以免对空 allocator
@@ -2920,6 +3110,22 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         store.upper_alloc_->Init(info.allocator_infos[2]);
     }
 
+    std::unordered_set<idx_t> valid_node_buffers;
+    std::unordered_set<idx_t> valid_vector_buffers;
+    std::unordered_set<idx_t> valid_upper_buffers;
+    if (info.allocator_infos.size() >= 3) {
+        valid_node_buffers.insert(info.allocator_infos[0].buffer_ids.begin(),
+                                  info.allocator_infos[0].buffer_ids.end());
+        valid_vector_buffers.insert(info.allocator_infos[1].buffer_ids.begin(),
+                                    info.allocator_infos[1].buffer_ids.end());
+        valid_upper_buffers.insert(info.allocator_infos[2].buffer_ids.begin(),
+                                   info.allocator_infos[2].buffer_ids.end());
+    }
+    auto pointer_buffer_exists = [](const IndexPointer &ptr,
+                                    const std::unordered_set<idx_t> &valid_buffers) {
+        return !ptr.Get() || valid_buffers.find(ptr.GetBufferId()) != valid_buffers.end();
+    };
+
     size_t node_count = 0;
     size_t upper_count = 0;
     auto nc_it = info.options.find("node_count");
@@ -2929,6 +3135,9 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
     auto uc_it = info.options.find("upper_count");
     if (uc_it != info.options.end()) {
         upper_count = uc_it->second.GetValue<uint64_t>();
+    }
+    if (info.allocator_infos.size() < 3 && (node_count != 0 || upper_count != 0)) {
+        storage_pointer_corruption_ = true;
     }
     store.ResizeForReload(node_count, upper_count);
     store.id_to_node_ptr_.resize(node_count);
@@ -2964,8 +3173,26 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 std::memcpy(&ptr_val, ptr, sizeof(ptr_val));
                 ptr += sizeof(ptr_val);
                 store.id_to_node_ptr_[i].Set(ptr_val);
-                store.node_ptr_to_id_[ptr_val] = static_cast<uint32_t>(i);
             }
+        }
+    }
+    store.node_ptr_to_id_.clear();
+    if (store.id_to_node_ptr_.size() != node_count) {
+        storage_pointer_corruption_ = true;
+    }
+    for (idx_t i = 0; i < store.id_to_node_ptr_.size(); i++) {
+        auto &node_ptr = store.id_to_node_ptr_[i];
+        if (i < node_count && !node_ptr.Get()) {
+            storage_pointer_corruption_ = true;
+            continue;
+        }
+        if (!pointer_buffer_exists(node_ptr, valid_node_buffers)) {
+            node_ptr.Clear();
+            storage_pointer_corruption_ = true;
+            continue;
+        }
+        if (node_ptr.Get()) {
+            store.node_ptr_to_id_[node_ptr.Get()] = static_cast<uint32_t>(i);
         }
     }
 
@@ -2985,6 +3212,148 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 ptr += sizeof(rid_val);
                 deleted_rids_.insert(static_cast<row_t>(rid_val));
             }
+        }
+    }
+
+    // Compact PQ keeps an append-only code order whose physical row ids are
+    // already persisted separately. Restoring the historical tid list here
+    // can resurrect a pre-UPDATE row; use the node-header/deleted-row fallback
+    // for this layout. Full and RaBitQ indexes still restore the richer history
+    // metadata needed for duplicate-row coverage.
+    const bool compact_pq_storage = compact_mode_flag &&
+                                    info.options.find("pq_codes") != info.options.end();
+    // Start from the portable single-row fallback in each node header. Sparse
+    // row_id_records below only overrides nodes that cannot be represented by
+    // this common case.
+    for (idx_t i = 0; i < store.id_to_node_ptr_.size() && i < store.elems.size(); i++) {
+        auto &elem = store.elems[i];
+        elem.tids.clear();
+        auto node_ptr = store.id_to_node_ptr_[i];
+        if (!node_ptr.Get() || !store.node_alloc_) {
+            continue;
+        }
+        auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<uint32_t> *>(
+            store.node_alloc_->Get(node_ptr));
+        // Compact indexes deliberately reset the raw-vector allocator while
+        // retaining historical vector_ptr values in node headers. They never
+        // dereference those pointers, so this is not recovery corruption.
+        if (header && !compact_mode_flag &&
+            !pointer_buffer_exists(header->vector_ptr, valid_vector_buffers)) {
+            header->vector_ptr.Clear();
+            storage_pointer_corruption_ = true;
+        }
+        if (!header || header->deleted || deleted_rids_.find(header->row_id) != deleted_rids_.end()) {
+            continue;
+        }
+        ItemPointerData tid;
+        tid.row_id = header->row_id;
+        elem.tids.push_back(tid);
+    }
+
+    auto rowid_it = compact_pq_storage ? info.options.end() : info.options.find("row_id_records");
+    if (rowid_it != info.options.end()) {
+        auto blob = StringValue::Get(rowid_it->second.DefaultCastAs(LogicalType::BLOB));
+        const char *ptr = blob.data();
+        const char *end = ptr + blob.size();
+        uint32_t rowid_version = 1;
+        auto version_it = info.options.find("row_id_records_version");
+        if (version_it != info.options.end()) {
+            rowid_version = version_it->second.GetValue<uint32_t>();
+        }
+        if (rowid_version == 1) {
+            uint64_t num_entries = 0;
+            if (end - ptr < static_cast<ptrdiff_t>(sizeof(num_entries))) {
+                throw InvalidInputException("GRAPH_INDEX row-id metadata is truncated");
+            }
+            std::memcpy(&num_entries, ptr, sizeof(num_entries));
+            ptr += sizeof(num_entries);
+            if (num_entries != store.elems.size()) {
+                throw InvalidInputException("GRAPH_INDEX row-id metadata node count does not match graph");
+            }
+            for (uint64_t i = 0; i < num_entries; i++) {
+                uint64_t row_count = 0;
+                if (end - ptr < static_cast<ptrdiff_t>(sizeof(row_count))) {
+                    throw InvalidInputException("GRAPH_INDEX row-id metadata is truncated");
+                }
+                std::memcpy(&row_count, ptr, sizeof(row_count));
+                ptr += sizeof(row_count);
+                if (row_count > static_cast<uint64_t>((end - ptr) / sizeof(ItemPointerData))) {
+                    throw InvalidInputException("GRAPH_INDEX row-id metadata is invalid");
+                }
+                auto &tids = store.elems[i].tids;
+                tids.clear();
+                tids.reserve(row_count);
+                for (uint64_t row = 0; row < row_count; row++) {
+                    ItemPointerData persisted_tid;
+                    std::memcpy(&persisted_tid, ptr, sizeof(persisted_tid));
+                    ptr += sizeof(persisted_tid);
+                    if (persisted_tid.row_id < 0 || persisted_tid.row_id >= MAX_ROW_ID) {
+                        throw InvalidInputException("GRAPH_INDEX row-id metadata contains an invalid row id");
+                    }
+                    ItemPointerData tid;
+                    tid.row_id = persisted_tid.row_id;
+                    tids.push_back(tid);
+                }
+            }
+            if (ptr != end) {
+                throw InvalidInputException("GRAPH_INDEX row-id metadata has trailing data");
+            }
+        } else if (rowid_version == 2) {
+            const char *validate_ptr = ptr;
+            uint64_t num_entries = 0;
+            uint64_t override_count = 0;
+            if (!ReadUInt64LE(validate_ptr, end, num_entries) ||
+                !ReadUInt64LE(validate_ptr, end, override_count) ||
+                num_entries != store.elems.size() || override_count > num_entries) {
+                throw InvalidInputException("GRAPH_INDEX row-id metadata header is invalid");
+            }
+            uint64_t previous_node_id = 0;
+            for (uint64_t record = 0; record < override_count; record++) {
+                uint64_t node_id = 0;
+                uint64_t row_count = 0;
+                if (!ReadUInt64LE(validate_ptr, end, node_id) ||
+                    !ReadUInt64LE(validate_ptr, end, row_count) ||
+                    node_id >= num_entries || (record > 0 && node_id <= previous_node_id) ||
+                    row_count > static_cast<uint64_t>((end - validate_ptr) / sizeof(uint64_t))) {
+                    throw InvalidInputException("GRAPH_INDEX sparse row-id metadata is invalid");
+                }
+                validate_ptr += row_count * sizeof(uint64_t);
+                previous_node_id = node_id;
+            }
+            if (validate_ptr != end) {
+                throw InvalidInputException("GRAPH_INDEX sparse row-id metadata has trailing data");
+            }
+
+            if (!ReadUInt64LE(ptr, end, num_entries) ||
+                !ReadUInt64LE(ptr, end, override_count)) {
+                throw InvalidInputException("GRAPH_INDEX sparse row-id metadata header is truncated");
+            }
+            for (uint64_t record = 0; record < override_count; record++) {
+                uint64_t node_id = 0;
+                uint64_t row_count = 0;
+                if (!ReadUInt64LE(ptr, end, node_id) || !ReadUInt64LE(ptr, end, row_count)) {
+                    throw InvalidInputException("GRAPH_INDEX sparse row-id metadata is truncated");
+                }
+                auto &tids = store.elems[node_id].tids;
+                tids.clear();
+                tids.reserve(row_count);
+                for (uint64_t row = 0; row < row_count; row++) {
+                    uint64_t encoded_row_id = 0;
+                    if (!ReadUInt64LE(ptr, end, encoded_row_id)) {
+                        throw InvalidInputException("GRAPH_INDEX sparse row-id metadata is truncated");
+                    }
+                    int64_t row_id = 0;
+                    std::memcpy(&row_id, &encoded_row_id, sizeof(row_id));
+                    if (row_id < 0 || row_id >= MAX_ROW_ID) {
+                        throw InvalidInputException("GRAPH_INDEX sparse row-id metadata contains an invalid row id");
+                    }
+                    ItemPointerData tid;
+                    tid.row_id = row_id;
+                    tids.push_back(tid);
+                }
+            }
+        } else {
+            throw InvalidInputException("Unsupported GRAPH_INDEX row-id metadata version %u", rowid_version);
         }
     }
 
@@ -3017,15 +3386,6 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<uint32_t> *>(store.node_alloc_->Get(ptr));
         if (!header) {
             continue;
-        }
-        // tids (skip deleted)
-        if (!header->deleted &&
-            deleted_rids_.find(header->row_id) == deleted_rids_.end()) {
-            auto &elem = store.elems[i];
-            elem.tids.clear();
-            ItemPointerData tid;
-            tid.row_id = header->row_id;
-            elem.tids.push_back(tid);
         }
         // base_points[i].neighbors mirror (search_layer fallback path)
         // ALSO patch the disk-backed header: zero-initialized slots past
@@ -3078,7 +3438,19 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
                 std::memcpy(&ptr_val, ptr, sizeof(ptr_val));
                 ptr += sizeof(ptr_val);
                 store.upper_idx_to_ptr_[i].Set(ptr_val);
+                if (!pointer_buffer_exists(store.upper_idx_to_ptr_[i], valid_upper_buffers)) {
+                    store.upper_idx_to_ptr_[i].Clear();
+                    storage_pointer_corruption_ = true;
+                }
             }
+        }
+    }
+    if (store.upper_idx_to_ptr_.size() != upper_count) {
+        storage_pointer_corruption_ = true;
+    }
+    for (idx_t i = 0; i < store.upper_idx_to_ptr_.size() && i < upper_count; i++) {
+        if (!store.upper_idx_to_ptr_[i].Get()) {
+            storage_pointer_corruption_ = true;
         }
     }
 

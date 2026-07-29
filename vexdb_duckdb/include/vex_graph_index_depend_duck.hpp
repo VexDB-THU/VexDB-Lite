@@ -44,6 +44,44 @@ using int64 = int64_t;
 using uint = unsigned int;
 using Size = size_t;
 
+// Keep cosine normalization byte-compatible with existing indexes for normal
+// inputs. Only fall back to the scaled calculation when the historical float
+// accumulation overflows; using the scaled formula unconditionally changes
+// float rounding and makes persisted coverage checks reject a healthy index.
+inline void NormalizeDuckVectorInPlace(float *vec, size_t dim) {
+    float norm2 = 0.0f;
+    for (size_t i = 0; i < dim; i++) {
+        norm2 += vec[i] * vec[i];
+    }
+    if (norm2 > 0.0f && std::isfinite(norm2)) {
+        const float inv = 1.0f / std::sqrt(norm2);
+        for (size_t i = 0; i < dim; i++) {
+            vec[i] *= inv;
+        }
+        return;
+    }
+    if (!std::isinf(norm2)) {
+        return;
+    }
+
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < dim; i++) {
+        max_abs = std::max(max_abs, std::abs(vec[i]));
+    }
+    if (!(max_abs > 0.0f) || !std::isfinite(max_abs)) {
+        return;
+    }
+    double scaled_norm2 = 0.0;
+    for (size_t i = 0; i < dim; i++) {
+        const double scaled = static_cast<double>(vec[i]) / max_abs;
+        scaled_norm2 += scaled * scaled;
+    }
+    const double inv = 1.0 / (static_cast<double>(max_abs) * std::sqrt(scaled_norm2));
+    for (size_t i = 0; i < dim; i++) {
+        vec[i] = static_cast<float>(static_cast<double>(vec[i]) * inv);
+    }
+}
+
 class BaseObject {
 };
 
@@ -843,18 +881,8 @@ public:
             normalized.resize(vec_size);
             auto *dst = reinterpret_cast<float *>(normalized.data());
             auto *src = reinterpret_cast<const float *>(query);
-            float norm2 = 0.0f;
-            for (uint_fast16_t i = 0; i < dim; i++) {
-                norm2 += src[i] * src[i];
-            }
-            if (norm2 > 0.0f) {
-                float inv_norm = 1.0f / std::sqrt(norm2);
-                for (uint_fast16_t i = 0; i < dim; i++) {
-                    dst[i] = src[i] * inv_norm;
-                }
-            } else {
-                std::memcpy(dst, src, vec_size);
-            }
+            std::memcpy(dst, src, vec_size);
+            NormalizeDuckVectorInPlace(dst, dim);
             store_data = normalized.data();
         }
 

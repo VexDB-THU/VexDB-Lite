@@ -13,14 +13,16 @@ steps:
   - query: SELECT '[1,2,3,4]'::floatvector - '[1,1,1,1]'::floatvector;
     expect: [["[0,1,2,3]"]]
 
-  # dim mismatch → error
-  - statement: SELECT '[1,2]'::floatvector + '[1,2,3]'::floatvector;
-    expect_error: ""
-  - statement: SELECT '[1,2,3]'::floatvector - '[1,2]'::floatvector;
-    expect_error: ""
-
   # NULL propagation
   - query: SELECT '[1,2]'::floatvector + NULL::floatvector IS NULL;
     expect: [["t"]]
   - query: SELECT NULL::floatvector - '[1,2]'::floatvector IS NULL;
     expect: [["t"]]
+
+  # dim mismatch → error. Keep error statements after normal-output queries:
+  # PG psql writes query results to stdout and errors to stderr, and the docker
+  # runner merges both streams into one file.
+  - statement: SELECT '[1,2]'::floatvector + '[1,2,3]'::floatvector;
+    expect_error: ""
+  - statement: SELECT '[1,2,3]'::floatvector - '[1,2]'::floatvector;
+    expect_error: ""

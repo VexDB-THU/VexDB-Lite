@@ -135,8 +135,7 @@ void graph_index_store_qt_centroids(Relation index, BlockNumber qtcode_block, co
             opaque->nextblkno = BufferGetBlockNumber(new_buf);
         }
         MarkBufferDirty(buf);
-        LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-        ReleaseBuffer(buf);
+        UnlockReleaseBuffer(buf);
         if (write_size == 0) {
             break;
         }

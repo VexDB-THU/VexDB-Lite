@@ -99,16 +99,7 @@ static uint64_t HashCoverageRowVector(row_t row_id, const float *vec, idx_t dim)
 }
 
 static void NormalizeCoverageVectorInPlace(float *vec, idx_t dim) {
-    float norm2 = 0.0f;
-    for (idx_t i = 0; i < dim; i++) {
-        norm2 += vec[i] * vec[i];
-    }
-    if (norm2 > 0.0f) {
-        float inv = 1.0f / std::sqrt(norm2);
-        for (idx_t i = 0; i < dim; i++) {
-            vec[i] *= inv;
-        }
-    }
+    NormalizeDuckVectorInPlace(vec, dim);
 }
 
 static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) {
@@ -444,6 +435,10 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
 
 static bool GraphIndexMayBeStaleAfterRecovery(ClientContext &context, DataTable &storage,
                                               DuckTransaction &transaction, GraphIndex &graph_idx) {
+    if (graph_idx.HasStoragePointerCorruption()) {
+        graph_idx.MarkRowIdCoverageChecked(true);
+        return true;
+    }
     if (graph_idx.HasRowIdCoverageCheck()) {
         return graph_idx.IsRowIdCoverageStale();
     }

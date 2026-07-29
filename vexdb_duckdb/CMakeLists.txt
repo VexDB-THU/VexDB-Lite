@@ -35,6 +35,7 @@ set(VEXDB_DUCK_EXTENSION_FILES
     functions/distance_functions.cpp
     functions/vector_functions.cpp
     functions/index_info_function.cpp
+    functions/rebuild_index_function.cpp
     index/graph_index.cpp
     index/graph_index_disk.cpp
     index/vex_disk_block_store.cpp

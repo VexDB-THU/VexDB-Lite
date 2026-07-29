@@ -10,6 +10,7 @@
 #include "rabitq/rabitq.h"
 
 #include <atomic>
+#include <functional>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -60,6 +61,15 @@ public:
     ~GraphIndex() override;
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
+    // Build from a read-only, random-access vector source. Rebuild can use a
+    // memory-mapped temporary file here so the full table vector payload does
+    // not have to live in the process heap.
+    void BuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                   bool vectors_are_normalized = false);
+    void RebuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
+    void RebuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                     bool vectors_are_normalized = false,
+                     std::function<void()> release_vector_source = nullptr);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
     // PQ ADC search over the shared graph topology. The graph keeps query cost
@@ -97,6 +107,9 @@ public:
     }
     bool IsRowIdCoverageStale() const {
         return rowid_coverage_stale_.load(std::memory_order_acquire);
+    }
+    bool HasStoragePointerCorruption() const {
+        return storage_pointer_corruption_.load(std::memory_order_acquire);
     }
     void MarkRowIdCoverageChecked(bool stale) {
         // Publish the result before the checked bit. Optimizer threads may read
@@ -145,6 +158,10 @@ public:
     // ClientContext is available (Create / PhysicalVexCreateIndex::Finalize) and applied
     // to the store after each InitAllocators via ApplyMirrorBudget(). 0 = unlimited.
     idx_t graph_memory_limit_bytes_ = 0;
+    // Rebuild keeps the live index resident until the staged build succeeds.
+    // Disable the staged raw-vector mirror explicitly so it cannot temporarily
+    // claim a second copy from the global mirror budget.
+    bool suppress_mirror_for_build_ = false;
     // Translate graph_memory_limit_bytes_ → store.mirror_max_nodes_ for the current
     // runtime_->store. Only tightens when vector_alloc_ exists (over-budget nodes need
     // the buffer-manager-backed copy as their home); otherwise leaves it unlimited.
@@ -157,6 +174,7 @@ private:
     void DeserializeFromStorage(const IndexStorageInfo &info);
     void DeserializePQAndModeFromStorage(const IndexStorageInfo &info);
     void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
+    void TrainAndEncodePQFromStore();
     void TrainAndEncodeRaBitQ();
 
     idx_t dimension_;
@@ -235,9 +253,19 @@ private:
 
     std::atomic<bool> rowid_coverage_checked_{false};
     std::atomic<bool> rowid_coverage_stale_{false};
+    // Hard process termination can leave index catalog metadata referring to an
+    // allocator buffer whose block was not recovered. Never pass such a pointer
+    // to FixedSizeAllocator::Get: release builds would dereference buffers.end().
+    // The optimizer treats this index as stale so exact scan remains available;
+    // PRAGMA rebuild can then replace it from the table.
+    std::atomic<bool> storage_pointer_corruption_{false};
 
     // Free the raw vector tier and clear the in-memory copy. Idempotent.
     void ReleaseRawVectors();
+    void SwapRebuildState(GraphIndex &staged) noexcept;
+    // Refill the optional hot mirror after an atomic rebuild has released the
+    // previous runtime and returned its share of the global mirror budget.
+    void WarmRawVectorMirror();
 };
 
 } // namespace duckdb
