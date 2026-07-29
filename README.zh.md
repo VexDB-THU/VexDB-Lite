@@ -7,6 +7,13 @@
 > DuckDB 扩展详见 [vexdb_duckdb/README.md](vexdb_duckdb/README.md)。  
 > 本根 README 只做项目级综述与构建总览。
 
+**最新版本：[v0.0.17](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17)**
+
+- PostgreSQL 16–19：Linux x86_64、AArch64
+- DuckDB v1.5.2：Linux x86_64、AArch64
+- SQLite：Linux、macOS、iOS、Android、WASM
+- `SHA256SUMS.txt` 覆盖全部 30 个发布压缩包
+
 ---
 
 ## 1. 组件概览
@@ -45,10 +52,21 @@
 - 向量缓存、并行建索引
 - 运行参数：`vexdb_ef_search`、`vexdb_brute_force_threshold`、`vexdb_pq_search_mode`、`vexdb_pq_refine_k_factor`
 
+### 1.3 SQLite：`vexdb_lite`
+
+完整 API 和构建方法见 [vexdb_sqlite/README.md](vexdb_sqlite/README.md)。当前能力：
+
+- `GRAPH_INDEX` 虚拟表和 shadow table 持久化
+- L2、cosine、inner product 检索，支持 JSON 和 float32 BLOB 向量
+- 增量插入、更新、删除、事务回滚和关库重开恢复
+- metadata 过滤、`LIMIT` 下推和并行建图
+- PQ、RaBitQ 的 full / compact 模式
+- 桌面端可加载扩展，以及 iOS、Android、WASM 静态注册
+
 ---
 
 ## 2. 产品能力矩阵
-### 2.2 PG拓展对比 (pgvector vs vexdb-lite vs VexDB)
+### 2.1 PostgreSQL 扩展对比（pgvector vs VexDB-Lite vs VexDB）
 
 | 分类 | 功能 | 描述 | pgvector | vexdb-lite（开源版） | VexDB（商用版） |
 |---|---|---|:---:|:---:|:---:|
@@ -265,7 +283,7 @@ SELECT * FROM vexdb_index_info();
 
 ## 5. 构建方法
 
-> **预编译产物（推荐）**：见 [GitHub Releases](https://github.com/VexDB-THU/vexdb_lite/releases) 下载 `vex-duckdb-linux-<arch>.tar.gz` / `vexdb_lite-linux-<arch>-pg19.tar.gz`，无需本地编译。
+> **预编译产物（推荐）**：从 [v0.0.17 Release](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17) 下载对应数据库、平台和架构的压缩包。SQLite 提供 Linux、macOS、iOS XCFramework、Android 和 WASM 产物；本版本暂不提供 Windows 预编译包。
 >
 > **从源码构建**：每个子项目的 README 有详细步骤：
 > - DuckDB 扩展：[vexdb_duckdb/README.md#构建](vexdb_duckdb/README.md#构建)
@@ -275,10 +293,16 @@ SELECT * FROM vexdb_index_info();
 > ```bash
 > bash scripts/release.sh build              # 远程 x86 + ARM 各 build 一份 → dist/
 > bash scripts/release.sh package            # 打 tarball + SHA256SUMS → dist/release/
-> bash scripts/release.sh upload v0.1.0      # gh release upload
+> bash scripts/release.sh upload v0.0.17     # gh release upload
 > ```
 
-### 4.1 构建 PostgreSQL 版本
+下载后使用发布页中的校验文件检查产物：
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+### 5.1 构建 PostgreSQL 版本
 
 #### 依赖
 
@@ -330,7 +354,7 @@ CREATE EXTENSION vexdb_lite;
 
 ---
 
-### 4.2 构建 DuckDB 版本
+### 5.2 构建 DuckDB 版本
 
 **推荐方式：使用 `build_duck.sh`**（封装了 DuckDB clone、cmake 配置、编译、元数据处理全流程）
 
@@ -343,7 +367,7 @@ bash build_duck.sh build   # 编译扩展（增量）
 
 #### 依赖
 
-- CMake 3.14+
+- CMake ≥ 3.28 且 < 4.x
 - C++17 编译器（GCC 9+ 或 Clang 10+）
 - Git
 
@@ -357,7 +381,7 @@ DuckDB 扩展需嵌入 DuckDB 源码树编译，无法单独 `cmake -B build vex
 
 ---
 
-### 运行测试
+## 6. 运行测试
 
 #### DuckDB 扩展测试
 
@@ -372,7 +396,16 @@ bash tests/spec/_lib/docker/run_duckdb.sh test  # 运行全量 spec 测试（需
 bash tests/spec/_lib/docker/run_pg.sh test      # 运行 PG spec 测试（需 Docker + PG19）
 ```
 
+#### SQLite 扩展测试
+
+```bash
+bash build_sqlite.sh test
+bash tests/spec/_lib/docker/run_sqlite.sh test
+```
+
 测试框架基于 YAML spec DSL，测试文件位于 `tests/spec/`。
+
+v0.0.17 发版验证结果：DuckDB 在 Linux x86_64 和 AArch64 上各通过 127/127；PostgreSQL 19 AArch64 通过 88/88；SQLite 在 3.46.0 和 3.53.4 上通过 32/32。iOS Simulator 通过 M0、M1、SIMD、M2、M3、M3+，其中 4 万向量并行建图的 recall@10 为 1.0000。
 
 ---
 
@@ -424,7 +457,12 @@ bash tests/spec/_lib/docker/run_pg.sh test      # 运行 PG spec 测试（需 Do
 - `threads`、`pq_m` 选项目前接受但部分路径仍是兼容保留/未完全实现
 - ARM Duck 构建当前也走 `GENERAL` 距离派发
 
-## 7. 仓库结构
+### SQLite 与发布产物
+
+- iOS、Android、WASM 使用静态注册；运行时 `.load` 只适用于桌面端和服务端
+- v0.0.17 暂不提供 Windows 预编译包
+
+## 9. 仓库结构
 
 | 目录 | 说明 |
 |---|---|

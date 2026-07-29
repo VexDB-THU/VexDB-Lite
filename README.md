@@ -7,6 +7,13 @@
 > See [vexdb_duckdb/README.md](vexdb_duckdb/README.md) for the DuckDB extension docs.  
 > This root README is a project-level overview and build guide.
 
+**Latest release: [v0.0.17](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17)**
+
+- PostgreSQL 16–19 packages for Linux x86_64 and AArch64
+- DuckDB v1.5.2 packages for Linux x86_64 and AArch64
+- SQLite packages for Linux, macOS, iOS, Android, and WASM
+- `SHA256SUMS.txt` covering all 30 release archives
+
 ---
 
 ## 1. Components
@@ -45,6 +52,17 @@ Current functionality:
 - Optimizer rewrite into `VEXDB_INDEX_SCAN`
 - Vector buffer cache and parallel index build
 - Runtime settings: `vexdb_ef_search`, `vexdb_brute_force_threshold`, `vexdb_pq_search_mode`, `vexdb_pq_refine_k_factor`
+
+### 1.3 SQLite: `vexdb_lite`
+
+See [vexdb_sqlite/README.md](vexdb_sqlite/README.md) for the full API and build guide. Current functionality:
+
+- `GRAPH_INDEX` virtual tables with shadow-table persistence
+- L2, cosine, and inner-product search with JSON or float32 BLOB vectors
+- Incremental insert, update, delete, transaction rollback, and reopen recovery
+- Metadata filtering, `LIMIT` pushdown, and parallel graph construction
+- PQ and RaBitQ in full or compact memory mode
+- Loadable desktop extension plus static registration for iOS, Android, and WASM
 
 ---
 
@@ -270,6 +288,14 @@ SELECT * FROM vexdb_index_info();
 
 ## 5. Build
 
+**Prebuilt packages are recommended.** Download the archive for your database, platform, and architecture from the [v0.0.17 release](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17), then verify it with the published checksum manifest:
+
+```bash
+shasum -a 256 -c SHA256SUMS.txt
+```
+
+SQLite package names include `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64`, `ios-xcframework`, `android-arm64-v8a`, `android-x86_64`, and `wasm`. Windows prebuilt packages are not available in v0.0.17.
+
 ### 5.1 Build the PostgreSQL Variant
 
 ### Dependencies
@@ -334,7 +360,7 @@ Output: `build/duck/build/extension/vexdb_lite/vexdb_lite.duckdb_extension`
 
 ### Dependencies
 
-- CMake 3.14+
+- CMake ≥ 3.28 and < 4.x
 - C++17 compiler (GCC 9+ or Clang 10+)
 - Git
 
@@ -363,7 +389,16 @@ bash tests/spec/_lib/docker/run_duckdb.sh test  # Run full spec tests (requires 
 bash tests/spec/_lib/docker/run_pg.sh test      # Run PG spec tests (requires Docker + PG19)
 ```
 
+### SQLite Extension Tests
+
+```bash
+bash build_sqlite.sh test
+bash tests/spec/_lib/docker/run_sqlite.sh test
+```
+
 Tests are driven by a YAML spec DSL; test files live under `tests/spec/`.
+
+The v0.0.17 release passed 127/127 DuckDB tests on Linux x86_64 and AArch64, 88/88 PostgreSQL 19 specs on AArch64, and 32/32 SQLite specs against SQLite 3.46.0 and 3.53.4. The iOS Simulator suite also passed M0, M1, SIMD, M2, M3, and M3+ scenarios, including the 40,000-vector parallel-build test with recall@10 of 1.0000.
 
 ---
 
@@ -415,7 +450,12 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 - `threads` and `pq_m` options are compatibility placeholders on some code paths
 - ARM Duck builds currently use scalar (`GENERAL`) distance dispatch without SIMD acceleration
 
-## 7. Repository Structure
+### SQLite and release packages
+
+- iOS, Android, and WASM use static registration; runtime `.load` is for desktop and server builds
+- v0.0.17 does not include Windows prebuilt packages
+
+## 9. Repository Structure
 
 | Directory | Description |
 |---|---|

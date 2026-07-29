@@ -5,7 +5,7 @@
 > 完整计划：`docs/plans/2026-06-10_sqlite-adapter-v1-plan.md`
 > 范围调研：`docs/research/2026-06-10_sqlite-v1-scope-reinvestigation.md`
 
-## 当前进度：M0～M4 ✅，PQ / RaBitQ 已接入共享图算法
+## 当前进度：M0～M5 ✅，PQ / RaBitQ 已接入共享图算法
 
 ```sql
 .load ./vexdb_lite              -- 桌面；移动端走静态注册
@@ -27,10 +27,10 @@ SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;
 | M2 虚拟表（shadow table 持久化 + 暴力 KNN） | `m2_vtab_smoke`（KNN 正确性/事务回滚/关库重开/错误路径） | ✅ arm64 + x86_64 |
 | M3 HNSW（共享算法 × SQLite store，>64 行走图，`%_graph` blob 持久化） | `m3_hnsw_smoke`（recall@10=1.000、增量、重开 blob 还原、DELETE/ROLLBACK） | ✅ arm64 + x86_64 |
 | M3+ 并行建图（rebuild 预读后多线程，publish fence，TSan 零 race） | `m3p_parallel_smoke`（N=40000、8 线程 ×3 轮 recall==串行 baseline） | ✅ |
-| M4 spec 落地 | SQLite spec 31 passed / 0 failed | ✅ |
+| M4 spec 落地 | SQLite spec 32 passed / 0 failed（SQLite 3.46.0、3.53.4） | ✅ |
 | PQ（共享训练、编码、ADC、SIMD） | full/compact、L2/cosine/IP、精确重排、增量和重启 | ✅ macOS arm64 |
 | RaBitQ（共享量化器、图遍历、持久化） | L2/cosine/IP recall@10 均为 1.000 | ✅ macOS arm64 |
-| M5 桌面发版 | — | 下一步 |
+| M5 跨平台发版 | Linux、macOS、iOS XCFramework、Android、WASM | ✅ v0.0.17 |
 
 距离语义三 metric 统一 **lower = closer**（L2=sqrt、cosine=1-sim、ip=负内积），`ORDER BY distance ASC` 即最近优先。跨 ISA（NEON/SSE）允许 ~1e-6 级 float32 重排序分歧。
 
@@ -97,6 +97,10 @@ clang++ build/smoke.o build/init_core.o build/vtab_core.o build/sqlite3.o -lpthr
 
 > macOS 注意：本机 anaconda clang 默认 target 是 x86_64，与系统 arm64 sqlite3 不匹配。
 > CMake 已自动对齐 host 架构；手动编 loadable 时按需加 `-arch arm64`。
+
+## 发布产物
+
+[v0.0.17](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17) 提供 Linux x86_64 / AArch64、macOS arm64 / x86_64、iOS XCFramework、Android arm64-v8a / x86_64 和 WASM 压缩包。本版本暂不提供 Windows 预编译包。
 
 ## 路线（详见计划文档）
 
