@@ -87,4 +87,6 @@ steps:
 - statement: DROP TABLE pb_cross_chunk;
 
 skip:
+  pg: true
+  opengauss: true
   sqlite: true

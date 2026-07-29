@@ -2,6 +2,7 @@
 
 #include "vex/vex_disk_block_store.hpp"
 #include "vex/vex_disk_layout.hpp"
+#include "vex_hnsw_node.hpp"
 
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/storage/table_io_manager.hpp"
@@ -15,6 +16,18 @@ namespace duckdb {
 
 namespace {
 
+static string MetricToStorageString(VexMetric metric) {
+    switch (metric) {
+    case VexMetric::L2:
+        return "l2";
+    case VexMetric::INNER_PRODUCT:
+        return "ip";
+    case VexMetric::COSINE:
+        return "cosine";
+    }
+    throw InternalException("Unknown GRAPH_INDEX metric");
+}
+
 template <class T>
 static void AppendBytes(std::string &out, const T &value) {
     auto old_size = out.size();
@@ -26,6 +39,12 @@ static void AppendRaw(std::string &out, const void *ptr, size_t len) {
     auto old_size = out.size();
     out.resize(old_size + len);
     std::memcpy(out.data() + old_size, ptr, len);
+}
+
+static void AppendUInt64LE(std::string &out, uint64_t value) {
+    for (idx_t i = 0; i < sizeof(value); i++) {
+        out.push_back(static_cast<char>((value >> (i * 8U)) & 0xffU));
+    }
 }
 
 template <class T>
@@ -240,13 +259,7 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     info.options["dimension"] = Value::UBIGINT(uint64_t(dimension_));
     info.options["m"] = Value::INTEGER(m_);
     info.options["ef_construction"] = Value::INTEGER(ef_construction_);
-    const char *metric_name = "l2";
-    if (metric_ == VexMetric::INNER_PRODUCT) {
-        metric_name = "ip";
-    } else if (metric_ == VexMetric::COSINE) {
-        metric_name = "cosine";
-    }
-    info.options["metric"] = Value(metric_name);
+    info.options["metric"] = Value(MetricToStorageString(metric_));
     info.options["node_count"] = Value::UBIGINT(uint64_t(store.elems.size()));
     info.options["upper_count"] = Value::UBIGINT(uint64_t(store.upper_points.size()));
     info.options["entry_id"] = Value::UBIGINT(uint64_t(store.entry_info.id));
@@ -283,6 +296,54 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
             deleted_blob.append(reinterpret_cast<const char *>(&rid_val), sizeof(rid_val));
         }
         info.options["deleted_rids"] = Value::BLOB(const_data_ptr_cast(deleted_blob.data()), deleted_blob.size());
+    }
+
+    if (!store.elems.empty()) {
+        string rowid_blob;
+        uint64_t num_entries = store.elems.size();
+        uint64_t override_count = 0;
+        AppendUInt64LE(rowid_blob, num_entries);
+        const auto override_count_offset = rowid_blob.size();
+        AppendUInt64LE(rowid_blob, 0);
+        for (idx_t node_id = 0; node_id < store.elems.size(); node_id++) {
+            const auto &elem = store.elems[node_id];
+            bool matches_header_default = false;
+            if (node_id < store.id_to_node_ptr_.size() && store.node_alloc_) {
+                auto node_ptr = store.id_to_node_ptr_[node_id];
+                if (node_ptr.Get()) {
+                    auto *header = reinterpret_cast<const duckdb::vex::HNSWNodeHeader<uint32_t> *>(
+                        store.node_alloc_->Get(node_ptr));
+                    if (header) {
+                        const bool header_live = !header->deleted &&
+                            deleted_rids_.find(header->row_id) == deleted_rids_.end();
+                        matches_header_default = header_live
+                            ? elem.tids.size() == 1 && elem.tids[0].row_id == header->row_id
+                            : elem.tids.empty();
+                    }
+                }
+            }
+            if (matches_header_default) {
+                continue;
+            }
+            AppendUInt64LE(rowid_blob, static_cast<uint64_t>(node_id));
+            AppendUInt64LE(rowid_blob, static_cast<uint64_t>(elem.tids.size()));
+            for (const auto &tid : elem.tids) {
+                if (tid.row_id < 0 || tid.row_id >= MAX_ROW_ID) {
+                    throw InternalException("GRAPH_INDEX contains an invalid row id");
+                }
+                AppendUInt64LE(rowid_blob, static_cast<uint64_t>(tid.row_id));
+            }
+            override_count++;
+        }
+        for (idx_t i = 0; i < sizeof(override_count); i++) {
+            rowid_blob[override_count_offset + i] =
+                static_cast<char>((override_count >> (i * 8U)) & 0xffU);
+        }
+        if (override_count > 0) {
+            info.options["row_id_records_version"] = Value::UINTEGER(2);
+            info.options["row_id_records"] = Value::BLOB(
+                const_data_ptr_cast(rowid_blob.data()), rowid_blob.size());
+        }
     }
 
     if (!store.upper_idx_to_ptr_.empty()) {
@@ -399,6 +460,7 @@ IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_in
         IndexLock maintenance_lock;
         Vacuum(maintenance_lock);
     }
+    vex_duck::SharedLockGuard _rg(graph_rwlock_);
 
     if (!runtime_ || !runtime_->store.node_alloc_) {
         return ExportStorageInfo();
@@ -426,6 +488,7 @@ IndexStorageInfo GraphIndex::SerializeToWAL(const case_insensitive_map_t<Value> 
         IndexLock maintenance_lock;
         Vacuum(maintenance_lock);
     }
+    vex_duck::SharedLockGuard _rg(graph_rwlock_);
 
     if (!runtime_ || !runtime_->store.node_alloc_) {
         return ExportStorageInfo();

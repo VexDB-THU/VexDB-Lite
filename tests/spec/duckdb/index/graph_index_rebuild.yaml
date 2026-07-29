@@ -1,0 +1,305 @@
+name: index__graph_index_rebuild
+tags:
+- vex
+- duckdb
+engines:
+- duckdb
+description: Verify explicit DuckDB GRAPH_INDEX rebuild refreshes live table coverage
+steps:
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- statement: PRAGMA vexdb_rebuild_index('idx_missing');
+  expect_error: does not exist
+- statement: CREATE TABLE t_rebuild (id INTEGER, vec ${VECTOR(4)});
+- statement: "INSERT INTO t_rebuild SELECT i, list_value(\n  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT,\n  sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(1, 121)} t(i);"
+- statement: CREATE INDEX idx_rebuild ON t_rebuild USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: BEGIN;
+  connection: rebuild_writer
+- statement: UPDATE t_rebuild SET vec = ${VEC_LITERAL([99,99,99,99], 4)} WHERE id = 120;
+  connection: rebuild_writer
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+- statement: COMMIT;
+  connection: rebuild_writer
+- query: SELECT id FROM t_rebuild ORDER BY ${L2(vec, ${VEC_LITERAL([99,99,99,99], 4)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 120
+- statement: BEGIN;
+  connection: rebuild_writer
+- statement: DELETE FROM t_rebuild WHERE id = 119;
+  connection: rebuild_writer
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+- statement: ROLLBACK;
+  connection: rebuild_writer
+- query: SELECT count(*), (SELECT row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild') FROM t_rebuild;
+  _field_types: II
+  expect:
+  - - 120
+    - 120
+- statement: BEGIN;
+- query: SELECT count(*) FROM t_rebuild;
+  _field_types: I
+  expect:
+  - - 120
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+  expect_error: auto-commit mode
+- statement: ROLLBACK;
+- statement: BEGIN;
+- statement: INSERT INTO t_rebuild VALUES (999, ${VEC_LITERAL([9.0,9.0,9.0,9.0], 4)});
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+  expect_error: auto-commit mode
+- statement: ROLLBACK;
+- statement: DELETE FROM t_rebuild WHERE id <= 30;
+- query: SELECT count(*) FROM t_rebuild;
+  _field_types: I
+  expect:
+  - - 90
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild';
+  _field_types: II
+  expect:
+  - - 90
+    - 90
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild';
+  _field_types: II
+  expect:
+  - - 90
+    - 90
+- query: EXPLAIN SELECT id FROM t_rebuild ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: "INSERT INTO t_rebuild SELECT i, list_value(\n  cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT,\n  cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(121, 141)} t(i);"
+- query: SELECT count(*) FROM t_rebuild;
+  _field_types: I
+  expect:
+  - - 110
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild';
+  _field_types: II
+  expect:
+  - - 110
+    - 110
+- statement: DROP TABLE t_rebuild;
+- statement: CREATE TABLE t_rebuild_empty (id INTEGER, vec ${VECTOR(4)});
+- statement: CREATE INDEX idx_rebuild_empty ON t_rebuild_empty USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_empty');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_empty';
+  _field_types: II
+  expect:
+  - - 0
+    - 0
+- statement: DROP TABLE t_rebuild_empty;
+- statement: CREATE TABLE t_rebuild_all_deleted (id INTEGER, vec ${VECTOR(4)});
+- statement: INSERT INTO t_rebuild_all_deleted VALUES (1, ${VEC_LITERAL([1.0,0.0,0.0,0.0], 4)}), (2, ${VEC_LITERAL([0.0,1.0,0.0,0.0], 4)});
+- statement: CREATE INDEX idx_rebuild_all_deleted ON t_rebuild_all_deleted USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: DELETE FROM t_rebuild_all_deleted;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_all_deleted');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_all_deleted';
+  _field_types: II
+  expect:
+  - - 0
+    - 0
+- statement: DROP TABLE t_rebuild_all_deleted;
+- statement: CREATE TABLE t_rebuild_null (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t_rebuild_null VALUES (1, ${VEC_LITERAL([1.0,0.0,0.0], 3)}), (2, NULL), (3, ${VEC_LITERAL([0.0,1.0,0.0], 3)});
+- statement: CREATE INDEX idx_rebuild_null ON t_rebuild_null USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_null');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_null';
+  _field_types: II
+  expect:
+  - - 2
+    - 2
+- query: SELECT id FROM t_rebuild_null ORDER BY ${L2(vec, ${VEC_LITERAL([1.0,0.0,0.0], 3)})} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+- statement: DROP TABLE t_rebuild_null;
+- statement: CREATE TABLE t_rebuild_metric (id INTEGER, vec ${VECTOR(3)});
+- statement: INSERT INTO t_rebuild_metric VALUES (1, ${VEC_LITERAL([1.0,0.0,0.0], 3)}), (2, ${VEC_LITERAL([0.0,1.0,0.0], 3)}), (3, ${VEC_LITERAL([0.8,0.2,0.0], 3)}), (4, ${VEC_LITERAL([0.2,0.8,0.0], 3)});
+- statement: CREATE INDEX idx_rebuild_cos ON t_rebuild_metric USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- statement: CREATE INDEX idx_rebuild_ip ON t_rebuild_metric USING ${VEX_INDEX} (vec${OPS_IP_COL})${IDX_OPTS_IP};
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_cos');
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_ip');
+- query: SELECT metric, node_count FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} IN ('idx_rebuild_cos', 'idx_rebuild_ip') ORDER BY metric;
+  _field_types: TI
+  expect:
+  - - cosine
+    - 4
+  - - ip
+    - 4
+- query: EXPLAIN SELECT id FROM t_rebuild_metric ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0], 3)})} LIMIT 2;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- query: SELECT id FROM t_rebuild_metric ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0], 3)})} LIMIT 2;
+  _field_types: I
+  expect:
+  - - 1
+  - - 3
+- query: EXPLAIN SELECT id FROM t_rebuild_metric ORDER BY ${IP(vec, ${VEC_LITERAL([1.0,0.0,0.0], 3)})} DESC LIMIT 2;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: DROP TABLE t_rebuild_metric;
+- statement: CREATE TABLE t_rebuild_pq (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO t_rebuild_pq SELECT i, ${VEC_LITERAL([(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT,\n  (i * 0.05)::FLOAT, (i * 0.06)::FLOAT, (i * 0.07)::FLOAT, (i * 0.08)::FLOAT], 8)}\nFROM ${RANGE(300)} t(i);"
+- statement: CREATE INDEX idx_rebuild_pq ON t_rebuild_pq USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer = 'pq', pq_m = 4)};
+- query: SELECT use_pq::INTEGER, pq_m FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_pq';
+  _field_types: II
+  expect:
+  - - 1
+    - 4
+- statement: DELETE FROM t_rebuild_pq WHERE id < 50;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_pq');
+- query: SELECT node_count, row_id_map_size, use_pq::INTEGER, pq_m FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_pq';
+  _field_types: IIII
+  expect:
+  - - 250
+    - 250
+    - 1
+    - 4
+- query: SELECT count(*) FROM (SELECT id FROM t_rebuild_pq ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0], 8)})} LIMIT 10);
+  _field_types: I
+  expect:
+  - - 10
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_pq');
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_pq');
+- query: SELECT node_count, row_id_map_size, use_pq::INTEGER, pq_m FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_pq';
+  _field_types: IIII
+  expect:
+  - - 250
+    - 250
+    - 1
+    - 4
+- statement: DROP TABLE t_rebuild_pq;
+- statement: CREATE TABLE t_rebuild_compact (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO t_rebuild_compact SELECT i, ${VEC_LITERAL([(i * 0.01)::FLOAT, (i * 0.02)::FLOAT, (i * 0.03)::FLOAT, (i * 0.04)::FLOAT,\n  (i * 0.05)::FLOAT, (i * 0.06)::FLOAT, (i * 0.07)::FLOAT, (i * 0.08)::FLOAT], 8)}\nFROM ${RANGE(300)} t(i);"
+- statement: CREATE INDEX idx_rebuild_compact ON t_rebuild_compact USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer = 'pq', pq_m = 4, memory_mode = 'compact')};
+- statement: DELETE FROM t_rebuild_compact WHERE id < 25;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_compact');
+- query: SELECT node_count, row_id_map_size, use_pq::INTEGER, pq_m, memory_mode FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_compact';
+  _field_types: IIIIT
+  expect:
+  - - 275
+    - 275
+    - 1
+    - 4
+    - compact
+- query: EXPLAIN SELECT id FROM t_rebuild_compact ORDER BY ${L2(vec, ${VEC_LITERAL([1.0,2.0,3.0,4.0,5.0,6.0,7.0,8.0], 8)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: DROP TABLE t_rebuild_compact;
+- statement: CREATE TABLE t_rebuild_rabitq_empty (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO t_rebuild_rabitq_empty SELECT i, ${VEC_LITERAL([
+    sin(i*0.07)::FLOAT, cos(i*0.09)::FLOAT,
+    sin(i*0.11)::FLOAT, cos(i*0.13)::FLOAT,
+    sin(i*0.17)::FLOAT, cos(i*0.19)::FLOAT,
+    sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT], 8)}
+    FROM ${RANGE2(1, 301)} t(i);"
+- statement: CREATE INDEX idx_rebuild_rabitq_empty ON t_rebuild_rabitq_empty USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact', m=16, ef_construction=160)};
+- statement: DELETE FROM t_rebuild_rabitq_empty;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_rabitq_empty');
+- query: SELECT node_count, quantizer, rabitq_codes_bytes, rabitq_fixed_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_rabitq_empty';
+  _field_types: ITII
+  expect:
+  - - 0
+    - rabitq
+    - 0
+    - 0
+- statement: "INSERT INTO t_rebuild_rabitq_empty VALUES (9001, ${VEC_LITERAL([9.01,9.02,9.03,9.04,9.05,9.06,9.07,9.08], 8)});"
+- query: SELECT node_count, quantizer, rabitq_codes_bytes > 0, rabitq_fixed_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_rabitq_empty';
+  _field_types: ITII
+  expect:
+  - - 1
+    - rabitq
+    - true
+    - true
+- query: SELECT id FROM t_rebuild_rabitq_empty ORDER BY ${L2(vec, ${VEC_LITERAL([9.01,9.02,9.03,9.04,9.05,9.06,9.07,9.08], 8)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 9001
+- statement: DROP TABLE t_rebuild_rabitq_empty;
+- statement: CREATE TABLE t_rebuild_pq_empty (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO t_rebuild_pq_empty SELECT i, ${VEC_LITERAL([
+    i::FLOAT, (i+1)::FLOAT, (i+2)::FLOAT, (i+3)::FLOAT,
+    (i+4)::FLOAT, (i+5)::FLOAT, (i+6)::FLOAT, (i+7)::FLOAT], 8)}
+    FROM ${RANGE2(1, 301)} t(i);"
+- statement: CREATE INDEX idx_rebuild_pq_empty ON t_rebuild_pq_empty USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, memory_mode='compact', m=16, ef_construction=160)};
+- statement: DELETE FROM t_rebuild_pq_empty;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_pq_empty');
+- query: SELECT node_count, use_pq::INTEGER, pq_codes_bytes FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_pq_empty';
+  _field_types: III
+  expect:
+  - - 0
+    - 0
+    - 0
+- statement: "INSERT INTO t_rebuild_pq_empty VALUES (9002, ${VEC_LITERAL([9.02,9.03,9.04,9.05,9.06,9.07,9.08,9.09], 8)});"
+- query: SELECT node_count, use_pq::INTEGER, pq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_pq_empty';
+  _field_types: III
+  expect:
+  - - 1
+    - 1
+    - true
+- query: SELECT id FROM t_rebuild_pq_empty ORDER BY ${L2(vec, ${VEC_LITERAL([9.02,9.03,9.04,9.05,9.06,9.07,9.08,9.09], 8)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 9002
+- statement: DROP TABLE t_rebuild_pq_empty;
+- statement: CREATE TABLE t_rebuild_failure (id INTEGER, vec ${VECTOR(8)});
+- statement: "INSERT INTO t_rebuild_failure SELECT i, ${VEC_LITERAL([
+    i::FLOAT, (i+1)::FLOAT, (i+2)::FLOAT, (i+3)::FLOAT,
+    (i+4)::FLOAT, (i+5)::FLOAT, (i+6)::FLOAT, (i+7)::FLOAT], 8)}
+    FROM ${RANGE2(1, 301)} t(i);"
+- statement: CREATE INDEX idx_rebuild_failure ON t_rebuild_failure USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', pq_m=4, m=16, ef_construction=160)};
+- statement: UPDATE t_rebuild_failure SET vec = [CAST('NaN' AS FLOAT), 0, 0, 0, 0, 0, 0, 0]::${VECTOR(8)} WHERE id = 1;
+- query: SELECT use_pq::INTEGER, pq_m, pq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_failure';
+  _field_types: III
+  expect:
+  - - 1
+    - 4
+    - true
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_failure');
+  expect_error: contains NaN or infinity
+- query: SELECT use_pq::INTEGER, pq_m, pq_codes_bytes > 0 FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_rebuild_failure';
+  _field_types: III
+  expect:
+  - - 1
+    - 4
+    - true
+- query: SELECT id FROM t_rebuild_failure ORDER BY ${L2(vec, ${VEC_LITERAL([300,301,302,303,304,305,306,307], 8)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 300
+- statement: UPDATE t_rebuild_failure SET vec = ${VEC_LITERAL([1,2,3,4,5,6,7,8], 8)} WHERE id = 1;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_failure');
+- query: SELECT id FROM t_rebuild_failure ORDER BY ${L2(vec, ${VEC_LITERAL([1,2,3,4,5,6,7,8], 8)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 1
+- statement: DROP TABLE t_rebuild_failure;
+- statement: CREATE TABLE t_rebuild_plain_invalid (id INTEGER, vec ${VECTOR(4)});
+- statement: "INSERT INTO t_rebuild_plain_invalid VALUES (1, ${VEC_LITERAL([1,0,0,0], 4)}), (2, ${VEC_LITERAL([0,1,0,0], 4)});"
+- statement: CREATE INDEX idx_rebuild_plain_invalid ON t_rebuild_plain_invalid USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: UPDATE t_rebuild_plain_invalid SET vec = [CAST('NaN' AS FLOAT), 0, 0, 0]::${VECTOR(4)} WHERE id = 1;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_plain_invalid');
+  expect_error: contains NaN or infinity
+- statement: UPDATE t_rebuild_plain_invalid SET vec = ${VEC_LITERAL([1,0,0,0], 4)} WHERE id = 1;
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_plain_invalid');
+- statement: DROP TABLE t_rebuild_plain_invalid;
+- statement: ATTACH '__TEST_DIR__/rebuild_attached.db' AS rebuild_aux;
+- statement: CREATE TABLE rebuild_aux.t_rebuild_attached (id INTEGER, vec ${VECTOR(4)});
+- statement: "INSERT INTO rebuild_aux.t_rebuild_attached VALUES (1, ${VEC_LITERAL([1,0,0,0], 4)}), (2, ${VEC_LITERAL([0,1,0,0], 4)}), (3, ${VEC_LITERAL([0,0,1,0], 4)});"
+- statement: CREATE INDEX idx_rebuild_attached ON rebuild_aux.t_rebuild_attached USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: PRAGMA vexdb_rebuild_index('idx_rebuild_attached');
+- query: SELECT id FROM rebuild_aux.t_rebuild_attached ORDER BY ${L2(vec, ${VEC_LITERAL([0,1,0,0], 4)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DROP TABLE rebuild_aux.t_rebuild_attached;
+- statement: DETACH rebuild_aux;

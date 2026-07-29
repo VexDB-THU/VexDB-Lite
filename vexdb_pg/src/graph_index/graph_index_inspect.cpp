@@ -13,6 +13,7 @@
 extern "C" {
 #include "funcapi.h"
 #include "catalog/pg_class.h"
+#include "utils/builtins.h"
 #include "utils/rel.h"
 }
 

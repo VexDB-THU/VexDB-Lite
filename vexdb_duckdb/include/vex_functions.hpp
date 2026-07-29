@@ -29,6 +29,7 @@ struct VexFunctions {
     static ScalarFunctionSet GetL2NormalizeFunction();
 
     static void RegisterIndexInfoFunction(ExtensionLoader &loader);
+    static void RegisterRebuildIndexFunction(ExtensionLoader &loader);
 };
 
 } // namespace duckdb
