@@ -222,7 +222,16 @@ int main(int argc, char **argv) {
         check(n == 1 && ids[0] != 9002, "rolled-back row absent from knn");
     }
 
-    if (!skip_rabitq) {
+    if (skip_rabitq) {
+        char *errmsg = NULL;
+        int rc = sqlite3_exec(db,
+            "CREATE VIRTUAL TABLE unsupported_rabitq USING GRAPH_INDEX("
+            "embedding FLOAT[16], metric=l2, quantizer=rabitq)",
+            NULL, NULL, &errmsg);
+        check(rc != SQLITE_OK && errmsg != NULL && strstr(errmsg, "not supported") != NULL,
+              "unsupported RaBitQ is rejected explicitly");
+        sqlite3_free(errmsg);
+    } else {
     // ── RaBitQ cosine：归一化语义 + distance 数值对照 ──
     exec_ok(db, "CREATE VIRTUAL TABLE idxc USING GRAPH_INDEX("
                 "embedding FLOAT[16], metric=cosine, quantizer=rabitq, "

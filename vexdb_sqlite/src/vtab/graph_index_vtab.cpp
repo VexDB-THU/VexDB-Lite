@@ -298,6 +298,12 @@ bool ParseCreateArgs(int argc, const char *const *argv, GraphIndexVtab &vt,
         err = "pq_m cannot be combined with quantizer='rabitq'";
         return false;
     }
+#if defined(_WIN32)
+    if (vt.quantizer == QuantizerType::RABITQ) {
+        err = "quantizer='rabitq' is not supported on Windows yet";
+        return false;
+    }
+#endif
     if (vt.quantizer == QuantizerType::NONE && (vt.compact_mode || vt.pq_m != 0)) {
         vt.quantizer = QuantizerType::PQ;
     }
@@ -515,6 +521,14 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
             delete vt;
             return SQLITE_CORRUPT;
         }
+#if defined(_WIN32)
+        if (vt->quantizer == QuantizerType::RABITQ) {
+            *pzErr = sqlite3_mprintf(
+                "GRAPH_INDEX: persisted quantizer='rabitq' is not supported on Windows yet");
+            delete vt;
+            return SQLITE_ERROR;
+        }
+#endif
         if (vt->compact_mode && vt->quantizer == QuantizerType::NONE) {
             *pzErr = sqlite3_mprintf(
                 "GRAPH_INDEX: persisted compact index requires a quantizer");
