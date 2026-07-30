@@ -4,8 +4,77 @@ on:
   workflow_dispatch:
 
 jobs:
+  sqlite:
+    name: SQLite Windows x86_64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSYS2 MinGW GCC
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            git
+            make
+            unzip
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Configure and build SQLite
+        shell: msys2 {0}
+        run: |
+          bash vexdb_sqlite/vendor_sqlite.sh
+          cmake -S vexdb_sqlite -B build/sqlite-windows -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DVEXDB_SQLITE_BUILD_TESTS=ON \
+            -DVEXDB_USE_CCACHE=OFF
+          cmake --build build/sqlite-windows -j 2
+
+      - name: Run SQLite smoke tests
+        shell: msys2 {0}
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          build/sqlite-windows/m0_static_smoke.exe
+          build/sqlite-windows/m1_distance_smoke.exe
+          build/sqlite-windows/m2_vtab_smoke.exe
+          build/sqlite-windows/m3_hnsw_smoke.exe --no-rabitq
+
+      - name: Package SQLite
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist/sqlite-windows
+          cp build/sqlite-windows/vexdb_lite.dll dist/sqlite-windows/
+          cp build/sqlite-windows/libvexdb_lite_static.a dist/sqlite-windows/
+          cp vexdb_sqlite/include/vexdb_sqlite.h dist/sqlite-windows/
+          cp vexdb_sqlite/README.md dist/sqlite-windows/
+          ldd build/sqlite-windows/vexdb_lite.dll | tee dist/sqlite-windows/DEPENDENCIES.txt
+          for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            path=$(command -v "$dll" || true)
+            [ -z "$path" ] || cp "$path" dist/sqlite-windows/
+          done
+          tar -C dist/sqlite-windows -czf vexdb-lite-sqlite-windows-x86_64.tar.gz .
+          sha256sum vexdb-lite-sqlite-windows-x86_64.tar.gz > SHA256SUMS-windows.txt
+
+      - name: Upload SQLite artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vexdb-lite-sqlite-windows-x86_64
+          path: |
+            vexdb-lite-sqlite-windows-x86_64.tar.gz
+            SHA256SUMS-windows.txt
+
   build:
-    name: Windows x86_64
+    name: DuckDB Windows x86_64
+    if: github.ref_name == 'main'
     runs-on: windows-2022
 
     steps:

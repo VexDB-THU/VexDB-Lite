@@ -11,8 +11,8 @@
 
 - PostgreSQL 16–19 packages for Linux x86_64 and AArch64
 - DuckDB v1.5.2 packages for Linux x86_64 and AArch64
-- SQLite packages for Linux, macOS, iOS, Android, and WASM
-- `SHA256SUMS.txt` covering all 30 release archives
+- SQLite packages for Linux, macOS, iOS, Android, HarmonyOS, and WASM
+- `SHA256SUMS.txt` covering all 31 release archives
 
 ---
 
@@ -62,7 +62,7 @@ See [vexdb_sqlite/README.md](vexdb_sqlite/README.md) for the full API and build 
 - Incremental insert, update, delete, transaction rollback, and reopen recovery
 - Metadata filtering, `LIMIT` pushdown, and parallel graph construction
 - PQ and RaBitQ in full or compact memory mode
-- Loadable desktop extension plus static registration for iOS, Android, and WASM
+- Loadable desktop extension plus static registration for iOS, Android, HarmonyOS, and WASM
 
 ---
 
@@ -294,7 +294,7 @@ SELECT * FROM vexdb_index_info();
 shasum -a 256 -c SHA256SUMS.txt
 ```
 
-SQLite package names include `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64`, `ios-xcframework`, `android-arm64-v8a`, `android-x86_64`, and `wasm`. Windows prebuilt packages are not available in v0.0.17.
+SQLite package names include `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64`, `ios-xcframework`, `android-arm64-v8a`, `android-x86_64`, `ohos-arm64-v8a`, and `wasm`. Windows prebuilt packages are not available in v0.0.17.
 
 ### 5.1 Build the PostgreSQL Variant
 
@@ -452,8 +452,9 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 
 ### SQLite and release packages
 
-- iOS, Android, and WASM use static registration; runtime `.load` is for desktop and server builds
+- iOS, Android, HarmonyOS, and WASM use static registration; runtime `.load` is for desktop and server builds
 - v0.0.17 does not include Windows prebuilt packages
+- The repository can build and smoke-test SQLite on `windows-2022` with MinGW GCC; this artifact is not part of v0.0.17. Windows currently uses scalar distance kernels and rejects `quantizer='rabitq'` explicitly.
 
 ## 9. Repository Structure
 

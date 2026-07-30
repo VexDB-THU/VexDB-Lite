@@ -7,6 +7,17 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
+
+inline void vexdb_aligned_free(void *ptr) {
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
 
 #if (defined(PG_VEXDB_TARGET_DUCK) || defined(PG_VEXDB_TARGET_SQLITE))
 using MemoryContext = void *;
@@ -37,10 +48,17 @@ inline void *MemoryContextAlloc(MemoryContext /*ctx*/, size_t size) { return pal
 /* MemoryContextAllocZero 是两侧共用的补充。 */
 inline void *MemoryContextAllocZero(MemoryContext /*ctx*/, size_t size) { return palloc0(size); }
 inline void *palloc_aligned(size_t size, size_t align, int /*flags*/) {
+#if defined(_WIN32)
+    void *ptr = _aligned_malloc(size, align);
+    if (!ptr) {
+        throw std::bad_alloc();
+    }
+#else
     void *ptr = nullptr;
     if (posix_memalign(&ptr, align, size) != 0 || !ptr) {
         throw std::bad_alloc();
     }
+#endif
     return ptr;
 }
 #else
@@ -162,8 +180,22 @@ struct MallocAlloc {
     template <class U, class... Args> void construct(U* p, Args&&... args) { ::new(p) U(std::forward<Args>(args)...); }
     template <class U> void destroy(U* p) { p->~U(); }
 
-    static pointer aligned_allocate(size_t align, size_t n) { void *p; posix_memalign(&p, align, n); return (pointer)p; }
-    static void aligned_deallocate(pointer p, size_t) { ::free(p); }
+    static pointer aligned_allocate(size_t align, size_t n) {
+#if defined(_WIN32)
+        return (pointer)_aligned_malloc(n, align);
+#else
+        void *p = nullptr;
+        posix_memalign(&p, align, n);
+        return (pointer)p;
+#endif
+    }
+    static void aligned_deallocate(pointer p, size_t) {
+#if defined(_WIN32)
+        _aligned_free(p);
+#else
+        ::free(p);
+#endif
+    }
 };
 template <class T, class U> bool operator==(const MallocAlloc<T>&, const MallocAlloc<U>&) { return true; }
 template <class T, class U> bool operator!=(const MallocAlloc<T>&, const MallocAlloc<U>&) { return false; }
@@ -186,7 +218,7 @@ struct PgAlloc {
     template <class U> void destroy(U* p) { p->~U(); }
 
     static pointer aligned_allocate(size_t align, size_t n) { return (pointer)palloc_aligned(n, align, 0); }
-    static void aligned_deallocate(pointer p, size_t) { pfree(p); }
+    static void aligned_deallocate(pointer p, size_t) { vexdb_aligned_free(p); }
 };
 template <class T, class U> bool operator==(const PgAlloc<T>&, const PgAlloc<U>&) { return true; }
 template <class T, class U> bool operator!=(const PgAlloc<T>&, const PgAlloc<U>&) { return false; }

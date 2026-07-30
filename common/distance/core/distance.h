@@ -12,6 +12,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <boost/preprocessor/seq.hpp>
 #include <vtl/expr_helper>
 
@@ -188,7 +191,13 @@ struct RemainderPatcher {
 #endif
         RemainderSituationList<RemainderSituation::Unknown>,
         RemainderSituationList<RemainderSituation::NoPartial, RemainderSituation::NoTail, RemainderSituation::Unknown>>;
+#if defined(_WIN32)
+    static constexpr RemainderSituation get_remainder_situation(uint16) {
+        return RemainderSituation::Unknown;
+    }
+#else
     static RemainderSituation get_remainder_situation(uint16 dim);
+#endif
 };
 
 extern Arch get_best_arch(Metric m, DistPrecisionType dt, uint16 dim);
@@ -224,7 +233,14 @@ struct Distancer {
     using transform_type = Transformer<arch, op, dpt, rs, aligned>;
 
     /* Distance implementation - inline */
+#if defined(_WIN32) && (defined(__clang__) || defined(__GNUC__))
+    // MinGW/COFF does not coalesce this fallback with the strong per-ISA
+    // specialization the way ELF and Mach-O do. Mark it weak so SIMD wins.
+    static __attribute__((weak)) inline float get_distance_single(
+        const void *x, const void *y, uint16 dim) {
+#else
     static inline float get_distance_single(const void *x, const void *y, uint16 dim) {
+#endif
         /* General (scalar) implementation for all types */
         if constexpr (d == DistPrecisionType::FLOAT) {
             const float *fx = (const float *)x;
@@ -424,7 +440,11 @@ size_t get_aligned_vec_size(size_t vec_size);
 float *alloc_floatvector(uint32 dim, size_t n = 1);
 char *alloc_vector(size_t vec_size, size_t n = 1);
 #if (defined(PG_VEXDB_TARGET_DUCK) || defined(PG_VEXDB_TARGET_SQLITE))
+#if defined(_WIN32)
+inline void free_vector(void *vec) { _aligned_free(vec); }
+#else
 inline void free_vector(void *vec) { std::free(vec); }
+#endif
 #else
 inline void free_vector(void *vec) {
     if (vec != nullptr) {

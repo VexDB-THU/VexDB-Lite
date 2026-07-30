@@ -7,7 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#define unlink _unlink
+#else
 #include <unistd.h>
+#endif
 #include "sqlite3.h"
 #include "vexdb_sqlite.h"
 
@@ -92,7 +97,11 @@ static sqlite3_int64 count_rows(sqlite3 *db, const char *table) {
 }
 
 int main(void) {
-    const char *dbpath = "/tmp/vexdb_m2_smoke.db";
+    const char *tmpdir = getenv("VEXDB_SQLITE_TEST_TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = getenv("TMPDIR");
+    if (!tmpdir || !tmpdir[0]) tmpdir = "/tmp";
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/vexdb_m2_smoke.db", tmpdir);
     unlink(dbpath);
     sqlite3 *db = NULL;
     if (sqlite3_open(dbpath, &db) != SQLITE_OK) return 1;

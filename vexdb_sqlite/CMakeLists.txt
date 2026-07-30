@@ -116,6 +116,18 @@ elseif(_VEX_TARGET_ARCH MATCHES "aarch64|arm64")
     )
 endif()
 
+# MinGW/COFF does not support the ELF/Mach-O symbol interposition used by the
+# per-ISA Distancer specializations. Keep the first Windows package functional
+# with the header's scalar implementation; other platforms retain SIMD.
+if(WIN32)
+    list(REMOVE_ITEM VEXDB_DISTANCE_SRCS
+        ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/sse_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/avx_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/avx512_dispatcher.cpp
+    )
+endif()
+
 set(VEXDB_SQLITE_SRCS
     src/vexdb_sqlite_init.cpp
     src/vtab/graph_index_vtab.cpp
@@ -185,6 +197,10 @@ elseif(_VEX_TARGET_ARCH MATCHES "aarch64|arm64")
         # Android 端侧基线 = armv8-a（NDK 默认；大量在役设备是 v8.0 老核，
         # +lse/+fp16 会 SIGILL——服务器侧的 v8.2 基线是 Kunpeng 场景取舍）。
         set(NEON_FLAGS "${SIMD_COMMON_FLAGS}")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
+        # HarmonyOS 版与项目的 ARMv8.2+ 基线一致；dotprod 是当前 NEON
+        # dispatcher 的编译要求。端侧不使用服务器专用的 tsv110 调优参数。
+        set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+fp16+dotprod+crc")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         # iOS arm64 = A12+（armv8.3+），v8.2 特性全集安全。
         set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+lse+fp16+dotprod+crc")

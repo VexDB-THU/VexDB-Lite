@@ -67,6 +67,12 @@ Arch get_best_arch(Metric m, DistPrecisionType dt, uint16 dim)
     (void)dt;
     (void)dim;
 
+#if defined(_WIN32)
+    // The first MinGW build uses the scalar Distancer implementation. Keep
+    // RaBitQ transforms on the same architecture so its estimates stay valid.
+    return Arch::GENERAL;
+#endif
+
 #if COMPILER_TARGET_X86_64
     if (supports_avx512()) {
         return Arch::AVX512;
