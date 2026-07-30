@@ -125,7 +125,8 @@ static double recall_check(sqlite3 *db, const char *table, const char *fn,
     return (double)hit / K;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    const int skip_rabitq = argc > 1 && strcmp(argv[1], "--no-rabitq") == 0;
     /* Android 无 /tmp（用 TMPDIR=/data/local/tmp 覆盖）；桌面默认 /tmp */
     const char *tmpdir = getenv("TMPDIR");
     char dbpath[512];
@@ -221,6 +222,7 @@ int main(void) {
         check(n == 1 && ids[0] != 9002, "rolled-back row absent from knn");
     }
 
+    if (!skip_rabitq) {
     // ── RaBitQ cosine：归一化语义 + distance 数值对照 ──
     exec_ok(db, "CREATE VIRTUAL TABLE idxc USING GRAPH_INDEX("
                 "embedding FLOAT[16], metric=cosine, quantizer=rabitq, "
@@ -358,6 +360,7 @@ int main(void) {
         double rr = recall_check(db, "idxr", "vexdb_l2_distance", data[17],
                                  "rabitq reopen recall");
         check(rr >= 0.8, "rabitq reopen recall >= 0.8");
+    }
     }
 
     sqlite3_close(db);
