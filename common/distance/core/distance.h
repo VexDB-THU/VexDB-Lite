@@ -191,7 +191,13 @@ struct RemainderPatcher {
 #endif
         RemainderSituationList<RemainderSituation::Unknown>,
         RemainderSituationList<RemainderSituation::NoPartial, RemainderSituation::NoTail, RemainderSituation::Unknown>>;
+#if defined(_WIN32)
+    static constexpr RemainderSituation get_remainder_situation(uint16) {
+        return RemainderSituation::Unknown;
+    }
+#else
     static RemainderSituation get_remainder_situation(uint16 dim);
+#endif
 };
 
 extern Arch get_best_arch(Metric m, DistPrecisionType dt, uint16 dim);
