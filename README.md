@@ -454,6 +454,7 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 
 - iOS, Android, HarmonyOS, and WASM use static registration; runtime `.load` is for desktop and server builds
 - v0.0.17 does not include Windows prebuilt packages
+- The repository can build and smoke-test SQLite on `windows-2022` with MinGW GCC; this artifact is not part of v0.0.17. Windows currently uses scalar distance kernels and rejects `quantizer='rabitq'` explicitly.
 
 ## 9. Repository Structure
 

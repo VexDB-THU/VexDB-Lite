@@ -31,6 +31,7 @@ SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;
 | PQ（共享训练、编码、ADC、SIMD） | full/compact、L2/cosine/IP、精确重排、增量和重启 | ✅ macOS arm64 |
 | RaBitQ（共享量化器、图遍历、持久化） | L2/cosine/IP recall@10 均为 1.000 | ✅ macOS arm64 |
 | M5 跨平台发版 | Linux、macOS、iOS XCFramework、Android、HarmonyOS、WASM | ✅ v0.0.17 |
+| Windows 基础支持 | `windows-2022` 编译、M0/M1/M2/普通 HNSW、打包 | ✅ MinGW GCC x86_64 |
 
 距离语义三 metric 统一 **lower = closer**（L2=sqrt、cosine=1-sim、ip=负内积），`ORDER BY distance ASC` 即最近优先。跨 ISA（NEON/SSE）允许 ~1e-6 级 float32 重排序分歧。
 
@@ -84,6 +85,9 @@ bash build_sqlite.sh test     # vendor + 配置 + 编双形态 + 跑 M0 冒烟
 bash build_sqlite.sh vendor   # 仅拉取 amalgamation
 bash build_sqlite.sh clean
 
+# Windows x86_64：使用 GitHub Actions 的 Build Windows Binary workflow。
+# 当前产物采用 MinGW GCC ABI，Windows 暂用通用距离实现且不支持 RaBitQ。
+
 # HarmonyOS / OpenHarmony arm64-v8a（DevEco Studio 默认 SDK 路径）
 bash build_sqlite.sh ohos
 
@@ -107,6 +111,8 @@ clang++ build/smoke.o build/init_core.o build/vtab_core.o build/sqlite3.o -lpthr
 ## 发布产物
 
 [v0.0.17](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17) 提供 Linux x86_64 / AArch64、macOS arm64 / x86_64、iOS XCFramework、Android arm64-v8a / x86_64、HarmonyOS arm64-v8a 和 WASM 压缩包。本版本暂不提供 Windows 预编译包。
+
+仓库后续已加入 Windows x86_64 Actions 构建，产出 loadable DLL、MinGW 静态库、公共头文件和所需运行库。它尚未补入 v0.0.17；Windows 当前使用通用距离实现，`quantizer='rabitq'` 会返回明确的暂不支持错误。
 
 HarmonyOS 包包含 `vexdb_lite.so`、`libvexdb_lite_static.a` 和公共 C 头文件。应用持有 SQLite 连接后调用 `vexdb_sqlite_register(db)` 完成注册。ArkTS 项目需要在自己的 Native 模块中把该 C API 接到应用的 SQLite 连接；当前发布包不包含通用 Node-API 数据库封装。
 
