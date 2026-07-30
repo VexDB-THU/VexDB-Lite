@@ -30,6 +30,7 @@ jobs:
       - name: Configure and build SQLite
         shell: msys2 {0}
         run: |
+          bash vexdb_sqlite/vendor_sqlite.sh
           cmake -S vexdb_sqlite -B build/sqlite-windows -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DVEXDB_SQLITE_BUILD_TESTS=ON \
@@ -74,6 +75,7 @@ jobs:
 
   build:
     name: DuckDB Windows x86_64
+    if: github.ref_name == 'main'
     runs-on: windows-2022
 
     steps:
