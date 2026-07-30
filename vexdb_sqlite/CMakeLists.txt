@@ -116,6 +116,18 @@ elseif(_VEX_TARGET_ARCH MATCHES "aarch64|arm64")
     )
 endif()
 
+# MinGW/COFF does not support the ELF/Mach-O symbol interposition used by the
+# per-ISA Distancer specializations. Keep the first Windows package functional
+# with the header's scalar implementation; other platforms retain SIMD.
+if(WIN32)
+    list(REMOVE_ITEM VEXDB_DISTANCE_SRCS
+        ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/sse_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/avx_dispatcher.cpp
+        ${REPO_ROOT}/common/distance/src/avx512_dispatcher.cpp
+    )
+endif()
+
 set(VEXDB_SQLITE_SRCS
     src/vexdb_sqlite_init.cpp
     src/vtab/graph_index_vtab.cpp
