@@ -227,7 +227,14 @@ struct Distancer {
     using transform_type = Transformer<arch, op, dpt, rs, aligned>;
 
     /* Distance implementation - inline */
+#if defined(_WIN32) && (defined(__clang__) || defined(__GNUC__))
+    // MinGW/COFF does not coalesce this fallback with the strong per-ISA
+    // specialization the way ELF and Mach-O do. Mark it weak so SIMD wins.
+    static __attribute__((weak)) inline float get_distance_single(
+        const void *x, const void *y, uint16 dim) {
+#else
     static inline float get_distance_single(const void *x, const void *y, uint16 dim) {
+#endif
         /* General (scalar) implementation for all types */
         if constexpr (d == DistPrecisionType::FLOAT) {
             const float *fx = (const float *)x;
