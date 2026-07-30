@@ -22,6 +22,7 @@ jobs:
           install: >-
             git
             make
+            unzip
             mingw-w64-clang-x86_64-boost
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
