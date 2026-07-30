@@ -11,8 +11,8 @@
 
 - PostgreSQL 16–19：Linux x86_64、AArch64
 - DuckDB v1.5.2：Linux x86_64、AArch64
-- SQLite：Linux、macOS、iOS、Android、WASM
-- `SHA256SUMS.txt` 覆盖全部 30 个发布压缩包
+- SQLite：Linux、macOS、iOS、Android、HarmonyOS、WASM
+- `SHA256SUMS.txt` 覆盖全部 31 个发布压缩包
 
 ---
 
@@ -61,7 +61,7 @@
 - 增量插入、更新、删除、事务回滚和关库重开恢复
 - metadata 过滤、`LIMIT` 下推和并行建图
 - PQ、RaBitQ 的 full / compact 模式
-- 桌面端可加载扩展，以及 iOS、Android、WASM 静态注册
+- 桌面端可加载扩展，以及 iOS、Android、HarmonyOS、WASM 静态注册
 
 ---
 
@@ -283,7 +283,7 @@ SELECT * FROM vexdb_index_info();
 
 ## 5. 构建方法
 
-> **预编译产物（推荐）**：从 [v0.0.17 Release](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17) 下载对应数据库、平台和架构的压缩包。SQLite 提供 Linux、macOS、iOS XCFramework、Android 和 WASM 产物；本版本暂不提供 Windows 预编译包。
+> **预编译产物（推荐）**：从 [v0.0.17 Release](https://github.com/VexDB-THU/VexDB-Lite/releases/tag/v0.0.17) 下载对应数据库、平台和架构的压缩包。SQLite 提供 Linux、macOS、iOS XCFramework、Android、HarmonyOS 和 WASM 产物；本版本暂不提供 Windows 预编译包。
 >
 > **从源码构建**：每个子项目的 README 有详细步骤：
 > - DuckDB 扩展：[vexdb_duckdb/README.md#构建](vexdb_duckdb/README.md#构建)
@@ -459,7 +459,7 @@ v0.0.17 发版验证结果：DuckDB 在 Linux x86_64 和 AArch64 上各通过 12
 
 ### SQLite 与发布产物
 
-- iOS、Android、WASM 使用静态注册；运行时 `.load` 只适用于桌面端和服务端
+- iOS、Android、HarmonyOS、WASM 使用静态注册；运行时 `.load` 只适用于桌面端和服务端
 - v0.0.17 暂不提供 Windows 预编译包
 
 ## 9. 仓库结构

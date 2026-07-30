@@ -351,6 +351,9 @@ retry:
     {
         auto [neighbors_info, unused, id] = store.template get_point_info<false>(cur_layer_idx);
         (void)unused;
+        // C++17 does not allow lambdas to capture structured bindings. Keep a
+        // regular variable for older Clang toolchains such as HarmonyOS NDK.
+        const T point_id = id;
         if (deleted.contains((size_t)id)) {
             return;
         }
@@ -364,7 +367,7 @@ retry:
         auto vecbuf = store.read_data(id);
         const char *query = vecbuf.get_vecbuf();
         ep = search_layer<false>(query, std::move(ep), ef_construction, [&](T check_id) -> bool {
-            return id != check_id && !deleted.contains(check_id);
+            return point_id != check_id && !deleted.contains(check_id);
         });
         get_neighbors_data(ep);
         Vec<Cand> new_neighbors = select_neighbors<false>(std::move(ep));

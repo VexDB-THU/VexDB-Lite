@@ -876,6 +876,19 @@ cmd_package() {
         fi
     done
 
+    local ohos_dir="$sqlite_dist/ohos/arm64-v8a"
+    if [[ -f "$ohos_dir/vexdb_lite.so" && \
+          -f "$ohos_dir/libvexdb_lite_static.a" ]]; then
+        local ohos_stage="$sqlite_stage/ohos-arm64-v8a"
+        mkdir -p "$ohos_stage"
+        cp "$ohos_dir/vexdb_lite.so" "$ohos_stage/"
+        cp "$ohos_dir/libvexdb_lite_static.a" "$ohos_stage/"
+        cp "$ohos_dir/vexdb_sqlite.h" "$ohos_stage/"
+        cp "$REPO_ROOT/vexdb_sqlite/README.md" "$ohos_stage/"
+        pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-ohos-arm64-v8a.tar.gz" "$ohos_stage" \
+            vexdb_lite.so libvexdb_lite_static.a vexdb_sqlite.h README.md
+    fi
+
     if [[ -f "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.js" && \
           -f "$REPO_ROOT/examples/wasm/dist/vexdb-wasm.wasm" ]]; then
         local wasm_stage="$sqlite_stage/wasm"

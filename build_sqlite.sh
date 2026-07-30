@@ -8,6 +8,7 @@
 #   bash build_sqlite.sh package  # Release 编 macOS arm64+x86_64 → dist/ tarball + SHA256
 #   bash build_sqlite.sh ios      # Stage C：device+sim 静态库 → XCFramework（+sim smoke）
 #   bash build_sqlite.sh android  # Stage C：NDK arm64-v8a/x86_64 静态库 + loadable .so
+#   bash build_sqlite.sh ohos     # HarmonyOS/OpenHarmony arm64-v8a + 模拟器 smoke
 #   bash build_sqlite.sh wasm     # 浏览器版：构建 WASM + 跑真实图索引冒烟测试
 #   bash build_sqlite.sh vendor   # 仅拉取 SQLite amalgamation
 #   bash build_sqlite.sh clean    # 删 build 目录
@@ -214,6 +215,78 @@ case "$CMD" in
         echo "=== Android 产物 ==="
         ls -la "$DIST"/*/
         ;;
+    ohos)
+        # HarmonyOS/OpenHarmony Native SDK arm64-v8a。默认使用 DevEco Studio
+        # 自带 SDK，也可用 OHOS_NATIVE_HOME 指向 openharmony/native 目录。
+        [ -f "$DIR/third_party/sqlite/sqlite3ext.h" ] || bash "$DIR/vendor_sqlite.sh"
+        OHOS_NATIVE="${OHOS_NATIVE_HOME:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native}"
+        OHOS_TOOLCHAIN="$OHOS_NATIVE/build/cmake/ohos.toolchain.cmake"
+        OHOS_CMAKE="${OHOS_CMAKE:-$OHOS_NATIVE/build-tools/cmake/bin/cmake}"
+        OHOS_NINJA="${OHOS_NINJA:-$OHOS_NATIVE/build-tools/cmake/bin/ninja}"
+        [ -f "$OHOS_TOOLCHAIN" ] || { echo "找不到 OHOS NDK toolchain：设 OHOS_NATIVE_HOME" >&2; exit 1; }
+        [ -x "$OHOS_CMAKE" ] || { echo "找不到 OHOS SDK cmake：$OHOS_CMAKE" >&2; exit 1; }
+        [ -x "$OHOS_NINJA" ] || { echo "找不到 OHOS SDK ninja：$OHOS_NINJA" >&2; exit 1; }
+
+        ABI="${OHOS_ARCH:-arm64-v8a}"
+        [ "$ABI" = "arm64-v8a" ] || { echo "当前只发布 OHOS arm64-v8a" >&2; exit 1; }
+        BD="$DIR/build-ohos-$ABI"
+        DIST="$DIR/../dist/sqlite/ohos/$ABI"
+        TESTS="${OHOS_BUILD_TESTS:-ON}"
+        "$OHOS_CMAKE" -S "$DIR" -B "$BD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$OHOS_TOOLCHAIN" \
+            -DOHOS_ARCH="$ABI" -DOHOS_PLATFORM=OHOS -DOHOS_STL=c++_shared \
+            -DCMAKE_MAKE_PROGRAM="$OHOS_NINJA" \
+            -DVEXDB_SQLITE_BUILD_TESTS="$TESTS" -DVEXDB_USE_CCACHE=OFF \
+            "${BOOST_CMAKE_ARGS[@]}"
+        "$OHOS_CMAKE" --build "$BD" -j "$NCPU"
+
+        mkdir -p "$DIST"
+        cp "$BD/vexdb_lite.so" "$BD/libvexdb_lite_static.a" "$DIST/"
+        cp "$DIR/include/vexdb_sqlite.h" "$DIR/README.md" "$DIST/"
+        OHOS_STRIP="$OHOS_NATIVE/llvm/bin/llvm-strip"
+        [ -x "$OHOS_STRIP" ] && "$OHOS_STRIP" --strip-unneeded "$DIST/vexdb_lite.so" \
+                         && "$OHOS_STRIP" --strip-debug "$DIST/libvexdb_lite_static.a"
+
+        if [ "$TESTS" = "ON" ]; then
+            HDC="${HDC:-$(command -v hdc || true)}"
+            [ -n "$HDC" ] || HDC="$(dirname "$OHOS_NATIVE")/toolchains/hdc"
+            if [ -x "$HDC" ] && [ -n "$("$HDC" list targets 2>/dev/null)" ]; then
+                REMOTE=/data/local/tmp/vexdb-ohos-smoke
+                "$HDC" shell "mkdir -p $REMOTE"
+                for smoke in m0_static_smoke m1_distance_smoke simd_dispatch_smoke \
+                             m2_vtab_smoke m3_hnsw_smoke m3p_parallel_smoke; do
+                    "$HDC" file send "$BD/$smoke" "$REMOTE/$smoke"
+                done
+                "$HDC" shell "chmod 755 $REMOTE/* && cd $REMOTE && \
+                    ./m0_static_smoke && ./m1_distance_smoke && ./simd_dispatch_smoke && \
+                    VEXDB_SQLITE_TEST_TMPDIR=$REMOTE ./m2_vtab_smoke && ./m3_hnsw_smoke"
+
+                # M3+ 在模拟器上约需数分钟，hdc 长命令可能提前断开。
+                # 后台运行并轮询退出码，避免把仍在计算误判为成功。
+                "$HDC" shell "cd $REMOTE; rm -f m3p.log m3p.rc; \
+                    nohup sh -c './m3p_parallel_smoke >m3p.log 2>&1; echo \$? >m3p.rc' \
+                    >/dev/null 2>&1 &"
+                OHOS_M3P_DONE=0
+                for _ in $(seq 1 60); do
+                    OHOS_M3P_STATE=$("$HDC" shell "[ -f $REMOTE/m3p.rc ] && echo DONE || echo RUNNING")
+                    if echo "$OHOS_M3P_STATE" | grep -q DONE; then
+                        "$HDC" shell "cat $REMOTE/m3p.log"
+                        OHOS_M3P_RC=$("$HDC" shell "cat $REMOTE/m3p.rc" | tr -d '\r\n')
+                        [ "$OHOS_M3P_RC" = "0" ] || { echo "HarmonyOS M3+ smoke 失败: rc=$OHOS_M3P_RC" >&2; exit 1; }
+                        OHOS_M3P_DONE=1
+                        break
+                    fi
+                    sleep 5
+                done
+                [ "$OHOS_M3P_DONE" = "1" ] || { echo "HarmonyOS M3+ smoke 超时" >&2; exit 1; }
+                "$HDC" shell "rm -rf $REMOTE"
+            else
+                echo "未发现 HarmonyOS 设备/模拟器，已完成交叉编译，跳过 runtime smoke" >&2
+            fi
+        fi
+        echo "=== HarmonyOS 产物 ==="
+        ls -la "$DIST"
+        ;;
     wasm)
         WASM_DIR="$DIR/../examples/wasm"
         bash "$WASM_DIR/build.sh"
@@ -223,11 +296,11 @@ case "$CMD" in
         echo "开发调试服务: npm --prefix $WASM_DIR run serve"
         ;;
     clean)
-        rm -rf "$BUILD_DIR" "$DIR"/build-pkg-* "$DIR"/build-ios-* "$DIR"/build-android-*
+        rm -rf "$BUILD_DIR" "$DIR"/build-pkg-* "$DIR"/build-ios-* "$DIR"/build-android-* "$DIR"/build-ohos-*
         echo "已清理 build 目录"
         ;;
     *)
-        echo "Usage: $0 [build|test|benchmark|package|ios|android|wasm|vendor|clean]"
+        echo "Usage: $0 [build|test|benchmark|package|ios|android|ohos|wasm|vendor|clean]"
         exit 1
         ;;
 esac

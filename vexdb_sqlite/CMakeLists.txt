@@ -185,6 +185,10 @@ elseif(_VEX_TARGET_ARCH MATCHES "aarch64|arm64")
         # Android 端侧基线 = armv8-a（NDK 默认；大量在役设备是 v8.0 老核，
         # +lse/+fp16 会 SIGILL——服务器侧的 v8.2 基线是 Kunpeng 场景取舍）。
         set(NEON_FLAGS "${SIMD_COMMON_FLAGS}")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "OHOS")
+        # HarmonyOS 版与项目的 ARMv8.2+ 基线一致；dotprod 是当前 NEON
+        # dispatcher 的编译要求。端侧不使用服务器专用的 tsv110 调优参数。
+        set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+fp16+dotprod+crc")
     elseif(CMAKE_SYSTEM_NAME STREQUAL "iOS")
         # iOS arm64 = A12+（armv8.3+），v8.2 特性全集安全。
         set(NEON_FLAGS "${SIMD_COMMON_FLAGS} -march=armv8.2-a+lse+fp16+dotprod+crc")
