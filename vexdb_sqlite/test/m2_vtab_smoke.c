@@ -7,7 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#include <io.h>
+#define unlink _unlink
+#else
 #include <unistd.h>
+#endif
 #include "sqlite3.h"
 #include "vexdb_sqlite.h"
 
