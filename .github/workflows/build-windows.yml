@@ -14,19 +14,19 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up MSYS2 Clang
+      - name: Set up MSYS2 MinGW GCC
         uses: msys2/setup-msys2@v2
         with:
-          msystem: CLANG64
+          msystem: UCRT64
           update: true
           install: >-
             git
             make
             unzip
-            mingw-w64-clang-x86_64-boost
-            mingw-w64-clang-x86_64-cmake
-            mingw-w64-clang-x86_64-ninja
-            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-boost
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-toolchain
 
       - name: Configure and build SQLite
         shell: msys2 {0}
@@ -59,7 +59,7 @@ jobs:
           cp vexdb_sqlite/include/vexdb_sqlite.h dist/sqlite-windows/
           cp vexdb_sqlite/README.md dist/sqlite-windows/
           ldd build/sqlite-windows/vexdb_lite.dll | tee dist/sqlite-windows/DEPENDENCIES.txt
-          for dll in libc++-1.dll libunwind.dll libwinpthread-1.dll; do
+          for dll in libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
             path=$(command -v "$dll" || true)
             [ -z "$path" ] || cp "$path" dist/sqlite-windows/
           done
