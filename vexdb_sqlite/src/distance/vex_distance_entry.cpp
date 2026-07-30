@@ -21,8 +21,15 @@ float ComputeL2(const float *x, const float *y, uint16_t dim) {
 }
 
 float ComputeCosine(const float *x, const float *y, uint16_t dim) {
-    static const auto raw = GetRawDistanceFunc(Metric::COSINE);  // 返回 -cos_sim
-    return 1.0f + raw(x, y, dim);
+    static const auto raw = GetRawDistanceFunc(Metric::INNER_PRODUCT);  // 返回 -dot
+    float norm_x = 0.0f;
+    float norm_y = 0.0f;
+    for (uint16_t i = 0; i < dim; ++i) {
+        norm_x += x[i] * x[i];
+        norm_y += y[i] * y[i];
+    }
+    if (norm_x == 0.0f || norm_y == 0.0f) return 2.0f;
+    return 1.0f + raw(x, y, dim) / std::sqrt(norm_x * norm_y);
 }
 
 float ComputeNegIP(const float *x, const float *y, uint16_t dim) {
