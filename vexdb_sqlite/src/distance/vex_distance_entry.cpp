@@ -3,24 +3,16 @@
 #include "vex_distance_entry.h"
 
 #include "distance/core/distance.h"
-#include "distance/core/distance_dispatcher.h"
-#include "distance/core/distance_utils_core.h"
 
 #include <cmath>
 
 namespace {
 
-// 与 DuckDB 端 GetRawDistanceFunc 完全一致的 dispatcher 实例化（NO_QUANT、
-// FLOAT、unaligned——SQLite BLOB 指针不保证对齐）。
+// 复用 common 中已经实例化的 dispatcher。不要在本翻译单元重复实例化，
+// Windows COFF 链接器不会像 ELF/Mach-O 一样合并这些模板符号。
 ann_helper::distance_func GetRawDistanceFunc(Metric metric) {
-    return DispatchRunner<false,
-        MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(
-            metric, DistPrecisionType::FLOAT, 1, QuantizerType::NONE,
-            [](auto &d) -> ann_helper::distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
+    // dim=1 选择 unaligned/unknown remainder 版本，返回的函数可处理实际 dim。
+    return ann_helper::get_general_distance_func(metric, 1);
 }
 
 float ComputeL2(const float *x, const float *y, uint16_t dim) {
