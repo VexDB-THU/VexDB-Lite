@@ -9,6 +9,8 @@ extern "C" {
 #include "postgres.h"
 #include "utils/palloc.h"
 }
+#elif defined(_WIN32)
+#include <malloc.h>
 #endif
 
 uint32 get_aligned_dim(uint32 dim)
@@ -28,6 +30,12 @@ void *alloc_aligned(size_t size)
 {
 #if defined(PG_VEXDB_TARGET_PG)
     return palloc_aligned(size, ann_helper::vector_aligned_size, 0);
+#elif defined(_WIN32)
+    void *ptr = _aligned_malloc(size, ann_helper::vector_aligned_size);
+    if (!ptr) {
+        throw std::bad_alloc();
+    }
+    return ptr;
 #else
     void *ptr = nullptr;
     if (posix_memalign(&ptr, ann_helper::vector_aligned_size, size) != 0 || !ptr) {

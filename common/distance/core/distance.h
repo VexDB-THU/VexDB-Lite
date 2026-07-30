@@ -12,6 +12,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
+#if defined(_WIN32)
+#include <malloc.h>
+#endif
 #include <boost/preprocessor/seq.hpp>
 #include <vtl/expr_helper>
 
@@ -424,7 +427,11 @@ size_t get_aligned_vec_size(size_t vec_size);
 float *alloc_floatvector(uint32 dim, size_t n = 1);
 char *alloc_vector(size_t vec_size, size_t n = 1);
 #if (defined(PG_VEXDB_TARGET_DUCK) || defined(PG_VEXDB_TARGET_SQLITE))
+#if defined(_WIN32)
+inline void free_vector(void *vec) { _aligned_free(vec); }
+#else
 inline void free_vector(void *vec) { std::free(vec); }
+#endif
 #else
 inline void free_vector(void *vec) {
     if (vec != nullptr) {
