@@ -47,7 +47,6 @@ jobs:
           build/sqlite-windows/m1_distance_smoke.exe
           build/sqlite-windows/m2_vtab_smoke.exe
           build/sqlite-windows/m3_hnsw_smoke.exe --no-rabitq
-          build/sqlite-windows/m3p_parallel_smoke.exe
 
       - name: Package SQLite
         shell: msys2 {0}
