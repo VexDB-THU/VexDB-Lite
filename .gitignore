@@ -426,3 +426,6 @@ CHANGELOG.md
 # SIFT benchmark data (large, generated from hdf5; not in repo)
 vexdb_duckdb/test/benchmark/data/*.fbin
 vexdb_duckdb/test/benchmark/data/*.ibin
+
+# Local tool artifacts
+.gstack/

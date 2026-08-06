@@ -181,9 +181,11 @@ public:
         int_fast8_t insert_level = get_insert_level(m);
 retry:
         const bool bottom_only = false && !retried;
-        auto [entry_info, shared_lock] = bottom_only
+        auto entry = bottom_only
             ? store.template get_entry<true, true>(insert_level)
             : store.template get_entry<true, false>(insert_level);
+        auto entry_info = std::get<0>(entry);
+        auto shared_lock = std::get<1>(entry);
         int_fast8_t entry_level = entry_info.level;
         if (graph_is_empty(entry_level)) {
             /* graph is empty, insert the first point */
@@ -342,7 +344,10 @@ retry:
 
     void repair_upperpoint(T cur_layer_idx, const UnorderedSet<size_t> &deleted)
     {
-        auto [neighbors_info, unused, id] = store.template get_point_info<false>(cur_layer_idx);
+        auto point_info = store.template get_point_info<false>(cur_layer_idx);
+        auto neighbors_info = std::get<0>(point_info);
+        auto unused = std::get<1>(point_info);
+        auto id = std::get<2>(point_info);
         (void)unused;
         if (deleted.contains((size_t)id)) {
             return;
