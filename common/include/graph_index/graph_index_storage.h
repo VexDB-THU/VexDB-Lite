@@ -10,6 +10,7 @@
 #include <shared_mutex>
 #include <mutex>
 #include <vtl/vector>
+#include <vtl/hashtable>
 #include <vtl/holder>
 #include <vtl/disk_container/diskvector.hpp>
 #include <vtl/disk_container/freespace.hpp>
@@ -30,7 +31,7 @@
 /* graph_index_state.h is PG-only; included via vexdb_pg/include/ */
 #include "graph_index/graph_index_state.h"
 #include "module/perf_usage.h"
-#include "vector_buffer/vector_smgr.h"
+#include "vector_page_storage.h"
 #include "ann_utils.h"
 #include "floatvector.h"
 #include "index_inspect.h"
@@ -51,11 +52,11 @@ PERF_DECLARE_CATS(DiskPerfCats, false, read_node, read_neighbor, read_vec, write
  *   - Async I/O:      not supported                           — build is pure memory
  *   - OOM handling:   flush accumulated data to DiskStore
  *
- * Runtime:     DiskStore (direct disk access)
+ * Runtime:     DiskStore (PostgreSQL page access)
  *   - Distance cache: UnorderedMap<Pair<T,T>, float>          — on-demand, cleared after backend_insert
  *   - Point locking:  LockPage/UnlockPage                     — PostgreSQL buffer manager
  *   - ID assignment:  FreeSpace reuse + append                — supports vacuum recycling
- *   - Async I/O:      use_async_io() + batch                  — for large scan workloads
+ *   - Vector reads:   shared_buffers + backend scratch         — no second cache
  *   - Storage:        PlainStore overflow is chained via element flags (extended / double extended)
  *
  * DiskStoreVariant (2 instantiations):
@@ -694,7 +695,6 @@ public:
           dim(metap->dimension),
           precision_type(metap->precision_type),
           qt_type(metap->quantizer_metainfo.get_type()),
-          st(qt_type == QuantizerType::NONE ? VecStorageType::PureVec : VecStorageType::PureCode),
           vec_size(dim * VEC_ELEM_SIZE(metap->precision_type)),
           elems(index, metap->elems_block, need_wal),
           base_layer(index, metap->base_block, need_wal, m * 2 * sizeof(T)),
@@ -723,7 +723,6 @@ public:
         QuantizerType new_qt_type = metap->quantizer_metainfo.get_type();
         if (new_qt_type != qt_type) {
             qt_type = new_qt_type;
-            st = (qt_type == QuantizerType::NONE) ? VecStorageType::PureVec : VecStorageType::PureCode;
             if (qt_type == QuantizerType::PQ) {
                 elem_size = metap->quantizer_metainfo.get_pq_metainfo().code_size();
             } else if (qt_type == QuantizerType::RABITQ) {
@@ -748,10 +747,10 @@ public:
         PERF_DESTROY();
     }
 
-    VecBuffer read_data(T id)
+    VectorScratch read_data(T id)
     {
         DO_PERF(read_vec);
-        VecBuffer vec_buf = vec_read_buffer(index, id, elem_size, st);
+        VectorScratch vec_buf = read_vector(id);
         STOP_PERF(read_vec);
         return vec_buf;
     }
@@ -760,18 +759,76 @@ public:
     void get_distance_batch(const Distancer &d, const char *query, const Vector<T, VecAlloc> &ids, float *dists)
     {
         const uint_fast16_t num = ids.size();
-        for (T id : ids) {
-            DO_PERF(read_vec);
-            VecBuffer vec_buf = vec_read_buffer(index, id, elem_size, st);
-            char *val = vec_buf.get_vecbuf();
-            STOP_PERF(read_vec);
-            DO_PERF(calc);
-            *dists = d.get_distance_single((void *)query, (void *)val, dim);
-            STOP_PERF(calc);
-            ++dists;
-            vec_buf.release();
+        if (num == 0) {
+            return;
         }
-        return;
+
+        const size_t stride = get_aligned_vec_size(elem_size);
+        char *values = nullptr;
+        void *value_ptrs[num];
+        Buffer pinned_buffers[num];
+        for (uint_fast16_t i = 0; i < num; ++i) {
+            pinned_buffers[i] = InvalidBuffer;
+        }
+
+        PG_TRY();
+        {
+            DO_PERF_COUNT(read_vec, num);
+            for (uint_fast16_t i = 0; i < num; ++i) {
+                const char *page_value = nullptr;
+                refresh_vector_nblocks(ids[i]);
+                const VectorReadStatus status = vector_storage_pin(
+                    index, (off_t)((size_t)ids[i] * elem_size), elem_size,
+                    vector_nblocks, &pinned_buffers[i],
+                    &page_value);
+                if (status == VECTOR_READ_OK && page_value != nullptr &&
+                        is_aligned(page_value)) {
+                    value_ptrs[i] = const_cast<char *>(page_value);
+                } else {
+                    vector_storage_unpin(pinned_buffers[i]);
+                    pinned_buffers[i] = InvalidBuffer;
+                    if (status != VECTOR_READ_COPY_REQUIRED &&
+                            status != VECTOR_READ_OK) {
+                        ereport(ERROR,
+                                (errcode(ERRCODE_DATA_CORRUPTED),
+                                 errmsg("could not read vector %u from index \"%s\"",
+                                        (unsigned)ids[i], RelationGetRelationName(index)),
+                                 errdetail("vector page read status: %d", (int)status),
+                                 errhint("REINDEX the vexdb_graph index.")));
+                    }
+                    if (values == nullptr) {
+                        values = alloc_vector(stride, num);
+                    }
+                    char *value = values + i * stride;
+                    read_vector_into(ids[i], value);
+                    value_ptrs[i] = value;
+                }
+            }
+            STOP_PERF(read_vec);
+
+            DO_PERF_COUNT(calc, num);
+            d.get_distance_batch2(query, value_ptrs, dim, num, dists);
+            STOP_PERF(calc);
+            for (uint_fast16_t i = 0; i < num; ++i) {
+                vector_storage_unpin(pinned_buffers[i]);
+                pinned_buffers[i] = InvalidBuffer;
+            }
+        }
+        PG_CATCH();
+        {
+            for (uint_fast16_t i = 0; i < num; ++i) {
+                vector_storage_unpin(pinned_buffers[i]);
+            }
+            if (values != nullptr) {
+                free_vector(values);
+            }
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        if (values != nullptr) {
+            free_vector(values);
+        }
     }
 
     template <typename Distancer>
@@ -779,7 +836,7 @@ public:
     {
         float dist = 0;
         DO_PERF(read_vec);
-        VecBuffer vec_buf = vec_read_buffer(index, id, elem_size, st);
+        VectorScratch vec_buf = read_vector(id);
         char *val = vec_buf.get_vecbuf();
         STOP_PERF(read_vec);
         DO_PERF(calc);
@@ -807,7 +864,7 @@ public:
     {
         float dist = 0;
         DO_PERF(read_vec);
-        VecBuffer vec_buf = vec_read_buffer(index, id, elem_size, st);
+        VectorScratch vec_buf = read_vector(id);
         char *val = vec_buf.get_vecbuf();
         STOP_PERF(read_vec);
         DO_PERF(calc);
@@ -915,10 +972,7 @@ public:
             }
             data = code;
         }
-        vec_write(index->rd_smgr, elem_size * id, elem_size, data, false, st);
-        if (need_wal) {
-            // xlog.add_vector(data, elem_size * id, elem_size, st);
-        }
+        vector_storage_write(index, elem_size * id, elem_size, data, need_wal);
         if (code) {
             pfree(code);
         }
@@ -1177,7 +1231,7 @@ public:
         if (!neighbors_val_pool.has_value()) {
             neighbors_val_pool.emplace(elem_size, metap->ef_construction);
         }
-        VecBuffer vec_buf = vec_read_buffer(index, id, elem_size, st);
+        VectorScratch vec_buf = read_vector(id);
         char *val = vec_buf.get_vecbuf();
         char *res = neighbors_val_pool->set(val);
         vec_buf.release();
@@ -1331,7 +1385,6 @@ public:
 
     void mark_deleted(size_t basepoint_num, size_t upperpoint_num)
     {
-        Oid relNode = index->rd_smgr->smgr_rlocator.locator.relNumber;
         /* Pass 1: Mark elements as deleted based on their own state, collect recyclable IDs */
         size_t id = INVALID_VECTOR_ID;
         Vector<T> recycled_ids;
@@ -1347,9 +1400,7 @@ public:
                 return false;
             }
             elem->set_deleted();
-            vec_invalidate_buffer_cache(relNode, id, elem_size);
             Assert(need_wal);
-            // xlog.log_invalidate_vector_cache(id, elem_size);
             recycled_ids.push_back((T)id);
             if (elem->is_async()) {
                 skip_clear_ids.emplace((T)id);
@@ -1530,9 +1581,9 @@ private:
     uint_fast16_t dim;
     DistPrecisionType precision_type;
     QuantizerType qt_type;
-    VecStorageType st;
     uint_fast32_t vec_size;
     uint_fast32_t elem_size;
+    BlockNumber vector_nblocks{InvalidBlockNumber};
     GraphIndexXlog xlog;
     GraphIndexEntryInfo entry_info;
 public:
@@ -1540,6 +1591,39 @@ public:
 private:
     Optional<NeighborsValPool> neighbors_val_pool; /* used in algorithm:select_neighbors() */
     T *point_info_buf;
+
+    VectorScratch read_vector(T id)
+    {
+        refresh_vector_nblocks(id);
+        return read_vector_scratch(index, id, elem_size, vector_nblocks);
+    }
+
+    void read_vector_into(T id, char *buffer)
+    {
+        refresh_vector_nblocks(id);
+        ::read_vector_into(index, id, elem_size, buffer, vector_nblocks);
+    }
+
+    void refresh_vector_nblocks(T id)
+    {
+        const uint64 vector_end = ((uint64)id + 1) * elem_size;
+        const BlockNumber required_block =
+            (BlockNumber)((vector_end - 1) / VEX_VECTOR_PAGE_PAYLOAD_SIZE);
+
+        /*
+         * RelationGetNumberOfBlocksInFork() reaches smgrnblocks() and may issue
+         * an lseek.  A graph scan reads hundreds of vectors from the same fork,
+         * so keep the observed size in this query/build-local DiskStore.  If a
+         * concurrent extension (or this build) needs a newer page, refresh only
+         * at that boundary.
+         */
+        if (!BlockNumberIsValid(vector_nblocks) ||
+            required_block >= vector_nblocks) {
+            RelationGetSmgr(index);
+            vector_nblocks =
+                RelationGetNumberOfBlocksInFork(index, VECTOR_FORKNUM);
+        }
+    }
 
     size_t neighbors_size() const { return base_layer.data_size(); }
     size_t upperpoint_size() const { return upper_layer.data_size(); }
@@ -1561,6 +1645,22 @@ inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation he
         need_wal = RelationNeedsWAL(index);
     }
     const auto metap = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf));
+#if defined(PG_VEXDB_TARGET_PG)
+    if (metap->version != GRAPH_INDEX_VERSION) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("unsupported vexdb_graph index format version %u",
+                        metap->version),
+                 errhint("REINDEX the vexdb_graph index.")));
+    }
+    if (heap != NULL && heap->rd_rel->relispartition &&
+        metap->quantizer_metainfo.get_type() != QuantizerType::NONE) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("quantized vexdb_graph indexes are not supported on partitioned tables"),
+                 errhint("Use a plain vexdb_graph index for every leaf partition.")));
+    }
+#endif
     if (metap->use_cluster()) {
         Assert(metap->id_type == IdType::U32);
         Assert(false);

@@ -13,7 +13,7 @@
 #include <cfloat>
 
 /* Graph index version and magic */
-#define GRAPH_INDEX_VERSION 2
+#define GRAPH_INDEX_VERSION 3
 #define GRAPH_INDEX_MAGIC_NUMBER 0xA953A953
 
 /* Graph index block numbers */

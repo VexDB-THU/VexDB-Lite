@@ -27,6 +27,8 @@ extern LWLockPadded *VexGraphBuildStorageLocks;
 extern LWLockPadded *VexGraphBuildExtensionLocks;
 extern LWLockPadded *VexGraphBuildPointLocks;
 
+extern void init_graph_build_locks(void);
+
 static inline uint64
 vex_graph_build_mix64(uint64 value)
 {

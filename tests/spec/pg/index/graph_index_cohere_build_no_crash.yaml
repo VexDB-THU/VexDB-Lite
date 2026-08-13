@@ -1,8 +1,8 @@
 name: graph_index_cohere_build_no_crash
-tags: [pg-only, regression, must-not-crash, vecbuf]
+tags: [pg-only, regression, must-not-crash, shared-buffers]
 description: |
   高维向量 (256d × 5000 行) 建索引 + 多次查询路径验证 server 不崩。
-  覆盖 vecbuf evict 路径。enable_vec_buffer_manager 默认 on,触发 vecbuf 路径。
+  覆盖标准 PostgreSQL 向量页跨页读取和 shared_buffers 路径。
 engines: [pg]
 steps:
   - statement: SET maintenance_work_mem = '256MB';
@@ -15,7 +15,7 @@ steps:
   # cosine angular metric
   - statement: CREATE INDEX idx_1078913 ON t_1078913 USING vexdb_graph (v floatvector_cosine_ops) WITH (m = 16, ef_construction = 64);
 
-  # 查询路径触发 vecbuf evict
+  # 查询路径反复读取标准 PostgreSQL 向量页。
   - query: |
       WITH q AS (SELECT ('[' || array_to_string(array(SELECT (g % 100)::float/10 FROM generate_series(0,255) g), ',') || ']')::floatvector(256) AS qv)
       SELECT count(*) FROM (SELECT id FROM t_1078913, q ORDER BY v <=> q.qv LIMIT 20) s;

@@ -4,6 +4,16 @@
 -- OUT columns with CREATE OR REPLACE FUNCTION, so recreate the extension-owned
 -- function while keeping its public name and argument list stable.
 
+-- Vector pages now use shared_buffers and Generic WAL.  The private cache and
+-- its inspection function no longer exist.
+DROP FUNCTION IF EXISTS vectorbuffer_inspect();
+
+DO $$
+BEGIN
+    RAISE WARNING 'vexdb_graph storage format changed; REINDEX every existing vexdb_graph index after this upgrade';
+END
+$$;
+
 DROP FUNCTION vexdb_index_info();
 
 CREATE FUNCTION vexdb_index_info()

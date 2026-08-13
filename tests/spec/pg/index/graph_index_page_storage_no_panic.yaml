@@ -1,0 +1,22 @@
+name: graph_index_page_storage_no_panic
+tags: [pg-only, regression, must-not-crash, shared-buffers, wal]
+description: |
+  128 维、5000 行会产生大量向量页。重复查询必须只通过 PostgreSQL
+  shared_buffers 和后端 scratch 读取，并保持服务可用。
+engines: [pg]
+steps:
+  - statement: SET maintenance_work_mem = '512MB';
+  - statement: DROP TABLE IF EXISTS t_page_storage;
+  - statement: CREATE TABLE t_page_storage (id bigint, v floatvector(128));
+  - statement: |
+      INSERT INTO t_page_storage
+      SELECT i, ('[' || array_to_string(array(SELECT ((i*13+j*7) % 200)::float/10 FROM generate_series(0,127) j), ',') || ']')::floatvector(128)
+      FROM generate_series(1, 5000) AS i;
+  - statement: CREATE INDEX t_page_storage_idx ON t_page_storage USING vexdb_graph (v floatvector_l2_ops) WITH (m = 16, ef_construction = 64);
+  - query: SELECT count(*) FROM (SELECT id FROM t_page_storage ORDER BY v <-> '[1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8]'::floatvector LIMIT 50) s;
+    expect: [[50]]
+  - query: SELECT count(*) FROM (SELECT id FROM t_page_storage ORDER BY v <-> '[10,20,30,40,50,60,70,80,90,100,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8,9,10,1,2,3,4,5,6,7,8]'::floatvector LIMIT 50) s;
+    expect: [[50]]
+  - query: SELECT 1;
+    expect: [[1]]
+  - statement: DROP TABLE t_page_storage;

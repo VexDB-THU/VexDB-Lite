@@ -9,8 +9,6 @@ description: |
   不允许返回模糊的内部错误信息。
   本 spec 验证调用不崩 + 后续 DDL 正常。
 engines: [pg]
-skip:
-  pg: "vexdb_graph 当前完全拒绝分区表 (graph_index_partition_reject.yaml 覆盖), index_inspect 走不到分区索引路径。等支持分区索引后启用本 spec。"
 steps:
   - statement: DROP TABLE IF EXISTS t_1078943 CASCADE;
   - statement: CREATE TABLE t_1078943 (c1 int, c2 floatvector(4)) PARTITION BY LIST(c1);
@@ -20,22 +18,21 @@ steps:
   - statement: INSERT INTO t_1078943 VALUES (1,'[1,2,3,4]'), (2,'[4,5,6,7]'), (3,'[7,8,9,10]'), (4,'[11,12,13,14]');
   - statement: CREATE INDEX idx_1078943 ON t_1078943 USING vexdb_graph (c2 floatvector_l2_ops);
 
-  # index_inspect on partitioned (父) 索引: 必须不崩, 报错也接受 (语义未规定),
-  # 关键是不能是模糊内部状态错误。本 spec 不验证返回值,只验证连接不断 + 后续 SQL 仍能跑。
-  - query: SELECT 1;
-    expect: [["1"]]
+  # 父索引没有物理文件，必须提示查看叶子索引。
+  - query: SELECT * FROM index_inspect('idx_1078943') LIMIT 1;
+    expect:
+      - - ERROR ~ cannot inspect partitioned vexdb_graph index
 
-  # 在叶分区索引上调 index_inspect (应该 work)
-  - statement: |
-      DO $$
-      DECLARE leaf text;
-      BEGIN
-        SELECT indexrelid::regclass::text INTO leaf
-          FROM pg_index WHERE indrelid = 't_1078943_p1'::regclass LIMIT 1;
-        IF leaf IS NOT NULL THEN
-          PERFORM index_inspect(leaf);
-        END IF;
-      END $$;
+  # 叶子索引有自己的物理图和向量页，可以正常 inspect。
+  - query: |
+      SELECT count(*) > 0
+      FROM index_inspect((
+        SELECT indexrelid
+        FROM pg_index
+        WHERE indrelid = 't_1078943_p1'::regclass
+        LIMIT 1
+      ));
+    expect: [[t]]
 
   # 最终连接仍可用 + 数据完整
   - query: SELECT count(*) FROM t_1078943;

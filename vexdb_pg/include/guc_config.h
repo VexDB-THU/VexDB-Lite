@@ -16,9 +16,6 @@ extern void vexdb_lite_init_guc(void);
 
 /* Accessor functions */
 extern int vexdb_lite_get_ef_search(void);
-extern bool vexdb_lite_get_enable_vec_buffer_manager(void);
-extern int vexdb_lite_get_vector_buffers(void);
-extern int vexdb_lite_get_vector_buffer_workers(void);
 
 #ifdef __cplusplus
 }

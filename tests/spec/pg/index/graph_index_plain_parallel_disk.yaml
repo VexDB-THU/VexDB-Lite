@@ -63,6 +63,11 @@ steps:
       FROM pg_index i
       WHERE i.indexrelid = 'plain_parallel_w1_idx'::regclass;
     expect: [[t, t]]
+  # The leader must wait for workers before publishing IndexBuildResult.
+  - query: |
+      SELECT reltuples::bigint
+      FROM pg_class WHERE oid = 'plain_parallel_data'::regclass;
+    expect: [[20000]]
   - query: |
       SELECT content::text
       FROM index_inspect('plain_parallel_w1_idx')

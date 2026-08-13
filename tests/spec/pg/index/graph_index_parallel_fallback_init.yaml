@@ -15,10 +15,6 @@ description: |
   reltuples bug 已 fix(commit c8cbb7e89f),但 fallback 路径自身漏 mem_store
   init 还是潜在 hazard — 任何让 DSM 超 budget 的场景都会踩。
 
-  此 spec 用 `vexdb.vector_buffers = 1kB`(强制 DSM 估算 < /dev/shm 容易过,
-  但实际 vec_buffer pool 极小 → 进 serial fallback)。fix 前会 segv,fix 后
-  serial build 完成且 index 可查。
-
   Fix(src/graph_index_build.cpp): begin_parallel 失败回退时调
   init_single_thread_memstore() 补 emplace mem_store。
 

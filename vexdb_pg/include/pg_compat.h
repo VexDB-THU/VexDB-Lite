@@ -124,8 +124,8 @@ typedef BackendId ProcNumber;
 #define INVALID_PROC_NUMBER InvalidBackendId
 #endif
 
-/* Vector fork number - use VISIBILITYMAP_FORKNUM for vector storage
- * This index doesn't need visibility map, so we reuse that fork for vectors */
+/* The index does not need a visibility map, so its standard vector pages use
+ * the otherwise-unused VM fork. */
 #define VECTOR_FORKNUM VISIBILITYMAP_FORKNUM
 
 /* WAL resource manager - extensions can't register custom ones */
@@ -167,9 +167,6 @@ public:
 /* LWLock tranches - initialized at runtime */
 extern "C" int vexdb_lite_lock_tranche_id;
 #define LWTRANCHE_EXTEND vexdb_lite_lock_tranche_id
-
-/* Vector storage type */
-enum class VecStorageType : uint8 { PureVec, PureCode, VecWithCode, CodeWithVec };
 
 /* Inline macros for performance-critical functions */
 #define FORCE_INLINE __attribute__((always_inline)) inline

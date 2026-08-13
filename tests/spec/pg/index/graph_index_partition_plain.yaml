@@ -1,0 +1,93 @@
+name: graph_index_partition_plain
+tags: [pg-only, regression, partition, wal, plain]
+description: |
+  PostgreSQL 分区父索引是虚拟索引，每个叶子有自己的物理 vexdb_graph
+  索引。plain 距离可以由 Merge Append 做全局 Top-K；同时覆盖裁剪、
+  新建/分离/重新挂接/删除叶子、VACUUM 和 REINDEX。PQ/RaBitQ 仍明确拒绝。
+engines: [pg]
+steps:
+  - statement: DROP TABLE IF EXISTS t_part_root CASCADE;
+  - statement: |
+      CREATE TABLE t_part_root (id int, bucket int, v floatvector(4))
+      PARTITION BY RANGE (bucket);
+  - statement: |
+      CREATE TABLE t_part_p0 PARTITION OF t_part_root
+      FOR VALUES FROM (0) TO (10);
+  - statement: |
+      CREATE TABLE t_part_p1 PARTITION OF t_part_root
+      FOR VALUES FROM (10) TO (20);
+  - statement: |
+      INSERT INTO t_part_root VALUES
+        (1, 1,  '[0,0,0,0]'),
+        (2, 2,  '[4,0,0,0]'),
+        (3, 11, '[1,0,0,0]'),
+        (4, 12, '[2,0,0,0]'),
+        (5, 13, '[8,0,0,0]');
+  - statement: |
+      CREATE INDEX t_part_idx ON t_part_root
+      USING vexdb_graph (v floatvector_l2_ops);
+
+  # The parent owns two physical leaf indexes.
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits
+      WHERE inhparent = 't_part_idx'::regclass;
+    expect: [[2]]
+
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM t_part_root
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 3;
+    expect: [[3], [4], [1]]
+
+  # Partition pruning must leave only p0 and still preserve distance order.
+  - query: |
+      SELECT id FROM t_part_root WHERE bucket < 10
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 2;
+    expect: [[1], [2]]
+
+  # A partition created after the parent index gets its own physical index.
+  - statement: |
+      CREATE TABLE t_part_p2 PARTITION OF t_part_root
+      FOR VALUES FROM (20) TO (30);
+  - statement: INSERT INTO t_part_root VALUES (6, 21, '[1.05,0,0,0]');
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits
+      WHERE inhparent = 't_part_idx'::regclass;
+    expect: [[3]]
+  - query: |
+      SELECT id FROM t_part_root
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 3;
+    expect: [[6], [3], [4]]
+
+  - statement: VACUUM t_part_root;
+  - statement: REINDEX INDEX t_part_idx;
+  - statement: ALTER TABLE t_part_root DETACH PARTITION t_part_p1;
+  - query: |
+      SELECT id FROM t_part_root
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 3;
+    expect: [[6], [1], [2]]
+  - statement: |
+      ALTER TABLE t_part_root ATTACH PARTITION t_part_p1
+      FOR VALUES FROM (10) TO (20);
+  - statement: DROP TABLE t_part_p0;
+  - query: |
+      SELECT id FROM t_part_root
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 3;
+    expect: [[6], [3], [4]]
+  - statement: DROP TABLE t_part_root CASCADE;
+
+  # Independently trained quantizers do not provide comparable leaf distances.
+  - statement: |
+      CREATE TABLE t_part_quant (id int, bucket int, v floatvector(4))
+      PARTITION BY RANGE (bucket);
+  - statement: |
+      CREATE TABLE t_part_quant_p0 PARTITION OF t_part_quant
+      FOR VALUES FROM (0) TO (10);
+  - query: |
+      CREATE INDEX t_part_quant_idx ON t_part_quant
+      USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer=pq);
+    expect:
+      - - ERROR ~ quantized vexdb_graph indexes are not supported on partitioned tables
+  - statement: DROP TABLE t_part_quant CASCADE;

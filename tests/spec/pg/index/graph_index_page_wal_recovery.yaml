@@ -1,0 +1,33 @@
+name: graph_index_page_wal_recovery
+tags: [pg-only, regression, wal, crash-recovery, plain]
+description: |
+  plain 向量跨多个标准 PostgreSQL 页写入。建索引后再做增量扩页、更新和
+  删除，不执行 CHECKPOINT 就立即重启；查询必须从 WAL 恢复后的页返回结果。
+engines: [pg]
+steps:
+  - statement: DROP TABLE IF EXISTS t_page_wal CASCADE;
+  - statement: CREATE TABLE t_page_wal (id int primary key, v floatvector(4));
+  - statement: |
+      INSERT INTO t_page_wal
+      SELECT i, ('[' || i || ',0,0,0]')::floatvector
+      FROM generate_series(1, 700) AS g(i);
+  - statement: |
+      CREATE INDEX t_page_wal_idx ON t_page_wal
+      USING vexdb_graph (v floatvector_l2_ops);
+  - statement: CHECKPOINT;
+  - statement: INSERT INTO t_page_wal VALUES (701, '[1.05,0,0,0]');
+  - statement: |
+      INSERT INTO t_page_wal
+      SELECT i, ('[' || i || ',0,0,0]')::floatvector
+      FROM generate_series(702, 1200) AS g(i);
+  - statement: UPDATE t_page_wal SET v = '[9,0,0,0]' WHERE id = 2;
+  - statement: DELETE FROM t_page_wal WHERE id = 3;
+  - raw_directive: restart
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM t_page_wal
+      ORDER BY v <-> '[1.1,0,0,0]'::floatvector LIMIT 4;
+    expect: [[701], [1], [4], [5]]
+  - query: SELECT count(*) FROM t_page_wal;
+    expect: [[1199]]
+  - statement: DROP TABLE t_page_wal CASCADE;

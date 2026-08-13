@@ -18,7 +18,6 @@
 #include "ann_utils.h"
 #include "distance/core/distance_dispatcher.h"
 #include "floatvector.h"
-#include "vector_buffer/local_vec_cache.h"
 
 struct GraphIndexScanOpaqueData {
     bool first;
@@ -196,8 +195,6 @@ retry:
                 distancer.process(query);
                 GraphIndexAlgorithm algo{metap, store, distancer};
                 PointExtensionContext ctx(index, GRAPH_INDEX_PS_BLKNO, false);
-                /* 本地缓存(local_vec_cache)经实测证伪(命中率 0.4%,HNSW search 无时间
-                 * 局部性),暂不激活;改走 locmap 分区方案。代码保留但 dormant。 */
                 Vector<GraphIndexSearchRes> res = algo.search(ctx, query, ef);
                 ctx.destroy();
                 algo.destroy();

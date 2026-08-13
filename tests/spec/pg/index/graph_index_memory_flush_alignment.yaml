@@ -1,0 +1,31 @@
+name: graph_index_memory_flush_alignment
+tags: [pg-only, regression, memory-build, alignment, low-dimension]
+description: >
+  内存建索引的向量池会按 SIMD 边界补齐每条向量。落盘必须跳过补齐字节，
+  不能把填充区当成下一条低维向量的数据。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 0;
+  - statement: DROP TABLE IF EXISTS memory_flush_alignment CASCADE;
+  - statement: CREATE TABLE memory_flush_alignment (id int, v floatvector(4));
+  - statement: >
+      INSERT INTO memory_flush_alignment
+      SELECT i, ('[' || i || ',0,0,0]')::floatvector(4)
+      FROM generate_series(1,1000) AS g(i);
+  - statement: >
+      CREATE INDEX memory_flush_alignment_idx
+      ON memory_flush_alignment USING vexdb_graph (v floatvector_l2_ops)
+      WITH (m=16, ef_construction=64, parallel_workers=0);
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 64;
+  - query: >
+      SELECT string_agg(id::text, ',' ORDER BY rank)
+      FROM (
+        SELECT id, row_number() OVER () AS rank
+        FROM (
+          SELECT id FROM memory_flush_alignment
+          ORDER BY v <-> '[42.1,0,0,0]'::floatvector(4) LIMIT 3
+        ) nearest
+      ) ranked;
+    expect: [['42,43,41']]
+  - statement: DROP TABLE memory_flush_alignment CASCADE;

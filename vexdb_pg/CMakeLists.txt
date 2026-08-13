@@ -163,13 +163,10 @@ set(GRAPH_INDEX_SRCS
     src/floatvector.cpp
     src/ann_utils.cpp
     src/pg_yield.cpp
-    src/vector_buffer/vector_smgr.cpp
-    src/vector_buffer/local_vec_cache.cpp
+    src/vector_page_storage.cpp
     src/pq.cpp
     src/rabitq_distancer.cpp
     src/quantizer_stubs.cpp
-    src/vector_buffer/shared_alloc_set.cpp
-    src/vector_buffer/vecbuf_worker.cpp
     src/pg_init.cpp
 )
 

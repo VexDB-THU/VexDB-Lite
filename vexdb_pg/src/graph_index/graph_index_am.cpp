@@ -117,21 +117,19 @@ graph_index_amroutine(void)
 static IndexBuildResult *
 graph_index_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-    /* vexdb_graph does not yet support partitioned tables — the main DB
-     * (openGauss) relies on its own single-relation partition model
-     * (indexGetPartitionOidList / partitionOpen) that does not exist in
-     * stock PG 19 inheritance-based partitioning. Building per-leaf graph
-     * indexes succeeds, but cross-partition ORDER BY <-> LIMIT k returns
-     * wrong rows because each leaf scan returns its own top-K and the
-     * planner does not re-merge globally. Reject the
-     * build up front with a clear error rather than silently producing
-     * incorrect results. */
-    if (heap->rd_rel->relispartition ||
-        heap->rd_rel->relkind == RELKIND_PARTITIONED_TABLE) {
+    /*
+     * PostgreSQL owns the virtual parent index and creates one physical
+     * vexdb_graph index per leaf.  Plain distances are directly comparable
+     * across leaves and PostgreSQL can merge their ordered scans.  Quantized
+     * leaves train independent codebooks, so keep PQ/RaBitQ disabled until
+     * cross-leaf refine and recall tests are part of the release gate.
+     */
+    if (heap->rd_rel->relispartition &&
+        graph_index_get_quantizer_type(index) != QuantizerType::NONE) {
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("vexdb_graph does not support partitioned tables"),
-                 errhint("Build the index on a non-partitioned table, or wait for partitioned-table support.")));
+                 errmsg("quantized vexdb_graph indexes are not supported on partitioned tables"),
+                 errhint("Use quantizer='none' for each leaf partition.")));
     }
     check_ann_attributes(index);
     return graph_index_build_internal(heap, index, indexInfo);

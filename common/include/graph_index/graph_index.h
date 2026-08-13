@@ -74,7 +74,6 @@ bool graph_index_get_compact_mode(Relation index);
 int graph_index_get_threads(Relation index);
 const char *graph_index_get_metric_str(Relation index);
 FmgrInfo *graph_index_optional_proc_info(Relation index, uint16 procnum);
-void create_vec_data(Relation index, bool create);
 uint16_t graph_index_get_dim(Relation index);
 
 #endif /* GRAPH_INDEX_H */

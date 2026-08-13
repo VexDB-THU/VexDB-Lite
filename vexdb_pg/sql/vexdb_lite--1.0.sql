@@ -272,14 +272,6 @@ CREATE FUNCTION index_inspect(regclass)
 COMMENT ON FUNCTION index_inspect(regclass) IS
     'Returns statistics about a vexdb_graph index';
 
-CREATE FUNCTION vectorbuffer_inspect()
-    RETURNS TABLE(used_space text, elem_size text, elem_nums int8,
-                  hit int8, miss int8, eviction_rate float8)
-    AS 'MODULE_PATHNAME' LANGUAGE C;
-
-COMMENT ON FUNCTION vectorbuffer_inspect() IS
-    'Returns statistics about the vector buffer cache';
-
 -- vexdb_index_info: SRF that lists all vexdb_graph indexes with metadata.
 -- Schema mirrors duckdb/vexdb_duckdb/functions/index_info_function.cpp.
 CREATE FUNCTION vexdb_index_info()

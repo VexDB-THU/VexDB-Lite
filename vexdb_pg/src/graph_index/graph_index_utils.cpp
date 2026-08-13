@@ -168,9 +168,23 @@ extern "C" {
 }
 
 static HTAB *gi_state_hash = NULL;
-LWLock *GraphIndexStateLock = NULL;
+static LWLock *GraphIndexStateLock = NULL;
 
-void graph_index_state_init(void)
+static void *
+graph_index_state_hash_search(const Oid *key, HASHACTION action, bool *found)
+{
+    /*
+     * macOS exports an unrelated hash_search() from libSystem.  Extensions
+     * linked with dynamic lookup can otherwise bind to that symbol instead of
+     * PostgreSQL's dynahash implementation.  The explicit-hash variant has no
+     * platform name collision and is available on every supported PG version.
+     */
+    uint32 hash_value = get_hash_value(gi_state_hash, key);
+    return hash_search_with_hash_value(gi_state_hash, key, hash_value,
+                                       action, found);
+}
+
+static void graph_index_state_attach_local(void)
 {
     HASHCTL hash_ctl;
     MemSet(&hash_ctl, 0, sizeof(hash_ctl));
@@ -187,8 +201,24 @@ void graph_index_state_init(void)
     GraphIndexStateLock = &(GetNamedLWLockTranche("graph_index_state")->lock);
 }
 
+void graph_index_state_init(void)
+{
+    graph_index_state_attach_local();
+}
+
 void graph_index_get_state(Relation index, GIStateOper op, GIStateInput &input)
 {
+    /*
+     * A backend can load the module through the SQL function path after the
+     * postmaster loaded it from shared_preload_libraries.  On platforms where
+     * the dynamic loader does not reuse the same image, process-local pointers
+     * start as NULL even though the shared hash already exists.  Attach lazily
+     * before the first lookup.
+     */
+    if (gi_state_hash == NULL || GraphIndexStateLock == NULL) {
+        graph_index_state_attach_local();
+    }
+
     Oid keyid = RelationGetRelid(index);
     bool found;
 
@@ -197,7 +227,7 @@ void graph_index_get_state(Relation index, GIStateOper op, GIStateInput &input)
             LWLockAcquire(GraphIndexStateLock, LW_SHARED);
             {
                 GIStateEntry *entry = (GIStateEntry *)
-                    hash_search(gi_state_hash, &keyid, HASH_FIND, &found);
+                    graph_index_state_hash_search(&keyid, HASH_FIND, &found);
                 input.bool_val.val = found ? entry->under_vacuum : 0;
                 input.bool_val.set_result = true;
             }
@@ -209,7 +239,8 @@ void graph_index_get_state(Relation index, GIStateOper op, GIStateInput &input)
             {
                 if (input.bool_val.val) {
                     GIStateEntry *entry = (GIStateEntry *)
-                        hash_search(gi_state_hash, &keyid, HASH_ENTER, &found);
+                        graph_index_state_hash_search(&keyid, HASH_ENTER,
+                                                      &found);
                     if (!found) {
                         entry->index_oid = keyid;
                         entry->under_vacuum = 0;
@@ -219,13 +250,14 @@ void graph_index_get_state(Relation index, GIStateOper op, GIStateInput &input)
                     entry->under_vacuum = 1;
                 } else {
                     GIStateEntry *entry = (GIStateEntry *)
-                        hash_search(gi_state_hash, &keyid, HASH_FIND, &found);
+                        graph_index_state_hash_search(&keyid, HASH_FIND,
+                                                      &found);
                     if (found) {
                         entry->under_vacuum = 0;
                         if (!entry->under_qt_update &&
                             !entry->under_async_insert)
-                            hash_search(gi_state_hash, &keyid,
-                                        HASH_REMOVE, NULL);
+                            graph_index_state_hash_search(&keyid,
+                                                          HASH_REMOVE, NULL);
                     }
                 }
                 input.bool_val.set_result = true;

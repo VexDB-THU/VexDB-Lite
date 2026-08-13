@@ -38,6 +38,4 @@ void graph_index_get_state(Relation index, GIStateOper op, GIStateInput &input);
  * available. */
 void graph_index_state_init(void);
 
-extern LWLock *GraphIndexStateLock;
-
 #endif /* GRAPH_INDEX_STATE_H */

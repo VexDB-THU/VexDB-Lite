@@ -8,9 +8,6 @@
 
 /* GUC variables */
 static int vexdb_lite_ef_search = 64;
-static bool vexdb_lite_enable_vec_buffer_manager = true;
-static int vexdb_lite_vector_buffers = 2097152;  /* 2GB in KB */
-static int vexdb_lite_vector_buffer_workers = 1;
 static char *vexdb_lite_vec_architecture = NULL;
 
 
@@ -24,9 +21,6 @@ extern "C" {
 
 /* Accessor functions */
 int vexdb_lite_get_ef_search(void) { return vexdb_lite_ef_search; }
-bool vexdb_lite_get_enable_vec_buffer_manager(void) { return vexdb_lite_enable_vec_buffer_manager; }
-int vexdb_lite_get_vector_buffers(void) { return vexdb_lite_vector_buffers; }
-int vexdb_lite_get_vector_buffer_workers(void) { return vexdb_lite_vector_buffer_workers; }
 
 /* Assign hook for ef_search - syncs GUC to session struct */
 static void assign_ef_search(int newval, void *extra)
@@ -97,34 +91,6 @@ vexdb_lite_init_guc(void)
                             PGC_USERSET,
                             GUC_NOT_IN_SAMPLE,
                             NULL, assign_ef_search, NULL);
-
-    DefineCustomBoolVariable("vexdb.enable_vec_buffer_manager",
-                              "Enable the vector buffer manager.",
-                              "When enabled, uses a shared buffer pool for vector data.",
-                              &vexdb_lite_enable_vec_buffer_manager,
-                              true,
-                              PGC_POSTMASTER,
-                              GUC_NOT_IN_SAMPLE,
-                              NULL, NULL, NULL);
-
-    DefineCustomIntVariable("vexdb.vector_buffers",
-                            "Memory size for vector buffers in KB.",
-                            "Total memory for vector buffer manager. Each block is 1MB.",
-                            &vexdb_lite_vector_buffers,
-                            2097152,  /* 2GB in KB */
-                            64 * 1024, INT_MAX / 2,
-                            PGC_POSTMASTER,
-                            GUC_UNIT_KB,
-                            NULL, NULL, NULL);
-
-    DefineCustomIntVariable("vexdb.vector_buffer_workers",
-                            "Number of background workers for vector buffer management.",
-                            "Workers handle buffer expansion and eviction. Set to 0 to disable.",
-                            &vexdb_lite_vector_buffer_workers,
-                            1, 0, 16,
-                            PGC_POSTMASTER,
-                            GUC_NOT_IN_SAMPLE,
-                            NULL, NULL, NULL);
 
     DefineCustomStringVariable("vexdb.vec_architecture",
                                "SIMD architecture selection for distance functions.",

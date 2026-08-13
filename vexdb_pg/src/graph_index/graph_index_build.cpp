@@ -45,7 +45,7 @@ extern "C" {
 #include "pq.h"
 #include "rabitq/rabitq_distancer.h"
 #include "rel_utils.h"
-#include "vector_buffer/vector_smgr.h"
+#include "vector_page_storage.h"
 
 using namespace disk_container;
 using namespace ann_helper;
@@ -307,6 +307,9 @@ public:
         GraphIndexXlog xlog;
         xlog.init(index, metabuf, BufferGetPage(metabuf));
         xlog.log_build_index(fork_num);
+        if (smgrexists(index->rd_smgr, VECTOR_FORKNUM)) {
+            xlog.log_build_index(VECTOR_FORKNUM);
+        }
     }
 
     void destroy() {
@@ -417,7 +420,6 @@ private:
     QuantizerType qt_type;
     bool compact_mode;
     DistPrecisionType precision_type;
-    static constexpr VecStorageType storage_type = VecStorageType::PureVec;
     uint_fast16_t dimension;
     uint_fast16_t m;
     uint_fast16_t ef_construction;
@@ -493,7 +495,7 @@ private:
         constexpr int min_memory_required_kb = 1024 * 1024; /* 1GB */
         if (maintenance_work_mem_kb < min_memory_required_kb) {
             build_state = BuildState::DISK;
-            create_vec_data(index, true);
+            create_vector_storage(index);
             ereport(WARNING,
                 (errmsg("maintenance_work_mem below 1GB, will use direct disk build "
                         "and take significantly more time.")));
@@ -725,10 +727,10 @@ private:
         visit([&](auto &encoder) {
             auto encode_batch = [&](size_t first, size_t count) {
                 const size_t raw_bytes = count * vector_size;
-                SMGR_READ_STATUS status = vec_read(
-                    index->rd_smgr, (off_t)(first * vector_size), raw_bytes,
-                    raw, VecStorageType::PureVec);
-                if (status != SMGR_RD_OK) {
+                VectorReadStatus status = vector_storage_read(
+                    index, (off_t)(first * vector_size), raw_bytes,
+                    raw);
+                if (status != VECTOR_READ_OK) {
                     ereport(ERROR,
                         (errcode(ERRCODE_DATA_CORRUPTED),
                          errmsg("could not read raw vectors while compacting graph index"),
@@ -740,9 +742,8 @@ private:
                         (float *)(raw + i * vector_size),
                         codes + i * elem_size);
                 }
-                vec_write(index->rd_smgr, (off_t)(first * elem_size),
-                          count * elem_size, codes, false,
-                          VecStorageType::PureCode);
+                vector_storage_write(index, (off_t)(first * elem_size),
+                                     count * elem_size, codes, false);
             };
 
             if (elem_size <= vector_size) {
@@ -768,11 +769,13 @@ private:
         pfree(codes);
         pfree(raw);
 
-        if (enable_vec_buffer_manager()) {
-            Oid relnode = index->rd_smgr->smgr_rlocator.locator.relNumber;
-            vec_invalidate_buffer_cache(relnode, vector_size);
-        }
-        truncate_vector_file_to(index, vector_count * elem_size);
+        /*
+         * The metapage publishes elem_size, so bytes after the compact code
+         * range are unreachable.  Do not call smgrtruncate() here: PostgreSQL
+         * has no extension-safe WAL record for truncating an arbitrary fork,
+         * and a primary-only truncate would corrupt physical replicas.  The
+         * unused tail is reclaimed by DROP/REINDEX.
+         */
     }
 
     template <typename D>
@@ -980,6 +983,13 @@ private:
             mem_store->destroy();
         }
 
+        /* Worker tuple counts are only final after every parallel scan has
+         * finished.  Reading them earlier can publish a partial reltuples
+         * value to pg_class even though the workers continue building. */
+        if (parallel_workers_launched) {
+            WaitForParallelWorkersToFinish(parallel_pcxt);
+        }
+
         /* Read final progress */
         uint64 final_done;
         if (thread_queue) {
@@ -1002,9 +1012,8 @@ private:
             thread_ctx = nullptr;
         }
 
-        /* Wait for any PG parallel workers launched during the scan */
+        /* Release the parallel context after consuming its shared counters. */
         if (parallel_workers_launched) {
-            WaitForParallelWorkersToFinish(parallel_pcxt);
             DestroyParallelContext(parallel_pcxt);
             ExitParallelMode();
         } else if (parallel_pcxt) {
@@ -1090,11 +1099,12 @@ private:
         }
 
         flush_timer.report("Flushing Vector");
-        create_vec_data(index, true);
+        create_vector_storage(index);
         auto &vector_pool = (*store.vector_pool);
         auto &vec = *vector_pool.get_vec();
         uint32 num_vectors = store.get_vector_num();
         uint32 one_chunk_elem_nums = vector_pool.get_one_chunk_elem_nums();
+        const size_t vector_stride = vector_pool.get_elem_size();
 
         bool quantizer_on = (qt_type != QuantizerType::NONE) && !defer_compact_encoding;
         if (compact_mode && !quantizer_on && !defer_compact_encoding) {
@@ -1116,26 +1126,54 @@ private:
                     size_t actual_copy_num = Min(one_chunk_elem_nums, num_vectors - batch_offset);
                     if (actual_copy_num == 0) break;
                     for (size_t j = 0; j < actual_copy_num; ++j) {
-                        float *raw_vec = (float *)(vec[i].buf + j * vector_size);
+                        float *raw_vec = (float *)(vec[i].buf + j * vector_stride);
                         char *code_dest = code_chunk + j * code_size;
                         encoder.compute_code(raw_vec, code_dest);
                     }
                     off_t offset = batch_offset * code_size;
                     size_t nbytes = actual_copy_num * code_size;
-                    vec_write(index->rd_smgr, offset, nbytes, code_chunk, false,
-                              VecStorageType::PureCode);
+                    vector_storage_write(index, offset, nbytes, code_chunk,
+                                         false);
                 }
                 pfree(code_chunk);
             };
             visit(write_quantizer_codes, quantizer.value());
         } else {
+            constexpr size_t pack_buffer_bytes = 10 * 1024 * 1024;
+            const size_t pack_rows = Max((size_t)1,
+                                         pack_buffer_bytes / vector_size);
+            char *packed_vectors = vector_stride == vector_size ? NULL :
+                (char *)palloc(pack_rows * vector_size);
+
             for (size_t i = 0; i < vec.size(); ++i) {
                 size_t batch_offset = i * one_chunk_elem_nums;
                 size_t actual_copy_num = Min(one_chunk_elem_nums, num_vectors - batch_offset);
                 if (actual_copy_num == 0) break;
-                off_t offset = batch_offset * vector_size;
-                size_t nbytes = actual_copy_num * vector_size;
-                vec_write(index->rd_smgr, offset, nbytes, vec[i].buf, false, storage_type);
+
+                if (vector_stride == vector_size) {
+                    off_t offset = batch_offset * vector_size;
+                    size_t nbytes = actual_copy_num * vector_size;
+                    vector_storage_write(index, offset, nbytes, vec[i].buf,
+                                         false);
+                    continue;
+                }
+
+                for (size_t first = 0; first < actual_copy_num;
+                     first += pack_rows) {
+                    const size_t rows = Min(pack_rows,
+                                            actual_copy_num - first);
+                    for (size_t j = 0; j < rows; ++j) {
+                        memcpy(packed_vectors + j * vector_size,
+                               vec[i].buf + (first + j) * vector_stride,
+                               vector_size);
+                    }
+                    off_t offset = (batch_offset + first) * vector_size;
+                    vector_storage_write(index, offset, rows * vector_size,
+                                         packed_vectors, false);
+                }
+            }
+            if (packed_vectors != NULL) {
+                pfree(packed_vectors);
             }
         }
 

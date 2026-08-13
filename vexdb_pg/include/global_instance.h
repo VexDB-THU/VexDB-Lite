@@ -32,22 +32,9 @@ typedef struct knl_g_rabitq_context {
     char caches[1024];
 } knl_g_rabitq_context;
 
-/* Vector buffer manager context */
-typedef struct knl_g_diskann_context {
-    MemoryContext vec_buf_ctx;
-    void *vec_buffer_mgr;
-    size_t vector_buffers;
-    bool enable_buffer_manager;
-    int vector_buffer_workers;
-    int vec_writer_nproc;
-    int16 pool_offset_to_write;
-    void **vec_writer_latch;
-} knl_g_diskann_context;
-
 struct GlobalInstance {
     knl_g_annvec_context annvec_cxt;
     knl_g_rabitq_context rabitq_ctx;
-    knl_g_diskann_context diskann_cxt;
 };
 
 extern GlobalInstance g_instance;

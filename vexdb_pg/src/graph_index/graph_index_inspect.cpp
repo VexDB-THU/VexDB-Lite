@@ -88,6 +88,14 @@ static int64 calculate_relation_size(Relation rel, ForkNumber forknum)
 
 static void graph_index_inspect(Relation index, IndexInspectResult &res)
 {
+    if (index->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("cannot inspect partitioned vexdb_graph index \"%s\"",
+                        RelationGetRelationName(index)),
+                 errhint("Inspect one of its leaf indexes instead.")));
+    }
+
     RelationGetSmgr(index);
     
     const size_t vector_size = smgrexists(index->rd_smgr, VECTOR_FORKNUM) ?
@@ -107,6 +115,14 @@ static void graph_index_inspect(Relation index, IndexInspectResult &res)
     Buffer metabuf = ReadBuffer(index, meta_blkno);
     
     GraphIndexMetaPage metap = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf));
+
+    if (metap->version != GRAPH_INDEX_VERSION) {
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("unsupported vexdb_graph index format version %u",
+                        metap->version),
+                 errhint("REINDEX the vexdb_graph index.")));
+    }
     
     if (metap->id_type == IdType::U32) {
         DiskStore<uint32_t> disk_store{index, nullptr, metabuf, false};

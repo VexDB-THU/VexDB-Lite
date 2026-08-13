@@ -11,7 +11,7 @@
 #include "global_instance.h"
 #include "graph_index/graph_index_cluster.h"
 #include "graph_index/graph_index_storage.h"
-#include "vector_buffer/vector_smgr.h"
+#include "vector_page_storage.h"
 #else
 #error "One of PG_VEXDB_TARGET_DUCK or PG_VEXDB_TARGET_PG must be defined"
 #endif
