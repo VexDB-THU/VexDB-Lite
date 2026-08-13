@@ -21,6 +21,7 @@ struct RabitqDistancer {
 #pragma GCC diagnostic pop
     static constexpr bool has_estimation_func = true;
     static constexpr bool need_refine = false;
+    static constexpr bool requires_aligned_storage = false;
 
     RabitqDistancer()
         : dim(0),
@@ -30,6 +31,7 @@ struct RabitqDistancer {
           bin_size(0),
           code_len(0),
           qtcode_block(InvalidBlockNumber),
+          precise_distance(nullptr),
           prepared(false) {}
 
     void train(Relation index, FloatVectorArray samples, int dimension, Metric metric, bool need_norm,
@@ -66,6 +68,11 @@ struct RabitqDistancer {
         char *ext_data = bin_data + bin_size;
         estimator.get_full_dist(cluster_id, bin_data, ext_data, rec);
         return rec.est_dist;
+    }
+
+    float get_distance_precise(const void *x, const void *y, uint16 dim) const
+    {
+        return precise_distance(x, y, dim);
     }
 
     void get_distance_est_batch2(const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) const
@@ -110,6 +117,7 @@ private:
     uint32 bin_size;
     size_t code_len;
     BlockNumber qtcode_block;
+    ann_helper::distance_func precise_distance;
     bool prepared;
 };
 }

@@ -91,6 +91,9 @@ class GraphIndexAlgorithm : public PERFER(AlgPerfCats) {
     Store &store;
     Dister &distancer;
     Holder<Map<Pair<T, T>, float, PairHasher, PairCmp>> dist_cache;
+    PointExtensionContext *repair_ctx;
+    char *repair_pair_query;
+    T repair_pair_query_id;
 public:
     struct InsertContextBase {
         InsertContextBase(PointExtensionContext &c, const char *q, const ItemPointer t)
@@ -113,7 +116,10 @@ public:
           m(m),
           store(store),
           distancer(distancer),
-          dist_cache() {}
+          dist_cache(),
+          repair_ctx(nullptr),
+          repair_pair_query(nullptr),
+          repair_pair_query_id((T)INVALID_VECTOR_ID) {}
     GraphIndexAlgorithm(const GraphIndexMetaPage metap, Store &store, Dister &distancer)
         : GraphIndexAlgorithm(metap->ef_construction, metap->m, store, distancer) {}
 
@@ -132,6 +138,14 @@ public:
             constexpr float refine_factor = 1.25;
             ef_search *= refine_factor;
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        else if constexpr (!mem_store) {
+            if (store.requires_partition_refine()) {
+                constexpr float refine_factor = 1.25;
+                ef_search *= refine_factor;
+            }
+        }
+#endif
         Vec<Cand> ep(ef_search);
         ep.emplace_back((T)entry_info.id, (T)entry_info.cur_layer_idx, get_distance(query, entry_info.id));
         for (int_fast8_t l = entry_info.level; l > 0; --l) {
@@ -267,6 +281,18 @@ retry:
 
     void repair_entry(const UnorderedSet<size_t> &deleted)
     {
+        repair_entry_impl(nullptr, deleted);
+    }
+
+    void repair_entry(PointExtensionContext &ctx,
+                      const UnorderedSet<size_t> &deleted)
+    {
+        repair_entry_impl(&ctx, deleted);
+    }
+
+    void repair_entry_impl(PointExtensionContext *ctx,
+                           const UnorderedSet<size_t> &deleted)
+    {
         /* acquire exclusive lock forcefully */
         GraphIndexEntryInfo entry_info = get_entry_with_exclusive_lock();
         if (!deleted.contains(entry_info.id)) {
@@ -276,6 +302,84 @@ retry:
         size_t new_entry_id = INVALID_VECTOR_ID;
         size_t new_entry_cur_layer_idx = INVALID_VECTOR_ID;
         int8 new_entry_level = -1;
+
+#if defined(PG_VEXDB_TARGET_PG)
+        if (ctx != nullptr && store.has_quantized_storage()) {
+            char *scratch = alloc_vector(store.get_vecsize());
+            T cur_layer_idx = (T)entry_info.cur_layer_idx;
+
+            /*
+             * The deleted entry no longer has a heap vector, and its vector
+             * storage contains only a PQ/RaBitQ code.  An HNSW entry may be
+             * any live point on the highest remaining layer, so select a live
+             * neighbor without scoring against the deleted compressed code.
+             */
+            for (int8 l = entry_info.level; l > 0; --l) {
+                auto [neighbors_info, lower_layer_idx, unused] =
+                    store.template get_point_info<false>(cur_layer_idx);
+                (void)unused;
+                for (uint16 i = 0; i < m; ++i) {
+                    T id = neighbors_info[i];
+                    if (!is_valid(id)) {
+                        break;
+                    }
+                    if (deleted.contains((size_t)id) ||
+                        !store.fetch_vec_from_heap(*ctx, id, scratch)) {
+                        continue;
+                    }
+                    new_entry_id = id;
+                    new_entry_cur_layer_idx = neighbors_info[m + i];
+                    new_entry_level = l;
+                    break;
+                }
+                if (is_valid((T)new_entry_id)) {
+                    break;
+                }
+                cur_layer_idx = lower_layer_idx;
+            }
+
+            if (!is_valid((T)new_entry_id) && is_valid(cur_layer_idx)) {
+                T *neighbors_id = std::get<0>(
+                    store.template get_point_info<true>(cur_layer_idx));
+                for (uint16 i = 0; i < m * 2; ++i) {
+                    T id = neighbors_id[i];
+                    if (!is_valid(id)) {
+                        break;
+                    }
+                    if (deleted.contains((size_t)id) ||
+                        !store.fetch_vec_from_heap(*ctx, id, scratch)) {
+                        continue;
+                    }
+                    new_entry_id = id;
+                    new_entry_cur_layer_idx = id;
+                    new_entry_level = 0;
+                    break;
+                }
+            }
+
+            /* A disconnected deleted entry may have no live neighbors. */
+            if (!is_valid((T)new_entry_id)) {
+                const T vector_num = store.get_vector_num();
+                for (T id = 0; id < vector_num; ++id) {
+                    if (deleted.contains((size_t)id) ||
+                        !store.fetch_vec_from_heap(*ctx, id, scratch)) {
+                        continue;
+                    }
+                    new_entry_id = id;
+                    new_entry_cur_layer_idx = id;
+                    new_entry_level = 0;
+                    break;
+                }
+            }
+
+            free_vector(scratch);
+            store.set_entrypoint(new_entry_id, new_entry_cur_layer_idx,
+                                 new_entry_level);
+            release_exclusive_lock();
+            return;
+        }
+#endif
+
         auto vecbuf = store.read_data((T)entry_info.id);
         const char *query = vecbuf.get_vecbuf();
         Vec<Cand> ep(1);
@@ -319,7 +423,8 @@ retry:
                 store.base_layer.n_data_per_block(), store.upper_layer.n_data_per_block()};
     }
 
-    void repair_basepoint(T id, const UnorderedSet<size_t> &deleted)
+    void repair_basepoint(PointExtensionContext &ctx, T id,
+                          const UnorderedSet<size_t> &deleted)
     {
         auto neighbors_id = std::get<0>(store.template get_point_info<true>(id));
         uint16 nbr_num = m * 2;
@@ -329,8 +434,17 @@ retry:
 
         Vec<Cand> ep(ef_construction);
         ep.emplace_back(id, id, 0);
-        auto vecbuf = store.read_data(id);
-        const char *query = vecbuf.get_vecbuf();
+        char *query = alloc_vector(store.get_vecsize());
+        if (!store.fetch_vec_from_heap(ctx, id, query)) {
+            free_vector(query);
+            return;
+        }
+        const auto norm_func = get_norm_func();
+        if (norm_func) {
+            norm_func(query, store.get_dim(), query);
+        }
+        begin_repair_pair_distances(ctx, query, id);
+        distancer.process(query);
         ep = search_layer<true>(query, std::move(ep), ef_construction, [&](T check_id) -> bool {
             return id != check_id && !deleted.contains(check_id);
         });
@@ -343,11 +457,13 @@ retry:
         }
         set_base_neighbors(id, new_neighbors_id.data());
         update_reverse_edges<true>(std::move(new_neighbors), query, id, id);
-        vecbuf.release();
+        end_repair_pair_distances();
+        free_vector(query);
         dist_cache->clear();
     }
 
-    void repair_upperpoint(T cur_layer_idx, const UnorderedSet<size_t> &deleted)
+    void repair_upperpoint(PointExtensionContext &ctx, T cur_layer_idx,
+                           const UnorderedSet<size_t> &deleted)
     {
         auto [neighbors_info, unused, id] = store.template get_point_info<false>(cur_layer_idx);
         (void)unused;
@@ -364,8 +480,17 @@ retry:
 
         Vec<Cand> ep(ef_construction);
         ep.emplace_back(id, cur_layer_idx, 0);
-        auto vecbuf = store.read_data(id);
-        const char *query = vecbuf.get_vecbuf();
+        char *query = alloc_vector(store.get_vecsize());
+        if (!store.fetch_vec_from_heap(ctx, id, query)) {
+            free_vector(query);
+            return;
+        }
+        const auto norm_func = get_norm_func();
+        if (norm_func) {
+            norm_func(query, store.get_dim(), query);
+        }
+        begin_repair_pair_distances(ctx, query, id);
+        distancer.process(query);
         ep = search_layer<false>(query, std::move(ep), ef_construction, [&](T check_id) -> bool {
             return point_id != check_id && !deleted.contains(check_id);
         });
@@ -382,7 +507,8 @@ retry:
         }
         store.set_upper_neighbors(cur_layer_idx, new_neighbors_info.data());
         update_reverse_edges<false>(std::move(new_neighbors), query, id, cur_layer_idx);
-        vecbuf.release();
+        end_repair_pair_distances();
+        free_vector(query);
         dist_cache->clear();
     }
 
@@ -662,25 +788,37 @@ private:
             : nullptr;
     }
 
+    void refine_precise(PointExtensionContext &ctx, Vec<Cand> &candidates,
+                        const char *query) {
+        const auto norm_func = get_norm_func();
+        char *vec = alloc_vector(store.get_vecsize());
+        for (Cand &point : candidates) {
+            if (store.fetch_vec_from_heap(ctx, point.id, vec)) {
+                if (norm_func) {
+                    norm_func(vec, store.get_dim(), vec);
+                }
+                point.dist = get_distance_precise(query, vec);
+            } else {
+                point.dist = INVALID_DIST;
+            }
+        }
+        free_vector(vec);
+        std::sort(candidates.begin(), candidates.end(), [](const Cand &a, const Cand &b) -> bool {
+            return a.dist < b.dist;
+        });
+    }
+
     void refine(PointExtensionContext &ctx, Vec<Cand> &candidates, const char *query) {
         CONSTEXPR_IF (need_refine) {
-            const auto norm_func = get_norm_func();
-            char *vec = alloc_vector(store.get_vecsize());
-            for (Cand &point : candidates) {
-                if (store.fetch_vec_from_heap(ctx, point.id, vec)) {
-                    if (norm_func) {
-                        norm_func(vec, store.get_dim(), vec);
-                    }
-                    point.dist = get_distance_precise(query, vec);
-                } else {
-                    point.dist = INVALID_DIST;
-                }
-            }
-            free_vector(vec);
-            std::sort(candidates.begin(), candidates.end(), [](const Cand &a, const Cand &b) -> bool {
-                return a.dist < b.dist;
-            });
+            refine_precise(ctx, candidates, query);
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        else if constexpr (!mem_store) {
+            if (store.requires_partition_refine()) {
+                refine_precise(ctx, candidates, query);
+            }
+        }
+#endif
     }
 
     struct PruneNeighbor {
@@ -700,7 +838,7 @@ private:
         } else {
             auto [it, inserted] = dist_cache->try_emplace(Pair<T, T>(a.id, b.id), 0);
             if (inserted) {
-                it->second = get_distance(a.val, b.val);
+                it->second = get_repair_pair_distance(a.id, a.val, b.val);
             }
             return it->second;
         }
@@ -713,10 +851,65 @@ private:
         } else {
             auto [it, inserted] = dist_cache->try_emplace(Pair<T, T>(a.id, b.id), 0);
             if (inserted) {
-                it->second = get_distance(a.val, b.val);
+                it->second = get_repair_pair_distance(a.id, a.val, b.val);
             }
             return it->second;
         }
+    }
+
+    void begin_repair_pair_distances(PointExtensionContext &ctx,
+                                     const char *query, T query_id)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if constexpr (!mem_store) {
+            if (store.has_quantized_storage()) {
+                repair_ctx = &ctx;
+                repair_pair_query = alloc_vector(store.get_vecsize());
+                memcpy(repair_pair_query, query, store.get_vecsize());
+                repair_pair_query_id = query_id;
+            }
+        }
+#else
+        (void)ctx;
+        (void)query;
+        (void)query_id;
+#endif
+    }
+
+    void end_repair_pair_distances()
+    {
+        if (repair_pair_query != nullptr) {
+            free_vector(repair_pair_query);
+        }
+        repair_pair_query = nullptr;
+        repair_ctx = nullptr;
+        repair_pair_query_id = (T)INVALID_VECTOR_ID;
+    }
+
+    float get_repair_pair_distance(T query_id, const char *query_code,
+                                   const char *target_code)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if constexpr (!mem_store) {
+            if (repair_ctx != nullptr) {
+                if (repair_pair_query_id != query_id) {
+                    if (!store.fetch_vec_from_heap(*repair_ctx, query_id,
+                                                   repair_pair_query)) {
+                        return INVALID_DIST;
+                    }
+                    const auto norm_func = get_norm_func();
+                    if (norm_func) {
+                        norm_func(repair_pair_query, store.get_dim(),
+                                  repair_pair_query);
+                    }
+                    distancer.process(repair_pair_query);
+                    repair_pair_query_id = query_id;
+                }
+                return get_distance(repair_pair_query, target_code);
+            }
+        }
+#endif
+        return get_distance(query_code, target_code);
     }
 
     /* forward: new_point -> neighbors, select `m/2m` neighbors from current candidate */

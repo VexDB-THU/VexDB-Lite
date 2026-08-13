@@ -221,7 +221,8 @@ public:
                     enable_quantizer();
                 }
             } else {
-                if (compact_mode && heap != NULL) {
+                if (compact_mode && heap != NULL &&
+                    !empty_partition_quantizer_fallback) {
                     ereport(ERROR,
                         (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
                          errmsg("memory_mode='compact' requires an active %s quantizer",
@@ -232,7 +233,9 @@ public:
         }
         build_graph(heap, index, index_info);
         if (defer_compact_encoding) {
-            compact_raw_vectors(index);
+            if (!compact_encoded_during_flush) {
+                compact_raw_vectors(index);
+            }
             enable_quantizer();
         }
         if (RelationNeedsWAL(index) || fork_num == INIT_FORKNUM) {
@@ -433,6 +436,8 @@ private:
     Optional<Variant<PQDistancer, RabitqDistancer>> quantizer;
     size_t elem_size;
     bool defer_compact_encoding{false};
+    bool compact_encoded_during_flush{false};
+    bool empty_partition_quantizer_fallback{false};
 
     /* Statistics */
     double reltuples{0};
@@ -658,6 +663,16 @@ private:
         if (samples->length < minimum_samples) {
             int sample_len = samples->length;
             FloatVectorArrayFree(samples);
+            if (compact_mode && sample_len == 0 && heap != NULL &&
+                heap->rd_rel->relispartition) {
+                empty_partition_quantizer_fallback = true;
+                ereport(NOTICE,
+                    (errmsg("empty partition uses plain vector storage until REINDEX"),
+                     errdetail("The configured %s quantizer needs at least %d rows.",
+                         quantizer_name(qt_type), minimum_samples),
+                     errhint("Load the partition, then REINDEX the parent index to activate compact codes.")));
+                return false;
+            }
             if (compact_mode) {
                 ereport(ERROR,
                     (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -979,7 +994,7 @@ private:
 
         /* Flush if still in MEMORY mode (threshold never reached) */
         if (build_state == BuildState::MEMORY) {
-            flush(index);
+            flush(index, true);
             mem_store->destroy();
         }
 
@@ -1026,7 +1041,7 @@ private:
     }
 
     template <typename T>
-    void flush_graph(Relation index)
+    void flush_graph(Relation index, bool final_memory_build)
     {
         GraphIndexMetaPage metap = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf));
         Timer flush_timer{0, 500'000, "", ""};
@@ -1106,8 +1121,13 @@ private:
         uint32 one_chunk_elem_nums = vector_pool.get_one_chunk_elem_nums();
         const size_t vector_stride = vector_pool.get_elem_size();
 
-        bool quantizer_on = (qt_type != QuantizerType::NONE) && !defer_compact_encoding;
-        if (compact_mode && !quantizer_on && !defer_compact_encoding) {
+        const bool encode_compact_during_flush =
+            final_memory_build && compact_mode && defer_compact_encoding &&
+            qt_type != QuantizerType::NONE;
+        bool quantizer_on = (qt_type != QuantizerType::NONE) &&
+            (!defer_compact_encoding || encode_compact_during_flush);
+        if (compact_mode && !quantizer_on && !defer_compact_encoding &&
+            !empty_partition_quantizer_fallback) {
             ereport(ERROR,
                 (errcode(ERRCODE_DATA_EXCEPTION),
                  errmsg("memory_mode='compact' cannot flush raw vectors")));
@@ -1138,6 +1158,9 @@ private:
                 pfree(code_chunk);
             };
             visit(write_quantizer_codes, quantizer.value());
+            if (encode_compact_during_flush) {
+                compact_encoded_during_flush = true;
+            }
         } else {
             constexpr size_t pack_buffer_bytes = 10 * 1024 * 1024;
             const size_t pack_rows = Max((size_t)1,
@@ -1187,12 +1210,12 @@ private:
         flush_timer.destroy();
     }
 
-    void flush(Relation index)
+    void flush(Relation index, bool final_memory_build = false)
     {
         if (id_type == IdType::U32) {
-            flush_graph<uint32>(index);
+            flush_graph<uint32>(index, final_memory_build);
         } else {
-            flush_graph<size_t>(index);
+            flush_graph<size_t>(index, final_memory_build);
         }
     }
 

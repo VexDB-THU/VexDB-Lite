@@ -1,0 +1,269 @@
+name: graph_index_partition_quantized_recall_eval
+tags: [pg-only, eval, partition, pq, rabitq, recall, active-quantizer]
+engines: [pg]
+description: |
+  PQ/RaBitQ 分区质量 eval。两个叶子各自训练量化器，8 个查询跨两个叶子，
+  用函数式暴力搜索 Top-10 作为真值，检查父表 ANN Top-10。两种量化器都
+  必须在两个叶子真实激活；总 recall@10 至少 0.80，且不能有零命中查询。
+  该门禁专门防止跨叶候选不足或把不同叶子的估算距离直接全局排序。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 0;
+  - statement: SET max_parallel_workers_per_gather = 0;
+  - statement: SET vexdb.ef_search = 400;
+  - statement: DROP TABLE IF EXISTS qp_recall_eval CASCADE;
+  - statement: DROP FUNCTION IF EXISTS __qp_eval_vec16(int);
+  - statement: |
+      CREATE FUNCTION __qp_eval_vec16(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 15) AS j
+      $$;
+  - statement: |
+      CREATE TABLE qp_recall_eval (id int, bucket int, vec floatvector(16))
+      PARTITION BY RANGE (bucket);
+  - statement: |
+      CREATE TABLE qp_recall_eval_0 PARTITION OF qp_recall_eval
+      FOR VALUES FROM (1) TO (10001);
+  - statement: |
+      CREATE TABLE qp_recall_eval_1 PARTITION OF qp_recall_eval
+      FOR VALUES FROM (10001) TO (20001);
+  - statement: |
+      INSERT INTO qp_recall_eval
+      SELECT i, i, __qp_eval_vec16(i)
+      FROM generate_series(1, 20000) AS i;
+  - statement: ANALYZE qp_recall_eval;
+  - statement: CREATE TABLE qp_recall_queries (qid int PRIMARY KEY, vec floatvector(16));
+  - statement: |
+      INSERT INTO qp_recall_queries
+      SELECT id, vec FROM qp_recall_eval
+      WHERE id IN (137, 2345, 5879, 8717, 10021, 13457, 15000, 19991);
+  - statement: |
+      CREATE TABLE qp_recall_truth AS
+      SELECT q.qid, exact.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - query: SELECT count(*) FROM qp_recall_truth;
+    expect: [[80]]
+
+  # PQ partition recall.
+  - statement: |
+      CREATE INDEX qp_recall_pq_idx ON qp_recall_eval
+      USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=8, memory_mode=compact,
+            m=16, ef_construction=100);
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits i
+      JOIN pg_class child ON child.oid = i.inhrelid
+      CROSS JOIN LATERAL index_inspect(child.oid::regclass::text) info
+      WHERE i.inhparent = 'qp_recall_pq_idx'::regclass
+        AND info.attribute = 'Working Quantizer'
+        AND info.content::text = 'PQ';
+    expect: [[2]]
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qp_recall_pq_ann AS
+      SELECT q.qid, ann.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qp_recall_pq_ann a
+        LEFT JOIN qp_recall_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DELETE FROM qp_recall_eval WHERE id % 10 = 0;
+  - statement: DROP TABLE qp_recall_truth;
+  - statement: |
+      CREATE TABLE qp_recall_truth AS
+      SELECT q.qid, exact.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: VACUUM qp_recall_eval;
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qp_recall_pq_vacuum_ann AS
+      SELECT q.qid, ann.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qp_recall_pq_vacuum_ann a
+        LEFT JOIN qp_recall_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  # Empty the graph, then make 30001 the known entry and delete it while
+  # 30002 remains live. VACUUM must publish the live neighbor as the new entry.
+  - statement: DELETE FROM qp_recall_eval;
+  - statement: VACUUM qp_recall_eval;
+  - statement: |
+      INSERT INTO qp_recall_eval VALUES
+        (30001, 1, __qp_eval_vec16(30001)),
+        (30002, 2, __qp_eval_vec16(30002));
+  - statement: DELETE FROM qp_recall_eval WHERE id = 30001;
+  - statement: VACUUM qp_recall_eval;
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM qp_recall_eval
+      ORDER BY vec <-> __qp_eval_vec16(30002) LIMIT 1;
+    expect: [[30002]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP INDEX qp_recall_pq_idx;
+  - statement: TRUNCATE qp_recall_eval;
+  - statement: |
+      INSERT INTO qp_recall_eval
+      SELECT i, i, __qp_eval_vec16(i)
+      FROM generate_series(1, 20000) AS i;
+  - statement: ANALYZE qp_recall_eval;
+  - statement: DROP TABLE qp_recall_truth;
+  - statement: |
+      CREATE TABLE qp_recall_truth AS
+      SELECT q.qid, exact.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+
+  # RaBitQ partition recall. Each leaf returns heap-refined exact distances.
+  - statement: |
+      CREATE INDEX qp_recall_rq_idx ON qp_recall_eval
+      USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=rabitq, memory_mode=compact,
+            m=16, ef_construction=100);
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits i
+      JOIN pg_class child ON child.oid = i.inhrelid
+      CROSS JOIN LATERAL index_inspect(child.oid::regclass::text) info
+      WHERE i.inhparent = 'qp_recall_rq_idx'::regclass
+        AND info.attribute = 'Working Quantizer'
+        AND info.content::text = 'RaBitQ';
+    expect: [[2]]
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qp_recall_rq_ann AS
+      SELECT q.qid, ann.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qp_recall_rq_ann a
+        LEFT JOIN qp_recall_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DELETE FROM qp_recall_eval WHERE id % 10 = 0;
+  - statement: DROP TABLE qp_recall_truth;
+  - statement: |
+      CREATE TABLE qp_recall_truth AS
+      SELECT q.qid, exact.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: VACUUM qp_recall_eval;
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qp_recall_rq_vacuum_ann AS
+      SELECT q.qid, ann.id
+      FROM qp_recall_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM qp_recall_eval d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qp_recall_rq_vacuum_ann a
+        LEFT JOIN qp_recall_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DELETE FROM qp_recall_eval;
+  - statement: VACUUM qp_recall_eval;
+  - statement: |
+      INSERT INTO qp_recall_eval VALUES
+        (30001, 1, __qp_eval_vec16(30001)),
+        (30002, 2, __qp_eval_vec16(30002));
+  - statement: DELETE FROM qp_recall_eval WHERE id = 30001;
+  - statement: VACUUM qp_recall_eval;
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM qp_recall_eval
+      ORDER BY vec <-> __qp_eval_vec16(30002) LIMIT 1;
+    expect: [[30002]]
+  - statement: SET enable_seqscan = on;
+
+  - statement: RESET vexdb.ef_search;
+  - statement: DROP TABLE qp_recall_eval CASCADE;
+  - statement: DROP TABLE qp_recall_queries;
+  - statement: DROP TABLE qp_recall_truth;
+  - statement: DROP TABLE qp_recall_pq_ann;
+  - statement: DROP TABLE qp_recall_rq_ann;
+  - statement: DROP TABLE qp_recall_pq_vacuum_ann;
+  - statement: DROP TABLE qp_recall_rq_vacuum_ann;
+  - statement: DROP FUNCTION __qp_eval_vec16(int);

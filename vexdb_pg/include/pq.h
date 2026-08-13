@@ -41,6 +41,7 @@ using ProductQuantizer = ::vex::quantizer::ProductQuantizer;
 struct PQDistancer {
     static constexpr bool has_estimation_func = false;
     static constexpr bool need_refine = true;
+    static constexpr bool requires_aligned_storage = false;
 
     PQDistancer() : dist_table(NULL), flag(0.0f), prepared(false) {}
     void train(Relation index, FloatVectorArray samples, size_t dimension, Metric metric,

@@ -218,6 +218,7 @@ template <Arch ar, Metric m, DistPrecisionType d, RemainderSituation r, bool a>
 struct Distancer {
     static constexpr bool has_estimation_func = false;
     static constexpr bool need_refine = false;
+    static constexpr bool requires_aligned_storage = true;
     static constexpr void prepare(Relation index, void *meta) {}
     static constexpr void process(const char *query) {}
     static constexpr void compute_code(float *query, char *code) {}
@@ -370,6 +371,11 @@ struct Distancer {
         for (uint16 i = 0; i < y_size; i++) {
             out[i] = get_distance_single(x, y[i], dim);
         }
+    }
+
+    static inline float get_distance_precise(const void *x, const void *y,
+                                             uint16 dim) {
+        return get_distance_single(x, y, dim);
     }
 };
 

@@ -767,42 +767,96 @@ public:
         char *values = nullptr;
         void *value_ptrs[num];
         Buffer pinned_buffers[num];
+        bool copy_required[num];
+        bool has_copy_required = false;
         for (uint_fast16_t i = 0; i < num; ++i) {
             pinned_buffers[i] = InvalidBuffer;
+            const size_t in_page = (size_t)(
+                ((uint64)ids[i] * elem_size) % VEX_VECTOR_PAGE_PAYLOAD_SIZE);
+            copy_required[i] =
+                elem_size > VEX_VECTOR_PAGE_PAYLOAD_SIZE - in_page ||
+                (Distancer::requires_aligned_storage &&
+                 (VEX_VECTOR_PAGE_HEADER_SIZE + in_page) %
+                     ann_helper::vector_aligned_size != 0);
+            has_copy_required = has_copy_required || copy_required[i];
         }
 
         PG_TRY();
         {
             DO_PERF_COUNT(read_vec, num);
-            for (uint_fast16_t i = 0; i < num; ++i) {
-                const char *page_value = nullptr;
-                refresh_vector_nblocks(ids[i]);
-                const VectorReadStatus status = vector_storage_pin(
-                    index, (off_t)((size_t)ids[i] * elem_size), elem_size,
-                    vector_nblocks, &pinned_buffers[i],
-                    &page_value);
-                if (status == VECTOR_READ_OK && page_value != nullptr &&
-                        is_aligned(page_value)) {
-                    value_ptrs[i] = const_cast<char *>(page_value);
-                } else {
-                    vector_storage_unpin(pinned_buffers[i]);
-                    pinned_buffers[i] = InvalidBuffer;
-                    if (status != VECTOR_READ_COPY_REQUIRED &&
-                            status != VECTOR_READ_OK) {
-                        ereport(ERROR,
-                                (errcode(ERRCODE_DATA_CORRUPTED),
-                                 errmsg("could not read vector %u from index \"%s\"",
-                                        (unsigned)ids[i], RelationGetRelationName(index)),
-                                 errdetail("vector page read status: %d", (int)status),
-                                 errhint("REINDEX the vexdb_graph index.")));
-                    }
-                    if (values == nullptr) {
-                        values = alloc_vector(stride, num);
+
+            /*
+             * Copy cross-page or unaligned values before taking any page
+             * locks. Otherwise a scratch read can try to re-lock a page
+             * already pinned by an earlier value in this batch.
+             */
+            if (has_copy_required) {
+                values = alloc_vector(stride, num);
+                for (uint_fast16_t i = 0; i < num; ++i) {
+                    if (!copy_required[i]) {
+                        continue;
                     }
                     char *value = values + i * stride;
                     read_vector_into(ids[i], value);
                     value_ptrs[i] = value;
                 }
+            }
+
+            for (uint_fast16_t i = 0; i < num; ++i) {
+                if (copy_required[i]) {
+                    continue;
+                }
+
+                const char *page_value = nullptr;
+                const off_t vector_offset =
+                    (off_t)((size_t)ids[i] * elem_size);
+                const BlockNumber vector_block = (BlockNumber)(
+                    (uint64)vector_offset / VEX_VECTOR_PAGE_PAYLOAD_SIZE);
+                VectorReadStatus status = VECTOR_READ_NO_BLOCK;
+                bool found_locked_block = false;
+
+                /* Reuse one pin and content lock for values on the same page. */
+                for (uint_fast16_t j = 0; j < i; ++j) {
+                    if (!BufferIsValid(pinned_buffers[j])) {
+                        continue;
+                    }
+                    const off_t previous_offset =
+                        (off_t)((size_t)ids[j] * elem_size);
+                    const BlockNumber previous_block = (BlockNumber)(
+                        (uint64)previous_offset / VEX_VECTOR_PAGE_PAYLOAD_SIZE);
+                    if (previous_block != vector_block) {
+                        continue;
+                    }
+
+                    found_locked_block = true;
+                    const size_t in_page = (size_t)(
+                        (uint64)vector_offset % VEX_VECTOR_PAGE_PAYLOAD_SIZE);
+                    Page page = BufferGetPage(pinned_buffers[j]);
+                    if (!PageIsNew(page) && ((PageHeader)page)->pd_lower >=
+                            VEX_VECTOR_PAGE_HEADER_SIZE + in_page + elem_size) {
+                        page_value = page + VEX_VECTOR_PAGE_HEADER_SIZE + in_page;
+                        status = VECTOR_READ_OK;
+                    }
+                    break;
+                }
+
+                refresh_vector_nblocks(ids[i]);
+                if (!found_locked_block) {
+                    status = vector_storage_pin(
+                        index, vector_offset, elem_size, vector_nblocks,
+                        &pinned_buffers[i], &page_value);
+                }
+                if (status != VECTOR_READ_OK || page_value == nullptr) {
+                    ereport(ERROR,
+                            (errcode(ERRCODE_DATA_CORRUPTED),
+                             errmsg("could not read vector %u from index \"%s\"",
+                                    (unsigned)ids[i], RelationGetRelationName(index)),
+                             errdetail("vector page read status: %d", (int)status),
+                             errhint("REINDEX the vexdb_graph index.")));
+                }
+                Assert(!Distancer::requires_aligned_storage ||
+                       is_aligned(page_value));
+                value_ptrs[i] = const_cast<char *>(page_value);
             }
             STOP_PERF(read_vec);
 
@@ -1485,6 +1539,17 @@ public:
 
     Relation get_index() const { return index; }
     Relation get_heap() const { return heap; }
+    bool has_quantized_storage() const
+        { return qt_type != QuantizerType::NONE; }
+    bool requires_partition_refine() const
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        return heap != NULL && heap->rd_rel->relispartition &&
+               qt_type == QuantizerType::RABITQ;
+#else
+        return false;
+#endif
+    }
     T get_vector_num() const { return base_layer.size(); }
     T get_upper_num() const { return upper_layer.size(); }
     uint_fast16_t get_m() const { return m; }
@@ -1652,13 +1717,6 @@ inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation he
                  errmsg("unsupported vexdb_graph index format version %u",
                         metap->version),
                  errhint("REINDEX the vexdb_graph index.")));
-    }
-    if (heap != NULL && heap->rd_rel->relispartition &&
-        metap->quantizer_metainfo.get_type() != QuantizerType::NONE) {
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("quantized vexdb_graph indexes are not supported on partitioned tables"),
-                 errhint("Use a plain vexdb_graph index for every leaf partition.")));
     }
 #endif
     if (metap->use_cluster()) {

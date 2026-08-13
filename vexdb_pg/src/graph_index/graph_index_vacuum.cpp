@@ -91,7 +91,8 @@ private:
     }
 
     template <typename Algo>
-    static void repair_base_range(Algo &algo, size_t start, size_t num, const UnorderedSet<size_t> &deleted)
+    static void repair_base_range(Algo &algo, PointExtensionContext &ctx,
+        size_t start, size_t num, const UnorderedSet<size_t> &deleted)
     {
         for (size_t i = 0; i < num; ++i) {
             CHECK_FOR_INTERRUPTS();
@@ -99,22 +100,24 @@ private:
             if (deleted.contains(id)) {
                 continue;
             }
-            algo.repair_basepoint(id, deleted);
+            algo.repair_basepoint(ctx, id, deleted);
         }
     }
 
     template <typename Algo>
-    static void repair_upper_range(Algo &algo, size_t start, size_t num, const UnorderedSet<size_t> &deleted)
+    static void repair_upper_range(Algo &algo, PointExtensionContext &ctx,
+        size_t start, size_t num, const UnorderedSet<size_t> &deleted)
     {
         for (size_t i = 0; i < num; ++i) {
             CHECK_FOR_INTERRUPTS();
             size_t cur_layer_idx = start + i;
-            algo.repair_upperpoint(cur_layer_idx, deleted);
+            algo.repair_upperpoint(ctx, cur_layer_idx, deleted);
         }
     }
 
     void repair_graph(const UnorderedSet<size_t> &deleted)
     {
+        PointExtensionContext ctx{index, GRAPH_INDEX_PS_BLKNO, true};
         DiskStoreVariant disk_store;
         create_disk_store(disk_store, index, heap, metabuf, true);
         auto visitor = [&](auto &store) -> void {
@@ -128,7 +131,7 @@ private:
                     GraphIndexAlgorithm algo{metap, store, distancer};
 
                     /* Repair entry point if deleted */
-                    algo.repair_entry(deleted);
+                    algo.repair_entry(ctx, deleted);
 
                     /* Step 2.1: Repair existing points [0, basepoint_num) */
                     GIStateInput input;
@@ -139,18 +142,20 @@ private:
                     (void)u; (void)u1;
                     basepoint_num = bp_num;
                     upperpoint_num = up_num;
-                    repair_base_range(algo, 0, basepoint_num, deleted);
-                    repair_upper_range(algo, 0, upperpoint_num, deleted);
+                    repair_base_range(algo, ctx, 0, basepoint_num, deleted);
+                    repair_upper_range(algo, ctx, 0, upperpoint_num, deleted);
 
                     /* Step 2.2: Exclusive lock, repair final newest points */
                     algo.get_entry_with_exclusive_lock();
                     auto [final_bp_num, final_up_num, u2, u3] = algo.get_repair_info();
                     (void)u2; (void)u3;
                     if (final_bp_num > basepoint_num) {
-                        repair_base_range(algo, basepoint_num, final_bp_num - basepoint_num, deleted);
+                        repair_base_range(algo, ctx, basepoint_num,
+                            final_bp_num - basepoint_num, deleted);
                     }
                     if (final_up_num > upperpoint_num) {
-                        repair_upper_range(algo, upperpoint_num, final_up_num - upperpoint_num, deleted);
+                        repair_upper_range(algo, ctx, upperpoint_num,
+                            final_up_num - upperpoint_num, deleted);
                     }
                     algo.release_exclusive_lock();
 
@@ -161,6 +166,7 @@ private:
             );
         };
         visit(visitor, disk_store);
+        ctx.destroy();
         disk_store.destroy();
     }
 

@@ -71,6 +71,24 @@ SELECT i, ('[' || (i*.01) || ',' || (i*.02) || ',' || (i*.03) || ',' ||
 FROM generate_series(0, 499) AS g(i);
 CREATE INDEX ha_pq_idx ON ha_pq USING vexdb_graph (v floatvector_l2_ops)
 WITH (quantizer=pq, pq_m=4, memory_mode=compact);
+
+CREATE FUNCTION __ha_rq_vec16(i int) RETURNS floatvector
+LANGUAGE SQL IMMUTABLE STRICT AS $$
+  SELECT array_agg(
+    (sin(i * 0.013 + j * 0.17) +
+     cos(i * 0.007 * (j + 1)) +
+     ((i % 97) * (j + 1)) * 0.00001)::float4
+    ORDER BY j
+  )::floatvector
+  FROM generate_series(0, 15) AS j
+$$;
+CREATE TABLE ha_rq (id int primary key, v floatvector(16));
+INSERT INTO ha_rq
+SELECT i, __ha_rq_vec16(i)
+FROM generate_series(1, 12000) AS g(i);
+ANALYZE ha_rq;
+CREATE INDEX ha_rq_idx ON ha_rq USING vexdb_graph (v floatvector_l2_ops)
+WITH (quantizer=rabitq, memory_mode=compact, m=16, ef_construction=64);
 SQL
 
 "$PG_BIN/pg_basebackup" -h 127.0.0.1 -p "$PRIMARY_PORT" \
@@ -109,6 +127,19 @@ basebackup_pq_id=$(printf '%s\n' "$basebackup_pq_id" | tail -n 1)
     exit 1
 }
 
+basebackup_rq_id=$(standby_psql -At <<'SQL'
+SET enable_seqscan=off;
+SET vexdb.ef_search=100;
+SELECT id FROM ha_rq
+ORDER BY v <-> __ha_rq_vec16(5000) LIMIT 1;
+SQL
+)
+basebackup_rq_id=$(printf '%s\n' "$basebackup_rq_id" | tail -n 1)
+[[ "$basebackup_rq_id" == "5000" ]] || {
+    echo "basebackup RaBitQ index query mismatch: $basebackup_rq_id" >&2
+    exit 1
+}
+
 primary_psql <<'SQL' >/dev/null
 INSERT INTO ha_vectors VALUES (701, '[1.05,0,0,0]');
 INSERT INTO ha_vectors
@@ -120,6 +151,10 @@ VACUUM ha_vectors;
 
 INSERT INTO ha_pq VALUES (1000, '[1,2,3,4,5,6,7,8]');
 DELETE FROM ha_pq WHERE id = 100;
+
+INSERT INTO ha_rq VALUES
+  (20000, array_fill(50::float4, ARRAY[16])::floatvector);
+DELETE FROM ha_rq WHERE id = 5000;
 SQL
 
 target_lsn=$(primary_psql -Atc 'SELECT pg_current_wal_flush_lsn()')
@@ -165,10 +200,23 @@ incremental_pq_id=$(printf '%s\n' "$incremental_pq_id" | tail -n 1)
     exit 1
 }
 
+incremental_rq_id=$(standby_psql -At <<'SQL'
+SET enable_seqscan=off;
+SET vexdb.ef_search=100;
+SELECT id FROM ha_rq
+ORDER BY v <-> array_fill(50::float4, ARRAY[16])::floatvector LIMIT 1;
+SQL
+)
+incremental_rq_id=$(printf '%s\n' "$incremental_rq_id" | tail -n 1)
+[[ "$incremental_rq_id" == "20000" ]] || {
+    echo "streaming replication RaBitQ index query mismatch: $incremental_rq_id" >&2
+    exit 1
+}
+
 row_count=$(standby_psql -Atc 'SELECT count(*) FROM ha_vectors')
 [[ "$row_count" == "1199" ]] || {
     echo "streaming replication row count mismatch: $row_count" >&2
     exit 1
 }
 
-echo "PASS: pg_basebackup and streaming replay preserved vexdb_graph queries"
+echo "PASS: pg_basebackup and streaming replay preserved plain, PQ and RaBitQ queries"

@@ -117,20 +117,6 @@ graph_index_amroutine(void)
 static IndexBuildResult *
 graph_index_ambuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
-    /*
-     * PostgreSQL owns the virtual parent index and creates one physical
-     * vexdb_graph index per leaf.  Plain distances are directly comparable
-     * across leaves and PostgreSQL can merge their ordered scans.  Quantized
-     * leaves train independent codebooks, so keep PQ/RaBitQ disabled until
-     * cross-leaf refine and recall tests are part of the release gate.
-     */
-    if (heap->rd_rel->relispartition &&
-        graph_index_get_quantizer_type(index) != QuantizerType::NONE) {
-        ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("quantized vexdb_graph indexes are not supported on partitioned tables"),
-                 errhint("Use quantizer='none' for each leaf partition.")));
-    }
     check_ann_attributes(index);
     return graph_index_build_internal(heap, index, indexInfo);
 }

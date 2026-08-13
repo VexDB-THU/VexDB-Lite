@@ -100,6 +100,7 @@ void RabitqDistancer::train(Relation index, FloatVectorArray samples, int dimens
     dim = dimension;
     padded_dim = RABITQ_PADDED_DIM(dim);
     metric = metric_arg;
+    precise_distance = ann_helper::get_general_distance_func(metric);
     cid_size = kCodeHeaderSize;
     bin_size = RABITQ_BIN_DATA_SIZE(padded_dim);
     size_t ext_size = RABITQ_EXT_DATA_SIZE(padded_dim);
@@ -166,6 +167,7 @@ void RabitqDistancer::prepare(Relation index, void *metapage)
     dim = metap->dimension;
     padded_dim = RABITQ_PADDED_DIM(dim);
     metric = metap->metric;
+    precise_distance = ann_helper::get_general_distance_func(metric);
     cid_size = kCodeHeaderSize;
     bin_size = RABITQ_BIN_DATA_SIZE(padded_dim);
     size_t ext_size = RABITQ_EXT_DATA_SIZE(padded_dim);

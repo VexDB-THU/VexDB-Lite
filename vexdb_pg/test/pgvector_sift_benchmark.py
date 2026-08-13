@@ -71,6 +71,9 @@ class Benchmark:
             "m": args.m,
             "ef_construction": args.ef_construction,
             "ef_search": args.ef_search,
+            "vex_quantizer": args.vex_quantizer,
+            "vex_memory_mode": args.vex_memory_mode,
+            "pq_m": args.pq_m,
             "query_runs": args.query_runs,
             "transactions_per_run": args.transactions,
             "engines": {},
@@ -179,10 +182,20 @@ class Benchmark:
             index = "sift_bench_vex_idx"
             table = "sift_bench_vex"
             work_mem = self.args.vex_work_mem
+            options = [
+                f"m={self.args.m}",
+                f"ef_construction={self.args.ef_construction}",
+                "parallel_workers=0",
+            ]
+            if self.args.vex_quantizer == "pq":
+                options.extend(("quantizer=pq", f"pq_m={self.args.pq_m}",
+                                f"memory_mode={self.args.vex_memory_mode}"))
+            elif self.args.vex_quantizer == "rabitq":
+                options.extend(("quantizer=rabitq",
+                                f"memory_mode={self.args.vex_memory_mode}"))
             create = (
                 f"CREATE INDEX {index} ON {table} USING vexdb_graph "
-                f"(v floatvector_l2_ops) WITH (m={self.args.m}, "
-                f"ef_construction={self.args.ef_construction}, parallel_workers=0)"
+                f"(v floatvector_l2_ops) WITH ({','.join(options)})"
             )
         else:
             index = "sift_bench_pgvector_idx"
@@ -333,6 +346,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--query-runs", type=int, default=3)
     parser.add_argument("--transactions", type=int, default=1000)
     parser.add_argument("--vex-work-mem", default="2GB")
+    parser.add_argument("--vex-quantizer", choices=("plain", "pq", "rabitq"),
+                        default="plain")
+    parser.add_argument("--vex-memory-mode", choices=("full", "compact"),
+                        default="compact")
+    parser.add_argument("--pq-m", type=int, default=16)
     parser.add_argument("--pgvector-work-mem", default="2GB")
     parser.add_argument("--output")
     return parser.parse_args()

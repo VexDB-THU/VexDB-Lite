@@ -1,0 +1,197 @@
+name: graph_index_partition_quantized
+tags: [pg-only, regression, partition, pq, rabitq, refine, dml]
+engines: [pg]
+description: |
+  PQ 和 RaBitQ 的分区叶子会独立训练量化器。PQ 原本就从 heap 精排；
+  RaBitQ 在分区扫描时也必须从 heap 精排，使每个叶子向 PostgreSQL 返回
+  可比较的真实距离。空 compact 叶子先使用 plain，装载到训练门槛后通过
+  REINDEX 激活量化。覆盖跨叶全局 Top-K、裁剪、动态叶子、增量插入、
+  VACUUM 和 REINDEX。RaBitQ 每个活跃叶子保留 10000 行。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 0;
+  - statement: SET max_parallel_workers_per_gather = 0;
+
+  # PQ: 两个叶子独立训练 codebook，全局结果仍按 heap 精排距离归并。
+  - statement: DROP TABLE IF EXISTS t_part_pq CASCADE;
+  - statement: |
+      CREATE TABLE t_part_pq (id int, bucket int, v floatvector(8))
+      PARTITION BY RANGE (bucket);
+  - statement: |
+      CREATE TABLE t_part_pq_0 PARTITION OF t_part_pq
+      FOR VALUES FROM (0) TO (300);
+  - statement: |
+      CREATE TABLE t_part_pq_1 PARTITION OF t_part_pq
+      FOR VALUES FROM (300) TO (600);
+  - statement: |
+      INSERT INTO t_part_pq
+      SELECT i, i,
+        ('[' || (i*.01) || ',' || (i*.02) || ',' || (i*.03) || ',' ||
+         (i*.04) || ',' || (i*.05) || ',' || (i*.06) || ',' ||
+         (i*.07) || ',' || (i*.08) || ']')::floatvector
+      FROM generate_series(0, 599) AS g(i);
+  - statement: |
+      CREATE INDEX t_part_pq_idx ON t_part_pq
+      USING vexdb_graph (v floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=4, memory_mode=compact);
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <-> '[3.5025,7.005,10.5075,14.01,17.5125,21.015,24.5175,28.02]'::floatvector
+      LIMIT 3;
+    expect: [[350], [351], [349]]
+  - query: |
+      SELECT id FROM t_part_pq WHERE bucket < 300
+      ORDER BY v <-> '[2.5025,5.005,7.5075,10.01,12.5125,15.015,17.5175,20.02]'::floatvector
+      LIMIT 3;
+    expect: [[250], [251], [249]]
+  - statement: |
+      INSERT INTO t_part_pq VALUES
+      (70000, 450, '[50,50,50,50,50,50,50,50]'::floatvector);
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <-> '[50,50,50,50,50,50,50,50]'::floatvector LIMIT 1;
+    expect: [[70000]]
+  - statement: |
+      CREATE TABLE t_part_pq_2 PARTITION OF t_part_pq
+      FOR VALUES FROM (600) TO (900);
+  - statement: |
+      INSERT INTO t_part_pq
+      SELECT 100000 + i, i,
+        ('[' || (i*.01) || ',' || (i*.02) || ',' || (i*.03) || ',' ||
+         (i*.04) || ',' || (i*.05) || ',' || (i*.06) || ',' ||
+         (i*.07) || ',' || (i*.08) || ']')::floatvector
+      FROM generate_series(600, 899) AS g(i);
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <-> '[7,14,21,28,35,42,49,56]'::floatvector LIMIT 1;
+    expect: [[100700]]
+  - statement: REINDEX INDEX t_part_pq_idx;
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <-> '[7,14,21,28,35,42,49,56]'::floatvector LIMIT 1;
+    expect: [[100700]]
+  - statement: VACUUM t_part_pq;
+  - statement: REINDEX INDEX t_part_pq_idx;
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <-> '[50,50,50,50,50,50,50,50]'::floatvector LIMIT 1;
+    expect: [[70000]]
+  - statement: DROP INDEX t_part_pq_idx;
+  - statement: |
+      CREATE INDEX t_part_pq_cos_idx ON t_part_pq
+      USING vexdb_graph (v floatvector_cosine_ops)
+      WITH (quantizer=pq, pq_m=4, memory_mode=compact);
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <=> '[50,50,50,50,50,50,50,50]'::floatvector LIMIT 1;
+    expect: [[70000]]
+  - statement: DROP INDEX t_part_pq_cos_idx;
+  - statement: |
+      CREATE INDEX t_part_pq_ip_idx ON t_part_pq
+      USING vexdb_graph (v floatvector_ip_ops)
+      WITH (quantizer=pq, pq_m=4, memory_mode=compact);
+  - query: |
+      SELECT id FROM t_part_pq
+      ORDER BY v <#> '[50,50,50,50,50,50,50,50]'::floatvector LIMIT 1;
+    expect: [[70000]]
+  - statement: DROP TABLE t_part_pq CASCADE;
+
+  # RaBitQ: 分区叶子使用不同量化器，返回前先用 heap 原向量重算距离。
+  - statement: DROP TABLE IF EXISTS t_part_rq CASCADE;
+  - statement: DROP FUNCTION IF EXISTS __part_rq_vec16(int);
+  - statement: |
+      CREATE FUNCTION __part_rq_vec16(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 15) AS j
+      $$;
+  - statement: |
+      CREATE TABLE t_part_rq (id int, bucket int, v floatvector(16))
+      PARTITION BY RANGE (bucket);
+  - statement: |
+      CREATE TABLE t_part_rq_0 PARTITION OF t_part_rq
+      FOR VALUES FROM (1) TO (10001);
+  - statement: |
+      CREATE TABLE t_part_rq_1 PARTITION OF t_part_rq
+      FOR VALUES FROM (10001) TO (20001);
+  - statement: |
+      INSERT INTO t_part_rq
+      SELECT i, i, __part_rq_vec16(i)
+      FROM generate_series(1, 20000) AS g(i);
+  - statement: ANALYZE t_part_rq;
+  - statement: |
+      CREATE INDEX t_part_rq_idx ON t_part_rq
+      USING vexdb_graph (v floatvector_l2_ops)
+      WITH (quantizer=rabitq, memory_mode=compact,
+            m=16, ef_construction=64);
+  - statement: SET vexdb.ef_search = 100;
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <-> __part_rq_vec16(15000) LIMIT 3;
+    expect: [[15000], [8717], [2434]]
+  - query: |
+      SELECT id FROM t_part_rq WHERE bucket <= 10000
+      ORDER BY v <-> __part_rq_vec16(8717) LIMIT 1;
+    expect: [[8717]]
+  - statement: |
+      INSERT INTO t_part_rq VALUES
+      (30000, 15000, array_fill(50::float4, ARRAY[16])::floatvector);
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <-> array_fill(50::float4, ARRAY[16])::floatvector LIMIT 1;
+    expect: [[30000]]
+  - statement: |
+      CREATE TABLE t_part_rq_2 PARTITION OF t_part_rq
+      FOR VALUES FROM (20001) TO (30001);
+  - statement: |
+      INSERT INTO t_part_rq
+      SELECT 100000 + i, i, __part_rq_vec16(i)
+      FROM generate_series(20001, 30000) AS g(i);
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <-> __part_rq_vec16(25000) LIMIT 1;
+    expect: [[125000]]
+  - statement: REINDEX INDEX t_part_rq_idx;
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <-> __part_rq_vec16(25000) LIMIT 1;
+    expect: [[125000]]
+  - statement: VACUUM t_part_rq;
+  - statement: REINDEX INDEX t_part_rq_idx;
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <-> array_fill(50::float4, ARRAY[16])::floatvector LIMIT 1;
+    expect: [[30000]]
+  - statement: DROP INDEX t_part_rq_idx;
+  # Wider traversal keeps the metric checks focused on cross-leaf exact refine,
+  # rather than RaBitQ candidate recall at a small ef_search.
+  - statement: SET vexdb.ef_search = 2048;
+  - statement: |
+      CREATE INDEX t_part_rq_cos_idx ON t_part_rq
+      USING vexdb_graph (v floatvector_cosine_ops)
+      WITH (quantizer=rabitq, memory_mode=compact,
+            m=16, ef_construction=64);
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <=> __part_rq_vec16(15000) LIMIT 1;
+    expect: [[15000]]
+  - statement: DROP INDEX t_part_rq_cos_idx;
+  - statement: |
+      CREATE INDEX t_part_rq_ip_idx ON t_part_rq
+      USING vexdb_graph (v floatvector_ip_ops)
+      WITH (quantizer=rabitq, memory_mode=compact,
+            m=16, ef_construction=64);
+  - query: |
+      SELECT id FROM t_part_rq
+      ORDER BY v <#> array_fill(50::float4, ARRAY[16])::floatvector LIMIT 1;
+    expect: [[30000]]
+  - statement: RESET vexdb.ef_search;
+  - statement: RESET enable_seqscan;
+  - statement: DROP TABLE t_part_rq CASCADE;
+  - statement: DROP FUNCTION __part_rq_vec16(int);

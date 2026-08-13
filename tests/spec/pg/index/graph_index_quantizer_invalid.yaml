@@ -57,5 +57,5 @@ steps:
     expect: [[rabitq]]
   - statement: DROP INDEX idx_qz_rabitq_upper;
   - statement: CREATE INDEX idx_qz_bad_pq_m ON t_qz_invalid USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer='pq', pq_m=3);
-    expect_error: 'should be a multiple of pq_m'
+    expect_error: 'PQ: dimension 8 should be a multiple of pq_m=3'
   - statement: DROP TABLE t_qz_invalid;
