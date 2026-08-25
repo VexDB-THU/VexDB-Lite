@@ -1,0 +1,125 @@
+name: graph_index_partition_empty_leaf_fallback
+tags: [pg-only, regression, partition, pq, rabitq, fallback, reindex]
+engines: [pg]
+description: |
+  空 compact 叶子在 CREATE INDEX 时没有足够样本训练量化器，必须回退到 plain
+  存储（empty_partition_quantizer_fallback）并发 NOTICE，而不是报错。装载到训练
+  门槛后通过父索引 REINDEX 激活量化。覆盖：建索引时多叶子为空、查询不崩、
+  REINDEX 后量化器真实切换、DETACH/ATTACH 后状态一致。与
+  graph_index_partition_quantized（装载后再建空叶子）互补：本用例专门覆盖
+  CREATE INDEX 时叶子即空的回退分支。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 0;
+  - statement: SET max_parallel_workers_per_gather = 0;
+
+  # PQ: leaf0 loaded, leaf1 + leaf2 EMPTY at CREATE INDEX.
+  - statement: DROP TABLE IF EXISTS epfb CASCADE;
+  - statement: |
+      CREATE TABLE epfb (id int, bucket int, v floatvector(8))
+      PARTITION BY RANGE (bucket);
+  - statement: CREATE TABLE epfb_0 PARTITION OF epfb FOR VALUES FROM (0) TO (1000);
+  - statement: CREATE TABLE epfb_1 PARTITION OF epfb FOR VALUES FROM (1000) TO (2000);
+  - statement: CREATE TABLE epfb_2 PARTITION OF epfb FOR VALUES FROM (2000) TO (3000);
+  - statement: |
+      INSERT INTO epfb
+      SELECT i, i, ('['||(i*.01)||','||(i*.02)||','||(i*.03)||','||(i*.04)||','
+        ||(i*.05)||','||(i*.06)||','||(i*.07)||','||(i*.08)||']')::floatvector
+      FROM generate_series(0, 999) AS i;
+  - statement: |
+      CREATE INDEX epfb_idx ON epfb
+      USING vexdb_graph (v floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=4, memory_mode=compact);
+  # leaf0 = PQ, leaf1/leaf2 = Plain (fallback).
+  - query: |
+      WITH leaf_q AS (
+        SELECT c.relname,
+               max(info.content::text) FILTER (WHERE info.attribute='Working Quantizer') AS q
+        FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+        CROSS JOIN LATERAL index_inspect(c.oid::regclass::text) info
+        WHERE i.inhparent='epfb_idx'::regclass
+        GROUP BY c.relname ORDER BY c.relname)
+      SELECT (q='PQ')::int, (q='Plain Vector')::int FROM leaf_q ORDER BY relname;
+    expect: [[1, 0], [0, 1], [0, 1]]
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 100;
+  # Query must not crash even though two leaves are empty/plain.
+  - query: |
+      SELECT id FROM epfb
+      ORDER BY v <-> '[5,10,15,20,25,30,35,40]'::floatvector LIMIT 1;
+    expect: [[500]]
+  - statement: SET enable_seqscan = on;
+
+  # Load leaf1, REINDEX parent -> leaf1 activates PQ; leaf2 still empty/plain.
+  - statement: |
+      INSERT INTO epfb
+      SELECT 1000+i, 1000+i, ('['||((1000+i)*.01)||','||((1000+i)*.02)||','
+        ||((1000+i)*.03)||','||((1000+i)*.04)||','||((1000+i)*.05)||','
+        ||((1000+i)*.06)||','||((1000+i)*.07)||','||((1000+i)*.08)||']')::floatvector
+      FROM generate_series(0, 599) AS i;
+  - statement: REINDEX INDEX epfb_idx;
+  - query: |
+      WITH leaf_q AS (
+        SELECT max(info.content::text) FILTER (WHERE info.attribute='Working Quantizer') AS q
+        FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+        CROSS JOIN LATERAL index_inspect(c.oid::regclass::text) info
+        WHERE i.inhparent='epfb_idx'::regclass
+        GROUP BY c.relname ORDER BY c.relname)
+      SELECT count(*) FILTER (WHERE q='PQ'), count(*) FILTER (WHERE q='Plain Vector')
+      FROM leaf_q;
+    expect: [[2, 1]]
+
+  # DETACH the still-empty leaf2 then ATTACH it back; quantizer state consistent.
+  - statement: ALTER TABLE epfb DETACH PARTITION epfb_2;
+  - statement: ALTER TABLE epfb ATTACH PARTITION epfb_2 FOR VALUES FROM (2000) TO (3000);
+  - query: |
+      SELECT count(*) FROM pg_inherits WHERE inhparent='epfb_idx'::regclass;
+    expect: [[3]]
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM epfb
+      ORDER BY v <-> '[5,10,15,20,25,30,35,40]'::floatvector LIMIT 1;
+    expect: [[500]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE epfb CASCADE;
+
+  # RaBitQ: same fallback path (metric-agnostic sample check), one empty leaf.
+  - statement: DROP FUNCTION IF EXISTS __epfb_rq16(int);
+  - statement: |
+      CREATE FUNCTION __epfb_rq16(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i*0.013+j*0.17)+cos(i*0.007*(j+1))+((i%97)*(j+1))*0.00001)::float4
+          ORDER BY j)::floatvector FROM generate_series(0,15) AS j $$;
+  - statement: |
+      CREATE TABLE epfb_rq (id int, bucket int, v floatvector(16))
+      PARTITION BY RANGE (bucket);
+  - statement: CREATE TABLE epfb_rq_0 PARTITION OF epfb_rq FOR VALUES FROM (1) TO (10001);
+  - statement: CREATE TABLE epfb_rq_1 PARTITION OF epfb_rq FOR VALUES FROM (10001) TO (20001);
+  - statement: |
+      INSERT INTO epfb_rq
+      SELECT i, i, __epfb_rq16(i) FROM generate_series(1, 10000) AS i;
+  - statement: |
+      CREATE INDEX epfb_rq_idx ON epfb_rq
+      USING vexdb_graph (v floatvector_l2_ops)
+      WITH (quantizer=rabitq, memory_mode=compact, m=16, ef_construction=64);
+  - query: |
+      WITH leaf_q AS (
+        SELECT max(info.content::text) FILTER (WHERE info.attribute='Working Quantizer') AS q
+        FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+        CROSS JOIN LATERAL index_inspect(c.oid::regclass::text) info
+        WHERE i.inhparent='epfb_rq_idx'::regclass
+        GROUP BY c.relname ORDER BY c.relname)
+      SELECT count(*) FILTER (WHERE q='RaBitQ'), count(*) FILTER (WHERE q='Plain Vector')
+      FROM leaf_q;
+    expect: [[1, 1]]
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 200;
+  - query: |
+      SELECT id FROM epfb_rq
+      ORDER BY v <-> __epfb_rq16(5000) LIMIT 1;
+    expect: [[5000]]
+  - statement: SET enable_seqscan = on;
+  - statement: RESET vexdb.ef_search;
+  - statement: DROP TABLE epfb_rq CASCADE;
+  - statement: DROP FUNCTION __epfb_rq16(int);

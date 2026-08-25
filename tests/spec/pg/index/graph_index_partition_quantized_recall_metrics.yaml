@@ -1,0 +1,138 @@
+name: graph_index_partition_quantized_recall_metrics
+tags: [pg-only, eval, partition, rabitq, recall, cosine, inner-product, refine]
+engines: [pg]
+description: |
+  RaBitQ 分区叶子独立训练量化器，估算距离不可跨叶比较。分区扫描在返回前用
+  heap 原向量重算精确距离（refine_precise via get_general_distance_func(metric)）。
+  现有 recall 门禁 graph_index_partition_quantized_recall_eval 只覆盖 L2；本用例
+  补 cosine 与 inner-product 两种 metric 的 recall@10，且在正常 ef_search（400）
+  下验证，防止 refine 路径在非 L2 metric 下召回不足或归一化错误。
+  每种 metric 两个叶子都必须真实激活 RaBitQ；recall@10 至少 0.80，无零命中查询。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 0;
+  - statement: SET max_parallel_workers_per_gather = 0;
+  - statement: SET vexdb.ef_search = 400;
+  - statement: DROP TABLE IF EXISTS qpm CASCADE;
+  - statement: DROP FUNCTION IF EXISTS __qpm_vec16(int);
+  - statement: |
+      CREATE FUNCTION __qpm_vec16(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 15) AS j
+      $$;
+  - statement: |
+      CREATE TABLE qpm (id int, bucket int, vec floatvector(16))
+      PARTITION BY RANGE (bucket);
+  - statement: CREATE TABLE qpm_0 PARTITION OF qpm FOR VALUES FROM (1) TO (10001);
+  - statement: CREATE TABLE qpm_1 PARTITION OF qpm FOR VALUES FROM (10001) TO (20001);
+  - statement: |
+      INSERT INTO qpm
+      SELECT i, i, __qpm_vec16(i)
+      FROM generate_series(1, 20000) AS i;
+  - statement: ANALYZE qpm;
+  - statement: CREATE TABLE qpm_q (qid int PRIMARY KEY, vec floatvector(16));
+  - statement: |
+      INSERT INTO qpm_q
+      SELECT id, vec FROM qpm
+      WHERE id IN (137, 2345, 5879, 8717, 10021, 13457, 15000, 19991);
+
+  # ---- cosine ----
+  - statement: |
+      CREATE TABLE qpm_truth_cos AS
+      SELECT q.qid, ex.id
+      FROM qpm_q q CROSS JOIN LATERAL (
+        SELECT d.id FROM qpm d ORDER BY d.vec <=> q.vec, d.id LIMIT 10
+      ) ex;
+  - query: SELECT count(*) FROM qpm_truth_cos;
+    expect: [[80]]
+  - statement: |
+      CREATE INDEX qpm_cos_idx ON qpm USING vexdb_graph (vec floatvector_cosine_ops)
+      WITH (quantizer=rabitq, memory_mode=compact, m=16, ef_construction=100);
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits i
+      JOIN pg_class child ON child.oid = i.inhrelid
+      CROSS JOIN LATERAL index_inspect(child.oid::regclass::text) info
+      WHERE i.inhparent = 'qpm_cos_idx'::regclass
+        AND info.attribute = 'Working Quantizer'
+        AND info.content::text = 'RaBitQ';
+    expect: [[2]]
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qpm_ann_cos AS
+      SELECT q.qid, d.id
+      FROM qpm_q q CROSS JOIN LATERAL (
+        SELECT d.id FROM qpm d ORDER BY d.vec <=> q.vec LIMIT 10
+      ) d;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qpm_ann_cos a
+        LEFT JOIN qpm_truth_cos t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DROP INDEX qpm_cos_idx;
+
+  # ---- inner product (<#> returns negative IP, ascending = most similar) ----
+  - statement: |
+      CREATE TABLE qpm_truth_ip AS
+      SELECT q.qid, ex.id
+      FROM qpm_q q CROSS JOIN LATERAL (
+        SELECT d.id FROM qpm d ORDER BY d.vec <#> q.vec, d.id LIMIT 10
+      ) ex;
+  - query: SELECT count(*) FROM qpm_truth_ip;
+    expect: [[80]]
+  - statement: |
+      CREATE INDEX qpm_ip_idx ON qpm USING vexdb_graph (vec floatvector_ip_ops)
+      WITH (quantizer=rabitq, memory_mode=compact, m=16, ef_construction=100);
+  - query: |
+      SELECT count(*)
+      FROM pg_inherits i
+      JOIN pg_class child ON child.oid = i.inhrelid
+      CROSS JOIN LATERAL index_inspect(child.oid::regclass::text) info
+      WHERE i.inhparent = 'qpm_ip_idx'::regclass
+        AND info.attribute = 'Working Quantizer'
+        AND info.content::text = 'RaBitQ';
+    expect: [[2]]
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE qpm_ann_ip AS
+      SELECT q.qid, d.id
+      FROM qpm_q q CROSS JOIN LATERAL (
+        SELECT d.id FROM qpm d ORDER BY d.vec <#> q.vec LIMIT 10
+      ) d;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits
+        FROM qpm_ann_ip a
+        LEFT JOIN qpm_truth_ip t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 64 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) = 0 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DROP INDEX qpm_ip_idx;
+
+  - statement: RESET vexdb.ef_search;
+  - statement: DROP TABLE qpm CASCADE;
+  - statement: DROP TABLE qpm_q;
+  - statement: DROP TABLE qpm_truth_cos;
+  - statement: DROP TABLE qpm_truth_ip;
+  - statement: DROP TABLE qpm_ann_cos;
+  - statement: DROP TABLE qpm_ann_ip;
+  - statement: DROP FUNCTION __qpm_vec16(int);
