@@ -21,7 +21,7 @@ community CI 要求构建入口在**仓库根**，所以根目录只放了 2 个
 
 | 文件 | 位置 | 作用 |
 |---|---|---|
-| `Makefile` | 仓库根 | 5 行薄入口，CI 从根跑 `make`；`EXT_CONFIG` 指向本目录 |
+| `Makefile` | 仓库根 | CI 构建入口；准备 DuckDB checkout，`EXT_CONFIG` 指向本目录 |
 | `vcpkg.json` | 仓库根 | 声明唯一依赖 `boost-preprocessor`（header-only） |
 | `extension_config.cmake` | `community/` | `duckdb_extension_load(vexdb_lite)` |
 | `CMakeLists.txt` | `community/` | 扩展构建定义；**引用** `../vexdb_duckdb` + `../common`，源码不搬 |
@@ -29,8 +29,9 @@ community CI 要求构建入口在**仓库根**，所以根目录只放了 2 个
 
 - **源码零搬动**：`CMakeLists.txt` 直接引用仓库现有的 `vexdb_duckdb/` 与 `common/`，
   与 `vexdb_duckdb/CMakeLists.txt`（`build_duck.sh` 用）保持同一份源文件清单。
-- **duckdb / extension-ci-tools / vcpkg 不进本仓库**：community CI 在 workspace 里自己
-  checkout，不需要本仓库带 submodule。
+- **duckdb / extension-ci-tools / vcpkg 不进本仓库**：community CI 会 checkout
+  `extension-ci-tools`；根目录 `Makefile` 再按 CI 传入的版本浅拉取 `duckdb/`。不需要
+  本仓库带 submodule，也不会把 DuckDB 源码放进发布 tag。
 
 ## 发布步骤
 

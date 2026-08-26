@@ -1098,6 +1098,10 @@ void GraphIndex::CommitDrop(IndexLock &index_lock) {
     rowid_coverage_stale_ = false;
 }
 
+void GraphIndex::ResetStorage(IndexLock &index_lock) {
+    CommitDrop(index_lock);
+}
+
 ErrorData GraphIndex::Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     return Append(l, chunk, row_ids);
 }

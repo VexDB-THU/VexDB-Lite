@@ -108,7 +108,15 @@ public:
     void VerifyAppend(DataChunk &chunk, IndexAppendInfo &info, optional_ptr<ConflictManager> manager) override;
     void VerifyConstraint(DataChunk &chunk, IndexAppendInfo &info, ConflictManager &manager) override;
     void Delete(IndexLock &state, DataChunk &entries, Vector &row_identifiers) override;
+    // DuckDB renamed this hook from CommitDrop (v1.5.2) to ResetStorage
+    // (v1.5.5). Keep both signatures and mark the active API as the override.
+#ifdef VEXDB_DUCKDB_HAS_RESET_STORAGE
+    void CommitDrop(IndexLock &index_lock);
+    void ResetStorage(IndexLock &index_lock) override;
+#else
     void CommitDrop(IndexLock &index_lock) override;
+    void ResetStorage(IndexLock &index_lock);
+#endif
     ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) override;
     ErrorData Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids, IndexAppendInfo &info) override;
     bool MergeIndexes(IndexLock &state, BoundIndex &other_index) override;
@@ -154,7 +162,7 @@ private:
     std::unordered_set<row_t> deleted_rids_;
 
     // Index-level reader/writer lock. SearchANN/SearchPQ take it SHARED for the
-    // whole query; Append/Insert/Delete/CommitDrop take it EXCLUSIVE. This makes
+    // whole query; Append/Insert/Delete/index reset take it EXCLUSIVE. This makes
     // the per-node reader lock inside the HNSW walk redundant during search
     // (no writer can run concurrently), so search sets store.search_lock_free_
     // and skips it — eliminating hub-node reader-byte cacheline contention that
@@ -177,11 +185,11 @@ private:
     // memory_mode='compact' (PQ-only). After BuildBulk + TrainAndEncodePQ
     // releases the raw vector tier, SearchANN refuses to run and post-build
     // INSERTs encode into pq_codes_ without traversing the (now-broken) HNSW
-    // graph. Persisted across CommitDrop / Vacuum / Reload.
+    // graph. Persisted across index reset / Vacuum / Reload.
     bool compact_mode_ = false;
 
     // Lazy row_id → store_id index used by SearchPQ refine. Built on first
-    // refine query, invalidated on Append / Delete / CommitDrop.
+    // refine query, invalidated on Append / Delete / index reset.
     mutable std::unordered_map<row_t, uint32_t> pq_refine_rid_map_;
     mutable bool pq_refine_rid_map_dirty_ = true;
 

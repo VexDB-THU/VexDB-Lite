@@ -71,6 +71,14 @@ build_loadable_extension(${TARGET_NAME} "-warnings" ${EXTENSION_SOURCES})
 target_compile_features(${EXTENSION_NAME} PRIVATE cxx_std_17)
 target_compile_features(${LOADABLE_EXTENSION_NAME} PRIVATE cxx_std_17)
 
+# BoundIndex renamed CommitDrop(IndexLock &) to ResetStorage(IndexLock &) in
+# DuckDB v1.5.5. Export one feature flag to the shared extension sources so the
+# declarations can keep an exact override on both supported API shapes.
+if(DEFINED DUCKDB_VERSION_NUMBER AND DUCKDB_VERSION_NUMBER VERSION_GREATER_EQUAL "1.5.5")
+    target_compile_definitions(${EXTENSION_NAME} PRIVATE VEXDB_DUCKDB_HAS_RESET_STORAGE)
+    target_compile_definitions(${LOADABLE_EXTENSION_NAME} PRIVATE VEXDB_DUCKDB_HAS_RESET_STORAGE)
+endif()
+
 set(SIMD_COMMON_FLAGS "-ftree-vectorize -fassociative-math -fno-signed-zeros -fno-trapping-math -floop-interchange -fno-exceptions -funroll-loops -g1")
 set(SIMD_WARN_FLAGS "-Wno-ignored-attributes")
 if(NOT CMAKE_BUILD_TYPE STREQUAL "DEBUG")

@@ -407,7 +407,7 @@ public:
     /* When true, lock_point/unlock_point skip the per-node SHARED (reader)
      * stripe lock. GraphIndex::SearchANN/SearchPQ hold an index-level shared
      * rwlock (graph_rwlock_) for the whole query while writers (Append/Insert/
-     * Delete/CommitDrop) take it exclusive, so the striped reader-vs-writer
+     * Delete/index reset) take it exclusive, so the striped reader-vs-writer
      * per-node lock is redundant during search and only causes contention on
      * the few stripe atomics that hub nodes hash to (cacheline ping-pong that
      * collapsed throughput at high read concurrency). Set true on first search;
