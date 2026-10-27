@@ -30,8 +30,18 @@ using KMeansDistanceFn = float (*)(const void *a, const void *b, uint16_t dim);
 struct KMeansState {
     KMeansDistanceFn distance_fn = nullptr;
     KMeansDistanceFn norm_fn     = nullptr;  // optional: apply unit-norm to centers (cosine)
+    // Legacy explicit backend policy (PG maps its own skipCheckDuplicate).
     bool             skip_check_duplicate = false;
+    // Permit duplicate centers only if this subvector's input has fewer
+    // distinct finite vectors than the requested number of centers.
+    bool             allow_low_diversity_centers = false;
 };
+
+// Validate the trained centers against the actual input subvector data.
+// Unexpected duplicates and non-finite centers remain errors.
+void ValidateKMeansCenters(const KMeansState &state,
+                          const PQFloatArray &samples,
+                          const PQFloatArray &centers);
 
 // Run k-means on `samples`, write `centers->maxlen` centroids into `centers`.
 // On entry: centers->data must point to caller-allocated buffer of size

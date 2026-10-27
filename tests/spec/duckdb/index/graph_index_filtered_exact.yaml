@@ -1,0 +1,27 @@
+name: index__graph_index_filtered_exact
+tags: [vex, regression]
+engines: [duckdb]
+description: Filtered top-k keeps the filter-first exact plan, including a far-away subset and fewer than k matches.
+steps:
+- statement: SET vexdb_brute_force_threshold = 0;
+- statement: CREATE TABLE filter_exact AS SELECT i::INTEGER id, [i::FLOAT, 0::FLOAT, 0::FLOAT, 0::FLOAT]::FLOAT[4] vec FROM range(1000) t(i);
+- statement: CREATE INDEX filter_exact_idx ON filter_exact USING GRAPH_INDEX(vec) WITH (metric='l2', threads=1);
+- query: EXPLAIN SELECT id FROM filter_exact WHERE id >= 900 ORDER BY l2_distance(vec, [0,0,0,0]::FLOAT[4]) LIMIT 10;
+  _field_types: II
+  expect:
+  - [physical_plan, '<!REGEX>:.*VEXDB_INDEX_SCAN.*']
+- query: SELECT id FROM filter_exact WHERE id >= 900 ORDER BY l2_distance(vec, [0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[900], [901], [902]]
+- query: SELECT id FROM filter_exact WHERE id >= 998 ORDER BY l2_distance(vec, [0,0,0,0]::FLOAT[4]) LIMIT 10;
+  _field_types: I
+  expect: [[998], [999]]
+- query: SELECT count(*) FROM (SELECT id FROM filter_exact WHERE id < 0 ORDER BY l2_distance(vec, [0,0,0,0]::FLOAT[4]) LIMIT 10);
+  _field_types: I
+  expect: [[0]]
+- query: EXPLAIN SELECT id FROM filter_exact ORDER BY l2_distance(vec, [0,0,0,0]::FLOAT[4]) LIMIT 10;
+  _field_types: II
+  expect:
+  - [physical_plan, '<REGEX>:.*VEXDB_INDEX_SCAN.*']
+- statement: DROP TABLE filter_exact;
+- statement: RESET vexdb_brute_force_threshold;

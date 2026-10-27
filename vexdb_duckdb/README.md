@@ -144,10 +144,10 @@ WITH (
 | `metric` | `'l2'` | `'l2'` / `'cosine'` / `'ip'` |
 | `m` | `16` | 图索引每个节点的最大邻居数 |
 | `ef_construction` | `64` | 建图阶段搜索宽度，越大召回越好建索引越慢 |
-| `threads` | `1` | 并行构建 worker 数；`1` = 串行；>1 启用 striped lock 并发 |
+| `parallel_workers` / `threads` | 当前 `SET threads` | 图构建 worker 数及 PQ 训练并发上限；同时指定时 `parallel_workers` 优先。PQ 子码本数大于 64 时仍沿用串行训练路径 |
 | `quantizer` | `none` | `'pq'` 启用 Product Quantization |
 | `pq_m` | (无) | PQ 子量化器数；要求 `dim % pq_m == 0` |
-| `memory_mode` | `'full'` | `'full'` 存原始向量 + PQ；`'compact'` 仅 PQ codes（节省 ~32x 内存，无法精确 refine） |
+| `memory_mode` | `'full'` | `'full'` 存原始向量 + PQ；`'compact'` 释放原始向量，保留 PQ 编码、码本和图等结构，无法精确 refine；总内存需实测 |
 
 ### 索引 vs 暴力搜索
 
@@ -180,12 +180,14 @@ EXPLAIN SELECT id FROM items
 
 ### 元数据过滤
 
-支持在索引里附带标量列做 pre-filter：
+当前索引只接受单个 `FLOAT[N]` 向量列；查询可带 WHERE 条件。不要把标量列附加到索引定义中，当前源码会明确拒绝多列索引。
+
+执行计划仍包含实际过滤条件的向量 top-k 查询保留 DuckDB 先过滤、再按原向量精确排序的计划。不会先从全局 ANN 固定取 4 倍候选再过滤；合法记录足够时可以返回足量结果。此时 `EXPLAIN` 不含 `VEXDB_INDEX_SCAN`，`pq_only` / `pq_graph` 设置也不会把它变成过滤 ANN。被DuckDB消去的恒真条件等同无过滤。强过滤能减少距离计算，弱过滤仍可能扫描大量向量，速度需按实际条件验证。无过滤查询继续使用原有索引路径。三组数据与高并发实测见[过滤验证报告](../docs/reports/2026-10-27_filtered-vector-search-results.md)。
 
 ```sql
 CREATE INDEX idx_items_meta
 ON items
-USING GRAPH_INDEX (vec, category, status);
+USING GRAPH_INDEX (vec);
 
 SELECT id FROM items
 WHERE category = 'book' AND status = 'active'
@@ -198,6 +200,8 @@ LIMIT 10;
 ## 产品量化（PQ）
 
 PQ 把向量切成 `pq_m` 段，每段独立 k-means 量化到 256 个 centroid，存储压缩到 `pq_m` 字节。
+
+训练会检查样本和中心的 NaN/Inf、中心数量以及重复中心。只有某段实际训练数据的不同取值不足 256 种时，才允许该段出现重复中心，因此重复、稀疏或常量数据仍可建库；输入足够多样却训练出重复中心会报错。该判断根据实际子向量执行，不按业务或测试数据名称放行。
 
 ### 启用
 
@@ -218,17 +222,43 @@ WITH (quantizer = 'pq', pq_m = 16, memory_mode = 'compact');
 ```
 
 `memory_mode='compact'` 时：
-- 原始向量在 PQ 训练后被释放（节省 32x 内存）
-- 查询自动走 PQ 路径，无法 refine
-- 适合内存敏感场景（百亿向量）
+- 原始向量在 PQ 训练后被释放。例如 128 维、`pq_m=16` 时，单条原向量 512 字节、PQ 编码 16 字节；码本、行号和图等开销另计，不能据此推算总内存缩小 32 倍
+- 查询自动扫描全部 PQ 编码，无法 refine；数据增多时扫描工作量也会增加
+- 适合先按内存预算、召回和实际查询延迟验证的场景，目前没有百亿规模验收数据
 
 ### 搜索模式（GUC）
 
 ```sql
-SET vexdb_pq_search_mode = 'pq_only';   -- 仅用 PQ codes，最快
-SET vexdb_pq_search_mode = 'off';       -- 仅用原始向量（compact 模式会自动启用 pq_only）
-SET vexdb_pq_refine_k_factor = 4.0;     -- 图索引找 4k 个候选后用原向量精排
+SET vexdb_pq_search_mode = 'pq_only';   -- 扫描全部 PQ 编码，实际速度需测量
+SET vexdb_pq_search_mode = 'off';       -- 原始向量图搜索（compact 模式会自动启用 pq_only）
+SET vexdb_pq_refine_k_factor = 4.0;     -- PQ 扫描取最接近的 4×k 个候选，再用原向量精排
 ```
+
+这里的 4.0 是用户可配置的精排倍数，与已移除的过滤查询固定 4 倍规则不同；带 WHERE 的查询按上文的先过滤、再精确排序执行。
+
+可选的 `pq_graph` 用 PQ 距离沿现有图找候选，减少全量编码扫描，再按精排倍数读取原向量：
+
+```sql
+SET vexdb_pq_search_mode = 'pq_graph';
+SET vexdb_ef_search = 256;
+SET vexdb_pq_refine_k_factor = 16.0;    -- LIMIT 10 时最多精排 160 条
+```
+
+要求索引使用 PQ、保留原向量，且距离类型为 L2 或 cosine；compact 和内积索引会明确报错。`ef_search` 是搜索宽度，并非实际访问节点数。`EXPLAIN` 在索引路径上分别显示 `pq-graph`、`pq-full-scan` 或 `hnsw`；小表仍受 `vexdb_brute_force_threshold` 控制。
+
+上述参数在本地开发查询中，100K SIFT 和 10K 文本均为 99.9% Recall@10，比同倍精排全扫少 0.1 个百分点；编码估距分别少约 96.7% 和 67.5%。小库并发时没有稳定提速，因此保持可选，实际业务须同时检查召回和延迟。该模式没有省掉原向量，另外增加约每节点 8 字节的运行时编码位置缓存。详见 [实际 SQL 基准](../docs/reports/2026-10-27_product-quantization-benchmark.md)。
+
+补测100K文本后，同一 `ef=256、factor=16` 配置为99.45%召回；预先登记的 `ef=512、factor=16` 为99.80%，尚未达到99.9%。在接近99.4%的召回档，64连接PQ图为2053–2088 QPS，原向量图为1189–1218 QPS；这是12核共享桌面的本地SQL实测，不能直接当作线上容量。全部并发曲线及原图高召回对照见 [10万条文本并发报告](../docs/reports/2026-10-27_text-100k-concurrency-results.md)。
+
+另行冻结的高召回试验使用以下配置，仍只精排160条原向量（`LIMIT 10`）：
+
+```sql
+SET vexdb_pq_search_mode = 'pq_graph';
+SET vexdb_ef_search = 1536;
+SET vexdb_pq_refine_k_factor = 16;
+```
+
+同一100K文本索引上，两个各1024条的新代理查询组分别为99.960938% / 99.951172% Recall@10，16/64连接和两个反序轮次的返回集合一致。这是平均召回，仍有九条查询各漏一个真近邻。扩大搜索范围增加了编码估距工作；原向量仍保留。原登记的原图ef1024/1536/2048对照通过了速度门槛，但更快的ef768补充对照在B组首轮16/64连接均未通过，次轮16连接因磁盘保护缺测，因此没有稳定提速的验收结论。该配置须用业务查询验证，默认仍为 `off`。失败的邻居补查和长度修正原型没有保留为产品模式，完整结果见 [候选补齐报告](../docs/reports/2026-10-27_pq-candidate-rescue-results.md)。
 
 ---
 
@@ -238,8 +268,8 @@ SET vexdb_pq_refine_k_factor = 4.0;     -- 图索引找 4k 个候选后用原向
 |---|---|---|
 | `vexdb_ef_search` | 40 | 图索引查询搜索宽度。提高 → 召回 ↑ / QPS ↓ |
 | `vexdb_brute_force_threshold` | 10000 | 行数 ≤ 此值走 brute force 精确路径 |
-| `vexdb_pq_search_mode` | `'off'` | PQ 搜索模式：`'off'` / `'pq_only'` |
-| `vexdb_pq_refine_k_factor` | 1.0 | PQ pq_only 时取 k×factor 候选用原向量精排 |
+| `vexdb_pq_search_mode` | `'off'` | `'off'` 原向量图；`'pq_only'` 全扫编码；`'pq_graph'` 使用 PQ 距离沿图查找候选 |
+| `vexdb_pq_refine_k_factor` | 1.0 | PQ 搜索时取 k×factor 候选用原向量精排；compact 不支持精排 |
 
 ```sql
 SET vexdb_ef_search = 100;       -- 高召回
@@ -426,7 +456,7 @@ SELECT id FROM items ORDER BY list_negative_inner_product(vec, [...]::FLOAT[3]) 
 ### Index build OOM
 
 `m × ef_construction` 调小，或分批 INSERT 后 `CREATE INDEX`。
-PQ + `memory_mode='compact'` 在百万级以上明显省内存。
+PQ + `memory_mode='compact'` 会在建图和训练完成后释放原始向量；它不能避免构建阶段的原向量内存，最终总内存还包括图、码本和行号等结构。
 
 ---
 

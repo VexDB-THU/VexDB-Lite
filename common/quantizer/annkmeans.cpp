@@ -22,6 +22,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <vector>
 
 namespace vex {
@@ -353,7 +354,32 @@ void ElkanKmeans(const KMeansState &state,
     ctx.allocator.Free(newcdist);
 }
 
-void CheckCenters(const KMeansState &state, PQFloatArray centers) {
+bool HasLimitedDiversity(const PQFloatArray &samples, size_t required) {
+    auto compare = [&](const float *a, const float *b) {
+        return CompareVectors(a, b, samples.dim) < 0;
+    };
+    // Keep at most K references, not a second copy of the training data.
+    std::set<const float *, decltype(compare)> distinct(compare);
+    for (size_t i = 0; i < samples.length; ++i) {
+        distinct.insert(samples.Get(i));
+        if (distinct.size() >= required) return false;
+    }
+    return true;
+}
+
+void CheckFiniteSamples(const PQFloatArray &samples) {
+    for (size_t i = 0; i < samples.length; ++i) {
+        const auto *vec = samples.Get(i);
+        for (size_t j = 0; j < samples.dim; ++j) {
+            if (!std::isfinite(vec[j])) {
+                VEX_QUANT_ERROR("k-means: non-finite training sample");
+            }
+        }
+    }
+}
+
+void CheckCenters(const KMeansState &state, const PQFloatArray &samples,
+                  const PQFloatArray &centers) {
     size_t dim = centers.dim;
     if (centers.length != centers.maxlen) {
         VEX_QUANT_ERROR("k-means: not enough centers (please report a bug)");
@@ -379,6 +405,9 @@ void CheckCenters(const KMeansState &state, PQFloatArray centers) {
     for (size_t i = 1; i < order.size(); i++) {
         if (CompareVectors(centers.Get(order[i]), centers.Get(order[i - 1]), dim) == 0 &&
             !state.skip_check_duplicate) {
+            if (state.allow_low_diversity_centers && HasLimitedDiversity(samples, centers.maxlen)) {
+                return;
+            }
             VEX_QUANT_ERROR("k-means: duplicate centers detected");
         }
     }
@@ -386,17 +415,30 @@ void CheckCenters(const KMeansState &state, PQFloatArray centers) {
 
 } // namespace
 
+void ValidateKMeansCenters(const KMeansState &state,
+                          const PQFloatArray &samples,
+                          const PQFloatArray &centers) {
+    if (samples.dim != centers.dim) {
+        VEX_QUANT_ERROR("k-means: sample and center dimensions differ");
+    }
+    CheckFiniteSamples(samples);
+    CheckCenters(state, samples, centers);
+}
+
 void AnnKmeans(const KMeansState &state,
                PQFloatArray samples,
                PQFloatArray &centers,
                int avg_work_mem_kb,
                const PQContext &ctx) {
+    // Check before sorting, seeding or allocating the large K-means scratch
+    // arrays; NaN/Inf must not be classified as low input diversity.
+    CheckFiniteSamples(samples);
     if (samples.length <= centers.maxlen) {
         QuickCenters(state, samples, centers, ctx);
     } else {
         ElkanKmeans(state, samples, centers, avg_work_mem_kb, ctx);
     }
-    CheckCenters(state, centers);
+    CheckCenters(state, samples, centers);
 }
 
 } // namespace quantizer

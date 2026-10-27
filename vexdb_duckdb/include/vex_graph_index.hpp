@@ -1,6 +1,8 @@
 #pragma once
 
 #include "duckdb/execution/index/bound_index.hpp"
+#include "vex_pq_refine_lookup.hpp"
+#include "vex_pq_node_codes.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
@@ -40,6 +42,11 @@ struct GraphIndexRowIdCoverage {
     bool has_vector_checksum = false;
 };
 
+struct PQSearchMetrics {
+    idx_t codes_scored = 0;
+    idx_t raw_vectors_refined = 0;
+};
+
 class GraphIndex : public BoundIndex {
 public:
     static constexpr const char *TYPE_NAME = "GRAPH_INDEX";
@@ -58,14 +65,13 @@ public:
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
                    std::vector<float> &distances) const;
-    // Brute-force scan over PQ codes using a precomputed distance table. Skips
-    // the HNSW graph entirely; result is approximate but the per-row cost is
-    // an M-byte lookup vs a dim-float dot product, so this is faster than a
-    // raw seq_scan for indexes that fit in memory.
+    // graph_ef=0 scans every PQ code. graph_ef>0 navigates the existing graph
+    // with PQ distances (non-compact L2/cosine only). Both are approximate.
     // refine_factor > 1.0 takes top k*factor by PQ distance then re-ranks via
     // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
     void SearchPQ(const float *query_vec, idx_t k, std::vector<row_t> &row_ids,
-                  std::vector<float> &distances, double refine_factor = 1.0) const;
+                  std::vector<float> &distances, double refine_factor = 1.0,
+                  int graph_ef = 0, PQSearchMetrics *metrics = nullptr) const;
 
     idx_t GetDimension() const {
         return dimension_;
@@ -146,8 +152,10 @@ private:
     std::string BuildDiskImage() const;
     void LoadFromDiskImage(const std::string &blob);
     void DeserializeFromStorage(const IndexStorageInfo &info);
+    void RestoreDuplicateRowIds(const IndexStorageInfo &info);
     void DeserializePQAndModeFromStorage(const IndexStorageInfo &info);
     void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
+    const vex_duck::PQRefineLookup<row_t, uint32_t>::Map &GetPQRefineLookup() const;
 
     idx_t dimension_;
     int m_;
@@ -190,8 +198,9 @@ private:
 
     // Lazy row_id → store_id index used by SearchPQ refine. Built on first
     // refine query, invalidated on Append / Delete / index reset.
-    mutable std::unordered_map<row_t, uint32_t> pq_refine_rid_map_;
-    mutable bool pq_refine_rid_map_dirty_ = true;
+    mutable vex_duck::PQRefineLookup<row_t, uint32_t> pq_refine_lookup_;
+    // Runtime-only node -> PQ row slot, eight bytes per node on 64-bit hosts.
+    mutable vex_duck::PQNodeCodes<idx_t> pq_node_codes_;
 
     bool rowid_coverage_checked_ = false;
     bool rowid_coverage_stale_ = false;

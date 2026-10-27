@@ -249,8 +249,8 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
                 return true;
             }
             // CROSS_PRODUCT -> [FILTER -> GET, subquery]: WHERE clause + scalar
-            // subquery query vector. Rewrite the GET; FILTER stays where it is and
-            // post-filters VEXDB_INDEX_SCAN's row_id-fetched output.
+            // subquery query vector. Record the filter so TryOptimizeANN keeps
+            // this query's natural filter-first exact plan.
             if (cp_child->type == LogicalOperatorType::LOGICAL_FILTER &&
                 cp_child->children.size() == 1 &&
                 cp_child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
@@ -289,29 +289,6 @@ static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
 struct IndexMatch {
     GraphIndex *graph_idx = nullptr;
 };
-
-// Default over-sample factor when the planner can't estimate filter selectivity.
-// Picked so a moderately selective filter (~25%) still produces k results without
-// burning budget on filters that are barely selective at all.
-static constexpr idx_t kDefaultOversampleFactor = 4;
-
-// Decide how many rows VEXDB_INDEX_SCAN should produce so that, after the post-filter
-// trims, the outer TOPN still has at least k rows. When cardinality estimates are
-// unavailable or the filter isn't selective, fall back to k * factor; clamp to the
-// table's row count so we never ask for more than exists.
-static idx_t ComputeScanK(idx_t k, idx_t get_card, idx_t filter_card) {
-    idx_t k_scan;
-    if (get_card > 0 && filter_card > 0 && filter_card < get_card) {
-        double selectivity = static_cast<double>(filter_card) / static_cast<double>(get_card);
-        k_scan = static_cast<idx_t>(std::ceil(static_cast<double>(k) / selectivity));
-    } else {
-        k_scan = k * kDefaultOversampleFactor;
-    }
-    if (get_card > 0) {
-        k_scan = MinValue<idx_t>(k_scan, get_card);
-    }
-    return MaxValue<idx_t>(k_scan, k);
-}
 
 static bool TryFindMatchingIndex(ClientContext &context, DataTable &storage, const vector<ColumnIndex> &column_ids,
                                  idx_t col_index, const string &distance_func, IndexMatch &match) {
@@ -488,33 +465,14 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         return false;
     }
 
-    // dynamic_filters are runtime-built (semi-join pruning etc.) and not safe to
-    // lift; bail. table_filters from static pushdown are lifted back into a
-    // LogicalFilter above VEXDB_INDEX_SCAN below.
-    if (get->dynamic_filters && get->dynamic_filters->HasFilters()) {
+    // A global ANN prefix cannot guarantee enough qualifying neighbors, even
+    // with an accurate selectivity estimate: metadata and distance may be
+    // correlated. Keep the original filter-first exact SQL plan. Do not lift
+    // predicates out of table storage or guess an oversampling multiplier.
+    // Unfiltered queries still use the existing ANN rewrite below.
+    if (get_info.filter || !get->table_filters.filters.empty() ||
+        (get->dynamic_filters && get->dynamic_filters->HasFilters())) {
         return false;
-    }
-    vector<unique_ptr<Expression>> lifted_filter_exprs;
-    if (!get->table_filters.filters.empty()) {
-        auto &column_ids_for_lift = get->GetColumnIds();
-        for (auto &entry : get->table_filters.filters) {
-            idx_t physical_col_id = entry.first;
-            idx_t binding_idx = DConstants::INVALID_INDEX;
-            for (idx_t i = 0; i < column_ids_for_lift.size(); i++) {
-                if (column_ids_for_lift[i].GetPrimaryIndex() == physical_col_id) {
-                    binding_idx = i;
-                    break;
-                }
-            }
-            if (binding_idx == DConstants::INVALID_INDEX) {
-                // Filter references a column not in column_ids; can't reconstruct safely.
-                return false;
-            }
-            auto column_type = get->GetColumnType(ColumnIndex(physical_col_id));
-            ColumnBinding binding(get->table_index, binding_idx);
-            auto column_ref = make_uniq<BoundColumnRefExpression>(column_type, binding);
-            lifted_filter_exprs.push_back(entry.second->ToExpression(*column_ref));
-        }
     }
 
     auto &column_ids = get->GetColumnIds();
@@ -541,19 +499,8 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         fetch_output_positions.push_back(i);
     }
 
-    idx_t k_scan = k;
-    bool has_lifted_filter = !lifted_filter_exprs.empty();
-    if (get_info.filter || has_lifted_filter) {
-        idx_t get_card = get->has_estimated_cardinality ? get->estimated_cardinality : 0;
-        idx_t filter_card = 0;
-        if (get_info.filter && get_info.filter->has_estimated_cardinality) {
-            filter_card = get_info.filter->estimated_cardinality;
-        }
-        k_scan = ComputeScanK(k, get_card, filter_card);
-    }
-
     auto scan = make_uniq<LogicalVexIndexScan>(get->table_index, GetOutputTypes(get), duck_table, *match.graph_idx,
-                                               dist_info.query_vec_expr->Copy(), k_scan, column_ids,
+                                               dist_info.query_vec_expr->Copy(), k, column_ids,
                                                std::move(fetch_output_positions), optional_idx(),
                                                get->returned_types);
     scan->SetEstimatedCardinality(k);
@@ -563,17 +510,6 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     }
 
     unique_ptr<LogicalOperator> replacement = std::move(scan);
-    if (has_lifted_filter) {
-        // Reconstruct a LogicalFilter from predicates that DuckDB had pushed into
-        // LogicalGet.table_filters. VEXDB_INDEX_SCAN fetches by row_id and doesn't
-        // honor table_filters; wrapping with a LogicalFilter restores correctness
-        // and lets the over-sampled k_scan above provide enough candidates so the
-        // outer TOP-N still receives k results after this filter trims.
-        auto lifted_filter = make_uniq<LogicalFilter>();
-        lifted_filter->expressions = std::move(lifted_filter_exprs);
-        lifted_filter->children.push_back(std::move(replacement));
-        replacement = std::move(lifted_filter);
-    }
     ReplaceGetWithVexScan(get_owner, get_info, std::move(replacement));
     (void)node;
     return true;

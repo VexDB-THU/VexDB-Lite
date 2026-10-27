@@ -103,6 +103,17 @@ void ProductQuantizer::train(const KMeansState &kmeans_state,
     // task to ctx.parallel which serializes when no driver is provided.
     ctx.progress.Report(0, M, "kmeans subq");
     ctx.parallel.Run(M, [&](size_t m) {
+        // Also works in PG's -fno-exceptions build. Other backends unwind
+        // these buffers on validation errors; PG owns them in its context.
+        struct TrainingBuffers {
+            const PQAllocator &allocator;
+            float *samples = nullptr;
+            float *centers = nullptr;
+            ~TrainingBuffers() {
+                allocator.Free(samples);
+                allocator.Free(centers);
+            }
+        } buffers {ctx.allocator};
         // Subvector buffer: pack samples[*][m*dsub : (m+1)*dsub] into a
         // contiguous float array K-means expects.
         PQFloatArray subvecs;
@@ -110,6 +121,7 @@ void ProductQuantizer::train(const KMeansState &kmeans_state,
         subvecs.length = n;
         subvecs.dim    = dsub;
         subvecs.data   = static_cast<float *>(ctx.allocator.Alloc(n * dsub * sizeof(float)));
+        buffers.samples = subvecs.data;
 
         for (size_t j = 0; j < n; j++) {
             const float *src = samples.Get(j);
@@ -120,15 +132,11 @@ void ProductQuantizer::train(const KMeansState &kmeans_state,
         subcenters.maxlen = ksub;
         subcenters.length = 0;
         subcenters.dim    = dsub;
-        subcenters.data   = static_cast<float *>(ctx.allocator.AllocZero(ksub * dsub * sizeof(float)));
-
+        subcenters.data = static_cast<float *>(ctx.allocator.AllocZero(ksub * dsub * sizeof(float)));
+        buffers.centers = subcenters.data;
         AnnKmeans(kmeans_state, subvecs, subcenters, avg_work_mem_kb, ctx);
-
         // Copy trained centroids into the global table at slot m.
         set_params(subcenters, m);
-
-        ctx.allocator.Free(subvecs.data);
-        ctx.allocator.Free(subcenters.data);
 
         // Report progress per finished subquantizer. With ctx.parallel.Run
         // serialized (default), `m` increments monotonically; with a real

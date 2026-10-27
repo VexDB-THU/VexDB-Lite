@@ -73,7 +73,8 @@ void LoadInternal(ExtensionLoader &loader) {
     //                table. Approximate but fast for small indexes; useful
     //                as a way to verify PQ training is healthy.
     config.AddExtensionOption("vexdb_pq_search_mode",
-                              "PQ search mode for GRAPH_INDEX: 'off' or 'pq_only'.",
+                              "PQ search mode for GRAPH_INDEX: 'off', 'pq_only' (full scan), "
+                              "or 'pq_graph' (graph navigation, non-compact L2/cosine).",
                               LogicalType::VARCHAR, Value("off"));
     // pq_only-mode refinement: take top k*factor by PQ distance, then re-rank
     // via raw vector L2/cosine. Trades a per-query raw-vec lookup for higher

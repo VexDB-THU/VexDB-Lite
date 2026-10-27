@@ -2,6 +2,7 @@
 
 #include "vex_fetch_utils.hpp"
 #include "vex_graph_index.hpp"
+#include <cmath>
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -13,6 +14,26 @@ namespace duckdb {
 
 static constexpr const char *kAlgorithmBruteForce = "brute-force";
 static constexpr const char *kAlgorithmHnsw = "hnsw";
+
+static string GetPQSearchMode(ClientContext &context, const GraphIndex &index) {
+    string mode = "off";
+    Value value;
+    if (context.TryGetCurrentSetting("vexdb_pq_search_mode", value)) {
+        mode = StringUtil::Lower(value.ToString());
+    }
+    if (mode.empty()) mode = "off";
+    if (mode != "off" && mode != "pq_only" && mode != "pq_graph") {
+        throw InvalidInputException("vexdb_pq_search_mode must be 'off', 'pq_only' or 'pq_graph', got '%s'", mode);
+    }
+    if (mode == "pq_graph" && (index.IsCompactMode() || index.GetMetric() == VexMetric::INNER_PRODUCT)) {
+        throw InvalidInputException("pq_graph requires a non-compact L2 or cosine PQ index");
+    }
+    if (index.IsCompactMode()) mode = "pq_only";
+    if (mode != "off" && !index.UsesPQ()) {
+        throw InvalidInputException("PQ search requires the index to be built with WITH (quantizer='pq', pq_m=N)");
+    }
+    return mode;
+}
 
 class VexIndexScanOperatorState : public OperatorState {
 public:
@@ -39,7 +60,9 @@ PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, Physic
     {
         auto bft = GetBruteForceThreshold(context);
         auto &phys_scan = scan.Cast<PhysicalVexIndexScan>();
-        phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
+        const auto mode = GetPQSearchMode(context, graph_index);
+        phys_scan.algorithm_used = mode == "pq_graph" ? "pq-graph" : mode == "pq_only" ? "pq-full-scan" :
+                                  (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
                                        ? kAlgorithmBruteForce
                                        : kAlgorithmHnsw;
     }
@@ -203,39 +226,22 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
             ef = static_cast<int>(k) * 2;
         }
 
-        bool pq_only = false;
-        Value pq_mode_val;
-        if (context.client.TryGetCurrentSetting("vexdb_pq_search_mode", pq_mode_val)) {
-            auto mode = StringUtil::Lower(pq_mode_val.ToString());
-            if (mode == "pq_only") {
-                pq_only = true;
-            } else if (mode != "off" && !mode.empty()) {
-                throw InvalidInputException(
-                    "vexdb_pq_search_mode must be 'off' or 'pq_only', got '%s'", pq_mode_val.ToString());
-            }
-        }
-        // compact mode 不保留原始向量，只能走 PQ 搜索；无视 GUC 自动路由
-        if (graph_index.IsCompactMode()) {
-            pq_only = true;
-        }
+        const auto pq_mode = GetPQSearchMode(context.client, graph_index);
 
         vector<row_t> result_row_ids;
         vector<float> result_distances;
-        if (pq_only) {
-            if (!graph_index.UsesPQ()) {
-                throw InvalidInputException(
-                    "vexdb_pq_search_mode='pq_only' requires the index to be built with WITH (quantizer='pq', pq_m=N)");
-            }
+        if (pq_mode != "off") {
             double refine_factor = 1.0;
             Value refine_val;
             if (context.client.TryGetCurrentSetting("vexdb_pq_refine_k_factor", refine_val)) {
                 refine_factor = refine_val.GetValue<double>();
-                if (refine_factor < 1.0 || refine_factor > 1000.0) {
+                if (!std::isfinite(refine_factor) || refine_factor < 1.0 || refine_factor > 1000.0) {
                     throw InvalidInputException(
                         "vexdb_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", refine_factor);
                 }
             }
-            graph_index.SearchPQ(query_vec.data(), k, result_row_ids, result_distances, refine_factor);
+            graph_index.SearchPQ(query_vec.data(), k, result_row_ids, result_distances, refine_factor,
+                                 pq_mode == "pq_graph" ? ef : 0);
         } else {
             graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
         }
