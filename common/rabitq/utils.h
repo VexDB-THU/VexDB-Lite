@@ -6,12 +6,15 @@
 #ifndef RABITQ_UTILS_H
 #define RABITQ_UTILS_H
 
-#include <random>
-#include <vector>
-#include <queue>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <functional>
+#include <queue>
+#include <utility>
+#include <vector>
 
-#include "pg_compat.h"
+#include "rabitq/platform.h"
 
 #define HNSW_RABITQ_EX_BITS 8
 #define HNSW_RABITQ_NUM_CLUSTERS 16 /* TODO */
@@ -23,6 +26,9 @@
 #define RABITQ_EXT_DATA_SIZE(dim)  (RABITQ_EXT_CODE_SIZE(dim) + 3 * sizeof(float))
 
 namespace rabitq {
+
+// Keep the first code payload 8-byte aligned across every host adapter.
+inline constexpr size_t kCodeHeaderSize = sizeof(uint64_t);
 
 struct BinDataWithFactors {
     BinDataWithFactors(char *bin_data, int bin_code_size)
@@ -71,12 +77,33 @@ typedef struct EstimateRecord {
 template <typename T>
 inline void generate_random_matrix(T *matrix, int rows, int cols)
 {
-    static std::random_device rd;
-    static std::mt19937 gen(rd());
-    static std::normal_distribution<T> dist(0, 1);
+    /* A fixed local generator makes the query scaling constant reproducible
+     * and avoids std::random_device throwing across a PostgreSQL boundary. */
+    uint64 state = UINT64_C(0x9e3779b97f4a7c15) ^
+        (static_cast<uint64>(rows) << 32) ^ static_cast<uint64>(cols);
+    auto next_uniform = [&state]() -> double {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        uint64 value = state * UINT64_C(2685821657736338717);
+        return (static_cast<double>(value >> 11) + 1.0) /
+            (static_cast<double>(UINT64_C(1) << 53) + 1.0);
+    };
+
+    bool has_spare = false;
+    double spare = 0.0;
     for (int i = 0; i < rows; ++i) {
         for (int j = 0; j < cols; ++j) {
-            matrix[i * cols + j] = dist(gen);
+            if (has_spare) {
+                matrix[i * cols + j] = static_cast<T>(spare);
+                has_spare = false;
+                continue;
+            }
+            double radius = std::sqrt(-2.0 * std::log(next_uniform()));
+            double angle = 6.28318530717958647692 * next_uniform();
+            matrix[i * cols + j] = static_cast<T>(radius * std::cos(angle));
+            spare = radius * std::sin(angle);
+            has_spare = true;
         }
     }
 }
@@ -99,7 +126,7 @@ inline double best_rescale_factor(T* o_abs, int dim, int ex_bits)
     double t_end = static_cast<double>(((1 << ex_bits) - 1) + kNEnum) / max_o;
     double t_start = t_end * kTightStart[ex_bits];
 
-    int *cur_o_bar = (int *)palloc0(dim * sizeof(int));
+    int *cur_o_bar = alloc_array_zero<int>(dim);
     double sqr_denominator = static_cast<double>(dim) * 0.25;
     double numerator = 0;
 
@@ -110,11 +137,10 @@ inline double best_rescale_factor(T* o_abs, int dim, int ex_bits)
         numerator += (cur + 0.5) * o_abs[i];
     }
 
-    std::priority_queue<
-        std::pair<double, size_t>,
-        std::vector<std::pair<double, size_t>>,
-        std::greater<>>
-        next_t;
+    using QueueItem = std::pair<double, size_t>;
+    std::priority_queue<QueueItem,
+        std::vector<QueueItem, HostAllocator<QueueItem>>,
+        std::greater<QueueItem>> next_t;
 
     for (int i = 0; i < dim; ++i) {
         if (o_abs[i] > kEps) {
@@ -149,7 +175,7 @@ inline double best_rescale_factor(T* o_abs, int dim, int ex_bits)
         }
     }
 
-    pfree(cur_o_bar);
+    free_mem(cur_o_bar);
 
     return t;
 }
@@ -183,7 +209,7 @@ inline double get_const_scaling_factors(int dim, int ex_bits) {
 
     constexpr long kConstNum = 100;
 
-    double *matrix = (double *)palloc0(kConstNum * dim * sizeof(double));
+    double *matrix = alloc_array_zero<double>(kConstNum * dim);
 
     generate_random_matrix<double>(matrix, kConstNum, dim);
 
@@ -196,7 +222,7 @@ inline double get_const_scaling_factors(int dim, int ex_bits) {
 
     double t_const = sum / kConstNum;
 
-    pfree(matrix);
+    free_mem(matrix);
 
     return t_const;
 }

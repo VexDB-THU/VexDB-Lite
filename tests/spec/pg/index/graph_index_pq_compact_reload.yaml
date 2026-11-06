@@ -8,29 +8,45 @@ engines:
 - pg
 - opengauss
 steps:
+- statement: SET maintenance_work_mem = '2GB';
 - statement: CREATE TABLE pq_compact_r (id INTEGER, vec floatvector(8));
 - statement: "INSERT INTO pq_compact_r SELECT i,\n    ('[' || (i*0.01) || ',' || (i*0.02) || ',' || (i*0.03) || ',' || (i*0.04) || ','\n         || (i*0.05) || ',' || (i*0.06) || ',' || (i*0.07) || ','\
     \ || (i*0.08) || ']')::floatvector\nFROM generate_series(0, 499) AS t(i);"
+- statement: CREATE INDEX idx_pq_compact_auto ON pq_compact_r USING vexdb_graph (vec) WITH (memory_mode = 'compact');
+- query: SELECT memory_mode, quantizer, use_pq FROM vexdb_index_info() WHERE indexname = 'idx_pq_compact_auto';
+  expect:
+  - - compact
+    - pq
+    - t
+- statement: DROP INDEX idx_pq_compact_auto;
 - statement: "CREATE INDEX idx_pq_compact_r ON pq_compact_r USING vexdb_graph (vec)\n    WITH (quantizer = 'pq', pq_m = 4, memory_mode = 'compact');"
+- query: SELECT memory_mode, quantizer, use_pq FROM vexdb_index_info() WHERE indexname = 'idx_pq_compact_r';
+  expect:
+  - - compact
+    - pq
+    - t
+- query: SELECT content::text FROM index_inspect('idx_pq_compact_r') WHERE attribute = 'Vector Storage';
+  expect:
+  - - PQ Code
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    '
+- raw_directive: restart
 - query: SELECT id FROM pq_compact_r ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector) LIMIT 1;
-  expect: []
+  expect:
+  - - 100
 - query: 'SELECT id FROM pq_compact_r
 
     ORDER BY l2_distance(vec, ''[1,2,3,4,5,6,7,8]''::floatvector)
 
     LIMIT 1;'
-  expect: []
+  expect:
+  - - 100
 - statement: DELETE FROM pq_compact_r WHERE id BETWEEN 50 AND 99;
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    '
+- raw_directive: restart
 - query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact_r\n    ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector)\n    LIMIT 10000\n) t;"
-  expect: []
+  expect:
+  - - 450
 - query: "SELECT COUNT(*) FROM (\n    SELECT id FROM pq_compact_r\n    ORDER BY l2_distance(vec, '[1,2,3,4,5,6,7,8]'::floatvector)\n    LIMIT 10000\n) sub WHERE id BETWEEN 50 AND 99;"
-  expect: []
+  expect:
+  - - 0
 - statement: DROP TABLE pq_compact_r;

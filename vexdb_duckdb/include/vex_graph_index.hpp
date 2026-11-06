@@ -3,18 +3,25 @@
 #include "duckdb/execution/index/bound_index.hpp"
 #include "vex_pq_refine_lookup.hpp"
 #include "vex_pq_node_codes.hpp"
+#include "vex_reverse_graph.hpp"
+#include "vex_row_id_filter.hpp"
 #include "duckdb/execution/index/index_type.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 
 #include "vex_graph_index_depend_duck.hpp"
 #include "vex_distance.hpp"
 #include "quantizer/product_quantizer.h"
+#include "rabitq/rabitq.h"
 
+#include <atomic>
+#include <functional>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
 
 class PhysicalOperator;
+struct VexSearchProfileData;
 using DuckStore = MemStore<uint32, GraphIndexPoint>;
 
 struct GraphIndexRuntimeState {
@@ -60,18 +67,40 @@ public:
                const vector<unique_ptr<Expression>> &unbound_expressions,
                AttachedDatabase &db, idx_t dimension, int m, int ef_construction, VexMetric metric,
                idx_t vec_column_index, uint32_t pq_m = 0, bool compact_mode = false,
-               int build_threads = 1);
+               int build_threads = 1, bool rabitq_requested = false);
+    ~GraphIndex() override;
 
     void BuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
+    // Build from a read-only, random-access vector source. Rebuild can use a
+    // memory-mapped temporary file here so the full table vector payload does
+    // not have to live in the process heap.
+    void BuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                   bool vectors_are_normalized = false);
+    void RebuildBulk(const std::vector<float> &vectors, const std::vector<row_t> &row_ids);
+    void RebuildBulk(const float *vectors, idx_t vector_count, const std::vector<row_t> &row_ids,
+                     bool vectors_are_normalized = false,
+                     std::function<void()> release_vector_source = nullptr);
+    // SQL snapshot scans include retained deleted rows, then apply transaction
+    // visibility outside the graph lock. Direct callers retain the live-only API.
     void SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
-                   std::vector<float> &distances) const;
+                   std::vector<float> &distances, bool include_deleted = false,
+                   const vex_duck::RowIdFilter<row_t> *allowed = nullptr, bool bidirectional = false,
+                   VexSearchProfileData *profile = nullptr) const;
     // graph_ef=0 scans every PQ code. graph_ef>0 navigates the existing graph
     // with PQ distances (non-compact L2/cosine only). Both are approximate.
-    // refine_factor > 1.0 takes top k*factor by PQ distance then re-ranks via
-    // raw vector. Ignored in compact_mode_ (no raw vec). 1.0 = no refine.
+    // refine_factor > 1.0 enables exact raw-vector refinement. Full PQ scan
+    // refines top k*factor; graph search refines every returned graph node,
+    // using max(graph_ef, k*factor) as its width. 1.0 = no refinement.
+    // Ignored in compact_mode_ (no raw vec).
     void SearchPQ(const float *query_vec, idx_t k, std::vector<row_t> &row_ids,
                   std::vector<float> &distances, double refine_factor = 1.0,
-                  int graph_ef = 0, PQSearchMetrics *metrics = nullptr) const;
+                  int graph_ef = 0, PQSearchMetrics *metrics = nullptr, bool include_deleted = false,
+                  const vex_duck::RowIdFilter<row_t> *allowed = nullptr, bool bidirectional = false,
+                  VexSearchProfileData *profile = nullptr) const;
+    void SearchRaBitQ(const float *query_vec, idx_t k, int ef,
+                      std::vector<row_t> &row_ids, std::vector<float> &distances,
+                      bool include_deleted = false, const vex_duck::RowIdFilter<row_t> *allowed = nullptr,
+                      VexSearchProfileData *profile = nullptr) const;
 
     idx_t GetDimension() const {
         return dimension_;
@@ -87,25 +116,44 @@ public:
     }
 
     idx_t GetNodeCount() const;
-    idx_t GetRowIdCount() const;
+    idx_t GetRowIdCount(bool include_deleted = false) const;
     GraphIndexRowIdCoverage GetRowIdCoverage() const;
     bool HasVectorCoverageChecksum() const;
     bool UsesPQCoverageChecksum() const;
+    bool NeedsQuantizerRebuild() const {
+        return quantizer_search_stale_.load(std::memory_order_acquire);
+    }
     uint64_t HashPQVectorForCoverage(row_t row_id, const float *vec) const;
-    bool HasRowIdCoverageCheck() const { return rowid_coverage_checked_; }
-    bool IsRowIdCoverageStale() const { return rowid_coverage_stale_; }
+    bool UsesRaBitQCoverageChecksum() const;
+    uint64_t HashRaBitQVectorForCoverage(row_t row_id, const float *vec) const;
+    bool HasRowIdCoverageCheck() const {
+        return rowid_coverage_checked_.load(std::memory_order_acquire);
+    }
+    bool IsRowIdCoverageStale() const {
+        return rowid_coverage_stale_.load(std::memory_order_acquire);
+    }
+    bool HasStoragePointerCorruption() const {
+        return storage_pointer_corruption_.load(std::memory_order_acquire);
+    }
     void MarkRowIdCoverageChecked(bool stale) {
-        rowid_coverage_checked_ = true;
-        rowid_coverage_stale_ = stale;
+        // Publish the result before the checked bit. Optimizer threads may read
+        // this without graph_rwlock_, so the opposite order can expose a stale
+        // checked=true / stale=false pair during concurrent mutation.
+        rowid_coverage_stale_.store(stale, std::memory_order_relaxed);
+        rowid_coverage_checked_.store(true, std::memory_order_release);
     }
     // HNSW entry-point level (top layer). -1 when the index has no nodes.
     int GetMaxLevel() const;
     bool UsesPQ() const { return pq_use_; }
+    bool UsesRaBitQ() const;
+    const char *GetQuantizerName() const;
     uint32_t GetPQM() const { return pq_use_ ? static_cast<uint32_t>(pq_quantizer_.M) : 0u; }
     idx_t GetPQCodesBytes() const { return pq_codes_.size(); }
     idx_t GetPQCodebookBytes() const {
         return pq_use_ ? pq_quantizer_.get_centroids_size() * sizeof(float) : 0u;
     }
+    idx_t GetRaBitQCodesBytes() const;
+    idx_t GetRaBitQFixedBytes() const;
     bool IsCompactMode() const { return compact_mode_; }
 
 public:
@@ -142,12 +190,20 @@ public:
     // ClientContext is available (Create / PhysicalVexCreateIndex::Finalize) and applied
     // to the store after each InitAllocators via ApplyMirrorBudget(). 0 = unlimited.
     idx_t graph_memory_limit_bytes_ = 0;
+    // Rebuild keeps the live index resident until the staged build succeeds.
+    // Disable the staged raw-vector mirror explicitly so it cannot temporarily
+    // claim a second copy from the global mirror budget.
+    bool suppress_mirror_for_build_ = false;
     // Translate graph_memory_limit_bytes_ → store.mirror_max_nodes_ for the current
     // runtime_->store. Only tightens when vector_alloc_ exists (over-budget nodes need
     // the buffer-manager-backed copy as their home); otherwise leaves it unlimited.
     void ApplyMirrorBudget();
 
 private:
+    // Internal callers already hold graph_rwlock_; public planning helpers lock.
+    bool HasVectorCoverageChecksumUnlocked() const;
+    bool UsesPQCoverageChecksumUnlocked() const;
+    bool UsesRaBitQCoverageChecksumUnlocked() const;
     IndexStorageInfo ExportStorageInfo() const;
     std::string BuildDiskImage() const;
     void LoadFromDiskImage(const std::string &blob);
@@ -155,6 +211,8 @@ private:
     void RestoreDuplicateRowIds(const IndexStorageInfo &info);
     void DeserializePQAndModeFromStorage(const IndexStorageInfo &info);
     void TrainAndEncodePQ(const float *vec_data, const std::vector<row_t> &row_ids);
+    void TrainAndEncodePQFromStore();
+    void TrainAndEncodeRaBitQ();
     const vex_duck::PQRefineLookup<row_t, uint32_t>::Map &GetPQRefineLookup() const;
 
     idx_t dimension_;
@@ -181,32 +239,82 @@ private:
 
     // Product Quantization state. pq_m_ = 0 / pq_use_ = false means PQ disabled.
     // Once Train() runs (after BuildBulk completes), pq_quantizer_.trained = true
-    // and pq_codes_ holds m bytes per row, indexed by row_id sort order so reload
-    // can restore the alignment.
+    // and pq_codes_ holds m bytes per row. Graph search addresses nodes by
+    // internal id, so pq_node_code_positions_ maps nodes to code slots.
     uint32_t pq_m_ = 0;
     bool pq_use_ = false;
+    // Writes can leave new values outside an existing model's useful range.
+    // Until explicit retraining, full mode uses raw graph distance and compact
+    // mode uses exact table distance, including already prepared SQL plans.
+    std::atomic<bool> quantizer_search_stale_{false};
     ::vex::quantizer::ProductQuantizer pq_quantizer_;
     std::vector<uint8_t> pq_codes_;
     std::vector<row_t> pq_row_id_order_;
     std::vector<uint64_t> pq_vector_coverage_hashes_;
+    std::vector<uint32_t> pq_node_code_positions_;
+    // pq_row_id_order_ is append-only so persisted indexes remain compatible.
+    // UPDATE/reinsert can therefore leave historical code slots for the same
+    // physical row_id. Only the newest slot is live; older slots remain useful
+    // to historical graph nodes as navigation anchors but must never be emitted.
+    std::unordered_map<row_t, uint32_t> pq_latest_code_positions_;
 
-    // memory_mode='compact' (PQ-only). After BuildBulk + TrainAndEncodePQ
-    // releases the raw vector tier, SearchANN refuses to run and post-build
-    // INSERTs encode into pq_codes_ without traversing the (now-broken) HNSW
-    // graph. Persisted across index reset / Vacuum / Reload.
+    // RaBitQ shares the graph topology with the raw-vector index, but replaces
+    // distance reads during search with compact codes aligned by internal node
+    // id. Training and estimation live in common/rabitq; this class only adapts
+    // DuckDB build, persistence and row-id filtering.
+    bool rabitq_requested_ = false;
+    bool rabitq_use_ = false;
+    std::unique_ptr<::rabitq::RaBitQuantizer> rabitq_quantizer_;
+    double rabitq_query_rescaling_factor_ = 0.0;
+    std::vector<uint8_t> rabitq_codes_;
+
+    // memory_mode='compact' releases only the index-side raw-vector mirror; the
+    // table column remains unchanged. PQ searches its code array, while RaBitQ
+    // keeps using the graph through a code-aware store. Post-build RaBitQ INSERTs
+    // are encoded before graph insertion. Persisted across CommitDrop / Vacuum /
+    // Reload.
     bool compact_mode_ = false;
 
+    // Eager row_id → graph node map, rebuilt once after bulk load/recovery and
+    // maintained by every incremental insert. UPDATE is DELETE+INSERT in
+    // DuckDB; keeping this map avoids scanning every graph node to retire the
+    // previous row version. Duplicate-node history only exists in indexes
+    // written by older builds, so it is isolated in the sparse side map.
+    std::unordered_map<row_t, uint32_t> rowid_node_map_;
+    std::unordered_map<row_t, std::vector<uint32_t>> duplicate_rowid_nodes_;
+
+    void RebuildPQNodeCodePositions();
+    void RebuildPQLatestCodePositions();
+    void RebuildRowIdNodeMap();
+    void RecordRowIdNode(row_t row_id, uint32_t node_id);
+    bool IsLatestPQCodePosition(idx_t position) const;
+    void RetireDeletedRowVersion(row_t row_id);
+    // Checkpoint/WAL snapshots invoke maintenance once physical history grows
+    // beyond 2x the live row set. Explicit VACUUM remains the exact compactor.
+    bool HasExcessHistory() const;
     // Lazy row_id → store_id index used by SearchPQ refine. Built on first
     // refine query, invalidated on Append / Delete / index reset.
     mutable vex_duck::PQRefineLookup<row_t, uint32_t> pq_refine_lookup_;
     // Runtime-only node -> PQ row slot, eight bytes per node on 64-bit hosts.
     mutable vex_duck::PQNodeCodes<idx_t> pq_node_codes_;
 
-    bool rowid_coverage_checked_ = false;
-    bool rowid_coverage_stale_ = false;
+    std::atomic<bool> rowid_coverage_checked_{false};
+    std::atomic<bool> rowid_coverage_stale_{false};
+    // Hard process termination can leave index catalog metadata referring to an
+    // allocator buffer whose block was not recovered. Never pass such a pointer
+    // to FixedSizeAllocator::Get: release builds would dereference buffers.end().
+    // The optimizer treats this index as stale so exact scan remains available;
+    // PRAGMA rebuild can then replace it from the table.
+    std::atomic<bool> storage_pointer_corruption_{false};
+
+    mutable vex_duck::ReverseGraph<uint32_t> reverse_graph_;
 
     // Free the raw vector tier and clear the in-memory copy. Idempotent.
     void ReleaseRawVectors();
+    void SwapRebuildState(GraphIndex &staged) noexcept;
+    // Refill the optional hot mirror after an atomic rebuild has released the
+    // previous runtime and returned its share of the global mirror budget.
+    void WarmRawVectorMirror();
 };
 
 } // namespace duckdb

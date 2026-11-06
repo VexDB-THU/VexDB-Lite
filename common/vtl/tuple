@@ -46,13 +46,13 @@ public:
     constexpr const auto &get() const
     {
         static_assert(I < 0, "Empty tuple used");
-        return *static_cast<const void *>(NULL);
+        return *static_cast<const std::integral_constant<size_t, I> *>(NULL);
     }
     template<size_t I>
     constexpr auto &get()
     {
         static_assert(I < 0, "Empty tuple used");
-        return *static_cast<void *>(NULL);
+        return *static_cast<std::integral_constant<size_t, I> *>(NULL);
     }
     template <typename T>
     constexpr const auto &get() const
@@ -522,7 +522,12 @@ struct tuple_size<vtl::TupleImpl<Types...>> : integral_constant<size_t, sizeof..
 
 template <size_t I, typename... Types>
 struct tuple_element<I, vtl::TupleImpl<Types...>> {
-    using type = typename tuple_element<I, vtl::TupleImpl<Types...>>::type;
+    /* Primary partial: never selected — the <0, T, Rest...> and <I, T, Rest...>
+     * specializations below are strictly more specialized for every valid
+     * index. Kept as a complete type with no members so an out-of-range index
+     * yields a clean "no member named type" error instead of the infinite
+     * self-reference that used to live here (and that GCC 16's
+     * -Wtemplate-body rejects). */
 };
 template <typename T, typename... Rest>
 struct tuple_element<0, vtl::TupleImpl<T, Rest...>> { 

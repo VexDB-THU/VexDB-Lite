@@ -1,0 +1,34 @@
+name: duckdb_graph_index_pq_rebuild_duplicates
+engines: [duckdb]
+tags: [vex, regression]
+description: PQ rebuild covers live rows when duplicate vectors leave unused reserved node slots.
+steps:
+  - raw_directive: load __TEST_DIR__/pq_rebuild_duplicates.db
+  - statement: SET vexdb_brute_force_threshold=0;
+  - statement: SET vexdb_pq_search_mode='pq_graph';
+  - statement: SET vexdb_ef_search=1024;
+  - statement: CREATE TABLE pq_rebuild AS SELECT i::INTEGER id, [(i%256)::FLOAT,(i%256+1)::FLOAT,(i%256+2)::FLOAT,(i%256+3)::FLOAT]::FLOAT[4] vec FROM range(1024)t(i);
+  - statement: CREATE INDEX pq_rebuild_idx ON pq_rebuild USING GRAPH_INDEX(vec) WITH(metric='l2',quantizer='pq',pq_m=1,m=8,threads=1);
+  - statement: DELETE FROM pq_rebuild WHERE id%13=0;
+  - statement: PRAGMA vexdb_rebuild_index('pq_rebuild_idx');
+  - query: SELECT count(*) FROM (SELECT id FROM pq_rebuild ORDER BY l2_distance(vec,[1,2,3,4]::FLOAT[4]) LIMIT 10);
+    _field_types: I
+    expect: [[10]]
+  - query: SELECT row_id_map_size=(SELECT count(*) FROM pq_rebuild) FROM vexdb_index_info() WHERE index_name='pq_rebuild_idx';
+    _field_types: I
+    expect: [[true]]
+  - statement: INSERT INTO pq_rebuild VALUES(2000,[999,1000,1001,1002]::FLOAT[4]);
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - query: SELECT row_id_map_size=(SELECT count(*) FROM pq_rebuild) FROM vexdb_index_info() WHERE index_name='pq_rebuild_idx';
+    _field_types: I
+    expect: [[true]]
+  - query: SELECT id FROM pq_rebuild ORDER BY l2_distance(vec,[999,1000,1001,1002]::FLOAT[4]) LIMIT 1;
+    _field_types: I
+    expect: [[2000]]
+  - statement: PRAGMA vexdb_rebuild_index('pq_rebuild_idx');
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - query: SELECT row_id_map_size=(SELECT count(*) FROM pq_rebuild) FROM vexdb_index_info() WHERE index_name='pq_rebuild_idx';
+    _field_types: I
+    expect: [[true]]

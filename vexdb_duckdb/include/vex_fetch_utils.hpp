@@ -7,6 +7,7 @@
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 
 namespace duckdb {
 
@@ -57,7 +58,8 @@ static inline vector<LogicalType> BuildOutputTypes(const vector<ColumnIndex> &co
 
 static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
     ClientContext &context, DuckTableEntry &duck_table, const vector<ColumnIndex> &column_ids,
-    const vector<LogicalType> &output_types, const vector<row_t> &result_row_ids, idx_t limit = 0, idx_t offset = 0) {
+    const vector<LogicalType> &output_types, const vector<row_t> &result_row_ids, idx_t limit = 0, idx_t offset = 0,
+    bool visibility_checked = false) {
 
     auto &storage = duck_table.GetStorage();
     auto &db = duck_table.ParentCatalog().GetAttached();
@@ -66,7 +68,9 @@ static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
     vector<row_t> visible_row_ids;
     visible_row_ids.reserve(result_row_ids.size());
     for (auto &rid : result_row_ids) {
-        if (storage.CanFetch(transaction, rid)) {
+        const bool local = rid >= MAX_ROW_ID;
+        if (visibility_checked || (local ? LocalStorage::Get(transaction).CanFetch(storage, rid)
+                                        : storage.CanFetch(transaction, rid))) {
             visible_row_ids.push_back(rid);
         }
     }
@@ -102,13 +106,22 @@ static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
     }
 
     ColumnFetchState fetch_state;
+    // A small TopN must not allocate a full vector batch for every array
+    // column. The loop below never fetches more than this capacity.
+    const auto capacity = MinValue<idx_t>(STANDARD_VECTOR_SIZE, count);
     DataChunk fetch_chunk;
-    fetch_chunk.Initialize(context, fetch_types);
+    fetch_chunk.Initialize(context, fetch_types, capacity);
     DataChunk output_chunk;
-    output_chunk.Initialize(context, output_types);
+    output_chunk.Initialize(context, output_types, capacity);
 
     for (idx_t off = start; off < start + count;) {
         idx_t batch = MinValue<idx_t>(STANDARD_VECTOR_SIZE, start + count - off);
+        // Native TopN may mix committed rows with this transaction's inserts.
+        // Fetch each contiguous storage kind separately, retaining input order.
+        const bool local = visible_row_ids[off] >= MAX_ROW_ID;
+        for (idx_t i = 1; i < batch; ++i) {
+            if ((visible_row_ids[off + i] >= MAX_ROW_ID) != local) { batch = i; break; }
+        }
         fetch_chunk.Reset();
         output_chunk.Reset();
 
@@ -118,7 +131,8 @@ static inline unique_ptr<ColumnDataCollection> FetchRowsByRowIds(
             row_id_data[i] = visible_row_ids[off + i];
         }
 
-        storage.Fetch(transaction, fetch_chunk, fetch_col_ids, row_id_vec, batch, fetch_state);
+        if (local) LocalStorage::Get(transaction).FetchChunk(storage, row_id_vec, batch, fetch_col_ids, fetch_chunk, fetch_state);
+        else storage.Fetch(transaction, fetch_chunk, fetch_col_ids, row_id_vec, batch, fetch_state);
 
         for (idx_t f = 0; f < fetch_output_positions.size(); f++) {
             output_chunk.data[fetch_output_positions[f]].Reference(fetch_chunk.data[f]);

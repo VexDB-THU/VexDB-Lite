@@ -16,6 +16,7 @@
 #include "distance/distance_guc.h"
 #include "ann_utils.h"
 #include "distance_funcs.h"
+#include "global_instance.h"
 
 GlobalInstance g_instance;
 
@@ -79,18 +80,6 @@ static void pairwise_distance_dot(const float *x, const float *y, uint32 dim,
 }
 
 namespace ann_helper {
-distance_func get_general_distance_func(Metric metric, uint32 dim)
-{
-    return DispatchRunner<false,
-        MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE, Metric::COSINE,
-                   Metric::SPHERICAL, Metric::L2_SQRT, Metric::L2_NORM>,
-        DistPrecisionTypeList<DistPrecisionType::FLOAT>,
-        DispatcherMode::NO_QUANT>::call(metric, DistPrecisionType::FLOAT, dim, QuantizerType::NONE,
-            [](auto &d) -> distance_func {
-                return std::decay_t<decltype(d)>::get_distance_single;
-            });
-}
-
 distance_func get_aligned_distance_func(Metric metric, uint32 dim)
 {
     return DispatchRunner<true,
@@ -188,55 +177,6 @@ vector_preprocess_func get_vector_preprocess_func(Metric metric, DistPrecisionTy
 // / get_distance_single_code_func / get_distance_four_codes_func) live in
 // src/distance/core/pq_dispatcher.cpp so duck and PG share a single definition.
 
-fht_func get_fht_func(uint32 bottom_log_dim)
-{
-#define FHT_HELPER(z, i, func) case i: return func##i;
-#define DISTANCER_ARCH_ARG fht_helper_
-#define DISTANCER_ARCH_CALL(fht)    \
-    switch (bottom_log_dim) { \
-        BOOST_PP_REPEAT_FROM_TO(1, BOOST_PP_ADD(max_vector_bottom_dim, 1), FHT_HELPER, fht)   \
-    }   \
-    return NULL
-
-    ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-#undef FHT_HELPER
-}
-
-void init_rabitq_func()
-{
-#define DISTANCER_ARCH_ARG flip_sign
-#define DISTANCER_ARCH_CALL(fs) g_instance.annvec_cxt.f_flip_sign = fs; break
-        ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-
-#define DISTANCER_ARCH_ARG kacs_walk
-#define DISTANCER_ARCH_CALL(kw) g_instance.annvec_cxt.f_kacs_walk = kw; break
-        ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-
-#define DISTANCER_ARCH_ARG warmup_ip_x0_q
-#define DISTANCER_ARCH_CALL(wiq) g_instance.annvec_cxt.f_warmup_ip_x0_q = wiq; break
-        ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-
-#define DISTANCER_ARCH_ARG ip_fxi
-#define DISTANCER_ARCH_CALL(ipf) g_instance.annvec_cxt.f_ip_fxi = ipf; break
-        ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-
-#define DISTANCER_ARCH_ARG mask_ip_x0_q
-#define DISTANCER_ARCH_CALL(miq) g_instance.annvec_cxt.f_mask_ip_x0_q = miq; break
-        ARCH_FUNC_CALL(best_arch, DISTANCER_ARCH_ARG, DISTANCER_ARCH_CALL);
-#undef DISTANCER_ARCH_ARG
-#undef DISTANCER_ARCH_CALL
-}
-
 void pairwise_distance(const Metric metric, const float *x, const float *y, const float *x_norm,
     const float *y_norm, uint32 dim, uint32 x_size, uint32 y_size, float *out)
 {
@@ -252,33 +192,6 @@ void pairwise_distance(const Metric metric, const float *x, const float *y, cons
     }
 }
 } /* namespace ann_helper */
-
-uint32 get_aligned_dim(uint32 dim)
-    { return (dim + vector_step_size - 1) / vector_step_size * vector_step_size; }
-
-size_t get_aligned_vec_size(size_t vec_size)
-{
-    return (vec_size + ann_helper::vector_aligned_size - 1) /
-        ann_helper::vector_aligned_size * ann_helper::vector_aligned_size;
-}
-
-float *alloc_floatvector(uint32 dim, size_t n)
-{
-    void *res = mem_align_alloc(ann_helper::vector_aligned_size, sizeof(float) * dim * n);
-    return (float *)__builtin_assume_aligned(res, ann_helper::vector_aligned_size);
-}
-
-char *alloc_vector(size_t vec_size, size_t n)
-{
-    void *res = mem_align_alloc(ann_helper::vector_aligned_size, vec_size * n);
-    return (char *)__builtin_assume_aligned(res, ann_helper::vector_aligned_size);
-}
-
-bool is_aligned(const void *ptr)
-{
-    return reinterpret_cast<uintptr_t>(ptr) % ann_helper::vector_aligned_size == 0;
-}
-
 
 namespace {
 constexpr uint16 vec_arch_unset = 0;

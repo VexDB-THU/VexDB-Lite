@@ -8,7 +8,7 @@ steps:
     WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 100)
     INSERT INTO idx(rowid, embedding, category)
     SELECT i, vexdb_f32('[' || i || ',0]'), CASE WHEN i%2=0 THEN 'even' ELSE 'odd' END FROM c;
-# 触发建图 + special insert 写事务落盘 v3 段（tid 摘除需要图在/段在）
+# 触发建图 + special insert 写事务落盘当前 v4 段（tid 摘除需要图在/段在）
 - query: SELECT rowid FROM idx WHERE embedding MATCH '[50,0]' AND k = 1;
   expect:
   - - 50

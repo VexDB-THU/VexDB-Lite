@@ -1,8 +1,10 @@
 #!/bin/bash
 set -euo pipefail
 
+# Consume full command output: grep -q can cause SIGPIPE with pipefail.
+
 VEXFS="${1:?usage: vexfs_cli_smoke.sh /path/to/vexfs}"
-TMP_DIR="$(mktemp -d -t vexfs-cli-smoke)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vexfs-cli-smoke.XXXXXX")"
 DB="$TMP_DIR/vexfs.sqlite3"
 DEST_DB="$TMP_DIR/restored.sqlite3"
 ARCHIVE="$TMP_DIR/workspace.vexfs"
@@ -34,7 +36,7 @@ RUN_OUTSIDE="$("$VEXFS" --db "$DB" --workspace smoke run --snapshot-before -- \
 RUN_OUTSIDE_STATUS=$?
 set -e
 [ "$RUN_OUTSIDE_STATUS" -eq 2 ]
-printf '%s' "$RUN_OUTSIDE" | grep -q 'current directory is not inside an active mount'
+printf '%s' "$RUN_OUTSIDE" | grep 'current directory is not inside an active mount' >/dev/null
 case "$RUN_OUTSIDE" in
     \{*) echo "child --json leaked into global CLI options" >&2; exit 1 ;;
 esac
@@ -73,7 +75,7 @@ DIFF="$("$VEXFS" --db "$DB" --workspace smoke diff /agent/version.txt --from 1 -
 DIFF_STATUS=$?
 set -e
 [ "$DIFF_STATUS" -eq 1 ]
-printf '%s' "$DIFF" | grep -q -- '-alpha'
+printf '%s' "$DIFF" | grep -- '-alpha' >/dev/null
 BETA_LOG="$("$VEXFS" --db "$DB" --workspace smoke --json workspace log --limit 20)"
 BETA_COMMIT="$(printf '%s' "$BETA_LOG" | /usr/bin/python3 -c \
     'import json,sys; print(json.load(sys.stdin)["entries"][0]["commit"])')"
@@ -116,7 +118,7 @@ AMBIGUOUS_TIME="$("$VEXFS" --db "$DB" --workspace smoke \
 AMBIGUOUS_TIME_STATUS=$?
 set -e
 [ "$AMBIGUOUS_TIME_STATUS" -eq 2 ]
-printf '%s' "$AMBIGUOUS_TIME" | grep -q 'explicit Z or +HH:MM timezone'
+printf '%s' "$AMBIGUOUS_TIME" | grep 'explicit Z or +HH:MM timezone' >/dev/null
 HISTORICAL_TREE="$("$VEXFS" --db "$DB" --workspace smoke --json \
     workspace show --commit "$BETA_COMMIT" --limit 2)"
 printf '%s' "$HISTORICAL_TREE" | /usr/bin/python3 -c \
@@ -137,7 +139,7 @@ printf '%s' "$HISTORICAL_WORKSPACE_DIFF" | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["from_commit"]==int(sys.argv[1]); assert any(row["path"]=="/agent/version.txt" and row["change"]=="modify" for row in value["changes"])' \
     "$BETA_COMMIT"
 "$VEXFS" --db "$DB" --workspace smoke workspace show --commit "$BETA_COMMIT" --limit 2 | \
-    grep -q '^/'
+    grep '^/' >/dev/null
 set +e
 "$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-historical-beta >/dev/null
 HISTORICAL_DIFF_STATUS=$?
@@ -160,7 +162,7 @@ WORKSPACE_NEXT="$(printf '%s' "$WORKSPACE_LOG" | /usr/bin/python3 -c \
 "$VEXFS" --db "$DB" --workspace smoke --json workspace log --limit 2 \
     --before "$WORKSPACE_NEXT" | /usr/bin/python3 -c \
     'import json,sys; rows=json.load(sys.stdin)["entries"]; assert rows and all(row["commit"] < int(sys.argv[1]) for row in rows)' "$WORKSPACE_NEXT"
-"$VEXFS" --db "$DB" --workspace smoke workspace log --limit 1 | grep -q '^COMMIT'
+"$VEXFS" --db "$DB" --workspace smoke workspace log --limit 1 | grep '^COMMIT' >/dev/null
 printf 'changed after snapshot' | "$VEXFS" --db "$DB" --workspace smoke write /agent/task.txt >/dev/null
 printf 'extra after snapshot' | "$VEXFS" --db "$DB" --workspace smoke write /agent/extra.txt >/dev/null
 set +e
@@ -169,8 +171,8 @@ WORKSPACE_PLAIN_DIFF="$("$VEXFS" --db "$DB" --workspace smoke \
 WORKSPACE_PLAIN_DIFF_STATUS=$?
 set -e
 [ "$WORKSPACE_PLAIN_DIFF_STATUS" -eq 1 ]
-printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep -q $'^add\t/agent/extra.txt$'
-printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep -q $'^modify\t/agent/task.txt$'
+printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep $'^add\t/agent/extra.txt$' >/dev/null
+printf '%s\n' "$WORKSPACE_PLAIN_DIFF" | grep $'^modify\t/agent/task.txt$' >/dev/null
 set +e
 SNAPSHOT_DIFF="$("$VEXFS" --db "$DB" --workspace smoke snapshot diff cli-baseline)"
 SNAPSHOT_DIFF_STATUS=$?
@@ -203,7 +205,7 @@ printf '%s' "$SNAPSHOT_LIST" | /usr/bin/python3 -c \
 CHECK="$("$VEXFS" --db "$DB" --workspace smoke --json check)"
 printf '%s' "$CHECK" | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["ok"] is True; assert value["mode"] == "deep"; assert value["checked"]["versions"] >= 5'
-"$VEXFS" --db "$DB" --workspace smoke check --quick | grep -q '^OK '
+"$VEXFS" --db "$DB" --workspace smoke check --quick | grep '^OK ' >/dev/null
 
 "$VEXFS" --db "$DB" --workspace smoke quota show | /usr/bin/python3 -c \
     'import json,sys; value=json.load(sys.stdin); assert value["max_bytes"] is None; assert value["live_files"] > 0'

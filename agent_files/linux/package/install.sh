@@ -20,6 +20,17 @@ ACTUAL_ARCH="$(uname -m)"
     sha256sum -c SHA256SUMS.txt >/dev/null
 ) || { echo "安装包文件哈希校验失败" >&2; exit 1; }
 
+# Check dependencies before writing a partial installation. libpq is the
+# target distribution's client library, so TLS/Kerberos use that system's ABI.
+for binary in "$ROOT/bin/vexdb" "$ROOT/bin/vexfs-fuse" "$ROOT/lib/vexdb_lite.so"; do
+    dependencies="$(ldd "$binary" 2>&1)" || { echo "$dependencies" >&2; exit 1; }
+    if printf '%s\n' "$dependencies" | grep -q 'not found'; then
+        printf '%s\n' "$dependencies" >&2
+        echo "缺少运行库。Debian/Ubuntu: apt install libpq5 libfuse3-3 fuse3；RHEL: dnf install libpq fuse3" >&2
+        exit 1
+    fi
+done
+
 mkdir -p "$BIN_DIR" "$LIB_DIR"
 install -m 0755 "$ROOT/bin/vexdb" "$BIN_DIR/vexdb"
 install -m 0755 "$ROOT/bin/vexfs-fuse" "$BIN_DIR/vexfs-fuse"

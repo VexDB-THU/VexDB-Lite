@@ -44,6 +44,44 @@ using int64 = int64_t;
 using uint = unsigned int;
 using Size = size_t;
 
+// Keep cosine normalization byte-compatible with existing indexes for normal
+// inputs. Only fall back to the scaled calculation when the historical float
+// accumulation overflows; using the scaled formula unconditionally changes
+// float rounding and makes persisted coverage checks reject a healthy index.
+inline void NormalizeDuckVectorInPlace(float *vec, size_t dim) {
+    float norm2 = 0.0f;
+    for (size_t i = 0; i < dim; i++) {
+        norm2 += vec[i] * vec[i];
+    }
+    if (norm2 > 0.0f && std::isfinite(norm2)) {
+        const float inv = 1.0f / std::sqrt(norm2);
+        for (size_t i = 0; i < dim; i++) {
+            vec[i] *= inv;
+        }
+        return;
+    }
+    if (!std::isinf(norm2)) {
+        return;
+    }
+
+    float max_abs = 0.0f;
+    for (size_t i = 0; i < dim; i++) {
+        max_abs = std::max(max_abs, std::abs(vec[i]));
+    }
+    if (!(max_abs > 0.0f) || !std::isfinite(max_abs)) {
+        return;
+    }
+    double scaled_norm2 = 0.0;
+    for (size_t i = 0; i < dim; i++) {
+        const double scaled = static_cast<double>(vec[i]) / max_abs;
+        scaled_norm2 += scaled * scaled;
+    }
+    const double inv = 1.0 / (static_cast<double>(max_abs) * std::sqrt(scaled_norm2));
+    for (size_t i = 0; i < dim; i++) {
+        vec[i] = static_cast<float>(static_cast<double>(vec[i]) * inv);
+    }
+}
+
 class BaseObject {
 };
 
@@ -98,11 +136,7 @@ inline Oid index_getprocid(void *index, int attnum, int procnum) {
     return 0;
 }
 
-enum class QuantizerType : uint8 {
-    NONE = 0,
-    PQ = 1,
-    RABITQ = 2
-};
+#include "quantizer_type.h"
 
 using Relation = void *;
 
@@ -415,7 +449,7 @@ public:
      * the search path guarantees. Defaults false so the multi-threaded parallel
      * build path (which is not gated by graph_rwlock_) keeps its per-node
      * locks; a stale false merely takes the always-safe locking path. */
-    bool search_lock_free_ = false;
+    std::atomic<bool> search_lock_free_{false};
 
     GraphIndexEntryInfo entry_info;
     LayerView base_layer;
@@ -452,6 +486,7 @@ public:
     size_t mirror_max_nodes_ = SIZE_MAX;
     size_t mirror_limit_bytes_ = 0;
     size_t mirror_claimed_bytes_ = 0;
+    size_t mirror_allocated_bytes_ = 0;
     duckdb::Allocator *mirror_allocator_ = nullptr;
 
     ~MemStore() {
@@ -496,11 +531,20 @@ public:
     }
 
     void FreeMirrorSlot(MirrorVectorSlot &slot) {
+        const size_t old_size = static_cast<size_t>(slot.size());
+        VEXDB_DUCK_ASSERT(old_size <= mirror_allocated_bytes_);
+        mirror_allocated_bytes_ = old_size <= mirror_allocated_bytes_
+            ? mirror_allocated_bytes_ - old_size : 0;
         slot.Reset();
     }
 
     void AllocateMirrorSlot(MirrorVectorSlot &slot, duckdb::idx_t bytes) {
+        const size_t old_size = static_cast<size_t>(slot.size());
+        VEXDB_DUCK_ASSERT(old_size <= mirror_allocated_bytes_);
+        mirror_allocated_bytes_ = old_size <= mirror_allocated_bytes_
+            ? mirror_allocated_bytes_ - old_size : 0;
         slot.Allocate(MirrorAllocator(), bytes);
+        mirror_allocated_bytes_ += static_cast<size_t>(slot.size());
     }
 
     void AssignMirrorSlot(MirrorVectorSlot &slot, const char *data, duckdb::idx_t bytes) {
@@ -527,6 +571,29 @@ public:
         if (shrink) {
             vectors.shrink_to_fit();
         }
+    }
+
+    size_t GetTrackedInMemorySize() const {
+        size_t bytes = mirror_allocated_bytes_;
+        bytes += elems.capacity() * sizeof(point_type);
+        bytes += vectors.capacity() * sizeof(MirrorVectorSlot);
+        bytes += base_points.capacity() * sizeof(BasePointRec);
+        bytes += upper_points.capacity() * sizeof(UpperPointRec);
+        bytes += async_ids.capacity() * sizeof(T);
+        bytes += id_to_node_ptr_.capacity() * sizeof(duckdb::IndexPointer);
+        bytes += upper_idx_to_ptr_.capacity() * sizeof(duckdb::IndexPointer);
+        bytes += node_ptr_to_id_.size() *
+                 (sizeof(duckdb::idx_t) + sizeof(T) + 2 * sizeof(void *));
+        // Base/upper neighbor arrays are fixed-width after construction. Count
+        // their separately allocated payload without walking every node.
+        bytes += base_points.size() *
+                 (static_cast<size_t>(m) * 2 * (sizeof(T) + sizeof(float)) +
+                  ((static_cast<size_t>(m) * 2 + 31) / 32) * sizeof(uint32));
+        bytes += upper_points.size() *
+                 (static_cast<size_t>(m) * 2 * sizeof(T) +
+                  static_cast<size_t>(m) * sizeof(float) +
+                  ((static_cast<size_t>(m) + 31) / 32) * sizeof(uint32));
+        return bytes;
     }
 
     std::vector<duckdb::IndexPointer> id_to_node_ptr_;
@@ -631,10 +698,11 @@ public:
             if (node_alloc_ && vector_alloc_) {
                 for (size_t i = cur_base; i < base_n; i++) {
                     auto node_ptr = node_alloc_->New();
-                    auto vec_ptr = vector_alloc_->New();
                     auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                     std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
-                    header->vector_ptr = vec_ptr;
+                    if (!compact_mode_) {
+                        header->vector_ptr = vector_alloc_->New();
+                    }
                     id_to_node_ptr_[i] = node_ptr;
                     node_ptr_to_id_[node_ptr.Get()] = static_cast<T>(i);
                 }
@@ -663,17 +731,21 @@ public:
     //     或图为空 (entry.level < 0)，需要升级为 EXCLUSIVE。先抢 entry_waitlock
     //     阻拦后续 reader（防饥饿），再 release shared、acquire exclusive。
     //
-    // exclusive=true 表示 caller 跳过升级判断，强制 SHARED 模式（部分 query 路径）
-    template <bool exclusive = false, bool bottom_only = false>
+    // Shared-core contract: false returns a snapshot without a retained lock;
+    // true keeps the lock for insert(), which calls release_entry_lock().
+    template <bool with_lock = false, bool force_share_flag = false>
     std::pair<GraphIndexEntryInfo, bool> get_entry(int_fast8_t insert_level = 0) {
-        (void)bottom_only;
         LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
         LWLockRelease(&entry_waitlock);
 
         LWLockAcquire(&entry_lock, LW_SHARED);
         GraphIndexEntryInfo entry = entry_info;
+        if constexpr (!with_lock) {
+            LWLockRelease(&entry_lock);
+            return {entry, true};
+        }
         bool shared = true;
-        if ((!exclusive && insert_level > entry.level) || entry.level < 0) {
+        if ((!force_share_flag && insert_level > entry.level) || entry.level < 0) {
             LWLockRelease(&entry_lock);
             LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
             LWLockAcquire(&entry_lock, LW_EXCLUSIVE);
@@ -717,12 +789,18 @@ public:
                     id_to_node_ptr_.resize(id + 1);
                 }
             }
-            if (node_alloc_ && vector_alloc_ && !id_to_node_ptr_[id].Get()) {
+            if (node_alloc_ && !id_to_node_ptr_[id].Get()) {
                 auto node_ptr = node_alloc_->New();
-                auto vec_ptr = vector_alloc_->New();
                 auto *header = reinterpret_cast<duckdb::vex::HNSWNodeHeader<T> *>(node_alloc_->Get(node_ptr));
                 std::memset(header, 0, duckdb::vex::HNSWNodeHeader<T>::SegmentSize(m));
-                header->vector_ptr = vec_ptr;
+                // ReleaseRawVectors resets vector_alloc_ and marks the store
+                // compact. Quantized incremental inserts have no raw payload,
+                // so allocating an unused vector segment here both wastes space
+                // and eventually exhausts a reset allocator whose sentinel was
+                // intentionally removed.
+                if (vector_alloc_ && !compact_mode_) {
+                    header->vector_ptr = vector_alloc_->New();
+                }
                 id_to_node_ptr_[id] = node_ptr;
                 node_ptr_to_id_[node_ptr.Get()] = id;
             }
@@ -807,18 +885,8 @@ public:
             normalized.resize(vec_size);
             auto *dst = reinterpret_cast<float *>(normalized.data());
             auto *src = reinterpret_cast<const float *>(query);
-            float norm2 = 0.0f;
-            for (uint_fast16_t i = 0; i < dim; i++) {
-                norm2 += src[i] * src[i];
-            }
-            if (norm2 > 0.0f) {
-                float inv_norm = 1.0f / std::sqrt(norm2);
-                for (uint_fast16_t i = 0; i < dim; i++) {
-                    dst[i] = src[i] * inv_norm;
-                }
-            } else {
-                std::memcpy(dst, src, vec_size);
-            }
+            std::memcpy(dst, src, vec_size);
+            NormalizeDuckVectorInPlace(dst, dim);
             store_data = normalized.data();
         }
 
@@ -1093,7 +1161,7 @@ public:
     template <bool is_base_layer, bool shared_lock>
     void lock_point(T idx) {
         if constexpr (shared_lock) {
-            if (search_lock_free_) return;
+            if (search_lock_free_.load(std::memory_order_acquire)) return;
         }
         auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
         if constexpr (shared_lock) {
@@ -1105,7 +1173,7 @@ public:
     template <bool is_base_layer, bool shared_lock>
     void unlock_point(T idx) {
         if constexpr (shared_lock) {
-            if (search_lock_free_) return;
+            if (search_lock_free_.load(std::memory_order_acquire)) return;
         }
         auto &lock = (is_base_layer ? base_point_locks_ : upper_point_locks_)[idx & STRIPE_MASK].lock;
         LWLockRelease(&lock);

@@ -34,6 +34,14 @@ typedef void (*kacs_walk_func)(float *data, size_t len);
 typedef float (*warmup_ip_x0_q_func)(uint64 *data, const uint64 *query, float delta, float vl, size_t dim);
 typedef float (*ip_fxi_func)(float *query, uint8 *data, size_t dim);
 typedef float (*mask_ip_x0_q_func)(float *query, uint64 *data, size_t dim);
+
+struct RabitqKernels {
+    flip_sign_func flip_sign = nullptr;
+    kacs_walk_func kacs_walk = nullptr;
+    warmup_ip_x0_q_func warmup_ip_x0_q = nullptr;
+    ip_fxi_func ip_fxi = nullptr;
+    mask_ip_x0_q_func mask_ip_x0_q = nullptr;
+};
 } /* namespace ann_helper */
 
 #endif /* ANNVECTOR_DISTANCE_FUNC_H */

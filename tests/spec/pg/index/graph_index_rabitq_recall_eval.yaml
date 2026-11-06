@@ -1,0 +1,219 @@
+name: graph_index_rabitq_recall_eval
+tags: [pg-only, eval, rabitq, recall, active-quantizer]
+engines: [pg]
+description: |
+  RaBitQ 质量 eval。使用 12000 条确定性 32 维向量和 8 个查询，分别比较
+  L2、Cosine、Inner Product 的 ANN Top-10 与函数式暴力搜索 Top-10。
+  每种距离都必须真实启用 RaBitQ；总 recall@10 至少 0.70，且 8 个查询中
+  最多允许 2 个零命中。阈值为随机旋转和近似搜索保留波动空间，同时防止
+  平均值掩盖大面积查询失效。
+steps:
+  # Keep the quality gate on RaBitQ itself. At <=1GB PG intentionally switches
+  # to the separate disk-build path, whose graph quality has its own tests.
+  - statement: SET maintenance_work_mem = '2GB';
+  # RaBitQ uses approximate distances inside graph traversal. A wider search
+  # keeps this quality gate focused on quantization quality instead of a small
+  # graph-search budget.
+  - statement: SET vexdb.ef_search = 800;
+  - statement: DROP TABLE IF EXISTS rbq_recall_eval_data CASCADE;
+  - statement: DROP FUNCTION IF EXISTS __rbq_eval_vec32(int);
+  - statement: DROP FUNCTION IF EXISTS __rbq_plan_uses_index(text, text);
+  - statement: |
+      CREATE FUNCTION __rbq_eval_vec32(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 31) AS j
+      $$;
+  - statement: |
+      CREATE FUNCTION __rbq_plan_uses_index(sql_text text, index_name text)
+      RETURNS boolean LANGUAGE plpgsql AS $$
+      DECLARE plan_line text;
+      BEGIN
+        FOR plan_line IN EXECUTE 'EXPLAIN (COSTS OFF) ' || sql_text LOOP
+          IF plan_line LIKE '%' || index_name || '%' THEN RETURN true; END IF;
+        END LOOP;
+        RETURN false;
+      END
+      $$;
+  - statement: CREATE TABLE rbq_recall_eval_data (id int PRIMARY KEY, vec floatvector(32));
+  - statement: |
+      INSERT INTO rbq_recall_eval_data
+      SELECT i, __rbq_eval_vec32(i)
+      FROM generate_series(1, 12000) AS i;
+  - statement: CREATE TABLE rbq_recall_eval_queries (qid int PRIMARY KEY, vec floatvector(32));
+  - statement: |
+      INSERT INTO rbq_recall_eval_queries
+      SELECT id, vec FROM rbq_recall_eval_data
+      WHERE id IN (137, 1021, 2345, 4093, 5879, 7331, 9109, 11777);
+  - query: SELECT count(*) FROM rbq_recall_eval_data;
+    expect: [[12000]]
+  - query: SELECT count(*) FROM rbq_recall_eval_queries;
+    expect: [[8]]
+
+  # L2: function call is the exact path; the operator path uses the index.
+  - statement: |
+      CREATE TABLE rbq_recall_gt_l2 AS
+      SELECT q.qid, exact.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: |
+      CREATE INDEX rbq_recall_eval_l2_idx
+      ON rbq_recall_eval_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=rabitq, m=16, ef_construction=100, parallel_workers=4);
+  - query: |
+      SELECT content::text FROM index_inspect('rbq_recall_eval_l2_idx')
+      WHERE attribute = 'Working Quantizer';
+    expect: [[RaBitQ]]
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT __rbq_plan_uses_index(
+        $$SELECT id FROM rbq_recall_eval_data
+          ORDER BY vec <-> __rbq_eval_vec32(137) LIMIT 10$$,
+        'rbq_recall_eval_l2_idx');
+    expect: [["t"]]
+  - statement: |
+      CREATE TABLE rbq_recall_ann_l2 AS
+      SELECT q.qid, ann.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(g.id) AS hits
+        FROM rbq_recall_ann_l2 a
+        LEFT JOIN rbq_recall_gt_l2 g USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 56 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) <= 2 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DROP INDEX rbq_recall_eval_l2_idx;
+
+  # Cosine.
+  - statement: |
+      CREATE TABLE rbq_recall_gt_cos AS
+      SELECT q.qid, exact.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY cosine_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: |
+      CREATE INDEX rbq_recall_eval_cos_idx
+      ON rbq_recall_eval_data USING vexdb_graph (vec floatvector_cosine_ops)
+      WITH (quantizer=rabitq, m=16, ef_construction=100);
+  - query: |
+      SELECT content::text FROM index_inspect('rbq_recall_eval_cos_idx')
+      WHERE attribute = 'Working Quantizer';
+    expect: [[RaBitQ]]
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT __rbq_plan_uses_index(
+        $$SELECT id FROM rbq_recall_eval_data
+          ORDER BY vec <=> __rbq_eval_vec32(137) LIMIT 10$$,
+        'rbq_recall_eval_cos_idx');
+    expect: [["t"]]
+  - statement: |
+      CREATE TABLE rbq_recall_ann_cos AS
+      SELECT q.qid, ann.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY d.vec <=> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(g.id) AS hits
+        FROM rbq_recall_ann_cos a
+        LEFT JOIN rbq_recall_gt_cos g USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 56 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) <= 2 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DROP INDEX rbq_recall_eval_cos_idx;
+
+  # Inner product.
+  - statement: |
+      CREATE TABLE rbq_recall_gt_ip AS
+      SELECT q.qid, exact.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY floatvector_negative_inner_product(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: |
+      CREATE INDEX rbq_recall_eval_ip_idx
+      ON rbq_recall_eval_data USING vexdb_graph (vec floatvector_ip_ops)
+      WITH (quantizer=rabitq, m=16, ef_construction=100);
+  - query: |
+      SELECT content::text FROM index_inspect('rbq_recall_eval_ip_idx')
+      WHERE attribute = 'Working Quantizer';
+    expect: [[RaBitQ]]
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT __rbq_plan_uses_index(
+        $$SELECT id FROM rbq_recall_eval_data
+          ORDER BY vec <#> __rbq_eval_vec32(137) LIMIT 10$$,
+        'rbq_recall_eval_ip_idx');
+    expect: [["t"]]
+  - statement: |
+      CREATE TABLE rbq_recall_ann_ip AS
+      SELECT q.qid, ann.id
+      FROM rbq_recall_eval_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM rbq_recall_eval_data d
+        ORDER BY d.vec <#> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(g.id) AS hits
+        FROM rbq_recall_ann_ip a
+        LEFT JOIN rbq_recall_gt_ip g USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 56 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) <= 2 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+
+  - statement: DROP TABLE rbq_recall_eval_data CASCADE;
+  - statement: DROP TABLE rbq_recall_eval_queries;
+  - statement: DROP TABLE rbq_recall_gt_l2;
+  - statement: DROP TABLE rbq_recall_ann_l2;
+  - statement: DROP TABLE rbq_recall_gt_cos;
+  - statement: DROP TABLE rbq_recall_ann_cos;
+  - statement: DROP TABLE rbq_recall_gt_ip;
+  - statement: DROP TABLE rbq_recall_ann_ip;
+  - statement: DROP FUNCTION __rbq_eval_vec32(int);
+  - statement: DROP FUNCTION __rbq_plan_uses_index(text, text);

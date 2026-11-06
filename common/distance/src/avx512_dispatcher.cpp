@@ -135,10 +135,7 @@ private:
         }
 
         static INLINE_PROP AccT madd_square(VecT a, AccT s) {
-            __m512i a16 = _mm512_cvtepi8_epi16(_mm512_extracti64x4_epi64(a, 0));
-            __m512i sq = _mm512_mullo_epi16(a16, a16);
-            // TD: fix bug
-            return _mm512_add_epi32(sq, s);
+            return madd_vectors(a, a, s);
         }
 
         static INLINE_PROP AccT madd_vectors(VecT a, VecT b, AccT s) {
@@ -175,7 +172,7 @@ private:
             if (left) {
                 x += 64 * n_tail;
                 y += 64 * n_tail;
-                __mmask64 mask = (__mmask64)((1u << left) - 1u);
+                __mmask64 mask = (__mmask64)(UINT64_MAX >> (64 - left));
                 VecT xs = _mm512_maskz_loadu_epi8(mask, x);
                 VecT ys = _mm512_maskz_loadu_epi8(mask, y);
                 CONSTEXPR_IF (m == Metric::L2 || m == Metric::L2_SQRT) {
@@ -190,7 +187,11 @@ private:
         static INLINE_PROP float reduce(const Array<AccT, k> &accs) {
             AccT sum0 = _mm512_add_epi32(_mm512_add_epi32(accs[0], accs[1]),
                                          _mm512_add_epi32(accs[2], accs[3]));
-            return (float)_mm512_reduce_add_epi32(sum0);
+            alignas(64) int32 lanes[16];
+            _mm512_store_si512(reinterpret_cast<__m512i *>(lanes), sum0);
+            int64 sum = 0;
+            for (auto lane : lanes) sum += lane;
+            return static_cast<float>(sum);
         }
     };
 

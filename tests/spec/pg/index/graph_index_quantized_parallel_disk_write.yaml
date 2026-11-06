@@ -1,0 +1,102 @@
+name: graph_index_quantized_parallel_disk_write
+tags: [pg-only, regression, parallel, pq, rabitq, wal]
+engines: [pg]
+description: |
+  PQ 走内存并行路径，由 leader 写最终 code；RaBitQ 走低内存磁盘路径，
+  多个 PG worker 会把小于 PG_IO_ALIGN_SIZE 的 code 写入同一对齐块。
+  验证分片 LWLock 防止读改写覆盖、num_vectors 只增不减，以及
+  compact 模式没有 raw mirror，checkpoint/restart 后 code 仍完整；
+  重启后的 INSERT/DELETE 也必须继续走 code-aware 图。
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET max_parallel_maintenance_workers = 4;
+  - statement: DROP FUNCTION IF EXISTS __quant_parallel_vec32(int);
+  - statement: |
+      CREATE FUNCTION __quant_parallel_vec32(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          (sin(i * 0.013 + j * 0.17) +
+           cos(i * 0.007 * (j + 1)) +
+           ((i % 97) * (j + 1)) * 0.00001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 31) AS j
+      $$;
+  - statement: CREATE TABLE quant_parallel_data (id int PRIMARY KEY, vec floatvector(32));
+  - statement: |
+      INSERT INTO quant_parallel_data
+      SELECT i, __quant_parallel_vec32(i)
+      FROM generate_series(1, 12000) AS i;
+
+  - statement: |
+      CREATE INDEX quant_parallel_pq_idx
+      ON quant_parallel_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=8, m=16, ef_construction=100, parallel_workers=4);
+  - query: |
+      SELECT use_pq, pq_codes_bytes > 0, pq_codebook_bytes > 0
+      FROM vexdb_index_info() WHERE indexname='quant_parallel_pq_idx';
+    expect: [[t, t, t]]
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*) FROM (
+        SELECT id FROM quant_parallel_data
+        ORDER BY vec <-> __quant_parallel_vec32(7777) LIMIT 1
+      ) AS ann;
+    expect: [[1]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP INDEX quant_parallel_pq_idx;
+
+  - statement: SET maintenance_work_mem = '512MB';
+  - statement: |
+      CREATE INDEX quant_parallel_rbq_idx
+      ON quant_parallel_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=rabitq, memory_mode=compact,
+            m=16, ef_construction=100, parallel_workers=4);
+  - query: |
+      SELECT memory_mode, quantizer, rabitq_codes_bytes > 0, rabitq_fixed_bytes > 0
+      FROM vexdb_index_info() WHERE indexname='quant_parallel_rbq_idx';
+    expect: [[compact, rabitq, t, t]]
+  - query: |
+      SELECT content::text FROM index_inspect('quant_parallel_rbq_idx')
+      WHERE attribute = 'Vector Storage';
+    expect: [["RaBitQ Code"]]
+  - query: |
+      SELECT content::text FROM index_inspect('quant_parallel_rbq_idx')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [[12000]]
+  - statement: SET vexdb.ef_search = 2048;
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*) FROM (
+        SELECT id FROM quant_parallel_data
+        ORDER BY vec <-> __quant_parallel_vec32(7777) LIMIT 1
+      ) AS ann;
+    expect: [[1]]
+  - statement: INSERT INTO quant_parallel_data VALUES (20000, array_fill(50::float4, ARRAY[32])::floatvector);
+  - query: |
+      SELECT id FROM quant_parallel_data
+      ORDER BY vec <-> array_fill(50::float4, ARRAY[32])::floatvector LIMIT 1;
+    expect: [[20000]]
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT id FROM quant_parallel_data
+      ORDER BY vec <-> array_fill(50::float4, ARRAY[32])::floatvector LIMIT 1;
+    expect: [[20000]]
+  - statement: DELETE FROM quant_parallel_data WHERE id = 20000;
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - statement: SET enable_seqscan = off;
+  - query: |
+      SELECT count(*) FROM (
+        SELECT id FROM quant_parallel_data
+        ORDER BY vec <-> array_fill(50::float4, ARRAY[32])::floatvector LIMIT 10
+      ) AS ann WHERE id = 20000;
+    expect: [[0]]
+  - statement: SET enable_seqscan = on;
+  - statement: RESET vexdb.ef_search;
+  - statement: DROP TABLE quant_parallel_data;
+  - statement: DROP FUNCTION __quant_parallel_vec32(int);

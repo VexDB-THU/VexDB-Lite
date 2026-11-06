@@ -16,6 +16,7 @@
 
 #include "quantizer/pq_alloc.h"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace vex {
@@ -37,6 +38,13 @@ struct KMeansState {
     bool             allow_low_diversity_centers = false;
 };
 
+// Peak scratch owned by AnnKmeans itself. This excludes caller-owned samples
+// and centers so host adapters can combine it with their full training budget.
+// The estimate is saturating: SIZE_MAX means the requested shape cannot be
+// represented safely.
+size_t EstimateKMeansScratchBytes(size_t num_samples,
+                                  size_t num_centers,
+                                  size_t dim);
 // Validate the trained centers against the actual input subvector data.
 // Unexpected duplicates and non-finite centers remain errors.
 void ValidateKMeansCenters(const KMeansState &state,

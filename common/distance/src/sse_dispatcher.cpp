@@ -141,17 +141,14 @@ private:
         }
 
         static INLINE_PROP AccT madd_square(VecT a, AccT s) {
-            __m128i a16 = _mm_cvtepi8_epi16(a);
-            __m128i sq = _mm_mullo_epi16(a16, a16);
-            return _mm_add_epi32(sq, s);
+            return madd_vectors(a, a, s);
         }
 
         static INLINE_PROP AccT madd_vectors(VecT a, VecT b, AccT s) {
-            __m128i d_lo = _mm_sub_epi16(_mm_cvtepi8_epi16(a), _mm_cvtepi8_epi16(b));
-            __m128i d_hi = _mm_sub_epi16(_mm_cvtepi8_epi16(_mm_srli_si128(a, 8)),
-                                         _mm_cvtepi8_epi16(_mm_srli_si128(b, 8)));
-            s = _mm_add_epi32(s, _mm_madd_epi16(d_lo, d_lo));
-            return _mm_add_epi32(s, _mm_madd_epi16(d_hi, d_hi));
+            s = _mm_add_epi32(s, _mm_madd_epi16(_mm_cvtepi8_epi16(a), _mm_cvtepi8_epi16(b)));
+            return _mm_add_epi32(s, _mm_madd_epi16(
+                _mm_cvtepi8_epi16(_mm_srli_si128(a, 8)),
+                _mm_cvtepi8_epi16(_mm_srli_si128(b, 8))));
         }
 
         static INLINE_PROP AccT add_vectors(AccT a, AccT b) { return _mm_add_epi32(a, b); }
@@ -197,9 +194,11 @@ private:
         static INLINE_PROP float reduce(const Array<AccT, k> &accs) {
             AccT acc_sum = _mm_add_epi32(_mm_add_epi32(accs[0], accs[1]),
                                          _mm_add_epi32(accs[2], accs[3]));
-            __m128i sum = _mm_hadd_epi32(acc_sum, acc_sum);
-            sum = _mm_hadd_epi32(sum, sum);
-            return (float)_mm_cvtsi128_si32(_mm_hadd_epi32(sum, sum));
+            alignas(16) int32 lanes[4];
+            _mm_store_si128(reinterpret_cast<__m128i *>(lanes), acc_sum);
+            int64 sum = 0;
+            for (auto lane : lanes) sum += lane;
+            return static_cast<float>(sum);
         }
     };
 

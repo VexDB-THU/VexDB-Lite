@@ -1,9 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+# Consume full command output: grep -q can cause SIGPIPE with pipefail.
+
 VEXDB_INPUT="${1:?usage: vexdb_unified_smoke.sh /path/to/vexdb}"
 VEXDB="$(cd "$(dirname "$VEXDB_INPUT")" && pwd)/$(basename "$VEXDB_INPUT")"
-TMP_DIR="$(mktemp -d -t vexdb-unified-smoke)"
+TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/vexdb-unified-smoke.XXXXXX")"
 DB="$TMP_DIR/agent.sqlite3"
 COPY="$TMP_DIR/agent-copy.sqlite3"
 BACKUP_LINK_TARGET="$TMP_DIR/backup-link-target"
@@ -16,12 +18,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$VEXDB" --version | grep -q 'vexdb-lite'
+"$VEXDB" --version | grep 'vexdb-lite' >/dev/null
 # Keep the executable next to its package-relative runtime libraries. The real
 # installation also exposes vexfs as a symlink to vexdb; copying only the Mach-O
 # binary would deliberately break @executable_path dependency resolution.
 ln -s "$VEXDB" "$VEXFS_EXE"
-"$VEXFS_EXE" --help | grep -q 'Commands:'
+"$VEXFS_EXE" --help | grep 'Commands:' >/dev/null
 
 RESULT="$("$VEXDB" "$DB" \
     "SELECT vexfs_contract_version(), vexdb_l2_distance('[1,2]','[4,6]');")"
@@ -40,7 +42,7 @@ printf 'one product' | "$VEXDB" fs --db "$DB" --workspace smoke write /note.txt 
 "$VEXDB" backup "$DB" "$COPY" >/dev/null
 [ "$("$VEXDB" "$COPY" "SELECT count(*) FROM idx;")" = "2" ]
 [ "$("$VEXDB" fs --db "$COPY" --workspace smoke cat /note.txt)" = "one product" ]
-COPY_MODE="$(stat -f '%Lp' "$COPY" 2>/dev/null || stat -c '%a' "$COPY")"
+COPY_MODE="$(stat -c '%a' "$COPY" 2>/dev/null || stat -f '%Lp' "$COPY")"
 [ "$COPY_MODE" = "600" ]
 
 if [ "$(uname -s)" != Windows_NT ]; then
@@ -52,7 +54,7 @@ if [ "$(uname -s)" != Windows_NT ]; then
         exit 1
     fi
     [ "$(cat "$BACKUP_LINK_TARGET")" = "must-not-change" ]
-    TARGET_MODE="$(stat -f '%Lp' "$BACKUP_LINK_TARGET" 2>/dev/null || stat -c '%a' "$BACKUP_LINK_TARGET")"
+    TARGET_MODE="$(stat -c '%a' "$BACKUP_LINK_TARGET" 2>/dev/null || stat -f '%Lp' "$BACKUP_LINK_TARGET")"
     [ "$TARGET_MODE" = "644" ]
 fi
 

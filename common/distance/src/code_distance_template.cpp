@@ -57,18 +57,26 @@ void distance_four_codes_generic(
     const uint32 ksub = 1 << nbits;
 
     const float* tab = sim_table;
-    result0 = 0;
-    result1 = 0;
-    result2 = 0;
-    result3 = 0;
+    // Keep the four reduction chains local. Writing through output references
+    // in the loop prevents the compiler from proving that they do not alias
+    // the lookup table (or one another). It then reloads/stores every partial
+    // sum. The per-code addition order and final four scores stay unchanged.
+    float sum0 = 0;
+    float sum1 = 0;
+    float sum2 = 0;
+    float sum3 = 0;
 
     for (uint32 m = 0; m < M; m++) {
-        result0 += tab[decoder0.decode()];
-        result1 += tab[decoder1.decode()];
-        result2 += tab[decoder2.decode()];
-        result3 += tab[decoder3.decode()];
+        sum0 += tab[decoder0.decode()];
+        sum1 += tab[decoder1.decode()];
+        sum2 += tab[decoder2.decode()];
+        sum3 += tab[decoder3.decode()];
         tab += ksub;
     }
+    result0 = sum0;
+    result1 = sum1;
+    result2 = sum2;
+    result3 = sum3;
 }
 
 // This directory contains functions to compute a distance

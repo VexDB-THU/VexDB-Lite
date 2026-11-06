@@ -3,6 +3,7 @@
  */
 
 #include "pg_compat.h"
+#include "graph_signature.h"
 
 #include "graph_index/graph_index.h"
 #include "graph_index/graph_index_storage.h"
@@ -43,6 +44,8 @@ public:
         MemoryContext old_ctx = MemoryContextSwitchTo(vacuum_ctx);
 
         UnorderedSet<size_t> deleted;
+
+        graph_signature_invalidate(index,metap,GraphSignatureInvalidation::Vacuum);
 
         /* Stage 1: Remove heap TIDs */
         size_t remove_elem_num = remove_heaptids(deleted);

@@ -1,0 +1,131 @@
+name: Build Mobile Libraries
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Build profile'
+        required: false
+        default: 'full'
+        type: choice
+        options: ['full', 'compact', 'minimal']
+  push:
+    tags:
+      - 'v*'
+
+env:
+  PROFILE: ${{ inputs.profile || 'full' }}
+
+jobs:
+  # iOS disabled: build locally to save CI minutes (macOS runner = 10x multiplier)
+  # Uncomment and run when needed:
+  #   gh workflow run build-mobile.yml -f profile=full
+  #
+  # ios:
+  #   name: "iOS ${{ matrix.name }}"
+  #   runs-on: macos-latest
+  #   strategy:
+  #     fail-fast: false
+  #     matrix:
+  #       include:
+  #         - name: Device-arm64
+  #           sim: 0
+  #         - name: Simulator-arm64
+  #           sim: 1
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: hendrikmuhs/ccache-action@v1
+  #       with: { key: "ios-${{ matrix.name }}" }
+  #     - run: bash build.sh ios ${{ matrix.sim == '1' && '--sim' || '' }} --profile ${{ env.PROFILE }}
+  #     - uses: actions/upload-artifact@v4
+
+  android:
+    name: "Android ${{ matrix.abi }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, armeabi-v7a, x86_64]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r27
+
+      - name: Setup ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: android-${{ matrix.abi }}-${{ env.PROFILE }}
+
+      - name: Build Android
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          bash build.sh android --abi ${{ matrix.abi }} --profile ${{ env.PROFILE }}
+
+      - name: Package artifact
+        run: |
+          BUILD_DIR="build/android_${{ matrix.abi }}${{ env.PROFILE != 'full' && format('_{0}', env.PROFILE) || '' }}"
+          cd "$BUILD_DIR/libvexdb"
+
+          # Copy headers (Android build doesn't copy by default)
+          mkdir -p include
+          cp -r ../../src/include/duckdb include/ 2>/dev/null || cp -r ${{ github.workspace }}/src/include/duckdb include/
+          cp ${{ github.workspace }}/src/include/duckdb.hpp include/ 2>/dev/null || true
+
+          tar czf /tmp/libvexdb-android-${{ matrix.abi }}.tar.gz libvexdb.a include/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-${{ matrix.abi }}-${{ env.PROFILE }}
+          path: /tmp/libvexdb-android-*.tar.gz
+
+  # ── Collect all artifacts ──
+  collect:
+    needs: [android]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all
+        uses: actions/download-artifact@v4
+        with:
+          path: all-libs
+          pattern: "{ios,android}-*"
+          merge-multiple: true
+
+      - name: List artifacts
+        run: |
+          echo "=== Mobile Libraries ==="
+          ls -lh all-libs/
+
+      - name: Upload combined
+        uses: actions/upload-artifact@v4
+        with:
+          name: vexdb-lite-mobile-${{ inputs.profile || 'full' }}
+          path: all-libs/*.tar.gz
+
+  # ── Release (tag only) ──
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: collect
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          name: vexdb-lite-mobile-${{ inputs.profile || 'full' }}
+          path: libs
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: libs/*.tar.gz

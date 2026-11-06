@@ -2,6 +2,7 @@
 #define PG_COMPAT_H
 
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cfloat>
@@ -117,6 +118,15 @@ extern "C" {
 
 #ifdef __cplusplus
 }
+// PostgreSQL's C printf aliases also rewrite qualified std::snprintf /
+// std::vsnprintf in later C++/Boost headers. Keep their standard names usable;
+// callers needing PostgreSQL formatting can use pg_snprintf explicitly.
+#ifdef snprintf
+#undef snprintf
+#endif
+#ifdef vsnprintf
+#undef vsnprintf
+#endif
 #endif
 
 #if PG_VERSION_NUM < 170000

@@ -309,6 +309,20 @@ bytea *graph_index_options_internal(Datum reloptions, bool validate)
                     errmsg("Invalid \"memory_mode\" value '%s' (expected 'full' or 'compact')", s)));
             }
         }
+        const bool compact_mode = rdopts->memory_mode_offset > 0 &&
+            pg_strcasecmp((const char *)rdopts + rdopts->memory_mode_offset, "compact") == 0;
+        const char *quantizer = rdopts->qt_type_offset > 0 ?
+            (const char *)rdopts + rdopts->qt_type_offset : NULL;
+
+        if (compact_mode && quantizer != NULL && pg_strcasecmp(quantizer, "none") == 0) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("memory_mode='compact' requires quantizer='pq' or quantizer='rabitq'")));
+        }
+        if (quantizer != NULL && pg_strcasecmp(quantizer, "rabitq") == 0 &&
+            rdopts->pq_m > 0) {
+            ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                errmsg("pq_m is not valid with quantizer='rabitq'")));
+        }
         /* `threads` reloption is accepted for duck parity. PG build is currently
          * driven by `parallel_workers`; if the user only set `threads`, mirror
          * it into parallel_workers so build_with_workers picks it up. */

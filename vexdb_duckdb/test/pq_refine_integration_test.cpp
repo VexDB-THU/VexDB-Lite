@@ -162,6 +162,9 @@ static void RequireSingleRowLayout(Connection &con) {
 }
 
 static void RequireGraphModeGuards(Connection &con) {
+    // Earlier phases deliberately write to pq_test. Rebuild before testing
+    // active PQ parameter validation; stale models correctly use exact SQL.
+    Exec(con, "PRAGMA vexdb_rebuild_index('pq_test_idx')");
     auto reject = [&](const std::string &sql, const std::string &expected) {
         auto result = con.Query(sql);
         if (!result || !result->HasError() || result->GetError().find(expected) == std::string::npos) {

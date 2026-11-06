@@ -4,6 +4,7 @@
 #include "global_instance.h"
 #include "distance/core/distance.h"
 #include "vector_buffer/vector_smgr.h"
+#include "graph_index/parallel_build_locks.h"
 #include "guc_config.h"
 #include "graph_index/graph_index_state.h"
 #include "vector_buffer/shared_alloc_set.h"
@@ -92,6 +93,12 @@ vexdb_lite_shmem_request(void)
     RequestAddinShmemSpace(vecbuf_shmem_size());
     RequestNamedLWLockTranche("vector_buffer", 1);
     RequestNamedLWLockTranche("graph_index_state", 1);
+    RequestNamedLWLockTranche("vector_file_write", VEX_VEC_WRITE_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_entry", VEX_GRAPH_BUILD_ENTRY_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_entry_wait", VEX_GRAPH_BUILD_ENTRY_WAIT_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_storage", VEX_GRAPH_BUILD_STORAGE_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_extension", VEX_GRAPH_BUILD_EXTENSION_LOCK_STRIPES);
+    RequestNamedLWLockTranche("graph_build_point", VEX_GRAPH_BUILD_POINT_LOCK_STRIPES);
 }
 
 static void
@@ -163,6 +170,11 @@ void* mem_align_alloc(size_t alignment, size_t size)
     return palloc_aligned(size, alignment, 0);
 }
 
+void mem_align_free(void *ptr)
+{
+    pfree(ptr);
+}
+
 bool vexdb_lite_is_preloaded(void) { return vexdb_lite_preloaded; }
 
 extern "C" {
@@ -195,11 +207,7 @@ void _PG_init(void)
     g_instance.annvec_cxt.float_to_half = nullptr;
     g_instance.annvec_cxt.half_to_float = nullptr;
 
-    g_instance.annvec_cxt.f_flip_sign = nullptr;
-    g_instance.annvec_cxt.f_kacs_walk = nullptr;
-    g_instance.annvec_cxt.f_warmup_ip_x0_q = nullptr;
-    g_instance.annvec_cxt.f_ip_fxi = nullptr;
-    g_instance.annvec_cxt.f_mask_ip_x0_q = nullptr;
+    ann_helper::init_rabitq_func();
 
     g_instance.annvec_cxt.ann_cxt = nullptr;
     g_instance.annvec_cxt.redistrib_elem_tracker = nullptr;

@@ -1,0 +1,75 @@
+name: sqlite__vtab_rabitq_compact
+tags: [vex, sqlite, rabitq, compact, persistence, regression]
+description: RaBitQ compact 不保存索引侧原始向量段，查询、增量插入和重启都只依赖 code 与图结构。
+steps:
+- statement: CREATE VIRTUAL TABLE bad_compact USING GRAPH_INDEX(v FLOAT[8], memory_mode=compact, quantizer=none);
+  expect_error: requires quantizer='pq' or quantizer='rabitq'
+- statement: CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=rabitq, memory_mode=compact, m=16, ef_construction=160, ef_search=160, brute_force_threshold=0);
+- query: SELECT value FROM idx_config WHERE key = 'memory_mode';
+  expect:
+  - - compact
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 200)
+    INSERT INTO idx(rowid, v)
+    SELECT i, vexdb_f32('[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                              (i%13) || ',' || (i%17) || ',' || (i%19) || ',' ||
+                              (i%23) || ',' || (i%29) || ']') FROM c;
+# 首次查询在内存中建图并训练 RaBitQ；后续 INSERT 触发 xSync 全量落 compact 段。
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 64) WHERE rowid = 125;
+  expect:
+  - - 1
+- statement: INSERT INTO idx(rowid, v) VALUES (9001, '[150.25,3,7,7,14,17,12,5]');
+# 0/1/2/3 是 meta/elems/upper/base，5/6 是 RaBitQ fixed/code；kind=4 原始向量段必须不存在。
+- query: SELECT group_concat(kind, ',') FROM (SELECT DISTINCT kind FROM idx_graph ORDER BY kind);
+  expect:
+  - - 0,1,2,3,5,6
+- query: SELECT count(*) FROM idx_graph WHERE kind = 4;
+  expect:
+  - - 0
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150.25,3,7,7,14,17,12,5]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150.25,3,7,7,14,17,12,5]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 1
+# 重启后从 compact 段打开，再做真正的 code-aware 图插入。
+- statement: INSERT INTO idx(rowid, v) VALUES (9002, '[175.25,0,10,6,5,4,14,1]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[175.25,0,10,6,5,4,14,1]' AND k = 64) WHERE rowid = 9002;
+  expect:
+  - - 1
+# 低预算触发 DiskStore：两阶段构建、统一 base/code 缓存和追加同样不需要 kind=4。
+- statement: CREATE VIRTUAL TABLE idx_disk USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=rabitq, memory_mode=compact, m=16, ef_construction=160, ef_search=160, brute_force_threshold=0, graph_memory_limit=20000);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 300)
+    INSERT INTO idx_disk(rowid, v)
+    SELECT i, vexdb_f32('[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                              (i%13) || ',' || (i%17) || ',' || (i%19) || ',' ||
+                              (i%23) || ',' || (i%29) || ']') FROM c;
+- query: SELECT group_concat(kind, ',') FROM (SELECT DISTINCT kind FROM idx_disk_graph ORDER BY kind);
+  expect:
+  - - 0,1,2,3,5,6
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[250,5,8,3,12,3,20,18]' AND k = 64) WHERE rowid = 250;
+  expect:
+  - - 1
+- statement: INSERT INTO idx_disk(rowid, v) VALUES (9100, '[275.25,2,0,2,3,9,22,14]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[275.25,2,0,2,3,9,22,14]' AND k = 64) WHERE rowid = 9100;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM idx_disk_graph WHERE kind = 4;
+  expect:
+  - - 0
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[275.25,2,0,2,3,9,22,14]' AND k = 64) WHERE rowid = 9100;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM idx;
+  expect:
+  - - 202
+- query: SELECT count(*) FROM idx_graph WHERE kind = 4;
+  expect:
+  - - 0
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[175.25,0,10,6,5,4,14,1]' AND k = 64) WHERE rowid = 9002;
+  expect:
+  - - 1

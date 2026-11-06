@@ -1,0 +1,61 @@
+name: graph_index_filtered_rescan
+tags: [pg-only, regression, index, filtered]
+engines: [pg]
+description: |
+  A parameterized LATERAL index scan must release each candidate array once.
+  Compare all filtered results to exact SQL while reusing the scan descriptor.
+steps:
+- statement: DROP TABLE IF EXISTS rescan_vectors CASCADE;
+- statement: |
+    CREATE TABLE rescan_vectors(id int PRIMARY KEY, embedding floatvector(8), bucket int);
+    INSERT INTO rescan_vectors SELECT i,
+      ('['||string_agg(sin(i::float8*d*.017)::text,',' ORDER BY d)||']')::floatvector,i%17
+      FROM generate_series(1,512)i CROSS JOIN generate_series(1,8)d GROUP BY i;
+    CREATE INDEX rescan_ann ON rescan_vectors USING vexdb_graph(embedding floatvector_l2_ops)
+      WITH(m=8,ef_construction=64,parallel_workers=0);
+    ANALYZE rescan_vectors;
+    CREATE TEMP TABLE rescan_probes AS SELECT * FROM rescan_vectors WHERE id BETWEEN 11 AND 18;
+- statement: |
+    SET enable_indexscan=off;
+    SET enable_bitmapscan=off;
+    CREATE TEMP TABLE rescan_expected AS
+      SELECT q.id AS qid,array_agg(s.id ORDER BY s.id) AS ids
+      FROM rescan_probes q CROSS JOIN LATERAL (
+        SELECT v.id FROM rescan_vectors v WHERE v.bucket=q.bucket
+        ORDER BY v.embedding <-> q.embedding LIMIT 10
+      )s GROUP BY q.id;
+- statement: |
+    SET enable_indexscan=on;
+    SET enable_seqscan=off;
+    SET enable_sort=off;
+    SET enable_memoize=off;
+    SET vexdb.signature_rescue=off;
+    SET vexdb.ef_search=1024;
+    DO $$DECLARE plan json;BEGIN
+      EXECUTE 'EXPLAIN (FORMAT JSON) SELECT q.id,s.id FROM rescan_probes q CROSS JOIN LATERAL (
+        SELECT v.id FROM rescan_vectors v WHERE v.bucket=q.bucket
+        ORDER BY v.embedding <-> q.embedding LIMIT 10)s' INTO plan;
+      IF position('rescan_ann' IN plan::text)=0 THEN
+        RAISE EXCEPTION 'rescan regression must exercise native graph index';
+      END IF;
+    END$$;
+    CREATE TEMP TABLE rescan_actual AS
+      SELECT q.id AS qid,array_agg(s.id ORDER BY s.id) AS ids
+      FROM rescan_probes q CROSS JOIN LATERAL (
+        SELECT v.id FROM rescan_vectors v WHERE v.bucket=q.bucket
+        ORDER BY v.embedding <-> q.embedding LIMIT 10
+      )s GROUP BY q.id;
+- query: |
+    SELECT count(*) FROM rescan_actual a JOIN rescan_expected e USING(qid)
+    WHERE a.ids=e.ids;
+  expect: [[8]]
+- statement: |
+    RESET enable_indexscan;
+    RESET enable_bitmapscan;
+    RESET enable_seqscan;
+    RESET enable_sort;
+    RESET enable_memoize;
+    RESET vexdb.signature_rescue;
+    RESET vexdb.ef_search;
+    DROP TABLE rescan_actual,rescan_expected,rescan_probes;
+    DROP TABLE rescan_vectors;

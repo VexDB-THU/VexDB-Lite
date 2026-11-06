@@ -6,6 +6,7 @@
 #include "vex_fetch_utils.hpp"
 #include "vex_graph_index.hpp"
 #include "vex_physical_index_scan.hpp"
+#include "vex_native_topn_fetch.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/index/bound_index.hpp"
@@ -13,7 +14,12 @@
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_cross_product.hpp"
+#include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
@@ -22,7 +28,9 @@
 #include "duckdb/planner/operator/logical_top_n.hpp"
 #include "duckdb/planner/table_filter.hpp"
 #include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/statistics/base_statistics.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/main/config.hpp"
 
 namespace duckdb {
 
@@ -99,16 +107,7 @@ static uint64_t HashCoverageRowVector(row_t row_id, const float *vec, idx_t dim)
 }
 
 static void NormalizeCoverageVectorInPlace(float *vec, idx_t dim) {
-    float norm2 = 0.0f;
-    for (idx_t i = 0; i < dim; i++) {
-        norm2 += vec[i] * vec[i];
-    }
-    if (norm2 > 0.0f) {
-        float inv = 1.0f / std::sqrt(norm2);
-        for (idx_t i = 0; i < dim; i++) {
-            vec[i] *= inv;
-        }
-    }
+    NormalizeDuckVectorInPlace(vec, dim);
 }
 
 static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) {
@@ -119,6 +118,15 @@ static bool DistanceFunctionMatchesMetric(const string &name, VexMetric metric) 
 static bool IsAscDistanceFunction(const string &name) {
     auto *entry = FindDistanceFunc(name);
     return entry ? entry->ascending : true;
+}
+
+static string FilteredSearchMode(ClientContext &context) {
+    Value setting;
+    string mode = "exact";
+    if (context.TryGetCurrentSetting("vexdb_filtered_search_mode", setting)) mode = StringUtil::Lower(setting.ToString());
+    if (mode != "auto" && mode != "exact")
+        throw InvalidInputException("vexdb_filtered_search_mode must be 'auto' or 'exact'");
+    return mode;
 }
 
 static bool IsColumnRefFromTable(const Expression &expr, idx_t table_index, idx_t &col_index) {
@@ -158,25 +166,51 @@ static bool HasColumnRefFromTable(const Expression &expr, idx_t table_index) {
 }
 
 struct DistanceOrderInfo {
+    unique_ptr<Expression> resolved_order;
     BoundFunctionExpression *func_expr = nullptr;
     Expression *query_vec_expr = nullptr;
     idx_t col_index = 0;
+    OrderByNullType null_order = OrderByNullType::ORDER_DEFAULT;
 };
 
-static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, LogicalProjection *proj,
-                                    OrderType order_type, DistanceOrderInfo &info) {
-    Expression *resolved = order_expr;
-    while (resolved->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-        resolved = resolved->Cast<BoundCastExpression>().child.get();
-    }
-
-    if (proj && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-        auto &colref = resolved->Cast<BoundColumnRefExpression>();
-        if (colref.binding.table_index == proj->table_index && colref.binding.column_index < proj->expressions.size()) {
-            resolved = proj->expressions[colref.binding.column_index].get();
+static bool ExpandProjectionBindings(unique_ptr<Expression> &expr,
+                                     const vector<LogicalProjection *> &projections, idx_t depth = 0) {
+    if (depth > projections.size() + 1) return false;
+    if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+        const auto binding = expr->Cast<BoundColumnRefExpression>().binding;
+        for (auto *proj : projections) if (binding.table_index == proj->table_index) {
+            if (binding.column_index >= proj->expressions.size()) return false;
+            expr = proj->expressions[binding.column_index]->Copy();
+            return ExpandProjectionBindings(expr, projections, depth + 1);
         }
     }
+    bool valid = true;
+    ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+        valid &= ExpandProjectionBindings(child, projections, depth);
+    });
+    return valid;
+}
 
+static bool TryResolveDistanceOrder(Expression *order_expr, LogicalGet *get, const vector<LogicalProjection *> &projections,
+                                    OrderType order_type, OrderByNullType null_order, bool expand_views, DistanceOrderInfo &info) {
+    info.null_order = null_order;
+    Expression *resolved = order_expr;
+    if (expand_views) {
+        info.resolved_order = order_expr->Copy();
+        if (!ExpandProjectionBindings(info.resolved_order, projections)) return false;
+        resolved = info.resolved_order.get();
+    } else {
+        // Preserve the old direct-table shape by default. New view/projection
+        // rewrites opt in with scalar/PQ integration, just like filtered ANN.
+        if (projections.size() > 1) return false;
+        while (resolved->GetExpressionClass() == ExpressionClass::BOUND_CAST)
+            resolved = resolved->Cast<BoundCastExpression>().child.get();
+        if (!projections.empty() && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+            const auto binding = resolved->Cast<BoundColumnRefExpression>().binding;
+            if (binding.table_index == projections[0]->table_index && binding.column_index < projections[0]->expressions.size())
+                resolved = projections[0]->expressions[binding.column_index].get();
+        }
+    }
     while (resolved->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
         resolved = resolved->Cast<BoundCastExpression>().child.get();
     }
@@ -219,31 +253,42 @@ struct GetChildInfo {
     LogicalOperator *cross_product = nullptr;
     idx_t subquery_child_idx = 0;
     bool filter_inside_cross_product = false;
+    unique_ptr<LogicalOperator> *get_owner = nullptr;
+    vector<LogicalProjection *> projections;
+    vector<LogicalFilter *> filters;
+    unique_ptr<LogicalOperator> *cross_owner = nullptr;
 };
 
-static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
-    LogicalOperator *cur = &child;
+static bool FindGetChild(unique_ptr<LogicalOperator> &child, GetChildInfo &info) {
+    auto *owner = &child;
+    LogicalOperator *cur = owner->get();
 
-    if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && cur->children.size() == 1) {
-        info.proj = &cur->Cast<LogicalProjection>();
-        cur = cur->children[0].get();
-    }
-
-    if (cur->type == LogicalOperatorType::LOGICAL_FILTER && cur->children.size() == 1) {
-        info.filter = &cur->Cast<LogicalFilter>();
-        cur = cur->children[0].get();
+    while (cur->children.size() == 1 &&
+           (cur->type == LogicalOperatorType::LOGICAL_PROJECTION || cur->type == LogicalOperatorType::LOGICAL_FILTER)) {
+        if (cur->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+            if (!info.proj) info.proj = &cur->Cast<LogicalProjection>();
+            info.projections.push_back(&cur->Cast<LogicalProjection>());
+        } else {
+            if (!info.filter) info.filter = &cur->Cast<LogicalFilter>();
+            info.filters.push_back(&cur->Cast<LogicalFilter>());
+        }
+        owner = &cur->children[0];
+        cur = owner->get();
     }
 
     if (cur->type == LogicalOperatorType::LOGICAL_GET) {
         info.get = &cur->Cast<LogicalGet>();
+        info.get_owner = owner;
         return true;
     }
 
     if (cur->type == LogicalOperatorType::LOGICAL_CROSS_PRODUCT && cur->children.size() == 2) {
+        info.cross_owner = owner;
         for (idx_t i = 0; i < 2; i++) {
             auto *cp_child = cur->children[i].get();
             if (cp_child->type == LogicalOperatorType::LOGICAL_GET) {
                 info.get = &cp_child->Cast<LogicalGet>();
+                info.get_owner = &cur->children[i];
                 info.cross_product = cur;
                 info.subquery_child_idx = 1 - i;
                 return true;
@@ -255,7 +300,9 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
                 cp_child->children.size() == 1 &&
                 cp_child->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
                 info.filter = &cp_child->Cast<LogicalFilter>();
+                info.filters.push_back(info.filter);
                 info.get = &cp_child->children[0]->Cast<LogicalGet>();
+                info.get_owner = &cp_child->children[0];
                 info.cross_product = cur;
                 info.subquery_child_idx = 1 - i;
                 info.filter_inside_cross_product = true;
@@ -268,13 +315,117 @@ static bool FindGetChild(LogicalOperator &child, GetChildInfo &info) {
 
 static void ReplaceGetWithVexScan(unique_ptr<LogicalOperator> &get_owner, const GetChildInfo &info,
                                   unique_ptr<LogicalOperator> vex_scan) {
-    if (info.proj) {
-        info.proj->children[0] = std::move(vex_scan);
-    } else if (info.filter) {
-        info.filter->children[0] = std::move(vex_scan);
-    } else {
-        get_owner = std::move(vex_scan);
+    if (!info.get_owner) throw InternalException("VEX index scan lost its table owner");
+    *(info.cross_owner ? info.cross_owner : info.get_owner) = std::move(vex_scan);
+    (void)get_owner;
+}
+
+static unique_ptr<VexFilterPlan> MakeFilterPlan(const GetChildInfo &info, const DistanceOrderInfo &distance,
+                                                bool allow_unfiltered = false) {
+    auto &get = *info.get;
+    if (get.dynamic_filters && get.dynamic_filters->HasFilters()) return nullptr;
+    auto plan = make_uniq<VexFilterPlan>();
+    auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+    for (auto *filter : info.filters) for (auto &expr : filter->expressions)
+        conjunction->children.push_back(expr->Copy());
+    // LogicalGet filters use absolute physical column IDs (DuckDB v1.5.2
+    // CreateTableFilterSet), not positions in GetColumnIds().
+    for (const auto &entry : get.table_filters.filters) {
+        idx_t position = DConstants::INVALID_INDEX;
+        for (idx_t i = 0; i < get.GetColumnIds().size(); ++i)
+            if (get.GetColumnIds()[i].GetPrimaryIndex() == entry.first) { position = i; break; }
+        if (position == DConstants::INVALID_INDEX) return nullptr;
+        BoundColumnRefExpression column(get.GetColumnType(get.GetColumnIds()[position]), ColumnBinding(get.table_index, position));
+        conjunction->children.push_back(entry.second->ToExpression(column));
     }
+    if (conjunction->children.empty()) {
+        if (!allow_unfiltered) return nullptr;
+        plan->predicate = make_uniq<BoundConstantExpression>(Value::BOOLEAN(true));
+    } else {
+        plan->predicate = std::move(conjunction);
+    }
+    // Deterministic casts/arithmetic may be marked CanThrow even for ordinary
+    // metadata expressions (e.g. id % 2). Execute them with DuckDB's evaluator
+    // and preserve errors; do not silently disable filtering for such views.
+    if (!ExpandProjectionBindings(plan->predicate, info.projections) || plan->predicate->IsVolatile()) return nullptr;
+    bool valid = true;
+    const auto vector_column = get.GetColumnIds()[distance.col_index].GetPrimaryIndex();
+    std::function<void(unique_ptr<Expression> &)> bind = [&](unique_ptr<Expression> &expr) {
+        if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+            const auto &ref = expr->Cast<BoundColumnRefExpression>();
+            if (ref.binding.table_index != get.table_index || ref.depth || ref.binding.column_index >= get.GetColumnIds().size()) {
+                valid = false; return;
+            }
+            const auto id = get.GetColumnIds()[ref.binding.column_index].GetPrimaryIndex();
+            // If testing the predicate already reads the full vector, retain
+            // natural SQL instead of adding another vector-search pass.
+            if (id == vector_column) { valid = false; return; }
+            if (id != COLUMN_IDENTIFIER_ROW_ID &&
+                (id >= get.returned_types.size() || get.returned_types[id] != ref.return_type)) { valid = false; return; }
+            idx_t position = 0;
+            for (; position < plan->columns.size(); ++position) if (plan->columns[position] == id) break;
+            if (position == plan->columns.size()) { plan->columns.push_back(id); plan->types.push_back(ref.return_type); }
+            expr = make_uniq<BoundReferenceExpression>(ref.return_type, position);
+            return;
+        }
+        if (expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY || expr->GetExpressionClass() == ExpressionClass::BOUND_REF) {
+            valid = false; return;
+        }
+        ExpressionIterator::EnumerateChildren(*expr, bind);
+    };
+    bind(plan->predicate);
+    if (!valid) return nullptr;
+    plan->vector_column = get.GetColumnIds()[distance.col_index].GetPrimaryIndex();
+    plan->vector_type = get.returned_types[plan->vector_column];
+    plan->distance = distance.func_expr->Copy();
+    auto &function = plan->distance->Cast<BoundFunctionExpression>();
+    idx_t vector_argument = 0;
+    idx_t unused;
+    if (!IsColumnRefFromTable(*function.children[0], get.table_index, unused)) vector_argument = 1;
+    plan->query_argument = 1 - vector_argument;
+    function.children[vector_argument] = make_uniq<BoundReferenceExpression>(plan->vector_type, 0);
+    plan->ascending = IsAscDistanceFunction(function.function.name);
+    return plan;
+}
+
+// The selector path scans metadata and then fetches vectors by row ID. For a
+// selective stored-column equality, DuckDB's own filter/ART and vectorized scan
+// can be much cheaper. Use column statistics and the user's existing search
+// budget to retain that native plan. This estimate only chooses an execution
+// path: native SQL remains exact even with skewed or stale statistics.
+static bool PreferNativeEquality(ClientContext &context, DuckTableEntry &table,
+                                 const VexFilterPlan &plan, Expression &predicate, double budget) {
+    if (predicate.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
+        for (auto &child : predicate.Cast<BoundConjunctionExpression>().children)
+            if (PreferNativeEquality(context, table, plan, *child, budget)) return true;
+        return false;
+    }
+    if (predicate.GetExpressionType() != ExpressionType::COMPARE_EQUAL) return false;
+    auto &comparison = predicate.Cast<BoundComparisonExpression>();
+    Expression *column = comparison.left.get(), *value = comparison.right.get();
+    if (column->GetExpressionClass() != ExpressionClass::BOUND_REF) std::swap(column, value);
+    if (column->GetExpressionClass() != ExpressionClass::BOUND_REF ||
+        (!value->IsFoldable() && value->GetExpressionClass() != ExpressionClass::BOUND_PARAMETER)) return false;
+    const auto position = column->Cast<BoundReferenceExpression>().index;
+    if (position >= plan.columns.size() || plan.columns[position] == COLUMN_IDENTIFIER_ROW_ID) return false;
+    auto stats = table.GetStatistics(context, StorageIndex(plan.columns[position]));
+    idx_t distinct = stats ? stats->GetDistinctCount() : 0;
+    // A boolean equality can retain half the table even without NDV statistics.
+    if (!distinct && column->return_type == LogicalType::BOOLEAN) distinct = 2;
+    if (!distinct) return true; // Unknown selectivity: preserve native SQL.
+    return double(table.GetStorage().GetTotalRows()) / double(distinct) <= budget;
+}
+
+static double FilterSearchBudget(ClientContext &context, idx_t k) {
+    Value value;
+    int ef = 40;
+    if (context.TryGetCurrentSetting("vexdb_ef_search", value)) ef = value.GetValue<int>();
+    if (ef < 1 || ef > 65535) throw InvalidInputException("vexdb_ef_search must be in [1, 65535], got %d", ef);
+    double factor = 1.0;
+    if (context.TryGetCurrentSetting("vexdb_pq_refine_k_factor", value)) factor = value.GetValue<double>();
+    if (!std::isfinite(factor) || factor < 1.0 || factor > 1000.0)
+        throw InvalidInputException("vexdb_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", factor);
+    return std::max({double(GetBruteForceThreshold(context)), double(ef), double(k) * factor});
 }
 
 static vector<LogicalType> GetOutputTypes(LogicalGet *get) {
@@ -354,6 +505,7 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
     auto dimension = graph_idx.GetDimension();
     auto metric = graph_idx.GetMetric();
     auto use_pq_checksum = graph_idx.UsesPQCoverageChecksum();
+    auto use_rabitq_checksum = graph_idx.UsesRaBitQCoverageChecksum();
 
     vector<StorageIndex> scan_column_ids;
     scan_column_ids.emplace_back(vector_column_id);
@@ -407,6 +559,8 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
             }
             if (use_pq_checksum) {
                 coverage.vector_checksum += graph_idx.HashPQVectorForCoverage(rid, vec);
+            } else if (use_rabitq_checksum) {
+                coverage.vector_checksum += graph_idx.HashRaBitQVectorForCoverage(rid, vec);
             } else {
                 coverage.vector_checksum += HashCoverageRowVector(rid, vec, dimension);
             }
@@ -418,6 +572,13 @@ static TableRowIdCoverage ScanTableRowIdCoverage(ClientContext &context, DataTab
 
 static bool GraphIndexMayBeStaleAfterRecovery(ClientContext &context, DataTable &storage,
                                               DuckTransaction &transaction, GraphIndex &graph_idx) {
+    if (graph_idx.NeedsQuantizerRebuild() && graph_idx.IsCompactMode()) {
+        return true;
+    }
+    if (graph_idx.HasStoragePointerCorruption()) {
+        graph_idx.MarkRowIdCoverageChecked(true);
+        return true;
+    }
     if (graph_idx.HasRowIdCoverageCheck()) {
         return graph_idx.IsRowIdCoverageStale();
     }
@@ -464,15 +625,18 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
     if (transaction.ChangesMade()) {
         return false;
     }
+    if (DBConfig::GetConfig(context).ResolveNullOrder(context,
+            IsAscDistanceFunction(dist_info.func_expr->function.name) ? OrderType::ASCENDING : OrderType::DESCENDING,
+            dist_info.null_order) == OrderByNullType::NULLS_FIRST || dist_info.query_vec_expr->IsVolatile()) return false;
 
-    // A global ANN prefix cannot guarantee enough qualifying neighbors, even
-    // with an accurate selectivity estimate: metadata and distance may be
-    // correlated. Keep the original filter-first exact SQL plan. Do not lift
-    // predicates out of table storage or guess an oversampling multiplier.
-    // Unfiltered queries still use the existing ANN rewrite below.
-    if (get_info.filter || !get->table_filters.filters.empty() ||
-        (get->dynamic_filters && get->dynamic_filters->HasFilters())) {
-        return false;
+    if (get->dynamic_filters && get->dynamic_filters->HasFilters()) return false;
+    const bool filtered = !get_info.filters.empty() || !get->table_filters.filters.empty();
+    unique_ptr<VexFilterPlan> filter_plan;
+    if (filtered) {
+        const auto mode = FilteredSearchMode(context);
+        if (mode == "exact" || dist_info.null_order == OrderByNullType::NULLS_FIRST) return false;
+        filter_plan = MakeFilterPlan(get_info, dist_info);
+        if (!filter_plan) return false;
     }
 
     auto &column_ids = get->GetColumnIds();
@@ -493,7 +657,10 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
         return false;
     }
 
+    if (limit > std::numeric_limits<idx_t>::max() - offset) return false;
     idx_t k = limit + offset;
+    if (filter_plan && PreferNativeEquality(context, duck_table, *filter_plan, *filter_plan->predicate,
+                                            FilterSearchBudget(context, k))) return false;
     vector<idx_t> fetch_output_positions;
     for (idx_t i = 0; i < column_ids.size(); i++) {
         fetch_output_positions.push_back(i);
@@ -503,6 +670,9 @@ static bool TryOptimizeANN(ClientContext &context, unique_ptr<LogicalOperator> &
                                                dist_info.query_vec_expr->Copy(), k, column_ids,
                                                std::move(fetch_output_positions), optional_idx(),
                                                get->returned_types);
+    scan->quality_fallback_plan = MakeFilterPlan(get_info, dist_info, true);
+    if (!scan->quality_fallback_plan) return false;
+    scan->filter_plan = std::move(filter_plan);
     scan->SetEstimatedCardinality(k);
 
     if (get_info.cross_product) {
@@ -520,8 +690,135 @@ VexOptimizerExtension::VexOptimizerExtension() {
     optimize_function = OptimizeFunction;
 }
 
+// Follow an unmodified physical row ID through the native unary TopN plan.
+// Reject joins, casts, expressions and other sources that could duplicate or
+// manufacture row IDs. A SEMI join can otherwise return fewer rows than RHS.
+static bool IsNativeRowId(LogicalOperator &node, ColumnBinding binding, DuckTableEntry &table) {
+    if (node.type == LogicalOperatorType::LOGICAL_GET) {
+        auto &get = node.Cast<LogicalGet>();
+        return get.GetTable().get() == &table && binding.table_index == get.table_index &&
+               binding.column_index < get.GetColumnIds().size() &&
+               get.GetColumnIds()[binding.column_index].GetPrimaryIndex() == COLUMN_IDENTIFIER_ROW_ID;
+    }
+    if (node.children.size() != 1) return false;
+    if (node.type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        auto &projection = node.Cast<LogicalProjection>();
+        if (binding.table_index != projection.table_index || binding.column_index >= projection.expressions.size()) return false;
+        auto &expression = *projection.expressions[binding.column_index];
+        if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) return false;
+        return IsNativeRowId(*node.children[0], expression.Cast<BoundColumnRefExpression>().binding, table);
+    }
+    if (node.type != LogicalOperatorType::LOGICAL_TOP_N && node.type != LogicalOperatorType::LOGICAL_FILTER) return false;
+    return IsNativeRowId(*node.children[0], binding, table);
+}
+
+static void TryNativeTopNFetch(ClientContext &context, unique_ptr<LogicalOperator> &node) {
+    Value setting;
+    if (!context.TryGetCurrentSetting("vexdb_native_topn_fetch", setting) || !setting.GetValue<bool>()) return;
+    if (node->type != LogicalOperatorType::LOGICAL_COMPARISON_JOIN || node->children.size() != 2) return;
+    auto &join = node->Cast<LogicalComparisonJoin>();
+    if (join.join_type != JoinType::SEMI || join.conditions.size() != 1 || join.predicate ||
+        !join.duplicate_eliminated_columns.empty() || node->children[0]->type != LogicalOperatorType::LOGICAL_GET ||
+        node->children[1]->type != LogicalOperatorType::LOGICAL_TOP_N) return;
+    auto &condition = join.conditions[0];
+    if (condition.comparison != ExpressionType::COMPARE_EQUAL ||
+        condition.left->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+        condition.right->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) return;
+    auto &left = node->children[0]->Cast<LogicalGet>();
+    auto entry = left.GetTable();
+    if (!entry || !entry->IsDuckTable() || !left.table_filters.filters.empty()) return;
+    auto &table = entry->Cast<DuckTableEntry>();
+    if (!IsNativeRowId(left, condition.left->Cast<BoundColumnRefExpression>().binding, table) ||
+        !IsNativeRowId(*node->children[1], condition.right->Cast<BoundColumnRefExpression>().binding, table)) return;
+    auto &topn = node->children[1]->Cast<LogicalTopN>();
+    if (topn.orders.size() != 1 || !topn.limit) return;
+    GetChildInfo info;
+    DistanceOrderInfo distance;
+    if (!FindGetChild(topn.children[0], info) || info.cross_product ||
+        !TryResolveDistanceOrder(topn.orders[0].expression.get(), info.get, info.projections,
+                                 topn.orders[0].type, topn.orders[0].null_order, true, distance)) return;
+    auto output_bindings = join.GetColumnBindings();
+    const auto left_bindings = left.GetColumnBindings();
+    vector<ColumnIndex> columns;
+    vector<LogicalType> types;
+    for (const auto &binding : output_bindings) {
+        const auto it = std::find(left_bindings.begin(), left_bindings.end(), binding);
+        if (it == left_bindings.end() || binding.column_index >= left.GetColumnIds().size() ||
+            idx_t(it - left_bindings.begin()) >= left.types.size()) return;
+        const auto &column = left.GetColumnIds()[binding.column_index];
+        if (!column.HasPrimaryIndex() || column.HasChildren() || column.IsPushdownExtract() ||
+            (column.IsVirtualColumn() && column.GetPrimaryIndex() != COLUMN_IDENTIFIER_ROW_ID)) return;
+        columns.push_back(column);
+        types.push_back(left.types[idx_t(it - left_bindings.begin())]);
+    }
+    auto fetch = make_uniq<LogicalVexNativeTopNFetch>(table, std::move(columns), std::move(types),
+                                                     std::move(output_bindings), condition.right->Copy());
+    fetch->SetEstimatedCardinality(topn.limit);
+    fetch->children.push_back(std::move(node->children[1]));
+    node = std::move(fetch);
+}
+
 void VexOptimizerExtension::OptimizeFunction(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
     OptimizeNode(input.context, plan);
+}
+
+// The SQL expressions and candidate set stay unchanged. Only move the unary
+// output work into the bounded scan, so an ARRAY used solely for computing a
+// scalar distance need not cross a native pipeline boundary. Correlated scans
+// and volatile/subquery expressions retain their original operators.
+static void TryFuseScanOutput(unique_ptr<LogicalOperator> &node) {
+    if ((node->type != LogicalOperatorType::LOGICAL_PROJECTION &&
+         node->type != LogicalOperatorType::LOGICAL_FILTER) || node->children.size() != 1) return;
+    auto *scan = dynamic_cast<LogicalVexIndexScan *>(node->children[0].get());
+    if (!scan || !scan->children.empty()) return;
+    auto bindings = scan->GetColumnBindings();
+    auto input_types = scan->output_steps.empty() ? scan->output_types : scan->output_steps.back().types;
+    if (bindings.size() != input_types.size()) return;
+    bool valid = true;
+    std::function<void(unique_ptr<Expression> &)> bind = [&](unique_ptr<Expression> &expr) {
+        if (expr->IsVolatile() || expr->GetExpressionClass() == ExpressionClass::BOUND_SUBQUERY ||
+            expr->GetExpressionClass() == ExpressionClass::BOUND_REF) { valid = false; return; }
+        if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+            const auto &ref = expr->Cast<BoundColumnRefExpression>();
+            const auto it = std::find(bindings.begin(), bindings.end(), ref.binding);
+            if (ref.depth || it == bindings.end() || input_types[idx_t(it - bindings.begin())] != ref.return_type) {
+                valid = false; return;
+            }
+            expr = make_uniq<BoundReferenceExpression>(ref.return_type, idx_t(it - bindings.begin()));
+            return;
+        }
+        ExpressionIterator::EnumerateChildren(*expr, bind);
+    };
+    VexScanOutputStep step;
+    step.bindings = node->GetColumnBindings();
+    if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+        for (auto &expr : node->expressions) {
+            auto copy = expr->Copy();
+            bind(copy);
+            step.types.push_back(copy->return_type);
+            step.expressions.push_back(std::move(copy));
+        }
+    } else {
+        auto conjunction = make_uniq<BoundConjunctionExpression>(ExpressionType::CONJUNCTION_AND);
+        for (auto &expr : node->expressions) {
+            auto copy = expr->Copy();
+            bind(copy);
+            conjunction->children.push_back(std::move(copy));
+        }
+        if (!conjunction->children.empty()) step.predicate = std::move(conjunction);
+        const auto &map = node->Cast<LogicalFilter>().projection_map;
+        for (idx_t i = 0; i < (map.empty() ? input_types.size() : map.size()); ++i) {
+            const auto pos = map.empty() ? i : map[i];
+            if (pos >= input_types.size()) return;
+            step.types.push_back(input_types[pos]);
+            step.expressions.push_back(make_uniq<BoundReferenceExpression>(input_types[pos], pos));
+        }
+    }
+    if (!valid || step.types.empty() || step.types.size() != step.bindings.size()) return;
+    scan->output_steps.push_back(std::move(step));
+    auto replacement = std::move(node->children[0]);
+    node = std::move(replacement);
+    node->ResolveOperatorTypes();
 }
 
 void VexOptimizerExtension::OptimizeNode(ClientContext &context, unique_ptr<LogicalOperator> &node) {
@@ -529,18 +826,23 @@ void VexOptimizerExtension::OptimizeNode(ClientContext &context, unique_ptr<Logi
         OptimizeNode(context, child);
     }
 
+    TryFuseScanOutput(node);
+    TryNativeTopNFetch(context, node);
+
     if (node->type == LogicalOperatorType::LOGICAL_TOP_N) {
         auto &topn = node->Cast<LogicalTopN>();
         if (topn.orders.size() != 1) {
             return;
         }
         GetChildInfo get_info;
-        if (!FindGetChild(*topn.children[0], get_info)) {
+        if (!FindGetChild(topn.children[0], get_info)) {
             return;
         }
+        if (FilteredSearchMode(context) == "exact" && (!get_info.filters.empty() ||
+            !get_info.get->table_filters.filters.empty())) return;
         DistanceOrderInfo dist_info;
-        if (!TryResolveDistanceOrder(topn.orders[0].expression.get(), get_info.get, get_info.proj,
-                                     topn.orders[0].type, dist_info)) {
+        if (!TryResolveDistanceOrder(topn.orders[0].expression.get(), get_info.get, get_info.projections,
+                                     topn.orders[0].type, topn.orders[0].null_order, FilteredSearchMode(context) == "auto", dist_info)) {
             return;
         }
         (void)TryOptimizeANN(context, node, topn.children[0], get_info, dist_info, topn.limit, topn.offset);
@@ -570,12 +872,14 @@ void VexOptimizerExtension::OptimizeNode(ClientContext &context, unique_ptr<Logi
             return;
         }
         GetChildInfo get_info;
-        if (!FindGetChild(*order_node.children[0], get_info)) {
+        if (!FindGetChild(order_node.children[0], get_info)) {
             return;
         }
+        if (FilteredSearchMode(context) == "exact" && (!get_info.filters.empty() ||
+            !get_info.get->table_filters.filters.empty())) return;
         DistanceOrderInfo dist_info;
-        if (!TryResolveDistanceOrder(order_node.orders[0].expression.get(), get_info.get, get_info.proj,
-                                     order_node.orders[0].type, dist_info)) {
+        if (!TryResolveDistanceOrder(order_node.orders[0].expression.get(), get_info.get, get_info.projections,
+                                     order_node.orders[0].type, order_node.orders[0].null_order, FilteredSearchMode(context) == "auto", dist_info)) {
             return;
         }
         (void)TryOptimizeANN(context, node, order_node.children[0], get_info, dist_info,

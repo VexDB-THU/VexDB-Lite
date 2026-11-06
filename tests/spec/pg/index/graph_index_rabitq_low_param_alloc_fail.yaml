@@ -18,3 +18,23 @@ steps:
   - query: SELECT count(*) FROM (SELECT id FROM t_1078975 ORDER BY v <-> '[1,2,3,4,5,6,7,8]'::floatvector LIMIT 5) s;
     expect: [["5"]]
   - statement: DROP INDEX idx_1078975;
+
+  # A fixed 50k-row sample allocation overflowed or exceeded PostgreSQL's
+  # single-allocation limit for high dimensions before the code could fall
+  # back. Respect maintenance_work_mem and build a plain index instead.
+  - statement: SET maintenance_work_mem = '64MB';
+  - statement: DROP TABLE IF EXISTS t_rabitq_high_dim_alloc;
+  - statement: CREATE TABLE t_rabitq_high_dim_alloc (id int, v floatvector(8192));
+  - statement: >
+      INSERT INTO t_rabitq_high_dim_alloc VALUES
+      (1, ('[' || repeat('0,', 8191) || '0]')::floatvector(8192)),
+      (2, ('[' || repeat('1,', 8191) || '1]')::floatvector(8192));
+  - statement: >
+      CREATE INDEX idx_rabitq_high_dim_alloc ON t_rabitq_high_dim_alloc
+      USING vexdb_graph (v floatvector_l2_ops) WITH (quantizer = rabitq);
+  - query: >
+      SELECT content::text FROM index_inspect('idx_rabitq_high_dim_alloc')
+      WHERE attribute = 'Working Quantizer';
+    expect: [["Plain Vector"]]
+  - statement: DROP TABLE t_rabitq_high_dim_alloc CASCADE;
+  - statement: DROP TABLE t_1078975 CASCADE;

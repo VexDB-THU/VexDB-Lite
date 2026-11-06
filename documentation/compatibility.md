@@ -2,6 +2,8 @@
 
 本文档列出 VexDB 各产物所支持的数据库版本、操作系统和 CPU 架构。
 
+> 2026-10-26 校正：数据库目标和当前 CI 范围如下。历史系统、架构和库依赖表保留为既有产物记录，不能代表当前提交重新通过了全部平台验收。当前 CI artifact 与正式 Release 的兼容性承诺分开，详见 [当前状态](current-status.md)。
+
 ---
 
 ## 支持矩阵
@@ -17,10 +19,17 @@
 
 | 数据库 | 支持版本 | 说明 |
 |--------|----------|------|
-| DuckDB | **v1.5.2** | 当前唯一支持版本 |
-| DuckDB | 其他版本 | 不兼容（扩展 API 与 metadata footer 格式随版本变化） |
+| DuckDB | **v1.5.2** | 默认构建与当前 spec CI 目标 |
+| DuckDB | v1.5.5 | 历史记录有 macOS arm64 构建与冒烟，完整跨平台 spec 未确认 |
+| DuckDB | 其他版本 | 需要分别构建和验证，不能复用其他版本扩展 |
 
-> DuckDB 扩展与运行时版本严格绑定。加载前请通过 `SELECT version()` 确认版本为 v1.5.2。
+> DuckDB 扩展与运行时版本严格绑定。加载前请通过 `SELECT version()` 确认与构建目标完全相同。
+
+### SQLite 扩展与统一 CLI
+
+默认 vendor SQLite 3.45.3；动态扩展宿主最低 3.24。SQLite 构建有 Linux、macOS、Android 和 iOS 入口，但构建入口存在不等于设备与发布验收完成。
+Android CI 编译 arm64-v8a/x86_64 库；iOS 使用本地静态库构建。
+原生 Windows 工作流已归档，尚无支持承诺。
 
 ---
 
@@ -44,7 +53,7 @@
 | macOS 14 / 15 | arm64 (Apple Silicon) | 🔧 源码构建 | 开发者本地构建可用，不在 Release 中发布 |
 | macOS 13 | x86_64 | 🔧 源码构建 | 同上 |
 
-> macOS 产物不在预编译 Release 中发布，仅供本地开发使用。
+> 上表保留的是 PG/DuckDB 的历史说明。SQLite/VexFS 另有 macOS 统一技术预览包，默认 NFS 路径最低目标为 macOS 13，FSKit 为 macOS 26+ 的可选路径。实际安装、签名与公证状态以对应包的 MANIFEST 和验证记录为准；本次未查询远端 Release。
 
 ---
 
@@ -69,7 +78,7 @@
 | DuckDB 扩展（Linux） | **2.28** |
 | PG 插件（Linux） | **2.28** |
 
-两者均通过 manylinux_2_28 工具链或等效 GCC 10.3 / 9.3 编译，不支持 glibc < 2.28 的旧系统（如 CentOS 6）。
+上表对应历史发布链路。当前 Linux CI 使用 Ubuntu 24.04，上传的 CI artifact 不承诺可在 glibc 2.28 上运行；正式分发需走发布脚本并核对实际依赖。
 
 ### libstdc++ / GLIBCXX
 
@@ -79,7 +88,7 @@
 | `vexdb_lite.so`（x86） | `GLIBCXX_3.4.26` | x86 host GCC 10.3 |
 | `vexdb_lite.so`（ARM） | `GLIBCXX_3.4.26`（或更低） | ARM host GCC 9.3（Kylin V10 SP1 系统） |
 
-> DuckDB 扩展通过 manylinux_2_28 容器构建，GLIBCXX 上限有硬校验（`GLIBCXX_MAX=3.4.22`）；PG 插件走 host GCC，当前未做同等校验，实际依赖 GLIBCXX_3.4.26。
+> 上表是历史工具链记录。发布脚本中的 DuckDB GLIBCXX 上限校验仍需执行；PG、SQLite 和具体 Release 的实际依赖应检查对应产物，不能从 CI 编译成功推断。
 
 CentOS 7 默认 libstdc++ 为 GLIBCXX_3.4.19，需手动升级：
 
@@ -93,9 +102,9 @@ conda install -c conda-forge libstdcxx-ng
 
 | 场景 | 状态 | 原因 |
 |------|------|------|
-| DuckDB ≠ v1.5.2 | ❌ 不支持 | 扩展 API 与 metadata footer 格式随版本变化 |
+| DuckDB 运行时与构建版本不同 | ❌ 不支持 | 扩展 API 与 metadata footer 随版本变化，必须分别构建 |
 | PostgreSQL < 16 或 > 19 | ❌ 不支持 | 仅适配 PG 16-19 |
 | ARMv8.0 及更早（如 Cortex-A53/A57） | ❌ 不支持 | 构建使用 `+lse` 扩展指令，旧核触发 SIGILL |
-| Windows | ❌ 暂不支持 | 未适配 Windows 构建系统 |
+| Windows | ❌ 暂不支持 | 原生适配未完成，旧工作流已归档 |
 | CentOS 7 默认环境 | ⚠️ 需手动升级 libstdc++ | GLIBCXX 版本低 |
 | CMake 4.x 构建 DuckDB 扩展 | ❌ 不兼容 | CMake 4.x 与 DuckDB v1.5.2 `link_threads` 检查冲突；请用 3.28.x |

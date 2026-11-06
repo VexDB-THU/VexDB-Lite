@@ -1,0 +1,64 @@
+name: index__filtered_hybrid_search
+tags: [vex, regression]
+engines: [duckdb]
+description: Explicit scalar/vector integration preserves physical column bindings, predicates, views and exact rollback.
+steps:
+- statement: RESET vexdb_filtered_search_mode;
+- statement: RESET vexdb_graph_bidirectional_search;
+- query: SELECT CAST(current_setting('vexdb_graph_bidirectional_search') AS INTEGER);
+  _field_types: I
+  expect: [[0]]
+- query: SELECT current_setting('vexdb_filtered_search_mode');
+  _field_types: I
+  expect: [[exact]]
+- statement: SET vexdb_brute_force_threshold=0;
+- statement: SET vexdb_ef_search=2048;
+- statement: SET vexdb_pq_search_mode='pq_graph';
+- statement: SET vexdb_pq_refine_k_factor=16;
+- statement: CREATE TABLE scalar_hybrid AS SELECT (i%10)::INTEGER tenant, [i::FLOAT,0::FLOAT,0::FLOAT,0::FLOAT]::FLOAT[4] vec, i::INTEGER id, CASE WHEN i%3=0 THEN NULL ELSE i%7 END tag FROM range(1000)t(i);
+- statement: CREATE INDEX scalar_hybrid_idx ON scalar_hybrid USING GRAPH_INDEX(vec) WITH(quantizer='pq',pq_m=1,threads=1);
+- statement: SET vexdb_filtered_search_mode='auto';
+- statement: SET vexdb_graph_bidirectional_search=true;
+- query: EXPLAIN SELECT id FROM scalar_hybrid WHERE tenant=9 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: II
+  expect:
+  - [physical_plan, '<!REGEX>:.*VEXDB_INDEX_SCAN.*']
+- query: EXPLAIN SELECT id FROM scalar_hybrid WHERE id%10=9 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: II
+  expect:
+  - [physical_plan, '<REGEX>:.*snapshot-visible.*']
+- query: SELECT id FROM scalar_hybrid WHERE id%10=9 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[9],[19],[29]]
+- query: SELECT id FROM scalar_hybrid WHERE tenant=9 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[9],[19],[29]]
+- query: SELECT id FROM scalar_hybrid WHERE tenant=9 AND tag IS NULL ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[9],[39],[69]]
+- query: SELECT id FROM scalar_hybrid WHERE id>=998 OR tenant=999 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 10;
+  _field_types: I
+  expect: [[998],[999]]
+- query: SELECT count(*) FROM (SELECT id FROM scalar_hybrid WHERE tenant=999 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 10);
+  _field_types: I
+  expect: [[0]]
+- statement: CREATE VIEW scalar_hybrid_view AS SELECT tenant account,vec embedding,id FROM scalar_hybrid;
+- query: SELECT id FROM scalar_hybrid_view WHERE account=9 ORDER BY l2_distance(embedding,[0,0,0,0]::FLOAT[4]) LIMIT 3 OFFSET 1;
+  _field_types: I
+  expect: [[19],[29],[39]]
+- statement: SET vexdb_filtered_search_mode='exact';
+- query: EXPLAIN SELECT id FROM scalar_hybrid WHERE tenant=9 ORDER BY l2_distance(vec,[0,0,0,0]::FLOAT[4]) LIMIT 3;
+  _field_types: II
+  expect:
+  - [physical_plan, '<!REGEX>:.*VEXDB_INDEX_SCAN.*']
+- query: SELECT struct_extract(vexdb_search_queue_state(),'active'),struct_extract(vexdb_search_queue_state(),'waiting');
+  _field_types: II
+  expect: [[0,0]]
+- statement: DROP VIEW scalar_hybrid_view;
+- statement: DROP TABLE scalar_hybrid;
+- statement: RESET vexdb_filtered_search_mode;
+- statement: RESET vexdb_brute_force_threshold;
+- statement: RESET vexdb_ef_search;
+- statement: RESET vexdb_pq_search_mode;
+- statement: RESET vexdb_pq_refine_k_factor;
+- statement: RESET vexdb_graph_bidirectional_search;

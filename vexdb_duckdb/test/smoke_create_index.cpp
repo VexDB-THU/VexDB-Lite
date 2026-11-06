@@ -75,6 +75,9 @@ int main(int argc, char **argv) {
         Connection con(db);
 
         ExecOrThrow(con, "LOAD '" + std::string(argv[1]) + "'");
+        // The smoke test is specifically checking the optimizer/index-scan path.
+        // Keep it independent from the production small-table exact-scan default.
+        ExecOrThrow(con, "SET vexdb_brute_force_threshold=1");
         ExecOrThrow(con, "CREATE TABLE t (id INTEGER, vec FLOAT[3])");
         {
             Appender app(con, "t");

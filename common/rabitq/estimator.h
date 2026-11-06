@@ -6,7 +6,7 @@
 #ifndef RABITQ_ESTIMATOR_H
 #define RABITQ_ESTIMATOR_H
 
-#include "pg_compat.h"
+#include "rabitq/platform.h"
 #include "rabitq/query.h"
 #include "rabitq/utils.h"
 #include "rabitq/rabitq.h"
@@ -16,7 +16,7 @@ namespace rabitq {
 
 PERF_DECLARE_CATS(RaBitQPerfCats, false, bincmp, fullcmp);
 
-class RaBitQEstimator : public BaseObject, public PERFER(RaBitQPerfCats) {
+class RaBitQEstimator : public PERFER(RaBitQPerfCats) {
 public:
     using PerfCats = RaBitQPerfCats;
 
@@ -25,19 +25,33 @@ public:
           _metric(metric == Metric::L2 ? Metric::L2 : Metric::INNER_PRODUCT),
           _rescaling_factor(rescaling_factor),
           _bin_code_size(RABITQ_BIN_CODE_SIZE(_padded_dim)),
-          _ext_code_size(RABITQ_EXT_CODE_SIZE(_padded_dim))
+          _ext_code_size(RABITQ_EXT_CODE_SIZE(_padded_dim)),
+          _warmup_ip_x0_q(nullptr),
+          _ip_fxi(nullptr),
+          _mask_ip_x0_q(nullptr)
     {
+        auto kernels = ann_helper::get_rabitq_kernels();
+        _warmup_ip_x0_q = kernels.warmup_ip_x0_q;
+        _ip_fxi = kernels.ip_fxi;
+        _mask_ip_x0_q = kernels.mask_ip_x0_q;
+        if (!_warmup_ip_x0_q || !_ip_fxi || !_mask_ip_x0_q) {
+            fail("SIMD estimator kernels are unavailable");
+        }
         _rotated_query = alloc_floatvector(_padded_dim, 1);
-        _q_to_centroids = (float *)palloc0(2 * HNSW_RABITQ_NUM_CLUSTERS * sizeof(float));
+        _q_to_centroids = alloc_array_zero<float>(2 * HNSW_RABITQ_NUM_CLUSTERS);
         _l2_sqrt = ann_helper::get_general_distance_func(Metric::L2_SQRT, _padded_dim);
         _neg_dot_product = ann_helper::get_general_distance_func(Metric::INNER_PRODUCT, _padded_dim);
-        _query_wrapper = NEW QueryWrapper(_padded_dim, _metric);
+        _query_wrapper = make_object<QueryWrapper>(_padded_dim, _metric);
     }
 
     RaBitQEstimator()
         : _rotated_query(NULL),
           _q_to_centroids(NULL),
           _query_wrapper(NULL) {}
+    ~RaBitQEstimator() { destroy(); }
+
+    RaBitQEstimator(const RaBitQEstimator &) = delete;
+    RaBitQEstimator &operator=(const RaBitQEstimator &) = delete;
 
     RaBitQuantizer *get_quantizer() { return _quantizer; }
     void set_quantizer(RaBitQuantizer *quantizer) { _quantizer = quantizer; }
@@ -53,10 +67,14 @@ public:
     void destroy()
     {
         free_vector(_rotated_query);
-        pfree(_q_to_centroids);
+        _rotated_query = nullptr;
+        free_mem(_q_to_centroids);
+        _q_to_centroids = nullptr;
         PERF_DESTROY();
-        _query_wrapper->destroy();
-        delete _query_wrapper;
+        if (_query_wrapper) {
+            destroy_object(_query_wrapper);
+            _query_wrapper = nullptr;
+        }
     };
 
 private:
@@ -95,6 +113,9 @@ private:
     float *_q_to_centroids;
     ann_helper::distance_func _l2_sqrt;
     ann_helper::distance_func _neg_dot_product;
+    ann_helper::warmup_ip_x0_q_func _warmup_ip_x0_q;
+    ann_helper::ip_fxi_func _ip_fxi;
+    ann_helper::mask_ip_x0_q_func _mask_ip_x0_q;
     RaBitQuantizer *_quantizer{NULL};
     QueryWrapper *_query_wrapper;
 };

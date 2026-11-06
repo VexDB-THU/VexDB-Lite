@@ -3,6 +3,8 @@
 #include "vex_functions.hpp"
 #include "vex_graph_index.hpp"
 #include "vex_optimizer.hpp"
+#include "vex_search_admission.hpp"
+#include "vex_search_profile.hpp"
 
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
@@ -35,6 +37,42 @@ static void VexGraphMirrorUsedFunction(DataChunk &args, ExpressionState &state, 
     result.SetVectorType(VectorType::CONSTANT_VECTOR);
 }
 
+static void SetSearchConcurrency(ClientContext &, SetScope scope, Value &value) {
+    // DuckDB 1.5.2 RESET of an extension option defaults to SESSION even when
+    // SET defaults to GLOBAL. Require explicit scope for both operations.
+    if (scope != SetScope::GLOBAL) {
+        throw InvalidInputException("vexdb_search_concurrency is database-wide; use SET GLOBAL or RESET GLOBAL");
+    }
+    if (value.IsNull() || value.GetValue<int64_t>() < -1) {
+        throw InvalidInputException("vexdb_search_concurrency must be -1 (CPU count), 0 (unlimited), or positive");
+    }
+}
+
+static void SetSearchQueueTimeout(ClientContext &, SetScope, Value &value) {
+    if (value.IsNull()) throw InvalidInputException("vexdb_search_queue_timeout_ms cannot be NULL");
+}
+
+static LogicalType SearchQueueStateType() {
+    // DuckDB's C++11 core defines its static type IDs out of line. Passing one
+    // through pair's forwarding constructor can also emit a C++17 definition.
+    const LogicalType counter_type(LogicalTypeId::UBIGINT);
+    return LogicalType::STRUCT({{"limit", counter_type}, {"active", counter_type},
+        {"waiting", counter_type}, {"admitted", counter_type},
+        {"cancelled", counter_type}, {"timed_out", counter_type},
+        {"peak_active", counter_type}});
+}
+
+static void SearchQueueState(DataChunk &, ExpressionState &state, Vector &result) {
+    auto &db = *state.GetContext().db;
+    auto admission = VexSearchAdmission::Get(db);
+    const auto snapshot = admission->queue.GetSnapshot();
+    result.SetValue(0, Value::STRUCT({{"limit", Value::UBIGINT(admission->GetLimit(db))},
+        {"active", Value::UBIGINT(snapshot.active)}, {"waiting", Value::UBIGINT(snapshot.waiting)},
+        {"admitted", Value::UBIGINT(snapshot.admitted)}, {"cancelled", Value::UBIGINT(snapshot.cancelled)},
+        {"timed_out", Value::UBIGINT(snapshot.timed_out)}, {"peak_active", Value::UBIGINT(snapshot.peak_active)}}));
+    result.SetVectorType(VectorType::CONSTANT_VECTOR);
+}
+
 static void RegisterIndexTypes(DBConfig &config) {
     IndexType graph_index_type;
     graph_index_type.name = GraphIndex::TYPE_NAME;
@@ -53,6 +91,12 @@ void LoadInternal(ExtensionLoader &loader) {
     loader.RegisterFunction(ScalarFunction("vexdb_version", {}, LogicalType::VARCHAR, VexVersionFunction));
     loader.RegisterFunction(
         ScalarFunction("vexdb_graph_mirror_used", {}, LogicalType::UBIGINT, VexGraphMirrorUsedFunction));
+    ScalarFunction queue_state("vexdb_search_queue_state", {}, SearchQueueStateType(), SearchQueueState);
+    queue_state.stability = FunctionStability::VOLATILE;
+    loader.RegisterFunction(queue_state);
+    ScalarFunction search_profile("vexdb_last_search_profile", {}, VexSearchProfileType(), VexLastSearchProfile);
+    search_profile.stability = FunctionStability::VOLATILE;
+    loader.RegisterFunction(search_profile);
 
     auto &db = loader.GetDatabaseInstance();
     auto &config = DBConfig::GetConfig(db);
@@ -62,6 +106,29 @@ void LoadInternal(ExtensionLoader &loader) {
 
     config.AddExtensionOption("vexdb_ef_search", "Search expansion factor for GRAPH_INDEX.",
                               LogicalType::INTEGER, Value::INTEGER(40));
+    config.AddExtensionOption("vexdb_search_profile",
+                              "Collect connection-local stage times for VEXDB_INDEX_SCAN; inspect the previous SQL "
+                              "with vexdb_last_search_profile(). Nested times are not additive. Disabled by default.",
+                              LogicalType::BOOLEAN, Value::BOOLEAN(false));
+    config.AddExtensionOption("vexdb_graph_bidirectional_search",
+                              "Also follow reverse base-layer edges using a query-independent topology cache.",
+                              LogicalType::BOOLEAN, Value::BOOLEAN(false));
+    config.AddExtensionOption("vexdb_native_topn_fetch",
+                              "Fetch selected native vector TopN rows directly instead of rescanning output columns.",
+                              LogicalType::BOOLEAN, Value::BOOLEAN(false));
+    config.AddExtensionOption("vexdb_filtered_search_mode",
+                              "Scalar-filter/vector integration: 'auto' builds snapshot-visible allowed rows, "
+                              "then chooses exact or filtered graph/PQ search; 'exact' retains natural filtered SQL.",
+                              LogicalType::VARCHAR, Value("exact"));
+    config.AddExtensionOption("vexdb_search_concurrency",
+                              "Database-wide FIFO limit for VEXDB_INDEX_SCAN searches. "
+                              "0 = unlimited (default), -1 = hardware CPU count, positive = explicit limit. "
+                              "Requires SET GLOBAL / RESET GLOBAL. Existing searches drain on a decrease.",
+                              LogicalType::BIGINT, Value::BIGINT(0), SetSearchConcurrency, SetScope::GLOBAL);
+    config.AddExtensionOption("vexdb_search_queue_timeout_ms",
+                              "Maximum wait for a VEXDB_INDEX_SCAN search slot in milliseconds. "
+                              "0 = no wait deadline. Does not limit execution time. Interrupt() cancels waiting.",
+                              LogicalType::UBIGINT, Value::UBIGINT(0), SetSearchQueueTimeout);
     config.AddExtensionOption("vexdb_brute_force_threshold",
                               "Run exact brute-force search when index row count <= threshold. "
                               "Below ~10k rows ANN offers no perf win but loses recall, so default "
@@ -69,9 +136,9 @@ void LoadInternal(ExtensionLoader &loader) {
                               "churn where recall has degraded.",
                               LogicalType::UBIGINT, Value::UBIGINT(10000));
     // off (default): search ignores PQ, runs HNSW on raw vectors.
-    // pq_only:       brute-force over PQ codes using a precomputed distance
-    //                table. Approximate but fast for small indexes; useful
-    //                as a way to verify PQ training is healthy.
+    // pq_only:       graph search over PQ codes using a precomputed distance
+    //                table. Approximate, scalable, and useful as a way to
+    //                verify PQ training is healthy.
     config.AddExtensionOption("vexdb_pq_search_mode",
                               "PQ search mode for GRAPH_INDEX: 'off', 'pq_only' (full scan), "
                               "or 'pq_graph' (graph navigation, non-compact L2/cosine).",

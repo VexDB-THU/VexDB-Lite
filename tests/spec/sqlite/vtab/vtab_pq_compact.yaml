@@ -1,0 +1,164 @@
+name: sqlite__vtab_pq_compact
+tags: [vex, sqlite, pq, compact, persistence, diskstore, metrics]
+description: SQLite 复用公共 PQ 算法，compact 只保存 code；覆盖三种距离、增量写入和重启恢复。
+steps:
+# 参数边界：compact 默认自动选 PQ；显式 none、非法 pq_m 和 RaBitQ 混用必须报错。
+- statement: CREATE VIRTUAL TABLE bad_none USING GRAPH_INDEX(v FLOAT[8], memory_mode=compact, quantizer=none);
+  expect_error: requires quantizer='pq' or quantizer='rabitq'
+- statement: CREATE VIRTUAL TABLE bad_name USING GRAPH_INDEX(v FLOAT[8], quantizer=other);
+  expect_error: quantizer must be
+- statement: CREATE VIRTUAL TABLE bad_mix USING GRAPH_INDEX(v FLOAT[8], quantizer=rabitq, pq_m=4);
+  expect_error: cannot be combined
+- statement: CREATE VIRTUAL TABLE bad_divisor USING GRAPH_INDEX(v FLOAT[8], quantizer=pq, pq_m=3);
+  expect_error: positive divisor
+- statement: CREATE VIRTUAL TABLE bad_number USING GRAPH_INDEX(v FLOAT[8], quantizer=pq, pq_m=abc);
+  expect_error: non-negative integer
+
+- statement: CREATE VIRTUAL TABLE auto_pq USING GRAPH_INDEX(v FLOAT[8], memory_mode=compact);
+- query: SELECT value FROM auto_pq_config WHERE key = 'quantizer';
+  expect:
+  - - pq
+- query: SELECT value FROM auto_pq_config WHERE key = 'pq_m';
+  expect:
+  - - 2
+- statement: DROP TABLE auto_pq;
+
+# 子向量维度 2 不是当前 NEON/SSE 的整向量宽度；300 行强制走 K-means，
+# 防止训练 dispatcher 按原始 dim 选择无 tail kernel 后越界读取。
+- statement: CREATE VIRTUAL TABLE idx_tail USING GRAPH_INDEX(v FLOAT[6], metric=l2, quantizer=pq, pq_m=3, memory_mode=compact, ef_search=160, brute_force_threshold=0);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 300)
+    INSERT INTO idx_tail(rowid, v)
+    SELECT i, '[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                      (i%13) || ',' || (i%17) || ',' || (i%19) || ']' FROM c;
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_tail WHERE v MATCH '[123,4,2,6,4,9]' AND k = 160) WHERE rowid = 123;
+  expect:
+  - - 1
+- statement: DROP TABLE idx_tail;
+
+# Full PQ：保留索引侧 raw mirror，同时持久化 PQ codebook/code。
+- statement: CREATE VIRTUAL TABLE idx_full USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=pq, pq_m=4, memory_mode=full, ef_search=160, brute_force_threshold=0);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 180)
+    INSERT INTO idx_full(rowid, v)
+    SELECT i, '[' || i || ',' || (i%7) || ',' || (i%11) || ',' || (i%13) || ',' ||
+                      (i%17) || ',' || (i%19) || ',' || (i%23) || ',' || (i%29) || ']' FROM c;
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_full WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 64) WHERE rowid = 125;
+  expect:
+  - - 1
+- statement: INSERT INTO idx_full(rowid, v) VALUES (8501, '[150,3,8,8,16,0,15,8]');
+- query: SELECT group_concat(kind, ',') FROM (SELECT DISTINCT kind FROM idx_full_graph ORDER BY kind);
+  expect:
+  - - 0,1,2,3,4,5,6
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_full WHERE v MATCH '[150,3,8,8,16,0,15,8]' AND k = 64) WHERE rowid = 8501;
+  expect:
+  - - 1
+
+# L2：内存图建图、code-only 持久化、重启、重启后增量写入。
+- statement: CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=pq, pq_m=4, memory_mode=compact, m=16, ef_construction=160, ef_search=160, brute_force_threshold=0);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 240)
+    INSERT INTO idx(rowid, v)
+    SELECT i, vexdb_f32('[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                              (i%13) || ',' || (i%17) || ',' || (i%19) || ',' ||
+                              (i%23) || ',' || (i%29) || ']') FROM c;
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 64) WHERE rowid = 125;
+  expect:
+  - - 1
+- statement: INSERT INTO idx(rowid, v) VALUES (9001, '[150,3,8,8,16,0,15,8]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150,3,8,8,16,0,15,8]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 1
+- query: SELECT group_concat(kind, ',') FROM (SELECT DISTINCT kind FROM idx_graph ORDER BY kind);
+  expect:
+  - - 0,1,2,3,5,6
+- query: SELECT count(*) FROM idx_graph WHERE kind = 4;
+  expect:
+  - - 0
+- raw_directive: restart
+- query: SELECT count(*) FROM idx_graph WHERE kind = 4;
+  expect:
+  - - 0
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150,3,8,8,16,0,15,8]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 1
+- statement: INSERT INTO idx(rowid, v) VALUES (9002, '[175,0,0,7,7,6,17,4]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[175,0,0,7,7,6,17,4]' AND k = 64) WHERE rowid = 9002;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[175,0,0,7,7,6,17,4]' AND k = 64) WHERE rowid = 9002;
+  expect:
+  - - 1
+- statement: DELETE FROM idx WHERE rowid = 9001;
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150,3,8,8,16,0,15,8]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 0
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx WHERE v MATCH '[150,3,8,8,16,0,15,8]' AND k = 64) WHERE rowid = 9001;
+  expect:
+  - - 0
+
+# Cosine：归一化后复用 L2 PQ lookup，用户距离仍是 cosine distance。
+- statement: CREATE VIRTUAL TABLE idx_cos USING GRAPH_INDEX(v FLOAT[8], metric=cosine, quantizer=pq, pq_m=4, memory_mode=compact, ef_search=160, brute_force_threshold=0);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 200)
+    INSERT INTO idx_cos(rowid, v)
+    SELECT i, '[' || 0.01 || ',' || (1 + i%9) || ',' || (2 + i%7) || ',' ||
+                      (3 + i%5) || ',' || (4 + i%11) || ',' || (5 + i%13) || ',' ||
+                      (6 + i%17) || ',' || (7 + i%19) || ']' FROM c;
+- statement: INSERT INTO idx_cos(rowid, v) VALUES (7001, '[100,0,0,0,0,0,0,0]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_cos WHERE v MATCH '[1,0,0,0,0,0,0,0]' AND k = 32) WHERE rowid = 7001;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_cos WHERE v MATCH '[1,0,0,0,0,0,0,0]' AND k = 32) WHERE rowid = 7001;
+  expect:
+  - - 1
+
+# Inner product：PQ 使用公共 inner-product lookup，返回值保持负内积排序语义。
+- statement: CREATE VIRTUAL TABLE idx_ip USING GRAPH_INDEX(v FLOAT[8], metric=ip, quantizer=pq, pq_m=4, memory_mode=compact, ef_search=160, brute_force_threshold=0);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 200)
+    INSERT INTO idx_ip(rowid, v)
+    SELECT i, '[' || (i%3) || ',' || (i%5) || ',' || (i%7) || ',' ||
+                      (i%11) || ',' || (i%13) || ',' || (i%17) || ',' ||
+                      (i%19) || ',' || (i%23) || ']' FROM c;
+- statement: INSERT INTO idx_ip(rowid, v) VALUES (8001, '[100,100,100,100,100,100,100,100]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_ip WHERE v MATCH '[1,1,1,1,1,1,1,1]' AND k = 32) WHERE rowid = 8001;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_ip WHERE v MATCH '[1,1,1,1,1,1,1,1]' AND k = 32) WHERE rowid = 8001;
+  expect:
+  - - 1
+
+# 低内存预算强制走 DiskStore；base 与 PQ code 共用缓存，仍不产生 kind=4。
+- statement: CREATE VIRTUAL TABLE idx_disk USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=pq, pq_m=4, memory_mode=compact, m=16, ef_construction=160, ef_search=160, brute_force_threshold=0, graph_memory_limit=20000);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 240)
+    INSERT INTO idx_disk(rowid, v)
+    SELECT i, vexdb_f32('[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                              (i%13) || ',' || (i%17) || ',' || (i%19) || ',' ||
+                              (i%23) || ',' || (i%29) || ']') FROM c;
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[200,4,2,5,13,10,16,26]' AND k = 64) WHERE rowid = 200;
+  expect:
+  - - 1
+- query: SELECT group_concat(kind, ',') FROM (SELECT DISTINCT kind FROM idx_disk_graph ORDER BY kind);
+  expect:
+  - - 0,1,2,3,5,6
+- query: SELECT count(*) FROM idx_disk_graph WHERE kind = 4;
+  expect:
+  - - 0
+- statement: INSERT INTO idx_disk(rowid, v) VALUES (9100, '[210,0,2,3,8,3,6,10]');
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[210,0,2,3,8,3,6,10]' AND k = 64) WHERE rowid = 9100;
+  expect:
+  - - 1
+- raw_directive: restart
+- query: SELECT count(*) FROM idx_disk_graph WHERE kind = 4;
+  expect:
+  - - 0
+- query: SELECT count(*) FROM (SELECT rowid FROM idx_disk WHERE v MATCH '[210,0,2,3,8,3,6,10]' AND k = 64) WHERE rowid = 9100;
+  expect:
+  - - 1

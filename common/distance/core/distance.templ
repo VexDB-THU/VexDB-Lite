@@ -31,23 +31,16 @@ static_assert(false, "Please specify arch");
     BOOST_PP_SEQ_ELEM(3, product)
 #define DISTANCER_TEMPLATE(r, product) \
     Distancer<CUR_ARCH, TEMPLATE_EXPAND(r, product)>
-#define DECLARE_DISTANCER(r, product) \
-    template <> \
-    struct DISTANCER_TEMPLATE(r, product) { \
-        static float get_distance_single(const void *x, const void *y, uint16 dim); \
-        static void get_distance_batch2(const void *x, void *const *y, uint16 dim, uint16 y_size, float *out); \
-    };
 #define DECLARE_IMPL1(r, product) \
-    float DISTANCER_TEMPLATE(r, product)::get_distance_single(const void *x, const void *y, uint16 dim) \
+    template <> float DISTANCER_TEMPLATE(r, product)::get_distance_single(const void *x, const void *y, uint16 dim) \
     { return PatcherName::Distancer<TEMPLATE_EXPAND(r, product)>::get_distance_single(x, y, dim); }
 #define DECLARE_IMPL2(r, product) \
-    void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
+    template <> void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
         const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) \
     { PatcherName::Distancer<TEMPLATE_EXPAND(r, product)>::get_distance_batch2(x, y, dim, y_size, out); }
 #define DECLARE_END(r, product) \
     template struct DISTANCER_TEMPLATE(r, product);
 #define RENDER_PRODUCTS(r, product) \
-    DECLARE_DISTANCER(r, product) \
     DECLARE_IMPL1(r, product) \
     DECLARE_IMPL2(r, product) \
     DECLARE_END(r, product)
@@ -121,11 +114,10 @@ BOOST_PP_SEQ_FOR_EACH_PRODUCT(RENDER_TRANSFORM_PRODUCTS, T_PRODUCT_SETS)
 #undef DECLARE_IMPL2
 #undef RENDER_PRODUCTS
 #define DECLARE_IMPL2(r, product) \
-    void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
+    template <> void DISTANCER_TEMPLATE(r, product)::get_distance_batch2( \
         const void *x, void *const *y, uint16 dim, uint16 y_size, float *out) const \
     { Assert(false); }
 #define RENDER_PRODUCTS(r, product) \
-    DECLARE_DISTANCER(r, product) \
     DECLARE_IMPL1(r, product) \
     DECLARE_IMPL2(r, product) \
     DECLARE_END(r, product)

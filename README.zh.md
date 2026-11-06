@@ -2,7 +2,7 @@
 
 **[English](README.md)** | **中文**
 
-`VexDB-Lite` 是一个数据库能力扩展，提供 PostgreSQL、DuckDB 和 SQLite 三种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和量化器内核。SQLite 版还内置 VexFS 文件能力，让同一个数据库同时保存普通表、向量索引和文件。
+`VexDB-Lite` 是一个数据库能力扩展，提供 PostgreSQL、DuckDB 和 SQLite 三种适配形式，共享同一套 graph_index 图索引算法、SIMD 距离分发和 PQ/RaBitQ 量化内核。SQLite 版还内置 VexFS 文件能力，让同一个数据库同时保存普通表、向量索引和文件。
 
 > DuckDB 扩展详见 [vexdb_duckdb/README.md](vexdb_duckdb/README.md)。  
 > 本根 README 只做项目级综述与构建总览。
@@ -22,8 +22,8 @@
   - `inner_product`（负内积/最大内积检索用 `<~>`）
 - 标量工具：`vector_dims()`、`vector_norm()`、`l2_normalize()`、`vexdb_index_info()`
 - `CREATE INDEX ... USING vexdb_graph`
-- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer` / `pq_m`（PQ）
-- 产品量化 PQ + compact 模式
+- 索引参数：`m`、`ef_construction`、`parallel_workers`、`quantizer`（`pq` / `rabitq`）、`pq_m` 和 `memory_mode`
+- PQ 与 RaBitQ 编码存储；`memory_mode='compact'` 要求量化实际启用，不能静默回退为索引端原始向量存储
 - 优化器生成 Index Scan，执行器走 ANN 索引检索
 - 共享内存向量缓存、并行建索引
 - 运行参数：`vexdb.ef_search`、`vexdb.vec_architecture`
@@ -38,9 +38,9 @@
   - `cosine_distance`（`<=>`）
   - `inner_product`（负内积/最大内积检索用 `<~>`）
 - 标量工具：`vector_dims()`、`l2_normalize()`、`vexdb_version()`、`vexdb_index_info()`
-- `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])`，支持元数据过滤
-- 索引参数：`m`、`ef_construction`、`parallel_workers`（并行构建）、`quantizer` / `pq_m`（PQ）
-- 产品量化 PQ + compact 模式（百亿级内存优化）
+- `CREATE INDEX ... USING GRAPH_INDEX (vec)`，查询支持 WHERE 过滤
+- 索引参数：`m`、`ef_construction`、`parallel_workers`、`quantizer`（`pq` / `rabitq`）和 `pq_m`
+- PQ 与 RaBitQ 支持索引端 `memory_mode='compact'`
 - 优化器生成 `VEXDB_INDEX_SCAN`
 - 向量缓存、并行建索引
 - 运行参数：`vexdb_ef_search`、`vexdb_brute_force_threshold`、`vexdb_pq_search_mode`、`vexdb_pq_refine_k_factor`
@@ -85,8 +85,8 @@ vexdb fs --db agent.db mount ~/VexDB
 | 数据类型 | floatvector | 标准 float32 向量类型 | ✅ | ✅ | ✅ |
 | 数据类型 | halfvector | 半精度 float16 向量类型 | ✅ | 🟡 | ✅ |
 | 数据类型 | int8vector | int8 向量类型 | ❌ | 🟡 | ✅ |
-| 量化 | PQ 量化 | 向量压缩比最大，QPS 与原始向量相近 | ❌ | 🟡 | ✅ |
-| 量化 | RaBitQ 量化 | 向量压缩比中等，QPS 优于原始向量 | ❌ | 🟡 | ✅ |
+| 量化 | PQ 量化 | 编码压缩与可选精排；速度取决于数据、过滤和配置 | ❌ | ✅ | ✅ |
+| 量化 | RaBitQ 量化 | 编码估距与图搜索，支持索引端压缩存储 | ❌ | ✅ | ✅ |
 | 量化 | 量化自动开启 | 后台自动开启量化，支持空表建量化索引 | ❌ | ❌ | ✅ |
 | 图索引增强 | 图索引异步插入 | 多写少读场景下快速入库 | ❌ | ❌ | ✅ |
 | 图索引增强 | 图挂桶功能 | 小规格机器承载大规模向量检索 | ❌ | ❌ | ✅ |
@@ -101,10 +101,10 @@ vexdb fs --db agent.db mount ~/VexDB
 | 索引 | 图索引 | VSS：HNSW；VexDB：graph_index（自研融合图索引） | ✅ | ✅ |
 | 距离计算 | SIMD 分发 | 内联距离计算函数，编译时优化 | ❌ | ✅ |
 | 量化 | PQ 量化 | 内存受限场景下的向量压缩 | ❌ | ✅ |
-| 量化 | RaBitQ 量化 | 内存受限场景下的向量压缩 | ❌ | 🟡 |
+| 量化 | RaBitQ 量化 | 编码图搜索与可选的索引端压缩存储 | ❌ | ✅ |
 | 缓存 | 缓存管理 | 磁盘到内存向量缓存 | ❌ | ✅ |
 | 运维 | 索引压缩 | 回收软删除条目的空间 | ✅ | ❌ |
-| 搜索 | 过滤 ANN 搜索 | WHERE 过滤 + 自动过采样 | ❌ | ✅ |
+| 搜索 | 过滤 ANN 搜索 | 可显式启用标量与图/PQ联合执行；默认精确过滤 | ❌ | 🟡 |
 | 持久化 | 磁盘持久化 | 重启后无需重建索引 | ✅† | ✅ |
 
 † VSS 持久化为实验性功能——WAL 恢复未实现，异常关机可能导致索引损坏。VexDB-Lite 通过 DuckDB 标准序列化机制持久化。
@@ -247,7 +247,7 @@ LIMIT 10;
 ```sql
 CREATE INDEX idx_items_vec_meta
 ON items
-USING GRAPH_INDEX (vec, category);
+USING GRAPH_INDEX (vec);
 
 SELECT id
 FROM items
@@ -308,14 +308,11 @@ make install
 #### 编译 `vexdb_lite`
 
 ```bash
-cd /path/to/VexDB
-mkdir -p build-pg19rel-release
-cd build-pg19rel-release
-
+cd /path/to/VexDB-Lite
 export PG_CONFIG=/opt/postgresql-19rel-install/bin/pg_config
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-make install
+cmake -S vexdb_pg -B build/pg -DCMAKE_BUILD_TYPE=Release
+cmake --build build/pg -j$(nproc)
+cmake --install build/pg
 ```
 
 
@@ -344,11 +341,11 @@ bash build_duck.sh setup   # 首次：clone DuckDB v1.5.2 并 cmake configure
 bash build_duck.sh build   # 编译扩展（增量）
 ```
 
-生成物：`build/duck/build/extension/vexdb_lite/vexdb_lite.duckdb_extension`
+生成物：`build/duck/v1.5.2/build/extension/vexdb_lite/vexdb_lite.duckdb_extension`
 
 #### 依赖
 
-- CMake 3.14+
+- CMake ≥ 3.28，< 4.x
 - C++17 编译器（GCC 9+ 或 Clang 10+）
 - Git
 
@@ -368,16 +365,18 @@ DuckDB 扩展需嵌入 DuckDB 源码树编译，无法单独 `cmake -B build vex
 
 ```bash
 bash build_duck.sh build          # 构建扩展
-bash tests/spec/_lib/docker/run_duckdb.sh test  # 运行全量 spec 测试（需 Docker）
+bash tests/spec/_lib/docker/run_duckdb.sh test  # 本地运行全量 spec，不需要 Docker
 ```
 
 #### PostgreSQL 插件测试
 
 ```bash
-bash tests/spec/_lib/docker/run_pg.sh test      # 运行 PG spec 测试（需 Docker + PG19）
+python3 tests/spec/_lib/render.py --engine pg --out build/spec
+BUILDX_EXTRA_ARGS='--build-arg PG_GIT_TAG=REL_19_STABLE' bash tests/spec/_lib/docker/run_pg.sh build
+bash tests/spec/_lib/docker/run_pg.sh test      # 需要 Docker
 ```
 
-测试框架基于 YAML spec DSL，测试文件位于 `tests/spec/`。
+先用 `python3 -m pip install -r tests/spec/requirements.txt` 安装渲染依赖。SQLite 构建与测试入口为 `bash build_sqlite.sh test`。测试文件位于 `tests/spec/`，当前 CI 范围见 [状态说明](documentation/current-status.md)。
 
 ---
 
@@ -426,18 +425,20 @@ bash tests/spec/_lib/docker/run_pg.sh test      # 运行 PG spec 测试（需 Do
 
 ### DuckDB
 
-- `threads`、`pq_m` 选项目前接受但部分路径仍是兼容保留/未完全实现
-- ARM Duck 构建当前也走 `GENERAL` 距离派发
+- 扩展必须与 DuckDB 运行时版本完全匹配。
+- 距离计算在运行时选择 CPU 架构，可用 `vexdb_simd_arch()` 查看实际结果。
 
 ## 7. 仓库结构
 
 | 目录 | 说明 |
 |---|---|
-| `common/` | 双端共享内核：图索引算法、SIMD 距离分发、量化器（PQ/RaBitQ）、模板容器 |
+| `common/` | 三端共享内核：图索引算法、SIMD 距离分发、量化器（PQ/RaBitQ）、模板容器 |
 | `vexdb_pg/` | PostgreSQL 扩展：索引 AM、构建、搜索、DML、WAL、距离分发入口 |
 | `vexdb_duckdb/` | DuckDB 扩展：索引生命周期、优化器改写、距离函数 → [README](vexdb_duckdb/README.md) |
-| `documentation/` | 功能文档、构建指南 |
-| `tests/spec/` | 基于 YAML 的 spec 测试（shared / pg / duckdb） |
+| `vexdb_sqlite/` | SQLite GRAPH_INDEX、距离函数、VexFS SQL |
+| `agent_files/` | 文件命令、版本、快照和挂载适配 |
+| `documentation/` | 功能文档、构建指南、当前 CI 范围 |
+| `tests/spec/` | 基于 YAML 的 spec 测试（shared / pg / duckdb / sqlite / opengauss） |
 | `scripts/` | 构建、发版、打包脚本 |
 | `thirdparties/` | 第三方依赖（patched Boost） |
 

@@ -1,0 +1,30 @@
+name: DuckDB crash recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  recovery:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      DUCKDB_VERSION: v1.5.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libboost-dev
+          python -m pip install 'cmake>=3.28,<4'
+      - name: Run crash recovery harness
+        run: bash build_duck.sh crash-recovery

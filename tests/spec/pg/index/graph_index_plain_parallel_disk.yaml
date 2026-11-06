@@ -1,0 +1,287 @@
+name: graph_index_plain_parallel_disk
+tags: [pg-only, regression, parallel, plain, disk, persistence, cosine]
+engines: [pg]
+description: |
+  Force the plain graph index to build directly on disk, then validate both
+  one-worker and three-worker builds. This must not be replaced by a small
+  in-memory test: maintenance_work_mem below 1GB is what selects the PG
+  direct-to-disk path, and workers start from the first tuple. The case protects
+  empty-graph publication, node publication, reverse-edge distance-cache
+  identity, raw-vector writes, DiskVector growth, restart persistence,
+  approximate-search quality, and the requirement that leader and workers
+  apply identical cosine normalization.
+steps:
+  - statement: SET maintenance_work_mem = '512MB';
+  - statement: SET max_parallel_workers = 8;
+  - statement: SET max_parallel_maintenance_workers = 3;
+  - statement: DROP FUNCTION IF EXISTS __plain_parallel_vec32(int);
+  - statement: |
+      CREATE FUNCTION __plain_parallel_vec32(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          ((1 + (i % 31) * 100) *
+           (sin(i * 12.9898 + j * 78.233) +
+            cos(i * 4.1414 + j * 31.719) +
+            sin(i * j * 0.731)))::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 31) AS j
+      $$;
+  - statement: CREATE TABLE plain_parallel_data (id int PRIMARY KEY, vec floatvector(32) NOT NULL);
+  - statement: |
+      INSERT INTO plain_parallel_data
+      SELECT i, __plain_parallel_vec32(i)
+      FROM generate_series(1, 20000) AS i;
+  - statement: ANALYZE plain_parallel_data;
+
+  # Capture eight exact top-10 sets before any ANN index exists. A single
+  # HNSW query is too sensitive to the randomized level stream, so the
+  # corruption gate uses aggregate quality and self-hit coverage.
+  - statement: CREATE TABLE plain_parallel_queries (qid int PRIMARY KEY, vec floatvector(32) NOT NULL);
+  - statement: |
+      INSERT INTO plain_parallel_queries
+      SELECT id, vec FROM plain_parallel_data
+      WHERE id IN (137, 1021, 2345, 4093, 5879, 7331, 9109, 17777);
+  - statement: |
+      CREATE TABLE plain_parallel_truth AS
+      SELECT q.qid, exact.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM plain_parallel_data d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+
+  # One PG worker plus the leader, direct-to-disk from the first tuple.
+  - statement: |
+      CREATE INDEX plain_parallel_w1_idx
+      ON plain_parallel_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (m=16, ef_construction=100, parallel_workers=1);
+  - query: |
+      SELECT i.indisvalid, i.indisready
+      FROM pg_index i
+      WHERE i.indexrelid = 'plain_parallel_w1_idx'::regclass;
+    expect: [[t, t]]
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_w1_idx')
+      WHERE attribute = 'Vector Storage';
+    expect: [["Raw Vector"]]
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_w1_idx')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [[20000]]
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 200;
+  - statement: |
+      CREATE TABLE plain_parallel_w1_ann AS
+      SELECT q.qid, ann.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id FROM plain_parallel_data d
+        ORDER BY d.vec <-> q.vec LIMIT 10
+      ) ann;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits,
+               bool_or(a.id = a.qid) AS self_hit
+        FROM plain_parallel_w1_ann a
+        LEFT JOIN plain_parallel_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT sum(hits) >= 45,
+             count(*) FILTER (WHERE hits = 0) <= 3,
+             count(*) FILTER (WHERE self_hit) >= 4
+      FROM per_query;
+    expect: [[t, t, t]]
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE plain_parallel_w1_ann;
+  - statement: DROP INDEX plain_parallel_w1_idx;
+
+  # Three PG workers plus the leader. This crosses multiple graph/data page
+  # growth boundaries and is the regression target for true disk concurrency.
+  - statement: |
+      CREATE INDEX plain_parallel_w3_idx
+      ON plain_parallel_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (m=16, ef_construction=100, parallel_workers=3);
+  - query: |
+      SELECT i.indisvalid, i.indisready
+      FROM pg_index i
+      WHERE i.indexrelid = 'plain_parallel_w3_idx'::regclass;
+    expect: [[t, t]]
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_w3_idx')
+      WHERE attribute = 'Vector Storage';
+    expect: [["Raw Vector"]]
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_w3_idx')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [[20000]]
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 200;
+  - statement: |
+      CREATE TABLE plain_parallel_w3_ann AS
+      SELECT q.qid, ann.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id FROM plain_parallel_data d
+        ORDER BY d.vec <-> q.vec LIMIT 10
+      ) ann;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits,
+               bool_or(a.id = a.qid) AS self_hit
+        FROM plain_parallel_w3_ann a
+        LEFT JOIN plain_parallel_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT sum(hits) >= 45,
+             count(*) FILTER (WHERE hits = 0) <= 3,
+             count(*) FILTER (WHERE self_hit) >= 4
+      FROM per_query;
+    expect: [[t, t, t]]
+  - statement: DROP TABLE plain_parallel_w3_ann;
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+
+  # The graph pages and raw-vector file must remain readable after restart.
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 200;
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_w3_idx')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [[20000]]
+  - statement: |
+      CREATE TABLE plain_parallel_restart_ann AS
+      SELECT q.qid, ann.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id FROM plain_parallel_data d
+        ORDER BY d.vec <-> q.vec LIMIT 10
+      ) ann;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits,
+               bool_or(a.id = a.qid) AS self_hit
+        FROM plain_parallel_restart_ann a
+        LEFT JOIN plain_parallel_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT sum(hits) >= 45,
+             count(*) FILTER (WHERE hits = 0) <= 3,
+             count(*) FILTER (WHERE self_hit) >= 4
+      FROM per_query;
+    expect: [[t, t, t]]
+
+  # Rebuild the same high-dynamic-range vectors with cosine. Before the
+  # worker preprocessing fix, the leader normalized its tuples while PG
+  # parallel workers inserted raw vectors. Inner-product graph traversal then
+  # preferred large-norm rows and aggregate recall collapsed.
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE plain_parallel_restart_ann;
+  - statement: DROP INDEX plain_parallel_w3_idx;
+  - statement: |
+      CREATE TABLE plain_parallel_cosine_truth AS
+      SELECT q.qid, exact.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM plain_parallel_data d
+        ORDER BY cosine_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: |
+      CREATE INDEX plain_parallel_cosine_w3_idx
+      ON plain_parallel_data USING vexdb_graph (vec floatvector_cosine_ops)
+      WITH (m=16, ef_construction=100, parallel_workers=3);
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_cosine_w3_idx')
+      WHERE attribute = 'Base Container Number of Entries';
+    expect: [[20000]]
+  - statement: SET enable_seqscan = off;
+  - statement: SET vexdb.ef_search = 200;
+  - statement: |
+      CREATE TABLE plain_parallel_cosine_ann AS
+      SELECT q.qid, ann.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id FROM plain_parallel_data d
+        ORDER BY d.vec <=> q.vec LIMIT 10
+      ) ann;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits,
+               bool_or(a.id = a.qid) AS self_hit
+        FROM plain_parallel_cosine_ann a
+        LEFT JOIN plain_parallel_cosine_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT sum(hits) >= 78,
+             count(*) FILTER (WHERE hits = 0) = 0,
+             count(*) FILTER (WHERE self_hit) = 8
+      FROM per_query;
+    expect: [[t, t, t]]
+
+  # The quantized disk worker consumes the same normalized query and computes
+  # its code from that representation. Keep a separate compact RaBitQ gate so
+  # a future plain-only fix cannot reintroduce mixed cosine representations.
+  - statement: SET enable_seqscan = on;
+  - statement: DROP TABLE plain_parallel_cosine_ann;
+  - statement: DROP INDEX plain_parallel_cosine_w3_idx;
+  - statement: |
+      CREATE INDEX plain_parallel_rabitq_cosine_w3_idx
+      ON plain_parallel_data USING vexdb_graph (vec floatvector_cosine_ops)
+      WITH (m=16, ef_construction=100, parallel_workers=3,
+            quantizer='rabitq', memory_mode='compact');
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_rabitq_cosine_w3_idx')
+      WHERE attribute = 'Working Quantizer';
+    expect: [[RaBitQ]]
+  - query: |
+      SELECT content::text
+      FROM index_inspect('plain_parallel_rabitq_cosine_w3_idx')
+      WHERE attribute = 'Vector Storage';
+    expect: [[RaBitQ Code]]
+  - statement: SET enable_seqscan = off;
+  # RaBitQ's approximate ordering adds a small randomized boundary around the
+  # eighth synthetic query. Keep the same strict 78/80 quality gate, but use a
+  # wider candidate search so the regression measures mixed cosine
+  # preprocessing/corruption instead of random graph-level placement.
+  - statement: SET vexdb.ef_search = 400;
+  - statement: |
+      CREATE TABLE plain_parallel_rabitq_cosine_ann AS
+      SELECT q.qid, ann.id
+      FROM plain_parallel_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id FROM plain_parallel_data d
+        ORDER BY d.vec <=> q.vec LIMIT 10
+      ) ann;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(t.id) AS hits,
+               bool_or(a.id = a.qid) AS self_hit
+        FROM plain_parallel_rabitq_cosine_ann a
+        LEFT JOIN plain_parallel_cosine_truth t USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT sum(hits) >= 78,
+             count(*) FILTER (WHERE hits = 0) = 0,
+             count(*) FILTER (WHERE self_hit) = 8
+      FROM per_query;
+    expect: [[t, t, t]]
+
+  - statement: SET enable_seqscan = on;
+  - statement: RESET vexdb.ef_search;
+  - statement: DROP TABLE plain_parallel_rabitq_cosine_ann;
+  - statement: DROP TABLE plain_parallel_data;
+  - statement: DROP TABLE plain_parallel_queries;
+  - statement: DROP TABLE plain_parallel_truth;
+  - statement: DROP TABLE plain_parallel_cosine_truth;
+  - statement: DROP FUNCTION __plain_parallel_vec32(int);

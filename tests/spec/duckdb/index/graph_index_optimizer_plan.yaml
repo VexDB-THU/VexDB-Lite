@@ -12,6 +12,10 @@ engines:
 - opengauss
 description: Execution plan verification — ensure optimizer produces VEXDB_INDEX_SCAN (index) or SEQ_SCAN (fallback) as expected
 steps:
+- statement: RESET vexdb_filtered_search_mode;
+- query: SELECT current_setting('vexdb_filtered_search_mode');
+  _field_types: T
+  expect: [[exact]]
 - statement: CREATE TABLE t_plan (id INTEGER, tag VARCHAR, vec ${VECTOR(4)});
 - statement: "INSERT INTO t_plan SELECT i, 'tag_' || (i % 5)::VARCHAR, list_value(\n  sin(i*0.1)::FLOAT, cos(i*0.1)::FLOAT,\n  sin(i*0.2)::FLOAT, cos(i*0.2)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(1, 501)}\
     \ t(i);"
@@ -160,7 +164,7 @@ steps:
   _field_types: II
   expect:
   - - physical_plan
-    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+    - <REGEX>:.*SEQ_SCAN.*
 - query: EXPLAIN SELECT id FROM t_plan ORDER BY CAST(${L2(vec, ${VEC_LITERAL([0.5, 0.5, 0.5, 0.5], 4)})} AS REAL) LIMIT 5;
   _field_types: II
   expect:

@@ -68,7 +68,9 @@ pg:
     NULL_LITERAL: "NULL"
   functions:
     VECTOR: "floatvector({0})"
-    VEC_LITERAL: "'{0}'::floatvector"
+    # 显式消费维度参数。否则 renderer 会把多参数合并进唯一的 {0}，生成
+    # `'[1, 2], 2'::floatvector` 这类无效字面量。
+    VEC_LITERAL: "ARRAY{0}::floatvector /*dim={1}*/"
     L2: "({0} <-> {1})"
     COSINE: "({0} <=> {1})"
     # PG <#> 返回负内积 (pgvector 约定); 正内积用函数

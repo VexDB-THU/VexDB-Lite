@@ -96,14 +96,14 @@ struct DistanceHelper {
         CONSTEXPR_IF (Policy::use_asm_code) {
             return Policy::asm_code(x, y, dim);
         } else CONSTEXPR_IF (!Policy::use_custom_code) {
-            plaint sum = 0;
+            intm sum = 0;
             CONSTEXPR_IF (Policy::is_aligned) {
                 ASSUME_ALIGNED(x);
                 ASSUME_ALIGNED(y);
             }
             for (uint16 i = 0; i != dim; ++i) {
                 const intm diff = (intm)Policy::transform(x[i]) - (intm)Policy::transform(y[i]);
-                sum += (plaint)(diff * diff);
+                sum += diff * diff;
             }
             return sum;
         } else {
@@ -120,8 +120,14 @@ struct DistanceHelper {
                 Array<vect, k> xs = Policy::template loadk<Policy::is_aligned>(x);
                 Array<vect, k> ys = Policy::template loadk<Policy::is_aligned>(y);
                 ann_helper::unroll<k>([&](auto i) -> void {
-                    vect diff = Policy::sub_vectors(xs[i], ys[i]);
-                    accs[i] = Policy::madd_vectors(diff, diff, accs[i]);
+                    CONSTEXPR_IF (std::is_same<plaint, int8>::value) {
+                        // A signed-byte difference needs nine bits. Widen the
+                        // inputs before subtraction, rather than wrapping it.
+                        accs[i] = Policy::sub_madd_int8s(xs[i], ys[i], accs[i]);
+                    } else {
+                        vect diff = Policy::sub_vectors(xs[i], ys[i]);
+                        accs[i] = Policy::madd_vectors(diff, diff, accs[i]);
+                    }
                 });
                 x += k_step;
                 y += k_step;
@@ -133,8 +139,12 @@ struct DistanceHelper {
                     if (i >= n_tail) { return false; }
                     vect x0 = Policy::template load<Policy::is_aligned>(x + k_per_iter * i);
                     vect y0 = Policy::template load<Policy::is_aligned>(y + k_per_iter * i);
-                    vect diff = Policy::sub_vectors(x0, y0);
-                    accs[i] = Policy::madd_vectors(diff, diff, accs[i]);
+                    CONSTEXPR_IF (std::is_same<plaint, int8>::value) {
+                        accs[i] = Policy::sub_madd_int8s(x0, y0, accs[i]);
+                    } else {
+                        vect diff = Policy::sub_vectors(x0, y0);
+                        accs[i] = Policy::madd_vectors(diff, diff, accs[i]);
+                    }
                     return true;
                 });
             }
@@ -217,8 +227,6 @@ struct DistanceHelper {
             CONSTEXPR_IF (has_rem_tail && Policy::rem_before_reduce) {
                 const uint16 left = dim % k_per_iter;
                 if (left) {
-                    x += k_per_iter * n_tail;
-                    y += k_per_iter * n_tail;
                     // Handle remainder for all three accumulator sets
                     if constexpr (Policy::M == Metric::L2) {
                         accs[k - 1] = Policy::deal_remainder(x, y, dim, n_tail, accs[k - 1]);
@@ -236,8 +244,6 @@ struct DistanceHelper {
             CONSTEXPR_IF (has_rem_tail && Policy::rem_after_reduce) {
                 const uint16 left = dim % k_per_iter;
                 if (left) {
-                    x += k_per_iter * n_tail;
-                    y += k_per_iter * n_tail;
                     res += Policy::deal_remainder(x, y, dim, n_tail);
                     norm_x += Policy::deal_remainder(x, x, dim, n_tail);
                     norm_y += Policy::deal_remainder(y, y, dim, n_tail);
@@ -263,7 +269,7 @@ struct DistanceHelper {
             for (uint16 i = 0; i < dim; ++i) {
                 intm xi = (intm)Policy::transform(x[i]);
                 intm yi = (intm)Policy::transform(y[i]);
-                distance -= (plaint)(xi * yi);
+                distance -= xi * yi;
             }
             return (float)distance;
         } else {
@@ -296,12 +302,10 @@ struct DistanceHelper {
                     return true;
                 });
             }
-            /* deal with remainder */
+            /* The policy applies n_tail to the current full-block base. */
             CONSTEXPR_IF (has_rem_tail && Policy::rem_before_reduce) {
                 const uint16 left = dim % k_per_iter;
                 if (left) {
-                    x += k_per_iter * n_tail;
-                    y += k_per_iter * n_tail;
                     accs[k - 1] = Policy::deal_remainder(x, y, dim, n_tail, accs[k - 1]);
                 }
             }
@@ -309,8 +313,6 @@ struct DistanceHelper {
             CONSTEXPR_IF (has_rem_tail && !Policy::rem_before_reduce) {
                 const uint16 left = dim % k_per_iter;
                 if (left) {
-                    x += k_per_iter * n_tail;
-                    y += k_per_iter * n_tail;
                     res += Policy::deal_remainder(x, y, dim, n_tail);
                 }
             }

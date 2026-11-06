@@ -1,0 +1,50 @@
+name: functions__distance_constant_reuse
+tags: [vex, regression]
+engines: [duckdb]
+description: Repeated constant query arrays preserve distances and NULLs across multiple batches.
+steps:
+- statement: >
+    CREATE TABLE distance_reuse AS
+    SELECT i AS id,
+           (CASE WHEN i % 17 = 0 THEN NULL ELSE [3.0,4.0,0.0] END)::FLOAT[3] AS v
+    FROM range(4099) t(i);
+- query: >
+    SELECT count(v),
+           count(*) FILTER (WHERE l2_distance(v,[0,0,0]::FLOAT[3]) = 5),
+           count(*) FILTER (WHERE l2_distance([0,0,0]::FLOAT[3],v) = 5),
+           count(*) FILTER (WHERE l2_distance(v,[0,0,0]::FLOAT[3]) IS NULL)
+    FROM distance_reuse;
+  _field_types: IIII
+  expect: [[3857,3857,3857,242]]
+- query: >
+    SELECT count(*) FILTER (WHERE inner_product(v,[3,4,0]::FLOAT[3]) = 25),
+           count(*) FILTER (WHERE (v <~> [3,4,0]::FLOAT[3]) = -25),
+           count(*) FILTER (WHERE abs(cosine_distance(v,[3,4,0]::FLOAT[3])) < 0.000001),
+           count(*) FILTER (WHERE array_distance(v,[0,0,0]::FLOAT[3]) = 5)
+    FROM distance_reuse;
+  _field_types: IIII
+  expect: [[3857,3857,3857,3857]]
+- query: >
+    SELECT count(*) FILTER (WHERE v IS NOT NULL AND l2_distance(v,[0,0,0]::FLOAT[3]) <> 5),
+           count(*) FILTER (WHERE v IS NULL AND l2_distance(v,[0,0,0]::FLOAT[3]) IS NOT NULL)
+    FROM distance_reuse WHERE id % 3 IN (0,2);
+  _field_types: II
+  expect: [[0,0]]
+- query: >
+    SELECT sum(l2_distance([3,4,0]::FLOAT[3],[0,0,0]::FLOAT[3]))::BIGINT,
+           count(l2_distance(v,NULL::FLOAT[3])),
+           count(l2_distance(NULL::FLOAT[3],v)) FROM distance_reuse;
+  _field_types: III
+  expect: [[20495,0,0]]
+- statement: >
+    PREPARE distance_parameter AS
+    SELECT count(*) FILTER (WHERE d = 0), count(*) FILTER (WHERE d = 5)
+    FROM (SELECT l2_distance(v,$1::FLOAT[3]) AS d FROM distance_reuse);
+- query: EXECUTE distance_parameter([3,4,0]);
+  _field_types: II
+  expect: [[3857,0]]
+- query: EXECUTE distance_parameter([0,0,0]);
+  _field_types: II
+  expect: [[0,3857]]
+- statement: DEALLOCATE distance_parameter;
+- statement: DROP TABLE distance_reuse;

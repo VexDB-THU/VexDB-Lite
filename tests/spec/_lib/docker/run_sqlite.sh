@@ -16,7 +16,7 @@ set -u
 
 ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 FILTER="${1:-}"
-PYTHON_BIN="${VEXDB_LITE_PYTHON:-}"
+PYTHON_BIN="${VEXDB_LITE_PYTHON:-${PYTHON_BIN:-}}"
 
 python_is_usable() {
     "$1" -c 'import sqlite3,sys; connection=sqlite3.connect(":memory:"); raise SystemExit(sys.version_info < (3, 8) or not hasattr(connection, "enable_load_extension"))' \

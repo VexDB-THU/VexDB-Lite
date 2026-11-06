@@ -14,6 +14,9 @@
 #include "storage/bufpage.h"
 #include "storage/bufmgr.h"
 #include "commands/tablespace.h"
+#if defined(PG_VEXDB_TARGET_PG)
+#include "graph_index/parallel_build_locks.h"
+#endif
 
 namespace disk_container {
 
@@ -119,16 +122,36 @@ public:
             memcpy(PageGetSpecialPointer(page), obuf, opaque_size);
         }
 
+        /* Main-fork graph pages are read through PostgreSQL's shared buffer
+         * manager, so they must also be extended through it.  Direct
+         * smgrextend() leaves other parallel build backends with stale relation
+         * length state: a block number can be published in DiskVector metadata
+         * before ReadBuffer() in another backend can see that block.  Hold the
+         * extension lock for the whole batch to keep the returned range
+         * contiguous, matching the DiskVector layout contract. */
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *extension_lock = vex_graph_build_extension_lock(_rel);
+        vex_graph_build_lock_acquire(extension_lock, LW_EXCLUSIVE);
+#endif
         LockRelationForExtension(_rel, ExclusiveLock);
-        ((void)0);
-        RelationGetSmgr(_rel);
-        BlockNumber res = smgrnblocks(_rel->rd_smgr, fork_num);
-
-        for (BlockNumber i = res; i < res + num_page; ++i) {
-            PageSetChecksum((Page)page, i);
-            smgrextend(_rel->rd_smgr, fork_num, i, page, false);
+        BlockNumber res = InvalidBlockNumber;
+        for (size_t n = 0; n < num_page; ++n) {
+            Buffer buffer = ReadBufferExtended(_rel, fork_num, P_NEW, RBM_NORMAL, NULL);
+            LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+            BlockNumber blkno = BufferGetBlockNumber(buffer);
+            if (n == 0) {
+                res = blkno;
+            } else {
+                Assert(blkno == res + n);
+            }
+            memcpy(BufferGetPage(buffer), page, BLCKSZ);
+            MarkBufferDirty(buffer);
+            UnlockReleaseBuffer(buffer);
         }
         UnlockRelationForExtension(_rel, ExclusiveLock);
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(extension_lock);
+#endif
         return res;
     }
 

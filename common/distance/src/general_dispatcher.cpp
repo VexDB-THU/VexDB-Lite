@@ -43,7 +43,7 @@ private:
     struct GeneralPolicy<m, DistPrecisionType::INT8, rs, aligned>
         : public GeneralPolicyBase<rs, aligned> {
         using PlainT = int8;
-        using IntmT = int8;
+        using IntmT = int64;
         static INLINE_PROP int8 transform(int8 v) { return v; }
     };
 

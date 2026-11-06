@@ -2,7 +2,7 @@
 
 **English** | **[中文](README.zh.md)**
 
-`VexDB-Lite` extends PostgreSQL, DuckDB, and SQLite with a shared graph index, SIMD distance dispatch, and quantization kernel. The SQLite edition also includes VexFS, so one database can hold regular tables, vector indexes, and database-managed files.
+`VexDB-Lite` extends PostgreSQL, DuckDB, and SQLite with a shared graph index, SIMD distance dispatch, and PQ/RaBitQ quantization kernels. The SQLite edition also includes VexFS, so one database can hold regular tables, vector indexes, and database-managed files.
 
 > See [vexdb_duckdb/README.md](vexdb_duckdb/README.md) for the DuckDB extension docs.  
 > This root README is a project-level overview and build guide.
@@ -22,8 +22,8 @@ Current functionality:
   - `inner_product` (use `<~>` for negative inner product / MIPS)
 - Scalar helpers: `vector_dims()`, `vector_norm()`, `l2_normalize()`, `vexdb_index_info()`
 - `CREATE INDEX ... USING vexdb_graph`
-- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` / `pq_m` (PQ)
-- Product quantization (PQ) with `compact` mode
+- Index options: `m`, `ef_construction`, `parallel_workers`, `quantizer` (`pq` / `rabitq`), `pq_m`, and `memory_mode`
+- PQ and RaBitQ code storage; `memory_mode='compact'` requires quantizer activation rather than silently storing raw index vectors
 - Optimizer rewrite into an ANN Index Scan
 - Shared-memory vector buffer cache and parallel index build
 - Runtime settings: `vexdb.ef_search`, `vexdb.vec_architecture`
@@ -39,9 +39,9 @@ Current functionality:
   - `inner_product` (use `<~>` for negative inner product / MIPS)
   > Note: `<#>` is unavailable in DuckDB (`#` clashes with its comment syntax); use `<~>` for negative inner product — same meaning as in PG.
 - Scalar helpers: `vector_dims()`, `l2_normalize()`, `vexdb_version()`, `vexdb_index_info()`
-- `CREATE INDEX ... USING GRAPH_INDEX (vec [, metadata...])` with metadata filtering
-- Index options: `m`, `ef_construction`, `parallel_workers` (parallel build), `quantizer` / `pq_m` (PQ)
-- Product quantization (PQ) with `compact` mode
+- `CREATE INDEX ... USING GRAPH_INDEX (vec)` with WHERE filtering during queries
+- Index options: `m`, `ef_construction`, `parallel_workers`, `quantizer` (`pq` / `rabitq`), and `pq_m`
+- PQ and RaBitQ support `memory_mode='compact'` for index-side storage
 - Optimizer rewrite into `VEXDB_INDEX_SCAN`
 - Vector buffer cache and parallel index build
 - Runtime settings: `vexdb_ef_search`, `vexdb_brute_force_threshold`, `vexdb_pq_search_mode`, `vexdb_pq_refine_k_factor`
@@ -87,8 +87,8 @@ Build the unified macOS preview with `bash agent_files/macos/package_preview.sh`
 | Data types | floatvector | Standard float32 vector type | ✅ | ✅ | ✅ |
 | Data types | halfvector | Float16 vector type | ✅ | 🟡 | ✅ |
 | Data types | int8vector | Int8 vector type | ❌ | 🟡 | ✅ |
-| Quantization | PQ quantization | Maximum compression, QPS close to raw vectors | ❌ | 🟡 | ✅ |
-| Quantization | RaBitQ quantization | Moderate compression, QPS better than raw vectors | ❌ | 🟡 | ✅ |
+| Quantization | PQ quantization | Code compression and optional refinement; speed depends on data, filters, and configuration | ❌ | ✅ | ✅ |
+| Quantization | RaBitQ quantization | Quantized distance estimation and graph search with compact index-side storage | ❌ | ✅ | ✅ |
 | Quantization | Auto quantization | Background auto-enable, supports empty-table index build | ❌ | ❌ | ✅ |
 | Graph index enhancement | Async insert | Fast ingestion for write-heavy workloads | ❌ | ❌ | ✅ |
 | Graph index enhancement | Graph sharding | Large-scale vectors on small-memory machines | ❌ | ❌ | ✅ |
@@ -104,10 +104,10 @@ Build the unified macOS preview with `bash agent_files/macos/package_preview.sh`
 | Index | Graph index | VSS: HNSW; VexDB: graph_index (self-developed hybrid) | ✅ | ✅ |
 | Distance | SIMD dispatch | Inlined distance functions, compile-time optimized | ❌ | ✅ |
 | Quantization | PQ | Vector compression for memory-constrained scenarios | ❌ | ✅ |
-| Quantization | RaBitQ | Vector compression for memory-constrained scenarios | ❌ | 🟡 |
+| Quantization | RaBitQ | Quantized graph search with optional compact index-side storage | ❌ | ✅ |
 | Cache | Buffer management | Disk-to-memory vector caching | ❌ | ✅ |
 | Maintenance | Index compaction | Reclaim space from soft-deleted entries | ✅ | ❌ |
-| Search | Filtered ANN search | WHERE filter with automatic oversampling | ❌ | ✅ |
+| Search | Filtered ANN search | Opt-in scalar/graph/PQ integration; exact filtering remains the default | ❌ | 🟡 |
 | Persistence | Disk-backed index | Index survives database restart without rebuild | ✅† | ✅ |
 
 † VSS persistence is experimental — WAL recovery is not implemented, unexpected shutdowns may cause index corruption. VexDB-Lite persists via DuckDB's standard serialization.
@@ -253,7 +253,7 @@ LIMIT 10;
 ```sql
 CREATE INDEX idx_items_vec_meta
 ON items
-USING GRAPH_INDEX (vec, category);
+USING GRAPH_INDEX (vec);
 
 SELECT id
 FROM items
@@ -301,14 +301,11 @@ make install
 ### Build `vexdb_lite`
 
 ```bash
-cd /path/to/VexDB
-mkdir -p build-pg19rel-release
-cd build-pg19rel-release
-
+cd /path/to/VexDB-Lite
 export PG_CONFIG=/opt/postgresql-19rel-install/bin/pg_config
-cmake -DCMAKE_BUILD_TYPE=Release ..
-make -j$(nproc)
-make install
+cmake -S vexdb_pg -B build/pg -DCMAKE_BUILD_TYPE=Release
+cmake --build build/pg -j$(nproc)
+cmake --install build/pg
 ```
 
 ### PostgreSQL Configuration
@@ -336,11 +333,11 @@ bash build_duck.sh setup   # First time: clone DuckDB v1.5.2 and cmake configure
 bash build_duck.sh build   # Compile the extension (incremental)
 ```
 
-Output: `build/duck/build/extension/vexdb_lite/vexdb_lite.duckdb_extension`
+Output: `build/duck/v1.5.2/build/extension/vexdb_lite/vexdb_lite.duckdb_extension`
 
 ### Dependencies
 
-- CMake 3.14+
+- CMake ≥ 3.28, < 4.x
 - C++17 compiler (GCC 9+ or Clang 10+)
 - Git
 
@@ -360,16 +357,18 @@ DuckDB extensions must be compiled inside DuckDB's source tree — you cannot ru
 
 ```bash
 bash build_duck.sh build          # Build the extension
-bash tests/spec/_lib/docker/run_duckdb.sh test  # Run full spec tests (requires Docker)
+bash tests/spec/_lib/docker/run_duckdb.sh test  # Run full spec tests locally; Docker is not needed
 ```
 
 ### PostgreSQL Plugin Tests
 
 ```bash
-bash tests/spec/_lib/docker/run_pg.sh test      # Run PG spec tests (requires Docker + PG19)
+python3 tests/spec/_lib/render.py --engine pg --out build/spec
+BUILDX_EXTRA_ARGS='--build-arg PG_GIT_TAG=REL_19_STABLE' bash tests/spec/_lib/docker/run_pg.sh build
+bash tests/spec/_lib/docker/run_pg.sh test      # Requires Docker
 ```
 
-Tests are driven by a YAML spec DSL; test files live under `tests/spec/`.
+Install renderer dependencies with `python3 -m pip install -r tests/spec/requirements.txt`. SQLite build and tests use `bash build_sqlite.sh test`. Test files live under `tests/spec/`. See [current status and CI](documentation/current-status.md).
 
 ---
 
@@ -418,8 +417,8 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 
 ### DuckDB
 
-- `threads` and `pq_m` options are compatibility placeholders on some code paths
-- ARM Duck builds currently use scalar (`GENERAL`) distance dispatch without SIMD acceleration
+- The compiled extension must match the exact DuckDB runtime version.
+- CPU distance dispatch is selected at runtime; inspect `vexdb_simd_arch()` for the active architecture.
 
 ## 7. Repository Structure
 
@@ -428,8 +427,10 @@ Test environment: Intel Core Ultra 7-265K (20c/20t, 3.9 GHz) / 16 GB DDR5 / x86_
 | `common/` | Shared core: graph index algorithm, SIMD distance dispatch, quantizer (PQ/RaBitQ), template containers |
 | `vexdb_pg/` | PostgreSQL extension: index AM, build, search, DML, WAL, distance entry |
 | `vexdb_duckdb/` | DuckDB extension: index lifecycle, optimizer rewrite, distance functions → [README](vexdb_duckdb/README.md) |
-| `documentation/` | Feature docs, build guide |
-| `tests/spec/` | YAML-based spec tests (shared / pg / duckdb) |
+| `vexdb_sqlite/` | SQLite GRAPH_INDEX, distance functions and VexFS SQL |
+| `agent_files/` | File commands, versions, snapshots and mount adapters |
+| `documentation/` | Feature docs, build guide and current CI scope |
+| `tests/spec/` | YAML-based spec tests (shared / pg / duckdb / sqlite / opengauss) |
 | `scripts/` | Build, release, and packaging scripts |
 | `thirdparties/` | Vendored dependencies (patched Boost) |
 

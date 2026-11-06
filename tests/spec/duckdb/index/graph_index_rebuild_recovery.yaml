@@ -1,0 +1,123 @@
+name: index__graph_index_rebuild_recovery
+tags:
+- vex
+- duckdb
+engines:
+- duckdb
+description: Verify manual rebuild remains durable across DuckDB forced checkpoint and restart
+steps:
+- raw_directive: load __TEST_DIR__/graph_index_rebuild_recovery.db
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- statement: CREATE TABLE t_recover (id INTEGER, vec ${VECTOR(4)});
+- statement: "INSERT INTO t_recover SELECT i, list_value(\n  sin(i*0.1)::FLOAT, cos(i*0.2)::FLOAT,\n  sin(i*0.3)::FLOAT, cos(i*0.4)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(1, 81)} t(i);"
+- statement: CREATE INDEX idx_recover ON t_recover USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
+- statement: PRAGMA force_checkpoint;
+- statement: CHECKPOINT;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: "INSERT INTO t_recover SELECT i, list_value(\n  cos(i*0.1)::FLOAT, sin(i*0.2)::FLOAT,\n  cos(i*0.3)::FLOAT, sin(i*0.4)::FLOAT\n)::${VECTOR(4)}\nFROM ${RANGE2(81, 101)} t(i);"
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: SELECT count(*) FROM t_recover;
+  _field_types: I
+  expect:
+  - - 100
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: PRAGMA vexdb_rebuild_index('idx_recover');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_recover';
+  _field_types: II
+  expect:
+  - - 100
+    - 100
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: PRAGMA force_checkpoint;
+- statement: CHECKPOINT;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([0.0,0.0,0.0,0.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: DELETE FROM t_recover WHERE id <= 20;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: SELECT count(*) FROM t_recover;
+  _field_types: I
+  expect:
+  - - 80
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([1.0,1.0,1.0,1.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: PRAGMA vexdb_rebuild_index('idx_recover');
+- query: SELECT node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_recover';
+  _field_types: II
+  expect:
+  - - 80
+    - 80
+- query: EXPLAIN SELECT id FROM t_recover ORDER BY ${L2(vec, ${VEC_LITERAL([1.0,1.0,1.0,1.0], 4)})} LIMIT 10;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: CREATE TABLE t_recover_cos (id INTEGER, vec ${VECTOR(4)});
+- statement: "INSERT INTO t_recover_cos VALUES\n  (1, ${VEC_LITERAL([10.0,1.0,0.0,0.0], 4)}),\n  (2, ${VEC_LITERAL([0.0,10.0,0.0,0.0], 4)}),\n  (3, ${VEC_LITERAL([0.0,0.0,10.0,0.0], 4)}),\n  (4, ${VEC_LITERAL([0.0,0.0,0.0,10.0], 4)});"
+- statement: CREATE INDEX idx_recover_cos ON t_recover_cos USING ${VEX_INDEX} (vec${OPS_COSINE_COL})${IDX_OPTS_COSINE};
+- statement: PRAGMA force_checkpoint;
+- statement: CHECKPOINT;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: SELECT metric FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_recover_cos';
+  _field_types: T
+  expect:
+  - - cosine
+- query: EXPLAIN SELECT id FROM t_recover_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0,0.0], 4)})} LIMIT 1;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: UPDATE t_recover_cos SET vec = ${VEC_LITERAL([100.0,0.0,0.0,0.0], 4)} WHERE id = 4;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: EXPLAIN SELECT id FROM t_recover_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0,0.0], 4)})} LIMIT 1;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: PRAGMA vexdb_rebuild_index('idx_recover_cos');
+- query: SELECT metric, node_count, row_id_map_size FROM vexdb_index_info() WHERE ${SYS_INDEXES_NAME} = 'idx_recover_cos';
+  _field_types: TII
+  expect:
+  - - cosine
+    - 4
+    - 4
+- statement: PRAGMA force_checkpoint;
+- statement: CHECKPOINT;
+- raw_directive: restart
+- statement: SET ${GUC_BF_THRESHOLD} = 0;
+- query: SELECT id FROM t_recover_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0,0.0], 4)})} LIMIT 1;
+  _field_types: I
+  expect:
+  - - 4
+- query: EXPLAIN SELECT id FROM t_recover_cos ORDER BY ${COSINE(vec, ${VEC_LITERAL([1.0,0.0,0.0,0.0], 4)})} LIMIT 1;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: DROP TABLE t_recover;
+- statement: DROP TABLE t_recover_cos;

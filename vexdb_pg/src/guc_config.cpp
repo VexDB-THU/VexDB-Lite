@@ -8,6 +8,7 @@
 
 /* GUC variables */
 static int vexdb_lite_ef_search = 64;
+static bool vexdb_lite_signature_rescue = false;
 static bool vexdb_lite_enable_vec_buffer_manager = true;
 static int vexdb_lite_vector_buffers = 2097152;  /* 2GB in KB */
 static int vexdb_lite_vector_buffer_workers = 1;
@@ -24,6 +25,7 @@ extern "C" {
 
 /* Accessor functions */
 int vexdb_lite_get_ef_search(void) { return vexdb_lite_ef_search; }
+bool vexdb_lite_get_signature_rescue(void) { return vexdb_lite_signature_rescue; }
 bool vexdb_lite_get_enable_vec_buffer_manager(void) { return vexdb_lite_enable_vec_buffer_manager; }
 int vexdb_lite_get_vector_buffers(void) { return vexdb_lite_vector_buffers; }
 int vexdb_lite_get_vector_buffer_workers(void) { return vexdb_lite_vector_buffer_workers; }
@@ -41,6 +43,10 @@ static void assign_ef_search(int newval, void *extra)
 void
 vexdb_lite_init_guc(void)
 {
+    DefineCustomBoolVariable("vexdb.signature_rescue",
+        "Use L2 signature completion; use exact raw search while its model is unavailable.",
+        NULL, &vexdb_lite_signature_rescue, false, PGC_USERSET, 0, NULL, NULL, NULL);
+
     /* Register custom reloption kind */
     vexdb_lite_relopt_kind = add_reloption_kind();
 
@@ -79,8 +85,8 @@ vexdb_lite_init_guc(void)
                       "Number of PQ subspaces. 0 disables PQ; otherwise must divide dimension.",
                       0, 0, INT_MAX, AccessExclusiveLock);
     add_string_reloption(RELOPT_KIND_GRAPH_INDEX, "memory_mode",
-                         "'full' keeps raw vectors; 'compact' releases raw vectors after PQ "
-                         "training (auto-selects pq_m if 0).",
+                         "'compact' requires an active PQ or RaBitQ quantizer and stores only "
+                         "quantizer codes in the index vector fork; omitted quantizer selects PQ.",
                          NULL, NULL, AccessExclusiveLock);
     add_int_reloption(RELOPT_KIND_GRAPH_INDEX, "threads",
                       "Build-time worker count (duck-side name; alias of parallel_workers).",

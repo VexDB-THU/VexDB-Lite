@@ -6,9 +6,7 @@ tags:
 - duck-only
 engines:
 - duckdb
-description: GRAPH_INDEX persistence regression across m={4,8,12,32}. Default m=16 happened to round to a working FixedSizeAllocator segment_size; other m values hit SIGSEGV in DeserializeFromStorage during WAL replay (root cause in graph_index_disk.cpp::SerializeToWAL — InitSerializationToWAL must run before ExportStorageInfo, mirror ART::SerializeToWAL).
-skip:
-  duckdb: "pre-existing dev SIGSEGV in DeserializeFromStorage on m={4,8,12,32} WAL replay (2026-05-22). re-enable after the SerializeToWAL/InitSerializationToWAL ordering fix lands."
+description: GRAPH_INDEX persistence regression across m={4,8,12,32}. Default m=16 must not hide allocator-layout or WAL replay failures at other supported m values.
 
 steps:
 # ---- m=4 ----

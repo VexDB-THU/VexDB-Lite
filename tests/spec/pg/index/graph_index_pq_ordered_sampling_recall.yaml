@@ -1,0 +1,78 @@
+name: graph_index_pq_ordered_sampling_recall
+tags: [pg-only, pq, sampling, recall, regression]
+engines: [pg]
+description: PQ training must sample the full heap instead of learning only from the first physical rows.
+steps:
+  - statement: SET maintenance_work_mem = '2GB';
+  - statement: SET vexdb.ef_search = 200;
+  - statement: DROP FUNCTION IF EXISTS __pq_ordered_vec16(int);
+  - statement: |
+      CREATE FUNCTION __pq_ordered_vec16(i int) RETURNS floatvector
+      LANGUAGE SQL IMMUTABLE STRICT AS $$
+        SELECT array_agg(
+          ((CASE WHEN i <= 16384 THEN 0.0 ELSE 1000.0 END) +
+           sin(i * 0.013 + j * 0.17) * 3.0 +
+           cos(i * 0.007 * (j + 1)) * 2.0 +
+           ((i % 997) * (j + 1)) * 0.0001)::float4
+          ORDER BY j
+        )::floatvector
+        FROM generate_series(0, 15) AS j
+      $$;
+  - statement: CREATE TABLE pq_ordered_data (id int PRIMARY KEY, vec floatvector(16));
+  - statement: |
+      INSERT INTO pq_ordered_data
+      SELECT i, __pq_ordered_vec16(i)
+      FROM generate_series(1, 20000) AS i;
+  - statement: CREATE TABLE pq_ordered_queries (qid int PRIMARY KEY, vec floatvector(16));
+  - statement: |
+      INSERT INTO pq_ordered_queries
+      SELECT id, vec FROM pq_ordered_data
+      WHERE id IN (16601, 17003, 17507, 18101, 18713, 19211, 19603, 19997);
+  - statement: |
+      CREATE TABLE pq_ordered_gt AS
+      SELECT q.qid, exact.id
+      FROM pq_ordered_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM pq_ordered_data d
+        ORDER BY l2_distance(d.vec, q.vec), d.id
+        LIMIT 10
+      ) exact;
+  - statement: |
+      CREATE INDEX pq_ordered_idx
+      ON pq_ordered_data USING vexdb_graph (vec floatvector_l2_ops)
+      WITH (quantizer=pq, pq_m=4, m=16, ef_construction=160,
+            parallel_workers=0);
+  - query: |
+      SELECT use_pq, pq_codes_bytes > 0, pq_codebook_bytes > 0
+      FROM vexdb_index_info() WHERE indexname='pq_ordered_idx';
+    expect: [[t, t, t]]
+  - statement: SET enable_seqscan = off;
+  - statement: |
+      CREATE TABLE pq_ordered_ann AS
+      SELECT q.qid, ann.id
+      FROM pq_ordered_queries q
+      CROSS JOIN LATERAL (
+        SELECT d.id
+        FROM pq_ordered_data d
+        ORDER BY d.vec <-> q.vec
+        LIMIT 10
+      ) ann;
+  - statement: SET enable_seqscan = on;
+  - query: |
+      WITH per_query AS (
+        SELECT a.qid, count(g.id) AS hits
+        FROM pq_ordered_ann a
+        LEFT JOIN pq_ordered_gt g USING (qid, id)
+        GROUP BY a.qid
+      )
+      SELECT
+        CASE WHEN sum(hits) >= 48 THEN 1 ELSE 0 END,
+        CASE WHEN count(*) FILTER (WHERE hits = 0) <= 2 THEN 1 ELSE 0 END
+      FROM per_query;
+    expect: [[1, 1]]
+  - statement: DROP TABLE pq_ordered_data CASCADE;
+  - statement: DROP TABLE pq_ordered_queries;
+  - statement: DROP TABLE pq_ordered_gt;
+  - statement: DROP TABLE pq_ordered_ann;
+  - statement: DROP FUNCTION __pq_ordered_vec16(int);

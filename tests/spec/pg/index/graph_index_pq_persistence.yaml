@@ -13,32 +13,41 @@ steps:
     \ ',' || cos(i*0.8) || ']')::floatvector\nFROM generate_series(1, 300) AS t(i);"
 - statement: CREATE INDEX idx ON pq_p USING vexdb_graph (vec) WITH (quantizer = 'pq', pq_m = 4);
 - query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
-  expect: []
+  expect:
+  - - 10
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    SELECT count(*) FROM pq_p;'
+- raw_directive: restart
+- query: SELECT count(*) FROM pq_p;
+  expect:
+  - - 300
 - query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
-  expect: []
+  expect:
+  - - 10
 - statement: DELETE FROM pq_p WHERE id BETWEEN 1 AND 50;
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    SELECT count(*) FROM pq_p;'
+- raw_directive: restart
+- query: SELECT count(*) FROM pq_p;
+  expect:
+  - - 250
 - query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
-  expect: []
+  expect:
+  - - 10
 - statement: DELETE FROM pq_p WHERE id % 2 = 0;
-- statement: '\echo "TODO: pg_ctl restart here (no checkpoint)"
-
-    SELECT count(*) FROM pq_p;'
+- raw_directive: restart
+- query: SELECT count(*) FROM pq_p;
+  expect:
+  - - 125
 - query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5]'::floatvector) LIMIT 10) sub;
-  expect: []
+  expect:
+  - - 10
 - statement: "INSERT INTO pq_p SELECT i,\n    ('[' || cos(i*0.3) || ',' || sin(i*0.4) || ',' || cos(i*0.5) || ',' || sin(i*0.6) || ','\n         || cos(i*0.7) || ',' || sin(i*0.8) || ',' || cos(i*0.9) ||\
     \ ',' || sin(i*1.0) || ']')::floatvector\nFROM generate_series(301, 500) AS t(i);"
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    SELECT count(*) FROM pq_p;'
+- raw_directive: restart
+- query: SELECT count(*) FROM pq_p;
+  expect:
+  - - 325
 - query: SELECT count(*) FROM (SELECT id FROM pq_p ORDER BY l2_distance(vec, '[0,0,0,0,0,0,0,0]'::floatvector) LIMIT 10) sub;
-  expect: []
+  expect:
+  - - 10
 - statement: DROP TABLE pq_p;

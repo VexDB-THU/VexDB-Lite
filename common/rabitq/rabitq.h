@@ -7,19 +7,18 @@
 #define RABITQ_QUANTIZER_H
 
 #include <cfloat>
+#include <cmath>
 
-#include "pg_compat.h"
+#include "rabitq/platform.h"
 #include "rabitq/utils.h"
 #include "rabitq/rotator.h"
-#include "global_instance.h"
-#include "rabitq/rabitq_cache.h"
-#include "distance.h"
+#include "distance/core/distance.h"
 
 namespace rabitq {
 
 constexpr size_t query_kNumBits = 4;
 
-class RaBitQuantizer : public BaseObject {
+class RaBitQuantizer {
 public:
     RaBitQuantizer(int dim, int padded_dim, Metric metric)
         : _dim(dim),
@@ -28,22 +27,41 @@ public:
           _bin_code_size(RABITQ_BIN_CODE_SIZE(_padded_dim)),
           _ext_code_size(RABITQ_EXT_CODE_SIZE(_padded_dim))
     {
-        _centroids = (float *)RABITQ_CACHE_ALLOC_ALIGNED(HNSW_RABITQ_NUM_CLUSTERS * _dim * sizeof(float));
-        _rotated_centroids = (float *)RABITQ_CACHE_ALLOC_ALIGNED(HNSW_RABITQ_NUM_CLUSTERS * _padded_dim * sizeof(float));
+        _centroids = alloc_floatvector(HNSW_RABITQ_NUM_CLUSTERS * _dim);
+        _rotated_centroids = alloc_floatvector(HNSW_RABITQ_NUM_CLUSTERS * _padded_dim);
         _func_ptr = ann_helper::get_general_distance_func(_metric, _dim);
         _l2_norm = ann_helper::get_general_distance_func(Metric::L2_NORM, _padded_dim);
         _neg_dot_product = ann_helper::get_general_distance_func(Metric::INNER_PRODUCT, _padded_dim);
-        _rotator = NEW FhtKacRotator(_dim, _padded_dim);
+        _rotator = make_object<FhtKacRotator>(_dim, _padded_dim);
     }
     RaBitQuantizer() = delete;
+    ~RaBitQuantizer() { destroy(); }
+
+    RaBitQuantizer(const RaBitQuantizer &) = delete;
+    RaBitQuantizer &operator=(const RaBitQuantizer &) = delete;
 
     void train();
     int quantize(float *vec, char *bin_data, char *ext_data = NULL);
+    // Reconstruct a stable centroid-plus-residual approximation from a stored
+    // code. Used for compact graph maintenance; raw source vectors remain
+    // intentionally unavailable.
+    void reconstruct(const void *raw_code, float *vec);
+    void reconstruct(const void *raw_code, float *vec, float *padded_scratch);
     void quantize_scalar(float *vec, float *centroid, int total_bits, uint16 *total_code,
                          float &delta, float &vl, ScalarQuantizerType sqtype = RECONSTRUCTION);
 
     void load(char *random_matrix, float *centroids, float *rotate_centroids)
     {
+        const size_t centroids_count = HNSW_RABITQ_NUM_CLUSTERS * size_t(_dim);
+        const size_t rotated_count = HNSW_RABITQ_NUM_CLUSTERS * size_t(_padded_dim);
+        for (size_t i = 0; i < centroids_count; i++) {
+            if (!std::isfinite(centroids[i])) fail("centroid data is not finite");
+        }
+        for (size_t i = 0; i < rotated_count; i++) {
+            if (!std::isfinite(rotate_centroids[i])) {
+                fail("rotated centroid data is not finite");
+            }
+        }
         size_t random_matrix_size = _rotator->get_random_matrix_size();
         memcpy(_rotator->get_random_matrix(), random_matrix, random_matrix_size);
         size_t centroids_size = HNSW_RABITQ_NUM_CLUSTERS * _dim * sizeof(float);
@@ -57,28 +75,40 @@ public:
     float *get_centroids() { return _centroids; }
     float *get_rotated_centroids() { return _rotated_centroids; }
     void rotate(float *vec, float *rotated) { _rotator->rotate(vec, rotated); }
+    void inverse_rotate(const float *rotated, float *vec) {
+        _rotator->inverse_rotate(rotated, vec);
+    }
     double get_query_rescaling_factor() { return get_const_scaling_factors(_padded_dim, query_kNumBits - 1); }
-    void set_rescaling_factor(double rescaling_factor) { _rescaling_factor = rescaling_factor; }
+    void set_rescaling_factor(double rescaling_factor) {
+        if (!std::isfinite(rescaling_factor) || rescaling_factor <= 0.0) {
+            fail("query rescaling factor must be finite and positive");
+        }
+        _rescaling_factor = rescaling_factor;
+    }
 
     void destroy()
     {
         if (_rotator) {
-            RABITQ_CACHE_FREE_ALIGNED_EXT(_centroids);
-            RABITQ_CACHE_FREE_ALIGNED_EXT(_rotated_centroids);
+            free_vector(_centroids);
+            free_vector(_rotated_centroids);
+            _centroids = nullptr;
+            _rotated_centroids = nullptr;
             _rotator->destroy();
-            delete _rotator;
+            destroy_object(_rotator);
             _rotator = NULL;
         }
     }
 
 private:
-    void pack_bin_code(int *bin_code_int, uint64 __restrict__ *bin_code);
+    void pack_bin_code(int *bin_code_int, uint64 *__restrict__ bin_code);
     void one_bit_code(float *vec, float *centroid, float *residual, int *bin_code_int);
     void quantize_bin_code(float *vec, float *centroid, BinDataWithFactors *bin_data);
 
     template <typename T> float faster_quantize_ex(float* o_abs, T* code, int ex_bits);
     template <typename T> float quantize_ex(float* o_abs, T* code, int ex_bits);
-    template <typename T> float ex_bits_code(float *residual, T *ex_code_int, int ex_bits);
+    template <typename T>
+    float ex_bits_code(float *residual, T *ex_code_int, int ex_bits,
+        bool use_const_rescaling);
     void quantize_ext_code(float *vec, float *centroid, ExtDataWithFactors *ext_data);
 
     void vec_sub(float *x, float *y, float *res)

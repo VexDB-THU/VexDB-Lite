@@ -1,0 +1,38 @@
+name: index__search_profile
+tags: [vex, regression]
+engines: [duckdb]
+description: Opt-in query-local stages preserve results and never reuse native or disabled SQL profiles.
+steps:
+- statement: RESET vexdb_search_profile;
+- query: SELECT current_setting('vexdb_search_profile')::INTEGER, (vexdb_last_search_profile() IS NULL)::INTEGER;
+  _field_types: II
+  expect: [[0, 1]]
+- statement: CREATE TABLE stage_profile_items AS SELECT i::INTEGER id, [i::FLOAT,0::FLOAT,0::FLOAT,0::FLOAT]::FLOAT[4] vec FROM range(128)t(i);
+- statement: CREATE INDEX stage_profile_idx ON stage_profile_items USING GRAPH_INDEX(vec) WITH(m=8,ef_construction=64,threads=1);
+- statement: SET vexdb_brute_force_threshold=0;
+- statement: SET vexdb_ef_search=128;
+- statement: SET vexdb_search_profile=true;
+- query: SELECT id FROM stage_profile_items ORDER BY l2_distance(vec,[0::FLOAT,0::FLOAT,0::FLOAT,0::FLOAT]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[0], [1], [2]]
+- query: >
+    SELECT (vexdb_last_search_profile()).route,
+           (vexdb_last_search_profile()).output_rows,
+           (vexdb_last_search_profile()).search_calls,
+           (vexdb_last_search_profile()).operators;
+  _field_types: TIII
+  expect: [[raw-graph, 3, 1, 1]]
+- query: SELECT (vexdb_last_search_profile() IS NULL)::INTEGER;
+  _field_types: I
+  expect: [[1]]
+- statement: SET vexdb_search_profile=false;
+- query: SELECT id FROM stage_profile_items ORDER BY l2_distance(vec,[0::FLOAT,0::FLOAT,0::FLOAT,0::FLOAT]::FLOAT[4]) LIMIT 3;
+  _field_types: I
+  expect: [[0], [1], [2]]
+- query: SELECT (vexdb_last_search_profile() IS NULL)::INTEGER;
+  _field_types: I
+  expect: [[1]]
+- statement: DROP TABLE stage_profile_items;
+- statement: RESET vexdb_search_profile;
+- statement: RESET vexdb_brute_force_threshold;
+- statement: RESET vexdb_ef_search;

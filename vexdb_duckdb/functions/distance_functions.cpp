@@ -1,5 +1,7 @@
 #include "vex_functions.hpp"
 
+#include <algorithm>
+
 #include "distance/core/distance.h"
 #include "distance/core/distance_dispatcher.h"
 #include "distance/core/distance_utils_core.h"
@@ -41,26 +43,41 @@ static void DistanceFunctionImpl(DataChunk &args, ExpressionState &state, Vector
     bool all_constant = vec_a.GetVectorType() == VectorType::CONSTANT_VECTOR &&
                         vec_b.GetVectorType() == VectorType::CONSTANT_VECTOR;
 
+    // A literal/parameter query array usually has one dense child. Flattening
+    // the parent duplicates that same query once per input row. Keep this
+    // representation and read row zero instead. Unusual/nullable child
+    // layouts retain the existing flatten path and its current semantics.
+    auto reuse_constant = [](Vector &vec, idx_t dim) {
+        if (vec.GetVectorType() != VectorType::CONSTANT_VECTOR || ConstantVector::IsNull(vec)) return false;
+        auto &child = ArrayVector::GetEntry(vec);
+        return child.GetVectorType() == VectorType::FLAT_VECTOR && FlatVector::Validity(child).CheckAllValid(dim);
+    };
+    const bool constant_a = reuse_constant(vec_a, dim_a);
+    const bool constant_b = reuse_constant(vec_b, dim_b);
+
     auto result_data = FlatVector::GetData<float>(result);
 
-    vec_a.Flatten(count);
-    vec_b.Flatten(count);
+    if (!constant_a) vec_a.Flatten(count);
+    if (!constant_b) vec_b.Flatten(count);
     auto &child_a = ArrayVector::GetEntry(vec_a);
     auto &child_b = ArrayVector::GetEntry(vec_b);
-    child_a.Flatten(count * dim_a);
-    child_b.Flatten(count * dim_b);
+    child_a.Flatten((constant_a ? 1 : count) * dim_a);
+    child_b.Flatten((constant_b ? 1 : count) * dim_b);
     auto data_a = FlatVector::GetData<float>(child_a);
     auto data_b = FlatVector::GetData<float>(child_b);
-    auto &validity_a = FlatVector::Validity(vec_a);
-    auto &validity_b = FlatVector::Validity(vec_b);
+    auto &validity_a = constant_a ? ConstantVector::Validity(vec_a) : FlatVector::Validity(vec_a);
+    auto &validity_b = constant_b ? ConstantVector::Validity(vec_b) : FlatVector::Validity(vec_b);
 
     auto dim = static_cast<uint16>(dim_a);
-    for (idx_t i = 0; i < count; i++) {
-        if (!validity_a.RowIsValid(i) || !validity_b.RowIsValid(i)) {
+    const auto compute_count = all_constant && constant_a && constant_b ? std::min<idx_t>(count, 1) : count;
+    for (idx_t i = 0; i < compute_count; i++) {
+        const auto a = constant_a ? 0 : i;
+        const auto b = constant_b ? 0 : i;
+        if (!validity_a.RowIsValid(a) || !validity_b.RowIsValid(b)) {
             FlatVector::SetNull(result, i, true);
             continue;
         }
-        result_data[i] = compute(data_a + i * dim_a, data_b + i * dim_a, dim);
+        result_data[i] = compute(data_a + a * dim_a, data_b + b * dim_b, dim);
     }
 
     if (all_constant) {
@@ -262,6 +279,7 @@ void VexFunctions::Register(ExtensionLoader &loader) {
     loader.RegisterFunction(ScalarFunction("vexdb_simd_arch", {}, LogicalType::VARCHAR,
                                            VexSimdArchFunction));
     RegisterIndexInfoFunction(loader);
+    RegisterRebuildIndexFunction(loader);
 }
 
 } // namespace duckdb

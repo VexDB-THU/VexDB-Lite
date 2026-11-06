@@ -78,6 +78,12 @@ struct ProductQuantizer {
     // Quantize one vector into `code` (must point to code_size bytes).
     void compute_code(const float *x, uint8_t *code) const;
 
+    // Reconstruct the centroid approximation represented by `code` into `x`.
+    // This is intentionally the inverse of the code layout, not of the lossy
+    // quantization itself. It is used by compact stores for maintenance tasks
+    // such as rebuilding graph topology without retaining raw vectors.
+    void decode_code(const uint8_t *code, float *x) const;
+
     // Distance from a code to a query, using a precomputed M*ksub table.
     float distance_to_code(const uint8_t *code, const float *dist_table) const;
     void  distance_to_four_code(const float *dist_table,

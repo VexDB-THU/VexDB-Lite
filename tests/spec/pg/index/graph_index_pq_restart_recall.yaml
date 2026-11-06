@@ -8,6 +8,7 @@ engines:
 - pg
 - opengauss
 steps:
+- statement: SET maintenance_work_mem = '2GB';
 - statement: CREATE TABLE t (id INTEGER, vec floatvector(16));
 - statement: "INSERT INTO t SELECT i,\n    ('[' || sin(i*0.11) || ',' || cos(i*0.13) || ',' || sin(i*0.17) || ',' || cos(i*0.19) || ','\n         || sin(i*0.23) || ',' || cos(i*0.29) || ',' || sin(i*0.31)\
     \ || ',' || cos(i*0.37) || ','\n         || sin(i*0.41) || ',' || cos(i*0.43) || ',' || sin(i*0.47) || ',' || cos(i*0.53) || ','\n         || sin(i*0.59) || ',' || cos(i*0.61) || ',' || sin(i*0.67)\
@@ -17,10 +18,10 @@ steps:
 - statement: "CREATE TABLE before_restart AS\nSELECT id, row_number() OVER () AS rn FROM (\n    SELECT id FROM t ORDER BY l2_distance(vec, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'::floatvector)\
     \ LIMIT 10\n) sub;"
 - statement: CHECKPOINT;
-- statement: '\echo "TODO: pg_ctl restart here"
-
-    SET vexdb.ef_search=100;'
-- statement: "WITH after_restart AS (\n    SELECT id, row_number() OVER () AS rn FROM (\n        SELECT id FROM t ORDER BY l2_distance(vec, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'::floatvector)\
+- raw_directive: restart
+- statement: SET vexdb.ef_search=100;
+- query: "WITH after_restart AS (\n    SELECT id, row_number() OVER () AS rn FROM (\n        SELECT id FROM t ORDER BY l2_distance(vec, '[0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8]'::floatvector)\
     \ LIMIT 10\n    ) sub\n)\nSELECT b.rn, b.id, a.id FROM before_restart b JOIN after_restart a USING (rn) WHERE b.id <> a.id ORDER BY b.rn;"
+  expect: []
 - statement: DROP TABLE t;
 - statement: DROP TABLE before_restart;

@@ -22,10 +22,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_program(CCACHE_PROGRAM ccache)
-if(CCACHE_PROGRAM)
-    set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
-    message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+option(VEXDB_USE_CCACHE "Use ccache when available" ON)
+if(VEXDB_USE_CCACHE)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+        message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+    endif()
+else()
+    set(CMAKE_CXX_COMPILER_LAUNCHER "")
 endif()
 
 execute_process(
@@ -102,6 +107,14 @@ if(BOOST_FALLBACK_INC)
     message(STATUS "Boost fallback (vendored 缺失部分): ${BOOST_FALLBACK_INC}")
 endif()
 
+if(APPLE)
+    execute_process(COMMAND "${PG_CONFIG_BIN}" --cppflags
+        OUTPUT_VARIABLE PG_CPPFLAGS OUTPUT_STRIP_TRAILING_WHITESPACE)
+    separate_arguments(PG_CPPFLAGS NATIVE_COMMAND "${PG_CPPFLAGS}")
+    list(FILTER PG_CPPFLAGS INCLUDE REGEX "^-I")
+    add_compile_options(${PG_CPPFLAGS})
+endif()
+
 add_compile_options(-std=c++17 -fPIC -fno-exceptions -fno-rtti -Wno-write-strings -Wno-ignored-attributes -pthread)
 
 string(TOLOWER ${CMAKE_BUILD_TYPE} BUILD_TYPE_LOWER)
@@ -152,6 +165,7 @@ set(GRAPH_INDEX_SRCS
     src/graph_index/graph_index_insert.cpp
     src/graph_index/graph_index_inspect.cpp
     src/vex_index_info.cpp
+    src/graph_index/graph_signature.cpp
     src/graph_index/graph_index_scan.cpp
     src/graph_index/graph_index_utils.cpp
     src/graph_index/graph_index_vacuum.cpp
@@ -172,6 +186,8 @@ set(DISTANCE_SRCS
     ${REPO_ROOT}/common/distance/src/architecture.cpp
     ${REPO_ROOT}/common/distance/src/general_dispatcher.cpp
     ${REPO_ROOT}/common/distance/src/pq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/rabitq_dispatcher.cpp
+    ${REPO_ROOT}/common/distance/src/vector_alloc.cpp
     src/distance/distance.cpp
     src/distance/general.cpp
 )
@@ -179,6 +195,10 @@ set(DISTANCE_SRCS
 set(QUANTIZER_SRCS
     ${REPO_ROOT}/common/quantizer/annkmeans.cpp
     ${REPO_ROOT}/common/quantizer/pq_alloc.cpp
+    ${REPO_ROOT}/common/quantizer/product_quantizer.cpp
+    ${REPO_ROOT}/common/rabitq/rabitq.cpp
+    ${REPO_ROOT}/common/rabitq/estimator.cpp
+    ${REPO_ROOT}/common/rabitq/rotator.cpp
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
@@ -199,9 +219,21 @@ endif()
 
 find_package(Threads REQUIRED)
 
-add_library(vexdb_lite SHARED ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS} ${QUANTIZER_SRCS})
+add_library(vexdb_lite MODULE ${GRAPH_INDEX_SRCS} ${DISTANCE_SRCS} ${QUANTIZER_SRCS})
 set_target_properties(vexdb_lite PROPERTIES PREFIX "")
-target_link_libraries(vexdb_lite PRIVATE stdc++ Threads::Threads)
+target_link_libraries(vexdb_lite PRIVATE Threads::Threads)
+if(APPLE)
+    # Match PGXS Makefile.port: bind backend symbols to this PostgreSQL binary.
+    # Flat dynamic lookup can resolve hash_search to macOS libc's unrelated
+    # symbol and crash VACUUM even though loading the module succeeds.
+    execute_process(COMMAND ${PG_CONFIG_BIN} --bindir
+        OUTPUT_VARIABLE PG_BIN_DIR OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE PG_CONFIG_BIN_RC)
+    if(NOT PG_CONFIG_BIN_RC EQUAL 0 OR NOT EXISTS "${PG_BIN_DIR}/postgres")
+        message(FATAL_ERROR "Cannot find the PostgreSQL backend for macOS bundle linking")
+    endif()
+    target_link_options(vexdb_lite PRIVATE "-bundle_loader" "${PG_BIN_DIR}/postgres")
+endif()
 
 set_source_files_properties(src/distance/sse.cpp ${REPO_ROOT}/common/distance/src/sse_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${SSE_FLAGS}")
 set_source_files_properties(src/distance/avx.cpp ${REPO_ROOT}/common/distance/src/avx_dispatcher.cpp PROPERTIES COMPILE_FLAGS "${AVX_FLAGS}")
@@ -213,4 +245,9 @@ endif()
 
 install(TARGETS vexdb_lite LIBRARY DESTINATION "${PG_PKGLIB_DIR}")
 install(FILES sql/vexdb_lite--1.0.sql DESTINATION "${PG_SHARE_DIR}/extension")
+install(FILES sql/vexdb_lite--1.0.sql
+        DESTINATION "${PG_SHARE_DIR}/extension"
+        RENAME vexdb_lite--1.1.sql)
+install(FILES sql/vexdb_lite--1.0--1.1.sql sql/vexdb_lite--1.1--1.2.sql
+              sql/vexdb_lite--1.2.sql DESTINATION "${PG_SHARE_DIR}/extension")
 install(FILES vexdb_lite.control DESTINATION "${PG_SHARE_DIR}/extension")

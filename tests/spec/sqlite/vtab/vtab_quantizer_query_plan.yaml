@@ -1,0 +1,96 @@
+name: sqlite__vtab_quantizer_query_plan
+tags: [vex, sqlite, query-plan, pq, rabitq, compact]
+description: plain、PQ 和 RaBitQ 的 full/compact 查询必须选择虚拟表 KNN 计划，并直接输出距离有序结果。
+steps:
+- statement: CREATE TABLE plan_seed(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+- statement: |
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 300)
+    INSERT INTO plan_seed
+    SELECT i, '[' || i || ',' || (i%7) || ',' || (i%11) || ',' ||
+                      (i%13) || ',' || (i%17) || ',' || (i%19) || ',' ||
+                      (i%23) || ',' || (i%29) || ']' FROM c;
+
+- statement: CREATE VIRTUAL TABLE idx_plain USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=none, memory_mode=full, ef_search=160, brute_force_threshold=0);
+- statement: CREATE VIRTUAL TABLE idx_pq_full USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=pq, pq_m=4, memory_mode=full, ef_search=160, brute_force_threshold=0);
+- statement: CREATE VIRTUAL TABLE idx_pq_compact USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=pq, pq_m=4, memory_mode=compact, ef_search=160, brute_force_threshold=0);
+- statement: CREATE VIRTUAL TABLE idx_rq_full USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=rabitq, memory_mode=full, ef_search=160, brute_force_threshold=0);
+- statement: CREATE VIRTUAL TABLE idx_rq_compact USING GRAPH_INDEX(v FLOAT[8], metric=l2, quantizer=rabitq, memory_mode=compact, ef_search=160, brute_force_threshold=0);
+
+- statement: INSERT INTO idx_plain(rowid, v) SELECT id, v FROM plan_seed;
+- statement: INSERT INTO idx_pq_full(rowid, v) SELECT id, v FROM plan_seed;
+- statement: INSERT INTO idx_pq_compact(rowid, v) SELECT id, v FROM plan_seed;
+- statement: INSERT INTO idx_rq_full(rowid, v) SELECT id, v FROM plan_seed;
+- statement: INSERT INTO idx_rq_compact(rowid, v) SELECT id, v FROM plan_seed;
+
+# 先执行真实查询，触发两阶段构建和量化器训练；top-1 同时验证计划不是空壳。
+- query: SELECT rowid FROM idx_plain WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance LIMIT 1;
+  expect:
+  - - 125
+- query: SELECT rowid FROM idx_pq_full WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance LIMIT 1;
+  expect:
+  - - 125
+- query: SELECT rowid FROM idx_pq_compact WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance LIMIT 1;
+  expect:
+  - - 125
+- query: SELECT rowid FROM idx_rq_full WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance LIMIT 1;
+  expect:
+  - - 125
+- query: SELECT rowid FROM idx_rq_compact WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance LIMIT 1;
+  expect:
+  - - 125
+
+# PLAN_KNN=1。每个 EXPLAIN 只允许这一行；若 ORDER BY 未被消费，SQLite 还会
+# 输出 USE TEMP B-TREE FOR ORDER BY，使期望行数不匹配并令测试失败。
+- query: EXPLAIN QUERY PLAN SELECT rowid FROM idx_plain WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance;
+  expect:
+  - - 3
+    - 0
+    - 0
+    - 'SCAN idx_plain VIRTUAL TABLE INDEX 1:'
+- query: EXPLAIN QUERY PLAN SELECT rowid FROM idx_pq_full WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance;
+  expect:
+  - - 3
+    - 0
+    - 0
+    - 'SCAN idx_pq_full VIRTUAL TABLE INDEX 1:'
+- query: EXPLAIN QUERY PLAN SELECT rowid FROM idx_pq_compact WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance;
+  expect:
+  - - 3
+    - 0
+    - 0
+    - 'SCAN idx_pq_compact VIRTUAL TABLE INDEX 1:'
+- query: EXPLAIN QUERY PLAN SELECT rowid FROM idx_rq_full WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance;
+  expect:
+  - - 3
+    - 0
+    - 0
+    - 'SCAN idx_rq_full VIRTUAL TABLE INDEX 1:'
+- query: EXPLAIN QUERY PLAN SELECT rowid FROM idx_rq_compact WHERE v MATCH '[125,6,4,8,6,11,10,9]' AND k = 10 ORDER BY distance;
+  expect:
+  - - 3
+    - 0
+    - 0
+    - 'SCAN idx_rq_compact VIRTUAL TABLE INDEX 1:'
+
+- query: |
+    SELECT (SELECT value FROM idx_plain_config WHERE key='quantizer'),
+           (SELECT value FROM idx_plain_config WHERE key='memory_mode'),
+           (SELECT value FROM idx_pq_full_config WHERE key='quantizer'),
+           (SELECT value FROM idx_pq_full_config WHERE key='memory_mode'),
+           (SELECT value FROM idx_pq_compact_config WHERE key='quantizer'),
+           (SELECT value FROM idx_pq_compact_config WHERE key='memory_mode'),
+           (SELECT value FROM idx_rq_full_config WHERE key='quantizer'),
+           (SELECT value FROM idx_rq_full_config WHERE key='memory_mode'),
+           (SELECT value FROM idx_rq_compact_config WHERE key='quantizer'),
+           (SELECT value FROM idx_rq_compact_config WHERE key='memory_mode');
+  expect:
+  - - none
+    - full
+    - pq
+    - full
+    - pq
+    - compact
+    - rabitq
+    - full
+    - rabitq
+    - compact

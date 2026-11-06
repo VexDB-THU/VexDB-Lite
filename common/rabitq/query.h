@@ -7,12 +7,12 @@
 #define RABITQ_QUERY_H
 
 #include <numeric>
-#include "distance.h"
+#include "distance/core/distance.h"
 #include "rabitq/rabitq.h"
 
 namespace rabitq {
 
-class QueryWrapper : public BaseObject {
+class QueryWrapper {
 public:
     static constexpr size_t kNumBits = query_kNumBits;
 
@@ -20,11 +20,12 @@ public:
         : _padded_dim(padded_dim),
           _metric(metric)
     {
-        _query_bin = (uint64 *)palloc0(padded_dim * kNumBits / 64 * sizeof(uint64));
-        _centroid = (float *)palloc0(_padded_dim * sizeof(float));
-        _quant_query = (uint16 *)palloc0(_padded_dim * sizeof(uint16));
+        _query_bin = alloc_array_zero<uint64>(padded_dim * kNumBits / 64);
+        _centroid = alloc_array_zero<float>(_padded_dim);
+        _quant_query = alloc_array_zero<uint16>(_padded_dim);
     }
     QueryWrapper() = delete;
+    ~QueryWrapper() { destroy(); }
 
     void preprocess(float *rotated_query, RaBitQuantizer *quantizer)
     {
@@ -65,9 +66,12 @@ public:
 
     void destroy()
     {
-        pfree(_query_bin);
-        pfree(_centroid);
-        pfree(_quant_query);
+        free_mem(_query_bin);
+        free_mem(_centroid);
+        free_mem(_quant_query);
+        _query_bin = nullptr;
+        _centroid = nullptr;
+        _quant_query = nullptr;
     }
 
 private:

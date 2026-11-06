@@ -8,4 +8,5 @@
 #define __NEON_SUPPORT__
 #include "../../../common/distance/src/distances_simd_template.cpp"
 #include "../../../common/distance/src/code_distance_template.cpp"
+#include "../../../common/distance/src/rabitq_template.cpp"
 #endif /* COMPILER_SUPPORT_NEONV8 */

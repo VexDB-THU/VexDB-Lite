@@ -3,33 +3,31 @@
 // free without supplying their own callback.
 #include "quantizer/pq_alloc.h"
 
-#include <random>
-
 namespace vex {
 namespace quantizer {
 
-namespace {
-// Process-wide RNG. K-means / PQ training is single-threaded and serialized at
-// a higher level (one CREATE INDEX at a time per backend), so a non-locking
-// thread_local engine is sufficient. Seed is pinned (42) so two runs over the
-// same data produce identical codebooks — useful for regression tests and for
-// caching codebooks across CHECKPOINT/restart.
-thread_local std::mt19937 g_default_rng{42};
-} // namespace
+static uint64_t NextSplitMix64(uint64_t &state) {
+    uint64_t z = (state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
 
 uint32_t PQRandom::RandomInt() const {
     if (int_fn) {
         return int_fn(user);
     }
-    return static_cast<uint32_t>(g_default_rng());
+    return static_cast<uint32_t>(NextSplitMix64(fallback_state) >> 32);
 }
 
 double PQRandom::RandomDouble() const {
     if (double_fn) {
         return double_fn(user);
     }
-    std::uniform_real_distribution<double> dist(0.0, 1.0);
-    return dist(g_default_rng);
+    // Use the top 53 bits so results are identical across standard-library
+    // implementations (unlike uniform_real_distribution).
+    return static_cast<double>(NextSplitMix64(fallback_state) >> 11) *
+           (1.0 / 9007199254740992.0);
 }
 
 } // namespace quantizer

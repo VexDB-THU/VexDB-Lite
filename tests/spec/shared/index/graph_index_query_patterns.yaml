@@ -89,7 +89,7 @@ steps:
   expect:
   - - 1
   - - 2
-- query: SELECT id FROM items ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})} DESC LIMIT 3;
+- query: SELECT id FROM items ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 0.0, 0.0], 3)})} DESC, id LIMIT 3;
   _field_types: I
   expect:
   - - 3

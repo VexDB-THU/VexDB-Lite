@@ -11,9 +11,10 @@
 #   build arch:   x86 | arm | all (default: all)
 #
 #   示例:
-#     bash scripts/release.sh                          # build 全量 (4 个产物)
+#     bash scripts/release.sh                          # build DuckDB + PG + SQLite 全量产物
 #     bash scripts/release.sh build duck arm           # 只 build ARM DuckDB
-#     bash scripts/release.sh package                  # 4 个 tarball 进 dist/release/
+#     bash scripts/release.sh build sqlite all         # 只 build Linux SQLite（双架构）
+#     bash scripts/release.sh package                  # 所有 Linux 产物进 dist/release/
 #     bash scripts/release.sh test sqlite all          # 两个架构安装并验证 SQLite + VexFS 包
 #     bash scripts/release.sh upload v0.1.0            # 推送到 GitHub Release
 #
@@ -33,17 +34,30 @@ trap 'echo "[release] FAILED at line $LINENO" >&2' ERR
 # ============================================================
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SOURCE_ROOT="$REPO_ROOT"
 # PG source lives inside this repo. Separate PG_VEXDB checkout retired 2026-05-13;
 # nested duckdb/ wrapper retired 2026-05-13 — repo root is now flat.
 PG_VEXDB_ROOT="${PG_VEXDB_ROOT:-$REPO_ROOT}"
-DIST_DIR="$REPO_ROOT/dist"
+DIST_DIR="${VEXDB_LITE_DIST_DIR:-$REPO_ROOT/dist}"
 VEXDB_LITE_RELEASE_VERSION="${VEXDB_LITE_RELEASE_VERSION:-0.1.0-dev}"
 SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 SOURCE_DIRTY=false
 [[ -n "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null || true)" ]] && SOURCE_DIRTY=true
+SOURCE_FULL_COMMIT="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+if [[ -n "${VEXDB_LITE_RELEASE_REF:-}" ]]; then
+    SOURCE_FULL_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify "${VEXDB_LITE_RELEASE_REF}^{commit}")"
+    # The driver itself must be the committed one. Other local work stays put.
+    git -C "$REPO_ROOT" diff --quiet "$SOURCE_FULL_COMMIT" -- scripts/release.sh scripts/release_source.py || {
+        echo '发行脚本与指定提交不一致' >&2; exit 1;
+    }
+    SOURCE_ROOT="$(python3 "$REPO_ROOT/scripts/release_source.py" --repo "$REPO_ROOT" \
+        --ref "$SOURCE_FULL_COMMIT" --out "$REPO_ROOT/build/release-sources/$SOURCE_FULL_COMMIT")"
+    SOURCE_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short "$SOURCE_FULL_COMMIT")"
+    SOURCE_DIRTY=false
+fi
 SOURCE_REVISION="$SOURCE_COMMIT"
 [[ "$SOURCE_DIRTY" == true ]] && SOURCE_REVISION="${SOURCE_REVISION}-dirty"
-VEXFS_RUNTIME_HEADER="$REPO_ROOT/agent_files/mount/common/include/vexfs_runtime_types.h"
+VEXFS_RUNTIME_HEADER="$SOURCE_ROOT/agent_files/mount/common/include/vexfs_runtime_types.h"
 VEXFS_RUNTIME_ABI="$(sed -n 's/^#define VEXFS_RUNTIME_ABI_VERSION \([0-9][0-9]*\)u$/\1/p' "$VEXFS_RUNTIME_HEADER")"
 [[ -n "$VEXFS_RUNTIME_ABI" ]] || { echo "无法读取 VexFS runtime ABI" >&2; exit 1; }
 
@@ -52,7 +66,7 @@ CMAKE_VER="3.28.6"
 CMAKE_LINUX_X86="cmake-${CMAKE_VER}-linux-x86_64.tar.gz"
 CMAKE_TARBALL="/tmp/${CMAKE_LINUX_X86}"
 CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VER}/${CMAKE_LINUX_X86}"
-REMOTE_DIR="pkgbuild"
+REMOTE_DIR="${REMOTE_DIR:-pkgbuild}"
 
 # 多 DuckDB 版本矩阵：每条一个 git tag，空格分隔。留空 → 单版本(DUCKDB_VERSION
 # 默认 v1.5.2)，完全向后兼容。每版本的本地源码树由 build_duck.sh 放在
@@ -135,6 +149,7 @@ load_credentials() {
 
 # 通用 SSH/SCP helper — 第一个参数 x86/arm，复用 ControlMaster 大幅减少建连开销
 SSH_OPTS=(-o StrictHostKeyChecking=accept-new
+          -C
           -o ControlMaster=auto
           -o ControlPersist=600
           -o ControlPath=/tmp/ssh-vexdb-release-%r@%h:%p)
@@ -168,8 +183,33 @@ rrsync_up() {
     local ssh_cmd
     printf -v ssh_cmd "sshpass -p %q ssh" "$(_pass "$arch")"
     for opt in "${SSH_OPTS[@]}"; do ssh_cmd+=" $opt"; done
-    rsync -az --delete -e "$ssh_cmd" "$@" "$src/" \
+    # Source snapshots may preserve timestamps older than cached objects. Use
+    # content checks, and give changed remote files the receiver's current
+    # timestamp so CMake rebuilds every affected translation unit.
+    rsync -azc --no-times --delete -e "$ssh_cmd" "$@" "$src/" \
         "$(_user "$arch")@$(_host "$arch"):$dst/"
+}
+
+# Optional build-only limits. These never change query concurrency defaults.
+_build_container_limits() {
+    local arch=$1 cpuset memory
+    if [[ "$arch" == x86 ]]; then
+        cpuset="${X86_BUILD_CPUSET:-}"; memory="${X86_BUILD_MEMORY:-}"
+    else
+        cpuset="${ARM_BUILD_CPUSET:-}"; memory="${ARM_BUILD_MEMORY:-}"
+    fi
+    [[ -z "$cpuset" || "$cpuset" =~ ^[0-9,-]+$ ]] || fail "invalid build CPU set"
+    [[ -z "$memory" || "$memory" =~ ^[0-9]+[kKmMgG]?$ ]] || fail "invalid build memory limit"
+    [[ -z "$cpuset" ]] || printf -- '--cpuset-cpus %s ' "$cpuset"
+    [[ -z "$memory" ]] || printf -- '--memory %s ' "$memory"
+    return 0
+}
+_build_jobs() {
+    local arch=$1 jobs
+    if [[ "$arch" == x86 ]]; then jobs="${X86_BUILD_JOBS:-${BUILD_JOBS:-}}"
+    else jobs="${ARM_BUILD_JOBS:-${BUILD_JOBS:-}}"; fi
+    [[ -z "$jobs" || "$jobs" =~ ^[1-9][0-9]*$ ]] || fail "invalid build jobs"
+    printf '%s' "$jobs"
 }
 
 # ============================================================
@@ -203,22 +243,36 @@ prepare_local() {
         done
     fi
 
+    if [[ "$TARGET" == "all" || "$TARGET" == "sqlite" ]]; then
+        bash "$SOURCE_ROOT/vexdb_sqlite/vendor_sqlite.sh"
+    fi
+
     ok "本地准备完成"
 }
 
 # 这些 rsync exclude 与之前的 tar exclude 等价。--delete 让远程跟本地严格一致。
 VEXDB_RSYNC_EXCLUDES=(
     --exclude='build/'      --exclude='.git/'        --exclude='dist/'
+    # 同时排除各类本地测试构建和 Rust 缓存，不能只排除名为 build 的目录。
+    --exclude='build-*/' --exclude='build_*/' --exclude='cmake-build-*/'
+    --exclude='target/' --exclude='CMakeFiles/' --exclude='node_modules/' --exclude='.cache/'
+    # 公开向量输入独立登记和传输，不随每份源码重复复制 500MB 数据。
+    --exclude='/vexdb_duckdb/test/benchmark/data/*.fbin'
+    --exclude='/vexdb_duckdb/test/benchmark/data/*.ibin'
+    --exclude='/docs/reports/*-artifacts/'
     --exclude='.claude/'    --exclude='.specstory/'  --exclude='.local/'
     --exclude='.env'        --exclude='.env.*'       --exclude='credentials.json'
     --exclude='*.duckdb_extension'  --exclude='*.unstripped'
     --exclude='__pycache__' --exclude='*.o' --exclude='*.so' --exclude='*.so.debug'
     # spec test 在 docker 容器以 root 跑, 生成的 .db 文件 root-owned, host UID
     # rsync --delete 删不掉 → 整个 stage 失败. 这些是测试临时文件, 不需同步.
+    --exclude='vexdb_duckdb/test/sql/vex/spec_run/'
     --exclude='duckdb_unittest_tempdir/'
 )
 DUCKDB_RSYNC_EXCLUDES=(
     --exclude='.git/' --exclude='.github/'
+    # This file is generated for /work inside the build container.
+    --exclude='/extension/extension_config_local.cmake'
     # 容器内 spec test 以 root 在 duckdb_src 下生成的临时目录, host UID rsync --delete
     # 删不掉 → 整个 stage 失败 (exit 23). 与 VEXDB_RSYNC_EXCLUDES 同理排除.
     --exclude='duckdb_unittest_tempdir/'
@@ -230,7 +284,7 @@ stage() {
     local arch=$1
     section "$arch 同步源码(rsync 增量)"
     rssh "$arch" "mkdir -p ~/$REMOTE_DIR/vexdb_lite"
-    rrsync_up "$arch" "$REPO_ROOT" "~/$REMOTE_DIR/vexdb_lite" "${VEXDB_RSYNC_EXCLUDES[@]}"
+    rrsync_up "$arch" "$SOURCE_ROOT" "~/$REMOTE_DIR/vexdb_lite" "${VEXDB_RSYNC_EXCLUDES[@]}"
 
     if [[ "$arch" == "x86" ]] && ! rssh x86 "[ -x ~/opt/cmake-${CMAKE_VER}-linux-x86_64/bin/cmake ]"; then
         info "x86 部署 portable cmake $CMAKE_VER"
@@ -259,6 +313,11 @@ stage() {
 # manylinux_2_28 ABI 标准:产物 libstdc++ GLIBCXX 符号引用 <= GLIBCXX_3.4.22。
 # 超过即对外发版不兼容(客户机器旧 GLIBC 跑不起,"libc 版本不支持"报错)。
 GLIBCXX_MAX="3.4.22"
+
+_assert_elf_debug_remote() {
+    local arch=$1 binary=$2 debug=$3
+    rssh "$arch" "python3 ~/$REMOTE_DIR/vexdb_lite/scripts/check_elf_debug_companion.py '$binary' '$debug'"
+}
 
 # 远程校验 .duckdb_extension 的 GLIBCXX 上限——在 validate_duck 用,产物已在远程。
 # 用法: _assert_glibcxx_remote <arch> <remote_ext_path>
@@ -385,15 +444,15 @@ _build_duck_manylinux() {
     local arch=$1 dver=$2 image boost_src docker_pfx
     local rbuild="build/duck/$dver/build" rsrc="build/duck/$dver/duckdb_src"
     if [[ "$arch" == "x86" ]]; then
-        image="quay.io/pypa/manylinux_2_28_x86_64"
+        image="${X86_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}"
         boost_src="$X86_BOOST"
         # x86 docker rootful + vmuser 不在 docker 组 → sudo 喂密码
-        docker_pfx="echo '$X86_PASS' | sudo -S docker"
+        docker_pfx="${X86_DOCKER_CMD:-sudo -n docker}"
     else
-        image="quay.io/pypa/manylinux_2_28_aarch64"
+        image="${ARM_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_aarch64}"
         boost_src="$ARM_BOOST"
         # ARM vexdb 在 docker 组，免 sudo
-        docker_pfx="docker"
+        docker_pfx="${ARM_DOCKER_CMD:-docker}"
     fi
 
     # 镜像存在性预检——避免后面 docker run 失败时 build_duck.sh 报错不清晰
@@ -413,7 +472,7 @@ _build_duck_manylinux() {
     host_uid=$(rssh "$arch" 'id -u')
     host_gid=$(rssh "$arch" 'id -g')
 
-    rssh "$arch" "$docker_pfx run --rm \
+    rssh "$arch" "$docker_pfx run --rm $(_build_container_limits "$arch") \
         -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
         -v $boost_src:/opt/boost:ro \
         -w /work \
@@ -426,19 +485,26 @@ _build_duck_manylinux() {
             export PATH=/opt/python/cp310-cp310/bin:\$PATH
             pip install --quiet -i https://mirrors.aliyun.com/pypi/simple cmake==3.29.6 2>/dev/null || \
               pip install --quiet cmake==3.29.6
-            sed -i \"s|-DDUCKDB_EXTENSION_CONFIGS=|-DBOOST_ROOT=/opt/boost -DBoost_NO_BOOST_CMAKE=ON -DDUCKDB_EXTENSION_CONFIGS=|\" build_duck.sh
             # regenerate extension_config_local.cmake with container paths (/work/...)
             # — host (macOS) 上 build_duck.sh setup 生成的版本写死了本地绝对路径
             # (/Users/Four/...), rsync 同步到容器后 cmake add_subdirectory 找不到.
-            cat > $rsrc/extension/extension_config_local.cmake <<CFGEOF
+            cat > $rsrc/extension/extension_config_local.cmake.vexdb-tmp <<CFGEOF
 duckdb_extension_load(vexdb_lite
     SOURCE_DIR /work/vexdb_duckdb
     INCLUDE_DIR /work/vexdb_duckdb/include
     LOAD_TESTS
 )
 CFGEOF
+            # Preserve the CMake input timestamp when its content is unchanged.
+            if cmp -s $rsrc/extension/extension_config_local.cmake.vexdb-tmp \
+                $rsrc/extension/extension_config_local.cmake; then
+                rm -f $rsrc/extension/extension_config_local.cmake.vexdb-tmp
+            else
+                mv $rsrc/extension/extension_config_local.cmake.vexdb-tmp \
+                    $rsrc/extension/extension_config_local.cmake
+            fi
             ${clean_step_in_container}
-            DUCKDB_VERSION=$dver bash build_duck.sh build
+            BOOST_ROOT=/opt/boost BUILD_JOBS=${BUILD_JOBS:-\$(nproc)} DUCKDB_VERSION=$dver bash build_duck.sh build
             DUCKDB_VERSION=$dver UNSTRIPPED_OUT=$rbuild/extension/vexdb_lite/vexdb_lite.duckdb_extension.unstripped \
               bash build_duck.sh strip
             chown -R $host_uid:$host_gid $rbuild build_duck.sh
@@ -519,8 +585,8 @@ build_pg() {
     #   内含 PG 16-19)里编 → 产物 GLIBC_2.17 可移植。MANYLINUX=0:host build(绑构建机 glibc)。
     if [[ "${MANYLINUX:-1}" == "1" ]]; then
         local image pgc docker_pfx host_uid host_gid
-        [[ "$arch" == "x86" ]] && { image="vexdb-pg-manylinux:x86_64"; docker_pfx="echo '$X86_PASS' | sudo -S docker"; } \
-                              || { image="vexdb-pg-manylinux:aarch64"; docker_pfx="docker"; }
+        [[ "$arch" == "x86" ]] && { image="${X86_PG_MANYLINUX_IMAGE:-vexdb-pg-manylinux:x86_64}"; docker_pfx="${X86_DOCKER_CMD:-sudo -n docker}"; } \
+                              || { image="${ARM_PG_MANYLINUX_IMAGE:-vexdb-pg-manylinux:aarch64}"; docker_pfx="${ARM_DOCKER_CMD:-docker}"; }
         case "$PG_VERSION" in
             pg16) pgc=/usr/pgsql-16/bin/pg_config ;;
             pg17) pgc=/usr/pgsql-17/bin/pg_config ;;
@@ -538,8 +604,10 @@ build_pg() {
         # 又因 ARM 可用内存紧(~9G)会被封到 -j2 而它本无重文件, 用 -j4 下限兜住(已知安全)。
         local pg_jobs
         pg_jobs=$(rssh "$arch" 'C=$(nproc); MG=$(free -g | sed -n "2p" | tr -s " " | cut -d" " -f7); J=$((C*3/4)); MJ=$((MG/4)); if [ "$MJ" -ge 1 ] && [ "$MJ" -lt "$J" ]; then J=$MJ; fi; if [ "$J" -lt 4 ]; then J=4; fi; echo "$J"')
+        local configured_jobs; configured_jobs="$(_build_jobs "$arch")"
+        [[ -z "$configured_jobs" ]] || pg_jobs="$configured_jobs"
         info "$arch $PG_VERSION 并行度 -j$pg_jobs(min 75%核 / 可用内存GB/4)"
-        rssh "$arch" "$docker_pfx run --rm \
+        rssh "$arch" "$docker_pfx run --rm $(_build_container_limits "$arch") \
             -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
             -v $boost:/opt/boost:ro \
             -v \$HOME/.ccache_vexdb:/ccache \
@@ -548,13 +616,11 @@ build_pg() {
             $image \
             bash -c 'set -e
                 export PATH=/opt/python/cp310-cp310/bin:\$PATH
-                # ccache: 跨 --rm 持久缓存在 host \$HOME/.ccache_vexdb(挂到 /ccache)。
-                # 镜像若没自带就装(幂等, 已装则秒过); vexdb_pg/CMakeLists 的
-                # find_program(ccache) 据此设 CMAKE_CXX_COMPILER_LAUNCHER。CLEAN_BUILD
-                # 清的是 build 目录, ccache 按内容哈希命中, 全量重编也能秒级复用。
-                command -v ccache >/dev/null 2>&1 || yum install -y ccache >/dev/null 2>&1 || true
+                # ccache: 镜像已内置时由 CMake 自动使用。临时容器禁止现场
+                # yum install：远程源抖动曾让发版在编译前无输出卡住数分钟。
                 ${CLEAN_BUILD:+rm -rf build/pg-ml-$PG_VERSION;} mkdir -p build/pg-ml-$PG_VERSION && cd build/pg-ml-$PG_VERSION
-                PG_CONFIG=$pgc cmake ../../vexdb_pg -DCMAKE_BUILD_TYPE=Release -DBOOST_FALLBACK_INC=/opt/boost
+                PG_CONFIG=$pgc cmake ../../vexdb_pg -DCMAKE_BUILD_TYPE=Release \
+                  -DBOOST_FALLBACK_INC=/opt/boost -DVEXDB_USE_CCACHE=OFF
                 # 并行度 \$pg_jobs 由外层按本机核数+可用内存算(见 build_pg 注释), 避免
                 # AVX-512/annkmeans 重模板并行编时峰值内存撞 OOM。
                 cmake --build . -j$pg_jobs
@@ -595,6 +661,91 @@ build_pg() {
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_lite.so.debug" "$outdir/"
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/vexdb_lite.control" "$outdir/"
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0.sql" "$outdir/"
+    # 1.1 的完整安装内容与当前 1.0 安装脚本一致；另带增量升级脚本，
+    # 让已有 1.0 数据库可以通过 ALTER EXTENSION UPDATE 升级。
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/vexdb_lite--1.0.sql" "$outdir/vexdb_lite--1.1.sql"
+    local sql_file
+    for sql_file in "$SOURCE_ROOT"/vexdb_pg/sql/vexdb_lite--*--*.sql "$SOURCE_ROOT"/vexdb_pg/sql/vexdb_lite--1.2.sql; do
+        rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_pg/sql/$(basename "$sql_file")" "$outdir/"
+    done
+    ok "$arch $PG_VERSION vexdb_lite.so: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
+}
+
+# build_sqlite_linux <arch>：在与 PG/DuckDB 相同的 manylinux_2_28
+# 环境里构建 SQLite loadable 扩展和静态库。两种形态都是对外产物，
+# 公共头文件与 README 一起打包。
+build_sqlite_linux() {
+    local arch=$1 outdir image boost docker_pfx host_uid host_gid
+    [[ "$arch" == "x86" ]] && {
+        outdir="$DIST_DIR/x86_64-linux/sqlite"
+        image="${X86_PG_MANYLINUX_IMAGE:-vexdb-pg-manylinux:x86_64}"
+        boost="$X86_BOOST"
+        docker_pfx="${X86_DOCKER_CMD:-sudo -n docker}"
+    } || {
+        outdir="$DIST_DIR/aarch64-linux/sqlite"
+        image="${ARM_PG_MANYLINUX_IMAGE:-vexdb-pg-manylinux:aarch64}"
+        boost="$ARM_BOOST"
+        docker_pfx="${ARM_DOCKER_CMD:-docker}"
+    }
+
+    section "$arch build SQLite (manylinux 容器)"
+    rssh "$arch" "$docker_pfx image inspect $image >/dev/null 2>&1" \
+        || fail "$arch manylinux 镜像 $image 不在；先 docker build -f scripts/docker/Dockerfile.pg-manylinux"
+    host_uid=$(rssh "$arch" 'id -u')
+    host_gid=$(rssh "$arch" 'id -g')
+
+    rssh "$arch" "$docker_pfx run --rm $(_build_container_limits "$arch") \
+        -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
+        -v $boost:/opt/boost:ro \
+        -v \$HOME/.ccache_vexdb:/ccache \
+        -e CCACHE_DIR=/ccache \
+        -w /work \
+        $image \
+        bash -c 'set -e
+            ${CLEAN_SQLITE_BUILD:+rm -rf build/sqlite-ml;} \
+              cmake -S vexdb_sqlite -B build/sqlite-ml \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DVEXDB_SQLITE_BUILD_TESTS=ON \
+                -DVEXDB_USE_CCACHE=OFF \
+                -DVEXDB_LITE_VERSION=$VEXDB_LITE_RELEASE_VERSION \
+                -DVEXDB_SQLITE_GIT_HASH=$SOURCE_REVISION \
+                -DVEXDB_BOOST_INC=/opt/boost
+            cmake --build build/sqlite-ml -j4
+            build/sqlite-ml/m0_static_smoke
+            build/sqlite-ml/m1_distance_smoke
+            build/sqlite-ml/simd_dispatch_smoke
+            build/sqlite-ml/m2_vtab_smoke
+            build/sqlite-ml/m3_hnsw_smoke
+            build/sqlite-ml/m3p_parallel_smoke
+            cp build/sqlite-ml/vexdb_lite.so build/sqlite-ml/vexdb_lite.so.unstripped
+            objcopy --only-keep-debug build/sqlite-ml/vexdb_lite.so build/sqlite-ml/vexdb_lite.so.debug
+            strip --strip-unneeded build/sqlite-ml/vexdb_lite.so
+            (cd build/sqlite-ml && objcopy --add-gnu-debuglink=vexdb_lite.so.debug vexdb_lite.so)
+            chmod -x build/sqlite-ml/vexdb_lite.so.debug
+            chown -R $host_uid:$host_gid build/sqlite-ml
+        '" || fail "$arch SQLite manylinux build/test 失败"
+
+    local remote_so="~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so"
+    info "$arch SQLite 产物验证（ELF + 入口符号 + build-id + debuglink + GLIBCXX）"
+    rssh "$arch" "set -e
+        file $remote_so | grep -q ELF
+        nm -D $remote_so 2>/dev/null | grep -q sqlite3_vexdblite_init
+        readelf -n $remote_so 2>/dev/null | grep -q 'Build ID:'
+        readelf -S $remote_so 2>/dev/null | grep -q '.gnu_debuglink'
+        test -f ~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so.debug
+        test -f ~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/libvexdb_lite_static.a" \
+        || fail "$arch SQLite 产物验证失败"
+    _assert_glibcxx_remote "$arch" "$remote_so"
+    _assert_elf_debug_remote "$arch" "$remote_so" "$remote_so.debug" \
+        || fail "$arch SQLite 调试文件与模块不匹配"
+
+    mkdir -p "$outdir"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so" "$outdir/"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/vexdb_lite.so.debug" "$outdir/"
+    rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-ml/libvexdb_lite_static.a" "$outdir/"
+    cp "$SOURCE_ROOT/vexdb_sqlite/include/vexdb_sqlite.h" "$outdir/"
+    cp "$SOURCE_ROOT/vexdb_sqlite/README.md" "$outdir/"
+    ok "$arch SQLite: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
 }
 
 # PG smoke：替换远程现成 PG 的 .so + CREATE EXTENSION + 最小 ANN 查询。
@@ -630,7 +781,8 @@ validate_pg() {
         else
             echo '(skip in-PG smoke: no write perm to \$PG_LIB; ABI 符号检查通过)'
         fi"
-    ok "$arch vexdb_lite.so: $(ls -lh "$outdir/vexdb_lite.so" | awk '{print $5}')"
+    _assert_elf_debug_remote "$arch" "~/$REMOTE_DIR/vexdb_lite/vexdb_lite.so" \
+        "~/$REMOTE_DIR/vexdb_lite/vexdb_lite.so.debug" || fail "$arch PG 调试文件与模块不匹配"
 }
 
 # SQLite + VexFS Linux 发行物。和 DuckDB/PG 一样在 manylinux_2_28 容器中构建，
@@ -639,15 +791,15 @@ validate_pg() {
 build_sqlite_files() {
     local arch=$1 image docker_pfx boost outarch outdir host_uid host_gid remote_home
     if [[ "$arch" == "x86" ]]; then
-        image="quay.io/pypa/manylinux_2_28_x86_64"
+        image="${X86_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}"
         # 不把 sudo 密码拼进远程命令。构建账号必须能直接运行 Docker，或只对
         # Docker 配置免交互 sudo；否则这里明确失败。
-        docker_pfx="sudo -n docker"
+        docker_pfx="${X86_DOCKER_CMD:-sudo -n docker}"
         boost="$X86_BOOST"
         outarch=x86_64
     else
-        image="quay.io/pypa/manylinux_2_28_aarch64"
-        docker_pfx="docker"
+        image="${ARM_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_aarch64}"
+        docker_pfx="${ARM_DOCKER_CMD:-docker}"
         boost="$ARM_BOOST"
         outarch=aarch64
     fi
@@ -661,26 +813,36 @@ build_sqlite_files() {
     host_gid=$(rssh "$arch" 'id -g')
     remote_home=$(rssh "$arch" 'printf %s "$HOME"')
 
-    rssh "$arch" "$docker_pfx run --rm \
+    rssh "$arch" "$docker_pfx run --rm $(_build_container_limits "$arch") \
         -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
         -v $boost:/opt/boost:ro \
         -w /work \
         $image \
         bash -c 'set -e
             export PATH=/opt/python/cp310-cp310/bin:\$PATH
-            dnf install -y fuse3-devel pkgconf-pkg-config >/dev/null
+            if ! pkg-config --exists fuse3 >/dev/null 2>&1; then
+                dnf install -y fuse3-devel pkgconf-pkg-config >/dev/null
+            fi
+            have_libpq=0
+            for header in /usr/include/libpq-fe.h /usr/include/pgsql/libpq-fe.h /usr/pgsql-*/include/libpq-fe.h; do
+                if [ -f \"\$header\" ]; then have_libpq=1; break; fi
+            done
+            if [ \"\$have_libpq\" = 0 ]; then dnf install -y libpq-devel >/dev/null; fi
             pip install --quiet -i https://mirrors.aliyun.com/pypi/simple cmake==3.29.6 2>/dev/null || \
               pip install --quiet cmake==3.29.6
             ${CLEAN_SQLITE_BUILD:+rm -rf build/sqlite-files-ml;}
             cmake -S vexdb_sqlite -B build/sqlite-files-ml \
               -DCMAKE_BUILD_TYPE=Release -DVEXDB_SQLITE_BUILD_TESTS=OFF \
+              -DCMAKE_SKIP_RPATH=ON -DVEXFS_REQUIRE_POSTGRESQL=ON \
               -DVEXDB_BOOST_INC=/opt/boost \
               -DVEXDB_LITE_VERSION=$VEXDB_LITE_RELEASE_VERSION \
               -DVEXDB_SQLITE_GIT_HASH=$SOURCE_REVISION \
               -DCMAKE_EXE_LINKER_FLAGS=\"-static-libstdc++ -static-libgcc\" \
               -DCMAKE_SHARED_LINKER_FLAGS=\"-static-libstdc++ -static-libgcc\"
             cmake --build build/sqlite-files-ml \
-              --target vexdb_cli vexfs_fuse vexdb_lite_loadable -j\$(nproc)
+              --target vexdb_cli vexfs_fuse vexdb_lite_loadable -j${BUILD_JOBS:-\$(nproc)}
+            client_library=\$(sed -n \"s/^VEXFS_POSTGRESQL_CLIENT_LIBRARY:FILEPATH=//p\" build/sqlite-files-ml/CMakeCache.txt)
+            export LD_LIBRARY_PATH=\"\$(dirname \"\$client_library\"):\${LD_LIBRARY_PATH:-}\"
             build/sqlite-files-ml/vexdb --version
             DB=\$(mktemp /tmp/vexfs-release-smoke.XXXXXX.sqlite3)
             build/sqlite-files-ml/vexfs-fuse --db \$DB --workspace release --self-test
@@ -708,9 +870,9 @@ build_sqlite_files() {
     rscp_down "$arch" "~/$REMOTE_DIR/vexdb_lite/build/sqlite-files-ml/vexdb_lite.so" "$outdir/lib/vexdb_lite.so"
     chmod 0755 "$outdir/bin/vexdb" "$outdir/bin/vexfs-fuse"
     ln -sfn vexdb "$outdir/bin/vexfs"
-    install -m 0755 "$REPO_ROOT/agent_files/linux/package/install.sh" "$outdir/install.sh"
-    install -m 0755 "$REPO_ROOT/agent_files/linux/package/uninstall.sh" "$outdir/uninstall.sh"
-    install -m 0644 "$REPO_ROOT/agent_files/linux/package/使用说明.md" "$outdir/使用说明.md"
+    install -m 0755 "$SOURCE_ROOT/agent_files/linux/package/install.sh" "$outdir/install.sh"
+    install -m 0755 "$SOURCE_ROOT/agent_files/linux/package/uninstall.sh" "$outdir/uninstall.sh"
+    install -m 0644 "$SOURCE_ROOT/agent_files/linux/package/使用说明.md" "$outdir/使用说明.md"
     {
         echo "product=vexdb-lite"
         echo "component=sqlite-files"
@@ -720,7 +882,7 @@ build_sqlite_files() {
         echo "source_commit=$SOURCE_COMMIT"
         echo "source_dirty=$SOURCE_DIRTY"
         echo "build_environment=manylinux_2_28"
-        echo "runtime_dependency=fuse3"
+        echo "runtime_dependency=fuse3,libpq.so.5"
     } > "$outdir/MANIFEST.txt"
     (
         cd "$outdir"
@@ -763,6 +925,10 @@ cmd_build() {
         done
     fi
 
+    if [[ "$TARGET" == "sqlite" || "$TARGET" == "all" ]]; then
+        for arch in "${ARCHES[@]}"; do build_sqlite_linux "$arch"; done
+    fi
+
     # SQLite + VexFS：统一 CLI、SQLite loadable extension 和 libfuse3 helper。
     if [[ "$TARGET" == "sqlite" || "$TARGET" == "all" ]]; then
         section "SQLite + VexFS Files"
@@ -793,6 +959,11 @@ cmd_package() {
     done < <(find "$DIST_DIR" -maxdepth 3 -name "*.duckdb_extension" -type f 2>/dev/null | grep -v unstripped)
     [[ $pkg_fail -gt 0 ]] && fail "Package 终止:$pkg_fail 个 .duckdb_extension 产物 GLIBCXX 上限 > GLIBCXX_$GLIBCXX_MAX(对外不兼容,用 MANYLINUX=1 重 build)"
     ok "Package 前置:.duckdb_extension 产物 GLIBCXX <= GLIBCXX_$GLIBCXX_MAX"
+
+    while IFS= read -r binary; do
+        python3 "$SOURCE_ROOT/scripts/check_elf_debug_companion.py" "$binary" "$binary.debug" \
+            || fail "Package 终止：调试文件与模块不匹配 $binary"
+    done < <(find "$DIST_DIR" -mindepth 3 -maxdepth 3 -type f -name vexdb_lite.so)
 
     mkdir -p "$RELEASE_DIR"
     rm -f "$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/SHA256SUMS.txt"
@@ -855,7 +1026,9 @@ cmd_package() {
             local pgver="${entry%%:*}" pgdir="$archdir/${entry%%:*}"
             if [[ -f "$pgdir/vexdb_lite.so" ]]; then
                 pkg_tar "$RELEASE_DIR/vexdb-lite-${pgver}-linux-${arch}.tar.gz" "$pgdir" \
-                    vexdb_lite.so vexdb_lite.control vexdb_lite--1.0.sql
+                    vexdb_lite.so vexdb_lite.control vexdb_lite--1.0.sql \
+                    vexdb_lite--1.1.sql vexdb_lite--1.2.sql \
+                    vexdb_lite--1.0--1.1.sql vexdb_lite--1.1--1.2.sql
             fi
             if [[ -f "$pgdir/vexdb_lite.so.debug" ]]; then
                 pkg_tar "$RELEASE_DIR/vexdb-lite-${pgver}-debugsymbols-linux-${arch}.tar.gz" "$pgdir" \
@@ -863,6 +1036,17 @@ cmd_package() {
             fi
         done
 
+
+        # SQLite：loadable 扩展 + 静态库 + 公共头和文档。
+        local sqlitedir="$archdir/sqlite"
+        if [[ -f "$sqlitedir/vexdb_lite.so" && -f "$sqlitedir/libvexdb_lite_static.a" ]]; then
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-linux-${arch}.tar.gz" "$sqlitedir" \
+                vexdb_lite.so libvexdb_lite_static.a vexdb_sqlite.h README.md
+        fi
+        if [[ -f "$sqlitedir/vexdb_lite.so.debug" ]]; then
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-debugsymbols-linux-${arch}.tar.gz" "$sqlitedir" \
+                vexdb_lite.so.debug
+        fi
         # SQLite + VexFS：统一 CLI、libfuse3 helper、loadable extension 和普通用户安装说明。
         local filesdir="$archdir/sqlite-files"
         if [[ -x "$filesdir/bin/vexdb" && -x "$filesdir/bin/vexfs-fuse" &&
@@ -875,6 +1059,56 @@ cmd_package() {
                 "$filesdir" bin lib install.sh uninstall.sh 使用说明.md MANIFEST.txt SHA256SUMS.txt
         fi
     done
+
+    # SQLite 的 Apple/移动端/WASM 产物由 build_sqlite.sh 和
+    # examples/wasm/build.sh 在 Mac driver 上构建。这里只把已通过
+    # 各自 smoke 的当轮产物收口到同一个 release 目录。
+    local sqlite_dist="$DIST_DIR/sqlite"
+    local sqlite_stage="$sqlite_dist/.release-stage"
+    rm -rf "$sqlite_stage"
+    mkdir -p "$sqlite_stage"
+
+    for mac_arch in arm64 x86_64; do
+        local mac_pkg
+        mac_pkg=$(find "$sqlite_dist" -maxdepth 1 -type f \
+            -name "vexdb-lite-sqlite-*-macos-${mac_arch}.tar.gz" | sort | tail -1)
+        if [[ -n "$mac_pkg" ]]; then
+            cp "$mac_pkg" "$RELEASE_DIR/vexdb-lite-sqlite-macos-${mac_arch}.tar.gz"
+        fi
+    done
+
+    if [[ -d "$sqlite_dist/vexdb_lite.xcframework" ]]; then
+        mkdir -p "$sqlite_stage/ios"
+        cp -R "$sqlite_dist/vexdb_lite.xcframework" "$sqlite_stage/ios/"
+        cp "$SOURCE_ROOT/vexdb_sqlite/README.md" "$sqlite_stage/ios/"
+        pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-ios-xcframework.tar.gz" "$sqlite_stage/ios" \
+            vexdb_lite.xcframework README.md
+    fi
+
+    for android_abi in arm64-v8a x86_64; do
+        if [[ -f "$sqlite_dist/android/$android_abi/vexdb_lite.so" && \
+              -f "$sqlite_dist/android/$android_abi/libvexdb_lite_static.a" ]]; then
+            local android_stage="$sqlite_stage/android-$android_abi"
+            mkdir -p "$android_stage"
+            cp "$sqlite_dist/android/$android_abi/vexdb_lite.so" "$android_stage/"
+            cp "$sqlite_dist/android/$android_abi/libvexdb_lite_static.a" "$android_stage/"
+            cp "$sqlite_dist/android/vexdb_sqlite.h" "$android_stage/"
+            cp "$SOURCE_ROOT/vexdb_sqlite/README.md" "$android_stage/"
+            pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-android-${android_abi}.tar.gz" "$android_stage" \
+                vexdb_lite.so libvexdb_lite_static.a vexdb_sqlite.h README.md
+        fi
+    done
+
+    if [[ -f "$SOURCE_ROOT/examples/wasm/dist/vexdb-wasm.js" && \
+          -f "$SOURCE_ROOT/examples/wasm/dist/vexdb-wasm.wasm" ]]; then
+        local wasm_stage="$sqlite_stage/wasm"
+        mkdir -p "$wasm_stage"
+        cp "$SOURCE_ROOT/examples/wasm/dist/vexdb-wasm.js" "$wasm_stage/"
+        cp "$SOURCE_ROOT/examples/wasm/dist/vexdb-wasm.wasm" "$wasm_stage/"
+        cp "$SOURCE_ROOT/examples/wasm/README.md" "$wasm_stage/"
+        pkg_tar "$RELEASE_DIR/vexdb-lite-sqlite-wasm.tar.gz" "$wasm_stage" \
+            vexdb-wasm.js vexdb-wasm.wasm README.md
+    fi
 
     # 防回归: 每个 tarball 都扫一遍,有 AppleDouble 直接 fail。
     # macOS BSD tar `tar -tzf` 会隐藏 `._*` (作为 xattr resource fork),
@@ -908,7 +1142,12 @@ with tarfile.open(sys.argv[1]) as t:
     done
 
     info "生成 SHA256SUMS"
-    (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
+    if [[ -n "${VEXDB_LITE_RELEASE_REF:-}" ]]; then
+        cp "$SOURCE_ROOT/.release-source.json" "$RELEASE_DIR/SOURCE.json"
+        (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz SOURCE.json > SHA256SUMS.txt)
+    else
+        (cd "$RELEASE_DIR" && shasum -a 256 *.tar.gz > SHA256SUMS.txt)
+    fi
     ok "Release assets (AppleDouble check passed):"
     ls -lh "$RELEASE_DIR"
 }
@@ -966,7 +1205,7 @@ _sqlite_files_package_test() {
     pkg_name="$(basename "$pkg")"
     [[ -f "$pkg" ]] || fail "找不到 $pkg；请先运行 package"
 
-    # 上传到对应架构的真实 Linux 机器，在全新的 HOME 中走完整安装和卸载流程。
+    # 上传到对应架构的真实 Linux 机器，在独立安装目录和数据库中走完整安装和卸载流程。
     rscp_up "$arch" "$pkg"
     rssh "$arch" "set -euo pipefail
         package=\"\$HOME/$pkg_name\"
@@ -976,16 +1215,14 @@ _sqlite_files_package_test() {
         mkdir -p \"\$tmp/package\" \"\$tmp/home\" \"\$tmp/data\"
         tar xzf \"\$package\" -C \"\$tmp/package\"
 
-        export HOME=\"\$tmp/home\"
-        export XDG_DATA_HOME=\"\$tmp/data\"
-        export VEXDB_LITE_BIN_DIR=\"\$HOME/.local/bin\"
-        export VEXDB_LITE_LIB_DIR=\"\$HOME/.local/lib/vexdb-lite\"
+        export VEXDB_LITE_BIN_DIR=\"\$tmp/home/.local/bin\"
+        export VEXDB_LITE_LIB_DIR=\"\$tmp/home/.local/lib/vexdb-lite\"
         bash \"\$tmp/package/install.sh\"
 
         bin=\"\$VEXDB_LITE_BIN_DIR/vexdb\"
         helper=\"\$VEXDB_LITE_BIN_DIR/vexfs-fuse\"
         extension=\"\$VEXDB_LITE_LIB_DIR/vexdb_lite.so\"
-        db=\"\$XDG_DATA_HOME/package-test.sqlite3\"
+        db=\"\$tmp/data/package-test.sqlite3\"
         \"\$bin\" --version
         \"\$bin\" \"\$db\" 'SELECT sqlite_version(), vexdb_version();'
         python3 -c 'import sqlite3,sys; db=sqlite3.connect(\":memory:\"); db.enable_load_extension(True); db.load_extension(sys.argv[1]); print(db.execute(\"SELECT vexdb_version()\").fetchone()[0])' \"\$extension\"
@@ -1006,33 +1243,34 @@ _spec_test_manylinux() {
     local arch=$1 dver=$2 image boost_src docker_pfx
     local rbuild="build/duck/$dver/build"
     if [[ "$arch" == "x86" ]]; then
-        image="quay.io/pypa/manylinux_2_28_x86_64"
+        image="${X86_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_x86_64}"
         boost_src="$X86_BOOST"
-        docker_pfx="echo '$X86_PASS' | sudo -S docker"
+        docker_pfx="${X86_DOCKER_CMD:-sudo -n docker}"
     else
-        image="quay.io/pypa/manylinux_2_28_aarch64"
+        image="${ARM_MANYLINUX_IMAGE:-quay.io/pypa/manylinux_2_28_aarch64}"
         boost_src="$ARM_BOOST"
-        docker_pfx="docker"
+        docker_pfx="${ARM_DOCKER_CMD:-docker}"
     fi
 
     rssh "$arch" "$docker_pfx image inspect $image >/dev/null 2>&1" \
         || fail "$arch manylinux 镜像 $image 不在；先 docker load 一份"
 
-    # cmake 必须每次容器重装(临时层 pip,Makefile 记的绝对路径会失效)。
-    # 清 macOS `._*` xattr shadow 文件,否则 catch2 会注册它们为 test。
-    rssh "$arch" "$docker_pfx run --rm \
+    # Rendering and deployment are part of the official test entry. Running
+    # only an old unittest binary could silently skip newly added YAML cases.
+    rssh "$arch" "$docker_pfx run --rm $(_build_container_limits "$arch") \
         -v \$HOME/$REMOTE_DIR/vexdb_lite:/work \
         -v $boost_src:/opt/boost:ro \
         -w /work \
         $image \
-        bash -c 'set -e
-            PY=\$(ls /opt/python/cp3*/bin/python | head -1)
-            \$PY -m pip install --quiet -i https://mirrors.aliyun.com/pypi/simple cmake==3.29.6 2>/dev/null || \
-              \$PY -m pip install --quiet cmake==3.29.6
-            export PATH=\$(dirname \$PY):\$PATH
-            find vexdb_duckdb/test -name \"._*\" -delete 2>/dev/null || true
-            cmake --build $rbuild --target unittest -j 8 2>&1 | tail -5
-            ./$rbuild/test/unittest \"[spec_run]\"
+        bash -c 'set -euo pipefail
+            export PATH=/opt/python/cp310-cp310/bin:\$PATH
+            pip install --quiet cmake==3.29.6 PyYAML==6.0.2
+            export BOOST_ROOT=/opt/boost BUILD_JOBS=${BUILD_JOBS:-\$(nproc)} DUCKDB_VERSION=$dver
+            bash tests/spec/_lib/docker/run_duckdb.sh test
+            cmake --build $rbuild --target duckdb -j${BUILD_JOBS:-\$(nproc)}
+            bash vexdb_duckdb/test/run_entry_lock_contract_test.sh \
+                build/duck/$dver/duckdb_src/src/include $rbuild/src/libduckdb.so \
+                build/entry-lock-contract-$dver
         '" || return 1
 }
 
@@ -1047,6 +1285,7 @@ cmd_upload() {
     command -v gh >/dev/null || fail "缺少 gh CLI (brew install gh)"
     [[ -d "$RELEASE_DIR" ]] || fail "$RELEASE_DIR 不存在；先跑 package"
     local assets=("$RELEASE_DIR"/*.tar.gz "$RELEASE_DIR/SHA256SUMS.txt")
+    [[ ! -f "$RELEASE_DIR/SOURCE.json" ]] || assets+=("$RELEASE_DIR/SOURCE.json")
     [[ -f "${assets[0]}" ]] || fail "$RELEASE_DIR 里没找到 tarball"
 
     section "Upload to GitHub Release $tag"
@@ -1068,9 +1307,14 @@ cmd_upload() {
         gh release upload "$tag" "${assets[@]}" --clobber
     else
         info "新建 release $tag"
-        gh release create "$tag" "${assets[@]}" \
-            --title "$tag" \
-            --notes "Auto-generated release. See README for usage."
+        local release_args=(--title "$tag" --verify-tag --target "$SOURCE_FULL_COMMIT")
+        [[ "${VEXDB_LITE_RELEASE_PRERELEASE:-0}" != 1 ]] || release_args+=(--prerelease --latest=false)
+        if [[ -n "${VEXDB_LITE_RELEASE_NOTES:-}" ]]; then
+            release_args+=(--notes-file "$VEXDB_LITE_RELEASE_NOTES")
+        else
+            release_args+=(--notes "Auto-generated release. See README for usage.")
+        fi
+        gh release create "$tag" "${assets[@]}" "${release_args[@]}"
     fi
     ok "已上传 $tag"
 }

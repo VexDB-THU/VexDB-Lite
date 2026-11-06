@@ -32,8 +32,12 @@
 #include "module/perf_usage.h"
 #include "vector_buffer/vector_smgr.h"
 #include "ann_utils.h"
+#include "heap_vector_reader.h"
 #include "floatvector.h"
 #include "index_inspect.h"
+#if defined(PG_VEXDB_TARGET_PG)
+#include "graph_index/parallel_build_locks.h"
+#endif
 
 PERF_DECLARE_CATS(MemPerfCats, true, read, write, calc, lock);
 PERF_DECLARE_CATS(DiskPerfCats, false, read_node, read_neighbor, read_vec, write_node, write_neighbor, write_vec, calc, lock, fetch);
@@ -679,12 +683,14 @@ public:
     using point_type_data = typename elem_type::Data;
     static constexpr bool use_dist_cache = true;
 
-    DiskStore(Relation index, Relation heap, Buffer metabuf, bool need_wal)
+    DiskStore(Relation index, Relation heap, Buffer metabuf, bool need_wal,
+              bool parallel_build = false)
         : index(index),
           heap(heap),
           metap(GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf))),
           metabuf(metabuf),
           need_wal(need_wal),
+          parallel_build(parallel_build),
           m(metap->m),
           dim(metap->dimension),
           precision_type(metap->precision_type),
@@ -734,6 +740,7 @@ public:
         if (BufferIsValid(statbuf)) {
             ReleaseBuffer(statbuf);
         }
+        heap_vector_reader_.Destroy();
         base_layer.destroy();
         upper_layer.destroy();
         elems.destroy();
@@ -816,6 +823,18 @@ public:
     T assign_vector_id()
     {
         DO_PERF(write_node);
+#if defined(PG_VEXDB_TARGET_PG)
+        /*
+         * One short lock protects all graph DiskVector metadata updates for
+         * this index.  DiskVector::append() nests reserve() under its existing
+         * heavyweight page lock; putting a non-reentrant LWLock directly in
+         * that path would self-deadlock.  The outer storage lock keeps ID and
+         * capacity publication serialized without covering node writes or
+         * graph search.
+         */
+        LWLock *storage_lock = parallel_build ? vex_graph_build_storage_lock(index) : NULL;
+        vex_graph_build_lock_acquire(storage_lock, LW_EXCLUSIVE);
+#endif
         GIStateInput input;
         graph_index_get_state(index, GIStateOper::GET_UNDER_VACUUM, input);
         bool can_reuse = !input.bool_val.val;
@@ -829,9 +848,12 @@ public:
             if (!can_reuse) {
                 id = base_layer.append();
                 LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
-                metap->num_vectors = id + 1;
-                if (need_wal) {
-                    xlog.update_num_vector(metap->num_vectors);
+                const size_t new_count = size_t(id) + 1;
+                if (metap->num_vectors < new_count) {
+                    metap->num_vectors = new_count;
+                    if (need_wal) {
+                        xlog.update_num_vector(metap->num_vectors);
+                    }
                 }
                 LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
             }
@@ -845,6 +867,9 @@ public:
                 id = upper_layer.append();
             }
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(storage_lock);
+#endif
         STOP_PERF(write_node);
         return id;
     }
@@ -1015,13 +1040,55 @@ public:
         DO_PERF(lock);
         bool shared = true;
         CONSTEXPR_IF (with_lock) {
+#if defined(PG_VEXDB_TARGET_PG)
+            LWLock *entry_lock = parallel_build ? vex_graph_build_entry_lock(index) : NULL;
+            LWLock *entry_wait_lock = parallel_build ? vex_graph_build_entry_wait_lock(index) : NULL;
+            /* Stop new shared holders from passing an exclusive upgrader. */
+            vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+            vex_graph_build_lock_release(entry_wait_lock);
+            vex_graph_build_lock_acquire(entry_lock, LW_SHARED);
+#endif
             /* wait vacuum to operate atomically */
             LockPage(index, metablkno, ShareLock);
             if ((!force_share_flag && unlikely(insert_level > metap->entry_level)) ||
                 unlikely(metap->entry_level < 0)) {
                 UnlockPage(index, metablkno, ShareLock);
+#if defined(PG_VEXDB_TARGET_PG)
+                vex_graph_build_lock_release(entry_lock);
+                vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+                vex_graph_build_lock_acquire(entry_lock, LW_EXCLUSIVE);
+                vex_graph_build_lock_release(entry_wait_lock);
+#endif
                 LockPage(index, metablkno, ExclusiveLock);
                 shared = false;
+#if defined(PG_VEXDB_TARGET_PG)
+                if (parallel_build) {
+                    /*
+                     * Several workers can observe the same old entry level
+                     * before any of them obtains the exclusive lock.  Only
+                     * the first one still needs exclusivity; keeping every
+                     * stale upgrader exclusive serializes several complete
+                     * high-level insertions.  Entry level is monotonic during
+                     * CREATE INDEX, so after the first worker publishes the
+                     * requested level it is safe to join the normal shared
+                     * insertion path using the new entry point.
+                     */
+                    LockBuffer(metabuf, BUFFER_LOCK_SHARE);
+                    bool upgrade_still_needed =
+                        ((!force_share_flag && insert_level > metap->entry_level) ||
+                         metap->entry_level < 0);
+                    LockBuffer(metabuf, BUFFER_LOCK_UNLOCK);
+                    if (!upgrade_still_needed) {
+                        UnlockPage(index, metablkno, ExclusiveLock);
+                        vex_graph_build_lock_release(entry_lock);
+                        vex_graph_build_lock_acquire(entry_wait_lock, LW_EXCLUSIVE);
+                        vex_graph_build_lock_release(entry_wait_lock);
+                        vex_graph_build_lock_acquire(entry_lock, LW_SHARED);
+                        LockPage(index, metablkno, ShareLock);
+                        shared = true;
+                    }
+                }
+#endif
             }
         }
         init_entrypoint();
@@ -1036,6 +1103,11 @@ public:
         } else {
             UnlockPage(index, metablkno, ExclusiveLock);
         }
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            vex_graph_build_lock_release(vex_graph_build_entry_lock(index));
+        }
+#endif
     }
 
     void init_entrypoint()
@@ -1067,7 +1139,14 @@ public:
     void add_elem(PointExtensionContext &ctx, T id, Span<const point_type_data> d, bool is_async = false)
     {
         DO_PERF(write_node);
+#if defined(PG_VEXDB_TARGET_PG)
+        LWLock *storage_lock = parallel_build ? vex_graph_build_storage_lock(index) : NULL;
+        vex_graph_build_lock_acquire(storage_lock, LW_EXCLUSIVE);
+#endif
         elems.extend(id + 1);
+#if defined(PG_VEXDB_TARGET_PG)
+        vex_graph_build_lock_release(storage_lock);
+#endif
         point_type elem(ctx, d, is_async);
         elems.template set<AccessorLockType::WriteLock>(id, elem);
         STOP_PERF(write_node);
@@ -1108,56 +1187,73 @@ public:
         return res;
     }
 
-    void fetch_vec_via_slot(HeapTuple tuple, char *vec)
+    bool fetch_vec_via_slot(HeapTuple tuple, char *vec)
     {
-        /* Function-expression indexes carry attnum == 0 and resolve through
-         * rd_indexprs; plain column indexes have no FuncExpr so func_oid
-         * stays Invalid and the name-dispatch block below must be skipped. */
-        Oid func_oid = InvalidOid;
-        int attnum = index->rd_index->indkey.values[0];
-        if (attnum == 0) { /* function expression */
-            if (!index->rd_indexprs) {
-                RelationGetIndexExpressions(index);
-            }
-            FuncExpr *func_expr = (FuncExpr *)linitial(index->rd_indexprs);
-            func_oid = func_expr->funcid;
-            attnum = ((Var *)linitial(func_expr->args))->varattno;
-        }
-
-        Assert(heap->rd_tableam != NULL);
-        bool is_null;
-        Datum value = heap_getattr(tuple, attnum, RelationGetDescr(heap), &is_null);
-        Assert(!is_null);
-
-        Datum d = value;
-        if (OidIsValid(func_oid)) {
-            char *func_name = get_func_name(func_oid);
-            if (func_name != NULL) {
-                if (strcmp(func_name, "array_to_floatvector") == 0) {
-                    d = DirectFunctionCall2(array_to_floatvector, value, Int32GetDatum(dim));
-                } else if (strcmp(func_name, "subfloatvector") == 0) {
-                    FuncExpr *func_expr = (FuncExpr *)linitial(index->rd_indexprs);
-                    Assert(list_length(func_expr->args) == 3);
-                    ListCell *lc = list_nth_cell(func_expr->args, 1);
-                    Const *c = (Const *)lfirst(lc);
-                    Assert(IsA(c, Const) && c->consttype == INT4OID);
-                    Datum arg2 = c->constvalue;
-                    lc = list_nth_cell(func_expr->args, 2);
-                    c = (Const *)lfirst(lc);
-                    Assert(IsA(c, Const) && c->consttype == INT4OID);
-                    Datum arg3 = c->constvalue;
-                    d = DirectFunctionCall3(subfloatvector, value, arg2, arg3);
-                }
-            }
-        }
-
-        FloatVector *data = DatumGetFloatVector(d);
-        memcpy(vec, data->x, vec_size);
-
-        if (PointerGetDatum(data) != value) {
-            pfree(data);
-        }
+        return heap_vector_reader_.Copy(index, heap, tuple, uint16(dim), vec_size, vec);
     }
+
+    template <typename Candidates>
+    Vector<size_t> make_refinement_order(PointExtensionContext &ctx, const Candidates &candidates)
+    {
+        Vector<size_t> order;
+        if (candidates.size() < 2) {
+            return order;
+        }
+        order.reserve(candidates.size());
+        Vector<uint64> keys(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            CHECK_FOR_INTERRUPTS();
+            order.push_back(i);
+            keys.push_back(UINT64_MAX);
+            get_itempointer(candidates[i].id, [&](const point_type *point) {
+                // This is an IO scheduling hint only. The normal fetch below
+                // still tries the original TIDs and evaluates index expressions.
+                point->apply_on_tids(ctx, [&](const ItemPointerData &tid) {
+                    keys[i] = (uint64(ItemPointerGetBlockNumber(&tid)) << 16) |
+                              uint64(ItemPointerGetOffsetNumber(&tid));
+                    return true;
+                });
+            });
+        }
+        // std::sort needs no temporary heap allocation. All storage here uses
+        // the PostgreSQL allocator; equal physical keys retain candidate order.
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return keys[a] < keys[b] || (keys[a] == keys[b] && a < b);
+        });
+        keys.destroy();
+        return order;
+    }
+
+    bool fetch_heap_tuple_hot(ItemPointerData tid, HeapTuple tuple, Buffer *buf)
+    {
+        SnapshotData snap_dirty;
+        InitDirtySnapshot(snap_dirty);
+#if defined(PG_VEXDB_TARGET_PG)
+        // Index TIDs can name the root of a HOT chain, including a redirect
+        // left by vacuum. Follow it just as a PostgreSQL index fetch does.
+        *buf = ReadBuffer(heap, ItemPointerGetBlockNumber(&tid));
+        LockBuffer(*buf, BUFFER_LOCK_SHARE);
+        Snapshot snapshot = heap_snapshot_ ? heap_snapshot_ : &snap_dirty;
+        bool fetched = heap_hot_search_buffer(&tid, heap, *buf, snapshot,
+                                             tuple, nullptr, true);
+        LockBuffer(*buf, BUFFER_LOCK_UNLOCK);
+        if (!fetched) {
+            ReleaseBuffer(*buf);
+            *buf = InvalidBuffer;
+        }
+        return fetched;
+#else
+        return heap_fetch(heap, &snap_dirty, tuple, buf, false);
+#endif
+    }
+
+#if defined(PG_VEXDB_TARGET_PG)
+    size_t search_node_count() const { return metap->num_vectors; }
+    void search_interrupt() const { CHECK_FOR_INTERRUPTS(); }
+    // Scan snapshots belong to PostgreSQL. Build and maintenance callers keep
+    // the dirty-snapshot fallback; ANN refinement follows its executor scan.
+    void set_heap_snapshot(Snapshot snapshot) { heap_snapshot_ = snapshot; }
+#endif
 
     bool fetch_vec_from_heap(ItemPointerData tid, char *dest)
     {
@@ -1166,12 +1262,10 @@ public:
         HeapTuple tuple = (HeapTupleData *)tuple_buf;
         tuple->t_data = (HeapTupleHeader)((char *)tuple + HEAPTUPLESIZE);
         tuple->t_self = tid;
-        SnapshotData snap_dirty;
-        InitDirtySnapshot(snap_dirty);
         Buffer buf;
-        bool res = heap_fetch(heap, &snap_dirty, tuple, &buf, false);
+        bool res = fetch_heap_tuple_hot(tid, tuple, &buf);
         if (res) {
-            fetch_vec_via_slot(tuple, dest);
+            res = fetch_vec_via_slot(tuple, dest);
             ReleaseBuffer(buf);
         }
         STOP_PERF(fetch);
@@ -1185,14 +1279,15 @@ public:
         HeapTuple tuple = (HeapTupleData *)tuple_buf;
         tuple->t_data = (HeapTupleHeader)((char *)tuple + HEAPTUPLESIZE);
         tuple->t_self = tid;
-        SnapshotData snap_dirty;
-        InitDirtySnapshot(snap_dirty);
         Buffer buf;
-        bool fetched = heap_fetch(heap, &snap_dirty, tuple, &buf, false);
+        bool fetched = fetch_heap_tuple_hot(tid, tuple, &buf);
         char *res = NULL;
         if (fetched) {
             res = alloc_vector(vec_size);
-            fetch_vec_via_slot(tuple, res);
+            if (!fetch_vec_via_slot(tuple, res)) {
+                free_vector(res);
+                res = NULL;
+            }
             ReleaseBuffer(buf);
         }
         STOP_PERF(fetch);
@@ -1366,14 +1461,43 @@ public:
     uint_fast32_t get_cluster_rate() const { return metap->cluster_rate; }
     DistPrecisionType get_precision() const { return metap->precision_type; }
 
-    /* no used */
-    template <bool, bool> static constexpr void lock_point(T) {}
-    template <bool, bool> static constexpr void unlock_point(T) {}
+    /*
+     * During a parallel build, readers take a shared point lock across copying
+     * and scoring one neighbor list, while writers take the exclusive form
+     * across the complete read/prune/write sequence.  Runtime scans keep their
+     * existing buffer-lock-only fast path, so this build fix does not add one
+     * named LWLock acquisition per visited node to query execution.
+     */
+    template <bool is_base_layer, bool shared_lock>
+    void lock_point(T id)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            LWLock *point_lock = vex_graph_build_point_lock(index, (uint64)id, is_base_layer);
+            vex_graph_build_lock_acquire(point_lock, shared_lock ? LW_SHARED : LW_EXCLUSIVE);
+        }
+#else
+        (void)id;
+#endif
+    }
+
+    template <bool is_base_layer, bool shared_lock>
+    void unlock_point(T id)
+    {
+#if defined(PG_VEXDB_TARGET_PG)
+        if (parallel_build) {
+            vex_graph_build_lock_release(
+                vex_graph_build_point_lock(index, (uint64)id, is_base_layer));
+        }
+#else
+        (void)id;
+#endif
+    }
     template <bool is_base_layer>
-    static constexpr Pair<float *, BitSpan<uint>> get_neighbor_stats(T id)
+    static Pair<float *, BitSpan<uint>> get_neighbor_stats(T id)
         { return Pair<float *, BitSpan<uint>>(nullptr, nullptr, 0, 0); }
-    static constexpr bool has_stat(BitSpan<uint> stat) { return false; }
-    static constexpr void set_stat(BitSpan<uint> stat) {}
+    static bool has_stat(BitSpan<uint> stat) { return false; }
+    static void set_stat(BitSpan<uint> stat) {}
     void lock_stats() const {}
     void unlock_stats() const {}
     template <typename F>
@@ -1413,12 +1537,17 @@ private:
 
     Relation index;
     Relation heap;
+    HeapIndexVectorReader heap_vector_reader_;
+#if defined(PG_VEXDB_TARGET_PG)
+    Snapshot heap_snapshot_ = nullptr;
+#endif
     GraphIndexMetaPage metap;
     Page statp;
     Buffer metabuf;
     Buffer statbuf{InvalidBuffer};
 
     bool need_wal;
+    bool parallel_build;
     uint_fast16_t m;
     uint_fast16_t dim;
     DistPrecisionType precision_type;
@@ -1447,7 +1576,8 @@ using DiskStoreVariant = Variant<
     DiskStore<size_t>
 >;
 
-inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation heap, Buffer metabuf, bool need_wal)
+inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation heap, Buffer metabuf,
+                              bool need_wal, bool parallel_build = false)
 {
     if (need_wal) {
         need_wal = RelationNeedsWAL(index);
@@ -1457,9 +1587,9 @@ inline void create_disk_store(DiskStoreVariant &var, Relation index, Relation he
         Assert(metap->id_type == IdType::U32);
         Assert(false);
     } else if (metap->id_type == IdType::U32) {
-        var.template emplace<DiskStore<uint32>>(index, heap, metabuf, need_wal);
+        var.template emplace<DiskStore<uint32>>(index, heap, metabuf, need_wal, parallel_build);
     } else {
-        var.template emplace<DiskStore<size_t>>(index, heap, metabuf, need_wal);
+        var.template emplace<DiskStore<size_t>>(index, heap, metabuf, need_wal, parallel_build);
     }
 }
 
