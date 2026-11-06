@@ -1,0 +1,99 @@
+name: pg__vexfs_transaction_role
+tags: [vexfs, pg, transaction, role]
+description: PostgreSQL VexFS 基础目录文件、事务回滚和登录角色隔离
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- statement: DROP ROLE IF EXISTS vexfs_pg_other;
+- query: SELECT vexfs_pg_adapter_version();
+  expect:
+  - - 0.4.0-alpha.1
+- query: SELECT vexfs_contract_version(), vexfs_init();
+  expect:
+  - - 0.9.0
+    - 1
+- query: SELECT vexfs_grep_index('status')->>'backend', (vexfs_grep_index('status')->>'available')::boolean;
+  expect:
+  - - pg-trgm
+    - true
+- query: SELECT vexfs_grep_index(NULL);
+  expect_error: VEXFS_INVALID_INDEX_ACTION
+- query: SELECT vexfs_workspace_create('pg-contract') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_diagnostics('pg-contract')->>'schema_version', vexfs_diagnostics('pg-contract')->>'adapter_version', (vexfs_diagnostics('pg-contract')->>'schema_ready')::boolean;
+  expect:
+  - - 0.9.0
+    - 0.4.0-alpha.1
+    - true
+- query: SELECT vexfs_mkdir('pg-contract', '/notes/2026') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-contract', '/notes/2026/hello.txt', convert_to('hello', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-contract', '/notes/2026/hello.txt'), 'UTF8');
+  expect:
+  - - hello
+- statement: CREATE TABLE vexfs_business_txn (id integer PRIMARY KEY, note text NOT NULL);
+- statement: BEGIN;
+- statement: INSERT INTO vexfs_business_txn VALUES (1, 'same transaction');
+- query: SELECT vexfs_write('pg-contract', '/notes/2026/hello.txt', convert_to('rolled back', 'UTF8'));
+  expect:
+  - - 2
+- statement: ROLLBACK;
+- query: SELECT count(*), convert_from(vexfs_read('pg-contract', '/notes/2026/hello.txt'), 'UTF8') FROM vexfs_business_txn;
+  expect:
+  - - 0
+    - hello
+- query: SELECT value FROM jsonb_each_text(vexfs_stat('pg-contract', '/notes/2026/hello.txt')) WHERE key = 'version';
+  expect:
+  - - 1
+- query: SELECT vexfs_stat('pg-contract', '/notes/2026/hello.txt')->>'path', vexfs_stat('pg-contract', '/')->>'path';
+  expect:
+  - - /notes/2026/hello.txt
+    - /
+- query: SELECT name, kind, size, version FROM vexfs_list('pg-contract', '/notes/2026');
+  expect:
+  - - hello.txt
+    - file
+    - 5
+    - 1
+- statement: CREATE ROLE vexfs_pg_other NOLOGIN;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_other;
+- query: SELECT convert_from(vexfs_read('pg-contract', '/notes/2026/hello.txt'), 'UTF8');
+  expect_error: VEXFS_PERMISSION_DENIED
+- query: SELECT count(*) FROM _vexfs.workspaces;
+  expect_error: permission denied
+- query: SELECT vexfs_workspace_create('pg-other') > 0;
+  expect:
+  - - true
+- query: SELECT value FROM jsonb_each_text(vexfs_stat('pg-other', '/')) WHERE key = 'owner';
+  expect:
+  - - vexfs_pg_other
+- query: SELECT vexfs_write('pg-other', '/owned.txt', convert_to('owned', 'UTF8'));
+  expect:
+  - - 1
+- statement: RESET SESSION AUTHORIZATION;
+- statement: ALTER ROLE vexfs_pg_other RENAME TO vexfs_pg_renamed;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_renamed;
+- query: SELECT convert_from(vexfs_read('pg-other', '/owned.txt'), 'UTF8');
+  expect:
+  - - owned
+- query: SELECT value FROM jsonb_each_text(vexfs_stat('pg-other', '/')) WHERE key = 'owner';
+  expect:
+  - - vexfs_pg_renamed
+- statement: RESET SESSION AUTHORIZATION;
+- statement: DROP ROLE vexfs_pg_renamed;
+- statement: CREATE ROLE vexfs_pg_other NOLOGIN;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_other;
+- query: SELECT convert_from(vexfs_read('pg-other', '/owned.txt'), 'UTF8');
+  expect_error: VEXFS_PERMISSION_DENIED
+- statement: RESET SESSION AUTHORIZATION;
+- query: SELECT vexfs_workspace_drop('pg-other');
+  expect:
+  - - 1
+- query: SELECT vexfs_workspace_drop('pg-contract');
+  expect:
+  - - 1
+- statement: DROP TABLE vexfs_business_txn;
+- statement: DROP ROLE vexfs_pg_other;

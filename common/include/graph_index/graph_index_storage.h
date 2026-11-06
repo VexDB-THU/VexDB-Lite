@@ -32,6 +32,7 @@
 #include "module/perf_usage.h"
 #include "vector_buffer/vector_smgr.h"
 #include "ann_utils.h"
+#include "heap_vector_reader.h"
 #include "floatvector.h"
 #include "index_inspect.h"
 #if defined(PG_VEXDB_TARGET_PG)
@@ -739,6 +740,7 @@ public:
         if (BufferIsValid(statbuf)) {
             ReleaseBuffer(statbuf);
         }
+        heap_vector_reader_.Destroy();
         base_layer.destroy();
         upper_layer.destroy();
         elems.destroy();
@@ -1185,56 +1187,73 @@ public:
         return res;
     }
 
-    void fetch_vec_via_slot(HeapTuple tuple, char *vec)
+    bool fetch_vec_via_slot(HeapTuple tuple, char *vec)
     {
-        /* Function-expression indexes carry attnum == 0 and resolve through
-         * rd_indexprs; plain column indexes have no FuncExpr so func_oid
-         * stays Invalid and the name-dispatch block below must be skipped. */
-        Oid func_oid = InvalidOid;
-        int attnum = index->rd_index->indkey.values[0];
-        if (attnum == 0) { /* function expression */
-            if (!index->rd_indexprs) {
-                RelationGetIndexExpressions(index);
-            }
-            FuncExpr *func_expr = (FuncExpr *)linitial(index->rd_indexprs);
-            func_oid = func_expr->funcid;
-            attnum = ((Var *)linitial(func_expr->args))->varattno;
-        }
-
-        Assert(heap->rd_tableam != NULL);
-        bool is_null;
-        Datum value = heap_getattr(tuple, attnum, RelationGetDescr(heap), &is_null);
-        Assert(!is_null);
-
-        Datum d = value;
-        if (OidIsValid(func_oid)) {
-            char *func_name = get_func_name(func_oid);
-            if (func_name != NULL) {
-                if (strcmp(func_name, "array_to_floatvector") == 0) {
-                    d = DirectFunctionCall2(array_to_floatvector, value, Int32GetDatum(dim));
-                } else if (strcmp(func_name, "subfloatvector") == 0) {
-                    FuncExpr *func_expr = (FuncExpr *)linitial(index->rd_indexprs);
-                    Assert(list_length(func_expr->args) == 3);
-                    ListCell *lc = list_nth_cell(func_expr->args, 1);
-                    Const *c = (Const *)lfirst(lc);
-                    Assert(IsA(c, Const) && c->consttype == INT4OID);
-                    Datum arg2 = c->constvalue;
-                    lc = list_nth_cell(func_expr->args, 2);
-                    c = (Const *)lfirst(lc);
-                    Assert(IsA(c, Const) && c->consttype == INT4OID);
-                    Datum arg3 = c->constvalue;
-                    d = DirectFunctionCall3(subfloatvector, value, arg2, arg3);
-                }
-            }
-        }
-
-        FloatVector *data = DatumGetFloatVector(d);
-        memcpy(vec, data->x, vec_size);
-
-        if (PointerGetDatum(data) != value) {
-            pfree(data);
-        }
+        return heap_vector_reader_.Copy(index, heap, tuple, uint16(dim), vec_size, vec);
     }
+
+    template <typename Candidates>
+    Vector<size_t> make_refinement_order(PointExtensionContext &ctx, const Candidates &candidates)
+    {
+        Vector<size_t> order;
+        if (candidates.size() < 2) {
+            return order;
+        }
+        order.reserve(candidates.size());
+        Vector<uint64> keys(candidates.size());
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            CHECK_FOR_INTERRUPTS();
+            order.push_back(i);
+            keys.push_back(UINT64_MAX);
+            get_itempointer(candidates[i].id, [&](const point_type *point) {
+                // This is an IO scheduling hint only. The normal fetch below
+                // still tries the original TIDs and evaluates index expressions.
+                point->apply_on_tids(ctx, [&](const ItemPointerData &tid) {
+                    keys[i] = (uint64(ItemPointerGetBlockNumber(&tid)) << 16) |
+                              uint64(ItemPointerGetOffsetNumber(&tid));
+                    return true;
+                });
+            });
+        }
+        // std::sort needs no temporary heap allocation. All storage here uses
+        // the PostgreSQL allocator; equal physical keys retain candidate order.
+        std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+            return keys[a] < keys[b] || (keys[a] == keys[b] && a < b);
+        });
+        keys.destroy();
+        return order;
+    }
+
+    bool fetch_heap_tuple_hot(ItemPointerData tid, HeapTuple tuple, Buffer *buf)
+    {
+        SnapshotData snap_dirty;
+        InitDirtySnapshot(snap_dirty);
+#if defined(PG_VEXDB_TARGET_PG)
+        // Index TIDs can name the root of a HOT chain, including a redirect
+        // left by vacuum. Follow it just as a PostgreSQL index fetch does.
+        *buf = ReadBuffer(heap, ItemPointerGetBlockNumber(&tid));
+        LockBuffer(*buf, BUFFER_LOCK_SHARE);
+        Snapshot snapshot = heap_snapshot_ ? heap_snapshot_ : &snap_dirty;
+        bool fetched = heap_hot_search_buffer(&tid, heap, *buf, snapshot,
+                                             tuple, nullptr, true);
+        LockBuffer(*buf, BUFFER_LOCK_UNLOCK);
+        if (!fetched) {
+            ReleaseBuffer(*buf);
+            *buf = InvalidBuffer;
+        }
+        return fetched;
+#else
+        return heap_fetch(heap, &snap_dirty, tuple, buf, false);
+#endif
+    }
+
+#if defined(PG_VEXDB_TARGET_PG)
+    size_t search_node_count() const { return metap->num_vectors; }
+    void search_interrupt() const { CHECK_FOR_INTERRUPTS(); }
+    // Scan snapshots belong to PostgreSQL. Build and maintenance callers keep
+    // the dirty-snapshot fallback; ANN refinement follows its executor scan.
+    void set_heap_snapshot(Snapshot snapshot) { heap_snapshot_ = snapshot; }
+#endif
 
     bool fetch_vec_from_heap(ItemPointerData tid, char *dest)
     {
@@ -1243,12 +1262,10 @@ public:
         HeapTuple tuple = (HeapTupleData *)tuple_buf;
         tuple->t_data = (HeapTupleHeader)((char *)tuple + HEAPTUPLESIZE);
         tuple->t_self = tid;
-        SnapshotData snap_dirty;
-        InitDirtySnapshot(snap_dirty);
         Buffer buf;
-        bool res = heap_fetch(heap, &snap_dirty, tuple, &buf, false);
+        bool res = fetch_heap_tuple_hot(tid, tuple, &buf);
         if (res) {
-            fetch_vec_via_slot(tuple, dest);
+            res = fetch_vec_via_slot(tuple, dest);
             ReleaseBuffer(buf);
         }
         STOP_PERF(fetch);
@@ -1262,14 +1279,15 @@ public:
         HeapTuple tuple = (HeapTupleData *)tuple_buf;
         tuple->t_data = (HeapTupleHeader)((char *)tuple + HEAPTUPLESIZE);
         tuple->t_self = tid;
-        SnapshotData snap_dirty;
-        InitDirtySnapshot(snap_dirty);
         Buffer buf;
-        bool fetched = heap_fetch(heap, &snap_dirty, tuple, &buf, false);
+        bool fetched = fetch_heap_tuple_hot(tid, tuple, &buf);
         char *res = NULL;
         if (fetched) {
             res = alloc_vector(vec_size);
-            fetch_vec_via_slot(tuple, res);
+            if (!fetch_vec_via_slot(tuple, res)) {
+                free_vector(res);
+                res = NULL;
+            }
             ReleaseBuffer(buf);
         }
         STOP_PERF(fetch);
@@ -1476,10 +1494,10 @@ public:
 #endif
     }
     template <bool is_base_layer>
-    static constexpr Pair<float *, BitSpan<uint>> get_neighbor_stats(T id)
+    static Pair<float *, BitSpan<uint>> get_neighbor_stats(T id)
         { return Pair<float *, BitSpan<uint>>(nullptr, nullptr, 0, 0); }
-    static constexpr bool has_stat(BitSpan<uint> stat) { return false; }
-    static constexpr void set_stat(BitSpan<uint> stat) {}
+    static bool has_stat(BitSpan<uint> stat) { return false; }
+    static void set_stat(BitSpan<uint> stat) {}
     void lock_stats() const {}
     void unlock_stats() const {}
     template <typename F>
@@ -1519,6 +1537,10 @@ private:
 
     Relation index;
     Relation heap;
+    HeapIndexVectorReader heap_vector_reader_;
+#if defined(PG_VEXDB_TARGET_PG)
+    Snapshot heap_snapshot_ = nullptr;
+#endif
     GraphIndexMetaPage metap;
     Page statp;
     Buffer metabuf;

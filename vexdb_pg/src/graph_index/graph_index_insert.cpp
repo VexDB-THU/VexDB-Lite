@@ -1,4 +1,5 @@
 #include "pg_compat.h"
+#include "graph_signature.h"
 #include "utils/relcache.h"
 #include "storage/itemptr.h"
 
@@ -22,6 +23,8 @@ bool graph_index_insert_internal(Relation index, Relation heap, Datum *values, c
 
     Buffer metabuf = ReadBuffer(index, metablkno);
     GraphIndexMetaPage metap = GRAPH_INDEX_PAGE_GET_META(BufferGetPage(metabuf));
+
+    graph_signature_invalidate(index,metap);
 
     Pointer vec_p;
     char *v = DatumGetVector(values[0], metap->precision_type, &vec_p);

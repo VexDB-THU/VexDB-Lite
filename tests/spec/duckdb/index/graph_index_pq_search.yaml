@@ -35,10 +35,10 @@ steps:
 - statement: CREATE INDEX idx_plain ON pq_search USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_OPTS_L2};
 - statement: SET ${GUC_PQ_SEARCH_MODE} = 'pq_only';
 - statement: SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;
-  expect_error: pq_only
+  expect_error: PQ search requires the index to be built with WITH
 - statement: SET ${GUC_PQ_SEARCH_MODE} = 'bogus';
 - statement: SELECT id FROM pq_search ORDER BY ${L2(vec, ${VEC_LITERAL([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], 8)})} LIMIT 1;
-  expect_error: must be 'off' or 'pq_only'
+  expect_error: must be 'off', 'pq_only' or 'pq_graph'
 - statement: RESET ${GUC_PQ_SEARCH_MODE};
 - statement: DROP TABLE pq_search;
 _migrated_from: vexdb_duckdb/test/sql/vex/index/graph_index_pq_search.test

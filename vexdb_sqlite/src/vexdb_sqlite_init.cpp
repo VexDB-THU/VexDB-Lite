@@ -5,6 +5,7 @@ SQLITE_EXTENSION_INIT1
 #endif
 
 #include "vexdb_sqlite.h"
+#include "agent_files/vexfs_sqlite.h"
 #include "functions/distance_functions.h"
 #include "vtab/graph_index_vtab.h"
 
@@ -14,13 +15,17 @@ SQLITE_EXTENSION_INIT1
 #ifndef VEXDB_SQLITE_BUILD_TIME
 #define VEXDB_SQLITE_BUILD_TIME "unknown"
 #endif
+#ifndef VEXDB_LITE_VERSION
+#define VEXDB_LITE_VERSION "0.1.0-dev"
+#endif
 
 namespace {
 
 void VexVersionFunc(sqlite3_context *ctx, int /*argc*/, sqlite3_value ** /*argv*/) {
     sqlite3_result_text(
         ctx,
-        "vexdb_lite sqlite extension " VEXDB_SQLITE_GIT_HASH " (" VEXDB_SQLITE_BUILD_TIME ")",
+        "vexdb-lite " VEXDB_LITE_VERSION " sqlite extension " VEXDB_SQLITE_GIT_HASH
+        " (" VEXDB_SQLITE_BUILD_TIME ")",
         -1, SQLITE_STATIC);
 }
 
@@ -44,6 +49,9 @@ extern "C" int vexdb_sqlite_register(sqlite3 *db) {
     if (rc != SQLITE_OK) return rc;
 
     rc = vexdb_sqlite_register_distance_functions(db);
+    if (rc != SQLITE_OK) return rc;
+
+    rc = vexfs_sqlite_register(db);
     if (rc != SQLITE_OK) return rc;
 
     rc = sqlite3_create_function(db, "vexdb_version", 0,

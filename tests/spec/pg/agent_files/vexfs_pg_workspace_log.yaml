@@ -1,0 +1,52 @@
+name: pg__vexfs_workspace_log
+tags: [vexfs, pg, workspace, log, pagination]
+description: PostgreSQL VexFS workspace 日志按 commit 分页并保留 actor、session、run 和快照
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-workspace-log') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_mkdir('pg-workspace-log', '/src') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-workspace-log', '/src/main.txt', convert_to('one', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('pg-workspace-log', 'baseline');
+  expect:
+  - - 3
+- statement: SET vexfs.session_id = 'session-log-spec';
+- statement: SET vexfs.run_id = 'run-log-spec';
+- query: SELECT vexfs_write('pg-workspace-log', '/src/main.txt', convert_to('two', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT (vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'commit')::bigint, (vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'parent_commit')::bigint, vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'operation', vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'path', vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'actor', vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'session_id', vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->0->>'run_id', (vexfs_workspace_log('pg-workspace-log', 2, 0)->>'next_before')::bigint;
+  expect:
+  - - 4
+    - 3
+    - write
+    - /src/main.txt
+    - postgres
+    - session-log-spec
+    - run-log-spec
+    - 3
+- query: SELECT (vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->1->>'commit')::bigint, (vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->1->>'has_snapshot')::boolean, vexfs_workspace_log('pg-workspace-log', 2, 0)->'entries'->1->'snapshots'->>0;
+  expect:
+  - - 3
+    - true
+    - baseline
+- query: SELECT (vexfs_workspace_log('pg-workspace-log', 2, NULL)->'entries'->0->>'commit')::bigint;
+  expect:
+  - - 4
+- query: SELECT (vexfs_workspace_log('pg-workspace-log', 2, 3)->'entries'->0->>'commit')::bigint, (vexfs_workspace_log('pg-workspace-log', 2, 3)->'entries'->1->>'commit')::bigint, vexfs_workspace_log('pg-workspace-log', 2, 3)->'next_before' = 'null'::jsonb;
+  expect:
+  - - 2
+    - 1
+    - true
+- query: SELECT vexfs_workspace_log('pg-workspace-log', 0, 0);
+  expect_error: VEXFS_INVALID_LIMIT
+- statement: RESET vexfs.session_id;
+- statement: RESET vexfs.run_id;
+- query: SELECT vexfs_workspace_drop('pg-workspace-log');
+  expect:
+  - - 1

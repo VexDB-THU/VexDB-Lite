@@ -1,0 +1,149 @@
+name: pg__vexfs_metadata_acl
+tags: [vexfs, pg, metadata, symlink, hardlink, xattr, acl, audit]
+description: PostgreSQL VexFS 元数据、链接、ACL 权限执行、审计和快照恢复
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- statement: DROP ROLE IF EXISTS vexfs_pg_acl_owner;
+- statement: DROP ROLE IF EXISTS vexfs_pg_acl_alice;
+- statement: DROP ROLE IF EXISTS vexfs_pg_acl_bob;
+- statement: CREATE ROLE vexfs_pg_acl_owner NOLOGIN;
+- statement: CREATE ROLE vexfs_pg_acl_alice NOLOGIN;
+- statement: CREATE ROLE vexfs_pg_acl_bob NOLOGIN;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_owner;
+- query: SELECT vexfs_workspace_create('pg-metadata') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_acl_set('pg-metadata', (vexfs_workspace_stat('pg-metadata')->>'root_inode')::bigint, '[{"principal":"vexfs_pg_acl_alice","effect":"allow","permissions":"read,write,execute,metadata","inherit":1}]');
+  expect:
+  - - 1
+- query: SELECT vexfs_acl_list('pg-metadata', (vexfs_workspace_stat('pg-metadata')->>'root_inode')::bigint) = vexfs_acl_get('pg-metadata', (vexfs_workspace_stat('pg-metadata')->>'root_inode')::bigint);
+  expect:
+  - - true
+- query: SELECT vexfs_mkdir('pg-metadata', '/docs/tree', true) > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-metadata', '/docs/file.txt', convert_to('hello', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_owner_set('pg-metadata', '/docs/file.txt', 'portable-owner');
+  expect:
+  - - portable-owner
+- query: SELECT vexfs_link('pg-metadata', '/docs/file.txt', '/docs/linked.txt') = (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint;
+  expect:
+  - - true
+- query: SELECT vexfs_symlink('pg-metadata', '/docs/current', convert_to('file.txt', 'UTF8')) > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_set_mode('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 493);
+  expect:
+  - - 493
+- query: SELECT vexfs_chown('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 501, 20)->>'uid', vexfs_chown('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, -1, 21)->>'gid';
+  expect:
+  - - 501
+    - 21
+- query: SELECT vexfs_xattr_set('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 'user.spec', convert_to('one', 'UTF8'), 1);
+  expect:
+  - - 1
+- query: SELECT vexfs_xattr_set('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 'user.spec', convert_to('duplicate', 'UTF8'), 1);
+  expect_error: VEXFS_XATTR_EXISTS
+- query: SELECT vexfs_snapshot_create('pg-metadata', 'baseline') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_acl_grant('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 'vexfs_pg_acl_alice', 'write', 'deny', 0);
+  expect:
+  - - 1
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_alice;
+- query: SELECT convert_from(vexfs_read('pg-metadata', '/docs/file.txt'), 'UTF8');
+  expect:
+  - - hello
+- query: SELECT vexfs_write('pg-metadata', '/docs/file.txt', convert_to('blocked', 'UTF8'));
+  expect_error: VEXFS_PERMISSION_DENIED
+- query: SELECT vexfs_owner_set('pg-metadata', '/docs/file.txt', 'forged-owner');
+  expect_error: VEXFS_PERMISSION_DENIED
+- query: SELECT vexfs_acl_delete('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint);
+  expect_error: VEXFS_PERMISSION_DENIED
+- query: SELECT vexfs_write('pg-metadata', '/docs/alice.txt', convert_to('alice', 'UTF8'));
+  expect:
+  - - 1
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_bob;
+- query: SELECT vexfs_read('pg-metadata', '/docs/file.txt');
+  expect_error: VEXFS_PERMISSION_DENIED
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_owner;
+- query: SELECT vexfs_snapshot_restore('pg-metadata', 'baseline', (vexfs_workspace_stat('pg-metadata')->>'head_commit')::bigint) > 0;
+  expect:
+  - - true
+- query: SELECT convert_from(vexfs_xattr_get('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, 'user.spec'), 'UTF8'), convert_from(vexfs_readlink('pg-metadata', (vexfs_stat('pg-metadata', '/docs/current')->>'inode')::bigint), 'UTF8'), (vexfs_stat('pg-metadata', '/docs/file.txt')->>'link_count')::bigint, vexfs_stat('pg-metadata', '/docs/file.txt')->>'uid', vexfs_stat('pg-metadata', '/docs/file.txt')->>'gid', vexfs_stat('pg-metadata', '/docs/file.txt')->>'owner_principal';
+  expect:
+  - - one
+    - file.txt
+    - 2
+    - 501
+    - 21
+    - portable-owner
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_alice;
+- query: SELECT vexfs_write('pg-metadata', '/docs/file.txt', convert_to('allowed', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT count(*) FROM vexfs_audit_list('pg-metadata', 1000, NULL);
+  expect_error: VEXFS_PERMISSION_DENIED
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_owner;
+- query: SELECT actor::text, operation, path, inode_id = (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint, details->>'before_version', details->>'after_version', position('allowed' in details::text) = 0 FROM vexfs_audit_list('pg-metadata', 1000, NULL) WHERE operation = 'write' AND actor = 'vexfs_pg_acl_alice' ORDER BY event_id DESC LIMIT 1;
+  expect:
+  - - vexfs_pg_acl_alice
+    - write
+    - /docs/file.txt
+    - true
+    - 1
+    - 2
+    - true
+- query: SELECT bool_and(actor IS NOT NULL AND path IS NOT NULL AND inode_id IS NOT NULL AND details ? 'before_version' AND details ? 'after_version'), bool_and(details::text !~ 'hello|allowed|blocked') FROM vexfs_audit_list('pg-metadata', 1000, NULL);
+  expect:
+  - - true
+    - true
+- query: SELECT vexfs_acl_delete('pg-metadata', (vexfs_stat('pg-metadata', '/docs/file.txt')->>'inode')::bigint) > 0;
+  expect:
+  - - true
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_alice;
+- query: SELECT vexfs_read('pg-metadata', '/docs/file.txt');
+  expect_error: VEXFS_PERMISSION_DENIED
+- statement: RESET SESSION AUTHORIZATION;
+- statement: SET SESSION AUTHORIZATION vexfs_pg_acl_owner;
+- query: SELECT vexfs_write('pg-metadata', '/outside.txt', convert_to('outside', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_link('pg-metadata', '/outside.txt', '/docs/tree/inside-link') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_remove('pg-metadata', '/docs/tree', true);
+  expect:
+  - - 1
+- query: SELECT convert_from(vexfs_read('pg-metadata', '/outside.txt'), 'UTF8');
+  expect:
+  - - outside
+- query: SELECT (vexfs_check('pg-metadata', 1)->>'ok')::boolean, (SELECT count(*) >= 15 FROM vexfs_audit_list('pg-metadata', 1000, NULL));
+  expect:
+  - - true
+    - true
+- statement: RESET SESSION AUTHORIZATION;
+- query: SELECT vexfs_workspace_drop('pg-metadata');
+  expect:
+  - - 1
+- query: SELECT workspace_id IS NULL, workspace_name, actor_role::text, operation, path, inode_id IS NOT NULL, details ? 'before_version', details->'after_version' = 'null'::jsonb FROM _vexfs.audit_events WHERE workspace_name = 'pg-metadata' AND operation = 'workspace_drop' ORDER BY event_id DESC LIMIT 1;
+  expect:
+  - - true
+    - pg-metadata
+    - postgres
+    - workspace_drop
+    - /
+    - true
+    - true
+    - true
+- statement: DROP ROLE vexfs_pg_acl_owner;
+- statement: DROP ROLE vexfs_pg_acl_alice;
+- statement: DROP ROLE vexfs_pg_acl_bob;

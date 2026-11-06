@@ -196,6 +196,9 @@ void GraphIndex::LoadFromDiskImage(const std::string &blob) {
 
     auto meta = ReadBytes<DiskMeta>(blob, offset);
 
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
     dimension_ = meta.dimension;
     m_ = int(meta.m);
     ef_construction_ = int(meta.ef_construction);
@@ -260,8 +263,15 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     info.options["m"] = Value::INTEGER(m_);
     info.options["ef_construction"] = Value::INTEGER(ef_construction_);
     info.options["metric"] = Value(MetricToStorageString(metric_));
-    info.options["node_count"] = Value::UBIGINT(uint64_t(store.elems.size()));
-    info.options["upper_count"] = Value::UBIGINT(uint64_t(store.upper_points.size()));
+    // ReserveCapacity preallocates one base slot per input row, but duplicate
+    // vectors share nodes. Unassigned slots have zero-filled headers, not rows.
+    const auto node_count = static_cast<size_t>(store.next_base_id_.load());
+    const auto upper_count = static_cast<size_t>(store.next_upper_id_.load());
+    if (node_count > store.elems.size()) {
+        throw InternalException("GRAPH_INDEX assigned node count exceeds reserved slots");
+    }
+    info.options["node_count"] = Value::UBIGINT(uint64_t(node_count));
+    info.options["upper_count"] = Value::UBIGINT(uint64_t(upper_count));
     info.options["entry_id"] = Value::UBIGINT(uint64_t(store.entry_info.id));
     info.options["entry_cur_layer_idx"] = Value::UBIGINT(uint64_t(store.entry_info.cur_layer_idx));
     info.options["entry_level"] = Value::INTEGER(int(store.entry_info.level));
@@ -278,10 +288,10 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
 
     if (!store.id_to_node_ptr_.empty()) {
         string id_ptr_blob;
-        uint64_t num_entries = store.id_to_node_ptr_.size();
+        uint64_t num_entries = std::min(node_count, store.id_to_node_ptr_.size());
         id_ptr_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
-        for (auto &ptr : store.id_to_node_ptr_) {
-            uint64_t ptr_val = ptr.Get();
+        for (uint64_t i = 0; i < num_entries; ++i) {
+            uint64_t ptr_val = store.id_to_node_ptr_[i].Get();
             id_ptr_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
         }
         info.options["id_ptr_map"] = Value::BLOB(const_data_ptr_cast(id_ptr_blob.data()), id_ptr_blob.size());
@@ -300,12 +310,14 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
 
     if (!store.elems.empty()) {
         string rowid_blob;
-        uint64_t num_entries = store.elems.size();
+        // Every persisted node array must cover the same assigned prefix.
+        // Duplicate vectors can leave unused slots in the reserved tail.
+        uint64_t num_entries = node_count;
         uint64_t override_count = 0;
         AppendUInt64LE(rowid_blob, num_entries);
         const auto override_count_offset = rowid_blob.size();
         AppendUInt64LE(rowid_blob, 0);
-        for (idx_t node_id = 0; node_id < store.elems.size(); node_id++) {
+        for (idx_t node_id = 0; node_id < node_count; node_id++) {
             const auto &elem = store.elems[node_id];
             bool matches_header_default = false;
             if (node_id < store.id_to_node_ptr_.size() && store.node_alloc_) {
@@ -348,10 +360,10 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
 
     if (!store.upper_idx_to_ptr_.empty()) {
         string upper_ptr_blob;
-        uint64_t num_entries = store.upper_idx_to_ptr_.size();
+        uint64_t num_entries = std::min(upper_count, store.upper_idx_to_ptr_.size());
         upper_ptr_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
-        for (auto &ptr : store.upper_idx_to_ptr_) {
-            uint64_t ptr_val = ptr.Get();
+        for (uint64_t i = 0; i < num_entries; ++i) {
+            uint64_t ptr_val = store.upper_idx_to_ptr_[i].Get();
             upper_ptr_blob.append(reinterpret_cast<const char *>(&ptr_val), sizeof(ptr_val));
         }
         info.options["upper_ptr_map"] = Value::BLOB(const_data_ptr_cast(upper_ptr_blob.data()), upper_ptr_blob.size());
@@ -363,9 +375,10 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
     // descent, so we write them out alongside lower_layer_idx and id.
     if (!store.upper_points.empty()) {
         string upper_data_blob;
-        uint64_t num_entries = store.upper_points.size();
+        uint64_t num_entries = std::min(upper_count, store.upper_points.size());
         upper_data_blob.append(reinterpret_cast<const char *>(&num_entries), sizeof(num_entries));
-        for (auto &up : store.upper_points) {
+        for (uint64_t i = 0; i < num_entries; ++i) {
+            const auto &up = store.upper_points[i];
             uint32_t id_val = static_cast<uint32_t>(up.id);
             uint32_t lower_val = static_cast<uint32_t>(up.lower_layer_idx);
             upper_data_blob.append(reinterpret_cast<const char *>(&id_val), sizeof(id_val));
@@ -387,6 +400,7 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
         // At 1M rows this removes one full codes/order/map/checksum copy from
         // checkpoint peak memory.
         info.options["pq_storage_version"] = Value::UINTEGER(2);
+
         info.options["pq_m"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.M));
         info.options["pq_dim"] = Value::UINTEGER(static_cast<uint32_t>(pq_quantizer_.d));
 
@@ -403,12 +417,12 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
             const_data_ptr_cast(pq_row_id_order_.data()),
             pq_row_id_order_.size() * sizeof(row_t));
 
-        if (pq_node_code_positions_.size() != runtime_->store.elems.size()) {
+        if (pq_node_code_positions_.size() < node_count) {
             throw InternalException("PQ node/code mapping does not match graph nodes");
         }
         info.options["pq_node_code_positions"] = Value::BLOB(
             const_data_ptr_cast(pq_node_code_positions_.data()),
-            pq_node_code_positions_.size() * sizeof(uint32_t));
+            node_count * sizeof(uint32_t));
 
         if (pq_vector_coverage_hashes_.size() == pq_row_id_order_.size()) {
             info.options["pq_vector_coverage_hashes"] = Value::BLOB(
@@ -442,11 +456,54 @@ IndexStorageInfo GraphIndex::ExportStorageInfo() const {
             const_data_ptr_cast(rabitq_codes_.data()), rabitq_codes_.size());
     }
 
+    if (pq_use_ || rabitq_use_) {
+        info.options["quantizer_search_stale"] = Value::BOOLEAN(
+            quantizer_search_stale_.load(std::memory_order_acquire));
+    }
     if (compact_mode_) {
         info.options["compact_mode"] = Value::BOOLEAN(true);
     }
 
     return info;
+}
+
+void GraphIndex::RestoreDuplicateRowIds(const IndexStorageInfo &info) {
+    auto entry = info.options.find("duplicate_row_ids_v1");
+    if (entry == info.options.end()) return;
+    const auto blob = StringValue::Get(entry->second.DefaultCastAs(LogicalType::BLOB));
+    size_t offset = 0;
+    const auto count = ReadBytes<uint64_t>(blob, offset);
+    auto &elems = runtime_->store.elems;
+    if (count > elems.size() || count > (blob.size() - offset) / (4 * sizeof(uint64_t))) {
+        throw InvalidInputException("GRAPH_INDEX duplicate row-id metadata has invalid node count");
+    }
+    std::unordered_set<uint64_t> restored;
+    for (uint64_t node = 0; node < count; ++node) {
+        const auto sid = ReadBytes<uint64_t>(blob, offset);
+        const auto rows = ReadBytes<uint64_t>(blob, offset);
+        if (sid >= elems.size() || !restored.insert(sid).second || rows < 2 ||
+            rows > (blob.size() - offset) / sizeof(int64_t)) {
+            throw InvalidInputException("GRAPH_INDEX duplicate row-id metadata has invalid row list");
+        }
+        auto &tids = elems[sid].tids;
+        tids.clear();
+        tids.reserve(rows);
+        for (uint64_t row = 0; row < rows; ++row) {
+            ItemPointerData tid;
+            tid.row_id = ReadBytes<int64_t>(blob, offset);
+            if (tid.row_id < 0 || tid.row_id >= MAX_ROW_ID) {
+                throw InvalidInputException("GRAPH_INDEX duplicate row-id metadata has invalid row id");
+            }
+            // Preserve deleted ids too, matching the pre-checkpoint tids list.
+            // Search and coverage checks filter deleted_rids_. Keeping the list
+            // also preserves a surviving duplicate on subsequent checkpoints
+            // when the primary row id in the fixed node header was deleted.
+            tids.push_back(tid);
+        }
+    }
+    if (offset != blob.size()) {
+        throw InvalidInputException("GRAPH_INDEX duplicate row-id metadata has trailing bytes");
+    }
 }
 
 IndexStorageInfo GraphIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {

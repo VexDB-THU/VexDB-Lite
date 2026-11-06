@@ -375,6 +375,12 @@ inline void transform_int8_to_int16(const int8 *src, int16 *dst, uint16 dim)
     }
 }
 
+// Native callers and ISA implementation files must see the same member
+// specializations. Otherwise callers may inline the primary scalar body while
+// another translation unit supplies a different SIMD definition for that same
+// symbol (including a different cosine distance convention).
+#include "distance/core/distance_specializations.h"
+
 inline void transform_int16_to_int8(const int16 *src, int8 *dst, uint16 dim)
 {
     for (uint16 i = 0; i < dim; ++i) {

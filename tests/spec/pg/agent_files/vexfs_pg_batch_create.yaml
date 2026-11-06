@@ -1,0 +1,92 @@
+name: pg__vexfs_batch_create
+tags: [vexfs, pg, batch, history, acl, atomicity]
+description: PostgreSQL VexFS 批量创建只生成一个提交，并保留逐路径历史、ACL 与原子性
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-batch') > 0;
+  expect:
+  - - true
+- statement: DO $$ DECLARE v_workspace _vexfs.workspaces%ROWTYPE; BEGIN SELECT * INTO STRICT v_workspace FROM _vexfs.workspaces WHERE name='pg-batch'; PERFORM _vexfs.begin_commit_batch(v_workspace.workspace_id, 'empty_batch', '/', v_workspace.root_inode, jsonb_build_object('before_version', NULL, 'after_version', NULL)); PERFORM _vexfs.end_commit_batch(v_workspace.workspace_id); END $$;
+- query: SELECT head_commit, (SELECT count(*) FROM _vexfs.commits AS commit WHERE commit.workspace_id=workspace.workspace_id), (SELECT count(*) FROM _vexfs.commit_changes AS change WHERE change.workspace_id=workspace.workspace_id) FROM _vexfs.workspaces AS workspace WHERE name='pg-batch';
+  expect:
+  - - 1
+    - 1
+    - 1
+- query: SELECT vexfs_acl_set('pg-batch', (vexfs_workspace_stat('pg-batch')->>'root_inode')::bigint, '[{"principal":"public","effect":"allow","permissions":"read","inherit":1}]');
+  expect:
+  - - 1
+- query: SELECT (vexfs_create_batch('pg-batch', '/', '[{"name":"a.txt"},{"name":"b.txt","mode":384},{"name":"c.txt"},{"name":"dir","kind":"directory"}]'::jsonb)->>'commit')::bigint;
+  expect:
+  - - 3
+- query: SELECT (vexfs_workspace_stat('pg-batch')->>'head_commit')::bigint, (vexfs_workspace_stat('pg-batch')->>'live_files')::bigint, (vexfs_workspace_stat('pg-batch')->>'live_bytes')::bigint;
+  expect:
+  - - 3
+    - 3
+    - 0
+- query: SELECT count(*), count(DISTINCT manifest_id) FROM _vexfs.file_versions WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch');
+  expect:
+  - - 3
+    - 1
+- query: SELECT count(*) FROM _vexfs.manifests WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch');
+  expect:
+  - - 1
+- query: SELECT count(*), min(ordinal), max(ordinal), string_agg(operation, ',' ORDER BY ordinal) FROM _vexfs.commit_changes WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch') AND commit_no=3;
+  expect:
+  - - 4
+    - 1
+    - 4
+    - create,create,create,create
+- query: SELECT count(*) FROM _vexfs.audit_events WHERE workspace_name='pg-batch' AND operation='create_batch';
+  expect:
+  - - 1
+- query: SELECT count(*) FROM _vexfs.acl_entries AS acl JOIN _vexfs.dentries AS child ON child.workspace_id=acl.workspace_id AND child.inode_id=acl.inode_id WHERE acl.workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch') AND child.parent_inode=(SELECT root_inode FROM _vexfs.workspaces WHERE name='pg-batch') AND acl.principal='public';
+  expect:
+  - - 4
+- query: SELECT convert_from(vexfs_read('pg-batch', '/a.txt'), 'UTF8'), (vexfs_stat('pg-batch', '/b.txt')->>'mode')::integer, vexfs_stat('pg-batch', '/dir')->>'kind';
+  expect:
+  - - ""
+    - 384
+    - directory
+- query: SELECT vexfs_create_batch('pg-batch', '/', '[{"name":"dup"},{"name":"dup"}]'::jsonb);
+  expect_error: VEXFS_INVALID_BATCH
+- query: SELECT vexfs_create_batch('pg-batch', '/', '[{"name":"a.txt"},{"name":"new.txt"}]'::jsonb);
+  expect_error: VEXFS_ALREADY_EXISTS
+- query: SELECT vexfs_create_batch('pg-batch', '/', '[{"name":"fractional","mode":420.5}]'::jsonb);
+  expect_error: VEXFS_INVALID_BATCH
+- query: SELECT vexfs_create_batch('pg-batch', '/', '[{"name":"typo","mod":420}]'::jsonb);
+  expect_error: VEXFS_INVALID_BATCH
+- query: SELECT (vexfs_workspace_stat('pg-batch')->>'head_commit')::bigint, count(*) FROM _vexfs.inodes WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch') GROUP BY workspace_id;
+  expect:
+  - - 3
+    - 5
+- query: SELECT (vexfs_check('pg-batch', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- query: WITH parent AS (SELECT '/' || array_to_string(ARRAY(SELECT repeat(chr(96+n), 200) FROM generate_series(1,15) AS n), '/') AS path) SELECT vexfs_mkdir('pg-batch', parent.path, true) > 0 FROM parent;
+  expect:
+  - - true
+- query: WITH parent AS (SELECT '/' || array_to_string(ARRAY(SELECT repeat(chr(96+n), 200) FROM generate_series(1,15) AS n), '/') AS path) SELECT jsonb_array_length(vexfs_create_batch('pg-batch', parent.path, '[{"name":"long-path.txt"}]'::jsonb)->'created') FROM parent;
+  expect:
+  - - 1
+- query: WITH parent AS (SELECT '/' || array_to_string(ARRAY(SELECT repeat(chr(96+n), 200) FROM generate_series(1,15) AS n), '/') AS path) SELECT octet_length(vexfs_read('pg-batch', parent.path || '/long-path.txt')) FROM parent;
+  expect:
+  - - 0
+- query: SELECT (vexfs_check('pg-batch', 1)->>'ok')::boolean;
+  expect:
+  - - true
+- query: SELECT vexfs_workspace_create('pg-batch-quota') > 0;
+  expect:
+  - - true
+- query: SELECT (vexfs_quota_set('pg-batch-quota', NULL, 1, NULL)->>'max_files')::bigint;
+  expect:
+  - - 1
+- query: SELECT vexfs_create_batch('pg-batch-quota', '/', '[{"name":"one"},{"name":"two"}]'::jsonb);
+  expect_error: VEXFS_QUOTA_FILES
+- query: SELECT (vexfs_workspace_stat('pg-batch-quota')->>'head_commit')::bigint, (vexfs_workspace_stat('pg-batch-quota')->>'live_files')::bigint, count(*) FROM _vexfs.inodes WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-batch-quota') GROUP BY workspace_id;
+  expect:
+  - - 1
+    - 0
+    - 1
+- query: SELECT (vexfs_check('pg-batch-quota', 1)->>'ok')::boolean;
+  expect:
+  - - true

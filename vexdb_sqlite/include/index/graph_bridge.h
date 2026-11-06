@@ -61,6 +61,17 @@ public:
     bool UsesRaBitQ() const;
     bool IsCompactMode() const;
 
+    // Optional L2 candidate source. Build once, persist with the graph; search
+    // never trains a model. The mode is passed per request by the host.
+    void BuildSignature(uint64_t seed);
+    void SetSignatureRescue(bool enabled);
+    bool HasSignature() const;
+    size_t SignatureMemoryBytes() const;
+    struct SearchStats {
+        size_t distance_calls = 0, rescue_refinements = 0;
+    };
+    SearchStats LastSearchStats() const;
+
     // ---- tid 摘除（DELETE/UPDATE 增量化，对齐 MySQL 二级索引 delete-mark+
     // insert 范式）----
     // 把 rowid 从其节点的 tids 里摘除：节点变空壳后天然零输出（查询展开

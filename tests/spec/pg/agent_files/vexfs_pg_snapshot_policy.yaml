@@ -1,0 +1,69 @@
+name: pg__vexfs_snapshot_policy
+tags: [vexfs, pg, snapshot, policy, prune]
+description: PostgreSQL 快照分类、保留策略、dry-run 和 GC 边界
+steps:
+- statement: TRUNCATE _vexfs.workspaces CASCADE;
+- query: SELECT vexfs_workspace_create('pg-snapshot-policy') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_mkdir('pg-snapshot-policy', '/src') > 0;
+  expect:
+  - - true
+- query: SELECT vexfs_write('pg-snapshot-policy', '/src/main.txt', convert_to('v1', 'UTF8'));
+  expect:
+  - - 1
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'agent-old', NULL, 'consistent', 'agent');
+  expect:
+  - - 3
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'safety-old', NULL, 'consistent', 'safety');
+  expect:
+  - - 3
+- query: SELECT vexfs_write('pg-snapshot-policy', '/src/main.txt', convert_to('v2', 'UTF8'));
+  expect:
+  - - 2
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'manual-current', NULL, 'consistent', 'manual');
+  expect:
+  - - 4
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'agent-new', NULL, 'consistent', 'agent');
+  expect:
+  - - 4
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'safety-new', NULL, 'consistent', 'safety');
+  expect:
+  - - 4
+- query: SELECT (vexfs_snapshot_policy_get('pg-snapshot-policy')->>'agent_keep')::integer, (vexfs_snapshot_policy_get('pg-snapshot-policy')->>'safety_keep')::integer, (vexfs_snapshot_policy_get('pg-snapshot-policy')->>'keep_days')::integer;
+  expect:
+  - - 20
+    - 10
+    - 30
+- query: SELECT (vexfs_snapshot_policy_set('pg-snapshot-policy', 1, 1, 0)->'expired'->>'total')::integer;
+  expect:
+  - - 2
+- query: SELECT (vexfs_snapshot_prune('pg-snapshot-policy', 1)->>'candidate_count')::integer, (vexfs_snapshot_prune('pg-snapshot-policy', 1)->>'deleted')::integer, (SELECT count(*) FROM vexfs_snapshot_list('pg-snapshot-policy'));
+  expect:
+  - - 2
+    - 0
+    - 5
+- query: SELECT (vexfs_snapshot_prune('pg-snapshot-policy', 0)->>'deleted')::integer;
+  expect:
+  - - 2
+- query: SELECT name, snapshot_type FROM vexfs_snapshot_list('pg-snapshot-policy') ORDER BY 1;
+  expect:
+  - - agent-new
+    - agent
+  - - manual-current
+    - manual
+  - - safety-new
+    - safety
+- query: SELECT (vexfs_retention_set('pg-snapshot-policy', 1, 0)->>'reclaimable_versions')::integer >= 1;
+  expect:
+  - - true
+- statement: UPDATE _vexfs.snapshots SET created_at=clock_timestamp()-interval '31 days' WHERE workspace_id=(SELECT workspace_id FROM _vexfs.workspaces WHERE name='pg-snapshot-policy') AND name='agent-new';
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'agent-recent', NULL, 'consistent', 'agent');
+  expect:
+  - - 4
+- query: SELECT (vexfs_snapshot_policy_set('pg-snapshot-policy', 0, 1, 30)->'expired'->>'agent')::integer, (vexfs_snapshot_prune('pg-snapshot-policy', 1)->>'candidate_count')::integer;
+  expect:
+  - - 1
+    - 1
+- query: SELECT vexfs_snapshot_create('pg-snapshot-policy', 'bad-type', NULL, 'consistent', 'other');
+  expect_error: VEXFS_INVALID_SNAPSHOT_TYPE

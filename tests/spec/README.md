@@ -1,73 +1,94 @@
-# Spec 测试框架（声明式 DSL，多引擎）
+# Spec 测试框架
 
-**Single Source of Truth**：一份 YAML 用例编译成 DuckDB sqllogictest / PG SQL+expected / openGauss / Python pytest 多份产物。
+更新日期：2026-10-26。业务用例写在 YAML 中，渲染器生成各数据库的测试格式。
+数量与渲染成功都不等于 SQL 测试通过，执行结果以实际 runner 和 CI 为准。
 
----
+## 目录与数量
 
-## 项目测试体系：**单一来源（spec yaml）**
+| 目录 | YAML 数量 | 用途 |
+|---|---:|---|
+| `shared/` | 26 | 跨引擎用例 |
+| `duckdb/` | 88 | DuckDB 专属 |
+| `pg/` | 74 | PostgreSQL 专属，含 VexFS |
+| `sqlite/` | 30 | SQLite 专属，含 VexFS |
+| `opengauss/` | 1 | openGauss 专属 |
+| **合计** | **219** | 不含 `_lib/dialects.yaml` 字典 |
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│ spec DSL yaml (本框架)        117 个   tests/spec/                      │
-│   多引擎 SSOT (DuckDB/PG/openGauss/...)                                 │
-│   - DuckDB runner: bash tests/spec/_lib/docker/run_duckdb.sh test       │
-│   - PG     runner: bash tests/spec/_lib/docker/run_pg.sh   test         │
-│   - 路由 ENGINE_DIRS, 加一行扩 SQLite                                   │
-│   通过率: DuckDB 105/105 (100%), PG 26/36 (72%, 余下是 PG_VEXDB 实现缺口) │
-└─────────────────────────────────────────────────────────────────────────┘
-
-退役的旧体系 (已删除):
-- ❌ vexdb_duckdb/test/sql/vex/*.test       109 个 sqllogictest (反向迁入 spec)
-- ❌ ../pg_tests/*.sql                    59 个手写 PG (迁入 spec/pg/)
-保留:
-- ✅ vexdb_duckdb/test/sql/unsupported_vex/  3 个 quarantine 测试 (功能未实现)
-```
-
----
-
-## 目录组织（按引擎物理分类）
-
-```
-tests/spec/
-├── _lib/                          工具链
-│   ├── dialects.yaml              各引擎变量字典 (vars / functions / inherit)
-│   ├── render.py                  YAML → 多引擎产物 (按 ENGINE_DIRS 路由)
-│   ├── classify.py                自动分类: shared / duckdb (含 strip_templates 平衡扫描器)
-│   ├── migrate_test_to_yaml.py    sqllogictest .test → YAML (反向迁移工具)
-│   ├── lint_review.py             spec 人工 review 提示生成
-│   └── docker/                    PG 19devel 测试容器
-│       ├── Dockerfile             三阶段: pg-build / vex-build / runtime (Trixie + Boost 1.83)
-│       ├── run_pg.sh              build / up / down / test / shell
-│       └── compare.py             容差比较器 (浮点 atol/rtol, NULL/bool 规范化, 向量字面量元素级)
-│
-├── shared/                        ✅ 跨引擎核心 (DuckDB + PG + openGauss 共用)
-│   ├── types/      (2)
-│   ├── functions/  (3)
-│   └── index/      (20)
-├── duckdb/                        ✅ DuckDB 独有 (~80 个)
-│   ├── functions/                 含 list_transform / vexdb_index_info / 表达式数组等 DuckDB-only
-│   └── index/                     含 ATTACH / restart / optimizer_explain / vexdb_simd_arch 等
-├── pg/                            🟡 PG 独有 (待补; 13 个 PG 专属用例)
-└── opengauss/                     🟡 openGauss 独有 (待补; ivfpq_basic_hnsw_adapted 等)
-```
-
-**为什么按引擎分目录而不用 capability tag**：物理目录直观（看路径就知道归属），`git log` 历史按引擎清晰，新引擎只在 `render.py` 的 `ENGINE_DIRS` 加一行路由，不用改业务规则。
-
----
-
-## 引擎路由（`render.py` 的 `ENGINE_DIRS`）
+`_lib/render.py` 中的 `ENGINE_DIRS` 是引擎路由的来源：
 
 ```python
 ENGINE_DIRS = {
     "duckdb":    ["shared", "duckdb"],
     "pg":        ["shared", "pg"],
-    "opengauss": ["shared", "pg", "opengauss"],   # opengauss = PG 兼容 + 自家
-    "sqlite":    ["shared", "sqlite"],            # 将来扩展
-    "python":    ["shared", "duckdb"],            # python 后端 = DuckDB
+    "opengauss": ["shared", "pg", "opengauss"],
+    "sqlite":    ["shared", "sqlite"],
+    "python":    ["shared", "duckdb"],
 }
 ```
 
----
+当前按目标发现的用例数是 DuckDB 114、PG 100、openGauss 101、SQLite 56、Python 114。
+shared 用例会复用，`skip.<engine>` 会在渲染时跳过，因此不能相加作为独立用例总数。
+历史文档里的 105/105、26/36 是当时记录，不代表当前分支通过率。
+
+## 准备和渲染
+
+```bash
+python3 -m pip install -r tests/spec/requirements.txt
+python3 tests/spec/_lib/render.py --engine all --out build/spec
+python3 tests/spec/_lib/render.py --engine sqlite --out build/spec
+```
+
+| 目标 | 产物 | 执行器 |
+|---|---|---|
+| DuckDB | `build/spec/duckdb/<name>.test` | DuckDB unittest |
+| PG / openGauss | `build/spec/<engine>/sql/`、`expected/` | PG runner / 对应宿主 |
+| SQLite | `build/spec/sqlite/sql/`、`expected/` | Python sqlite3 + 动态扩展 |
+| Python | `build/spec/python/test_<name>.py` | Python / DuckDB |
+
+只修改 YAML，不手工维护生成物。当前 PR CI 运行全部目标的渲染；openGauss 和 Python
+产物生成不表示 CI 已执行这两类测试。`render.py --check` 当前没有实现内容比对，不能当成一致性检查。
+
+## 运行测试
+
+### DuckDB
+
+```bash
+bash tests/spec/_lib/docker/run_duckdb.sh test
+bash tests/spec/_lib/docker/run_duckdb.sh test '*graph_index_ann*'
+```
+
+这个 runner 不使用 Docker。它先渲染并部署到
+`vexdb_duckdb/test/sql/vex/spec_run/`，再构建 unittest 并默认运行 `[spec_run]`。
+源码与二进制默认位于 `build/duck/v1.5.2/`；设置 `DUCKDB_VERSION` 后会使用对应版本目录。
+不要在干净检出中直接运行旧 `test/sql/vex/*` 路径而省略部署步骤。
+
+### PostgreSQL
+
+```bash
+python3 tests/spec/_lib/render.py --engine pg --out build/spec
+BUILDX_EXTRA_ARGS='--build-arg PG_GIT_TAG=REL_19_STABLE' \
+  bash tests/spec/_lib/docker/run_pg.sh build
+bash tests/spec/_lib/docker/run_pg.sh test
+bash tests/spec/_lib/docker/run_pg.sh test 'pg__vexfs_*'
+bash tests/spec/_lib/docker/run_pg.sh down
+```
+
+首次需要构建镜像。runner 会启动容器，结果位于 `build/spec/pg/results/`。
+Dockerfile 的历史默认是 `master`；CI 显式传入 `REL_19_STABLE`，防止测试宿主意外换代。
+
+### SQLite
+
+```bash
+bash build_sqlite.sh test
+# 已构建时，只运行 spec
+bash tests/spec/_lib/docker/run_sqlite.sh
+# 显式绑定动态扩展
+VEXDB_SQLITE_EXTENSION=/absolute/path/to/vexdb_lite.so \
+  bash tests/spec/_lib/docker/run_sqlite.sh
+```
+
+SQLite runner 不使用 Docker，需要 Python 带 SQLite 动态扩展加载能力。
+`build_sqlite.sh test` 还运行向量、VexFS、平台接口和 CLI 冒烟；平台接口的编译测试不等于真实挂载验收。
 
 ## 写一个用例
 
@@ -109,97 +130,13 @@ steps:
 
 ---
 
-## 命令
+## CI 与故障恢复
 
-```bash
-# 渲染所有引擎 → build/spec/{duckdb,pg,opengauss,python}/
-python3 tests/spec/_lib/render.py --engine all --out build/spec
+- `.github/workflows/pr-regression.yml`：PR、main push、手工触发；检查工作流、渲染全部目标，再执行 PG、DuckDB、SQLite Linux 回归。
+- `.github/workflows/build-linux.yml`：tag 或手工触发；执行 DuckDB、SQLite 的 x86_64/aarch64 回归。
+- `.github/workflows/duckdb-crash-recovery.yml`：手工运行已有 hard-kill harness；没有自动定时任务。
+- `.github/workflows/build-mobile.yml`：Android SQLite 库交叉编译；不执行设备测试。
 
-# 单引擎
-python3 tests/spec/_lib/render.py --engine pg --out build/spec
+完整范围与已归档流程见 [当前状态](../../documentation/current-status.md)。
 
-# 反向迁移已有 .test → spec yaml (生成在 migrated/, 需手工 review 后入库)
-python3 tests/spec/_lib/migrate_test_to_yaml.py --batch \
-  --src-root vexdb_duckdb/test/sql/vex \
-  --out-root tests/spec/migrated --include-slow
-
-# 自动分类 shared / duckdb (从 30+ DuckDB-only 模式判定)
-python3 tests/spec/_lib/classify.py --apply              # 从 migrated/ 首次分类
-python3 tests/spec/_lib/classify.py --from shared --apply  # 从 shared/ 重新分类
-
-# PG Docker 测试 (本仓库自带)
-bash tests/spec/_lib/docker/run_pg.sh build  # 首次 build PG 19devel + vexdb_lite (~30min)
-bash tests/spec/_lib/docker/run_pg.sh up     # 启动容器
-bash tests/spec/_lib/docker/run_pg.sh test   # 跑 build/spec/pg/ 全部
-bash tests/spec/_lib/docker/run_pg.sh down   # 清理
-```
-
----
-
-## 渲染产物形态
-
-| 引擎 | 路径 | 格式 |
-|---|---|---|
-| DuckDB | `build/spec/duckdb/<name>.test` | sqllogictest |
-| PG | `build/spec/pg/sql/<name>.sql` + `expected/<name>.out` | pg_regress 风格 |
-| openGauss | `build/spec/opengauss/...` | 同 PG |
-| Python | `build/spec/python/test_<name>.py` | pytest |
-
-**禁止手工编辑 `build/spec/`** —— CI 通过 `render-check` job 校验产物来自 spec。
-
----
-
-## 当前完成度（2026-05-09）
-
-| 项 | 数量 / 状态 |
-|---|---|
-| `shared/` 跨引擎 yaml | 25 |
-| `duckdb/` DuckDB-only yaml | 80 |
-| `pg/` PG-only yaml | 0（待迁 13 个） |
-| `opengauss/` openGauss-only yaml | 0（待迁 1 个） |
-| **DuckDB spec runner** | **105/105 (100%)** |
-| **PG Docker runner** | **26/36 (72%)** ← PG_VEXDB 真功能缺口 |
-| `pg_tests/` 退役 | ✅ 已删 |
-| `vexdb_duckdb/test/sql/vex/*.test` 退役 | ✅ 已删 (保留 unsupported_vex/) |
-| `build.sh test` 接 spec runner | 🟡 follow-up (build.sh 在工作区外层不在 git) |
-
----
-
-## 历史 (整理过程)
-
-```
-[✅] 1) spec 框架 + 工具链
-[✅] 2) PG Docker runner 跑通
-[✅] 3) DuckDB spec runner (run_duckdb.sh) 接通
-[✅] 4) 修漂移 (DuckDB 102/105 → 105/105)
-[✅] 5) 迁 13 个 PG 专属 + 1 openGauss → tests/spec/{pg,opengauss}/
-[✅] 6) rm -rf 105 legacy .test + 59 pg_tests/  (本次操作)
-```
-
----
-
-## 高阶断言（规划中，未实现 — render.py 不处理）
-
-```yaml
-assertions:
-  - recall_vs_brute_force:
-      query_count: 100
-      k: 10
-      min_recall: 0.95
-```
-
-差分测试将在阶段 2 接入。
-
----
-
-## CI
-
-`.github/workflows/spec-tests.yml`（独立分支，未入此分支 - 待并）：
-
-| Job | 内容 | 门禁 |
-|---|---|---|
-| `render-check` | YAML 语法 + render --engine all + classify 一致性 | 必须 100% |
-| `pg-spec` | Docker buildx + run_pg.sh test | 通过率 ≥ 90% |
-| `duckdb-spec` | (placeholder, `if: false`) 等 inline build 实现 | — |
-
-详见 `.github/workflows/spec-tests-README.md`。
+高阶 recall 断言仍未由渲染器实现；不要通过 YAML 中新增未支持的 `assertions` 字段来声明覆盖。

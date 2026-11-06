@@ -1,11 +1,61 @@
 #include "ann_utils.h"
 #include "floatvector.h"
 #include "pg_compat.h"
+#include "heap_vector_reader.h"
 
 extern "C" {
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "utils/syscache.h"
+}
+
+bool HeapIndexVectorReader::Copy(Relation index, Relation heap, HeapTuple tuple,
+                                 uint16 dimensions, size_t bytes, char *dest)
+{
+    bool is_null = false;
+    Datum value;
+    const int attribute = index->rd_index->indkey.values[0];
+    ExprContext *context = nullptr;
+    if (attribute != 0) {
+        value = heap_getattr(tuple, attribute, RelationGetDescr(heap), &is_null);
+    } else {
+        if (!estate_) {
+            estate_ = CreateExecutorState();
+            MemoryContext previous = MemoryContextSwitchTo(estate_->es_query_cxt);
+            index_info_ = BuildIndexInfo(index);
+            slot_ = MakeSingleTupleTableSlot(RelationGetDescr(heap), &TTSOpsHeapTuple);
+            MemoryContextSwitchTo(previous);
+        }
+        context = GetPerTupleExprContext(estate_);
+        ExecStoreHeapTuple(tuple, slot_, false);
+        context->ecxt_scantuple = slot_;
+        Datum values[INDEX_MAX_KEYS];
+        bool nulls[INDEX_MAX_KEYS];
+        FormIndexDatum(index_info_, slot_, estate_, values, nulls);
+        value = values[0];
+        is_null = nulls[0];
+    }
+    if (!is_null) {
+        FloatVector *data = DatumGetFloatVector(value);
+        if (data->dim != dimensions || bytes > size_t(dimensions) * sizeof(float))
+            elog(ERROR, "index vector dimensions changed during refinement");
+        memcpy(dest, data->x, bytes);
+        if ((Pointer)data != DatumGetPointer(value)) pfree(data);
+    }
+    if (context) {
+        ExecClearTuple(slot_);
+        ResetExprContext(context);
+    }
+    return !is_null;
+}
+
+void HeapIndexVectorReader::Destroy()
+{
+    if (slot_) ExecDropSingleTupleTableSlot(slot_);
+    if (estate_) FreeExecutorState(estate_);
+    slot_ = nullptr;
+    estate_ = nullptr;
+    index_info_ = nullptr;
 }
 
 // TypenameGetTypid only searches pg_catalog. Our extension types live in

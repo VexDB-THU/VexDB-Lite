@@ -4,6 +4,8 @@
  */
 
 #include "pg_compat.h"
+#include "graph_signature.h"
+#include "guc_config.h"
 
 #include <vtl/optional>
 #include <vtl/vector>
@@ -19,6 +21,27 @@
 #include "distance/core/distance_dispatcher.h"
 #include "floatvector.h"
 #include "vector_buffer/local_vec_cache.h"
+extern "C" {
+#include "utils/builtins.h"
+PG_FUNCTION_INFO_V1(vexdb_last_search_info);
+Datum vexdb_last_search_info(PG_FUNCTION_ARGS);
+}
+
+struct GraphScanInfo {
+    const char *route = "none", *signature_state = "disabled";
+    size_t rounds = 0, graph_ef = 0, distance_calls = 0, rescue_refinements = 0;
+    size_t counted_rounds = 0;
+};
+// Backend-local diagnostics, never shared across sessions or cached as answers.
+static GraphScanInfo last_search_info;
+Datum vexdb_last_search_info(PG_FUNCTION_ARGS) {
+    const auto &s=last_search_info;
+    PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+        "{\"route\":\"%s\",\"signature_state\":\"%s\",\"rounds\":%zu,"
+        "\"graph_ef\":%zu,\"distance_calls\":%zu,\"rescue_refinements\":%zu,\"distance_counted\":%s}",
+        s.route,s.signature_state,s.rounds,s.graph_ef,s.distance_calls,s.rescue_refinements,
+        s.rounds && s.counted_rounds==s.rounds?"true":"false")));
+}
 
 struct GraphIndexScanOpaqueData {
     bool first;
@@ -30,6 +53,8 @@ struct GraphIndexScanOpaqueData {
     Vector<ItemPointerData> unordered_tids;
     MemoryContext tmp_ctx;
     IndexTuple cached_itup;
+    size_t graph_ef = 0;
+    GraphScanInfo info;
 
     GraphIndexScanOpaqueData()
         : first(true),
@@ -84,9 +109,16 @@ void graph_index_rescan_internal(IndexScanDesc scan, ScanKey keys, int nkeys, Sc
     so->has_more_data = false;
     so->tid_offset = 0;
     so->tid_count = 0;
+    so->graph_ef = 0;
+    so->info = {};
     so->unordered_tids.clear();
     so->cached_itup = nullptr;
     MemoryContextReset(so->tmp_ctx);
+    // The previous candidate array belonged to tmp_ctx. A parameterized
+    // nested-loop scan reuses this descriptor after resetting that context.
+    // Never treat its freed array as a live retry result on the next query.
+    so->res = nullptr;
+    so->has_more_data = false;
 
     if (keys && scan->numberOfKeys > 0) {
         memmove(scan->keyData, keys, scan->numberOfKeys * sizeof(ScanKeyData));
@@ -105,6 +137,7 @@ bool graph_index_gettuple_internal(IndexScanDesc scan, void *in_so, BlockNumber 
     GraphIndexScanOpaque so = (GraphIndexScanOpaque)in_so;
 
     if (so->first) {
+        last_search_info = {};
         if (scan->orderByData == NULL) {
             MemoryContext old_ctx = MemoryContextSwitchTo(so->tmp_ctx);
             Buffer metabuf = ReadBuffer(index, metablkno);
@@ -186,6 +219,7 @@ retry:
         create_disk_store(disk_store, index, heap, metabuf, false);
 
         auto visitor = [&](auto &store) -> void {
+            store.set_heap_snapshot(scan->xs_snapshot);
             constexpr DispatcherMode mode = DispatcherMode::DEFAULT;
             DispatchRunner<true,
                 MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::FAST_COSINE>,
@@ -194,18 +228,69 @@ retry:
                 >, mode>::call(metap, [&](auto &distancer) {
                 distancer.prepare(index, metap);
                 distancer.process(query);
-                GraphIndexAlgorithm algo{metap, store, distancer};
+
                 PointExtensionContext ctx(index, GRAPH_INDEX_PS_BLKNO, false);
                 /* 本地缓存(local_vec_cache)经实测证伪(命中率 0.4%,HNSW search 无时间
                  * 局部性),暂不激活;改走 locmap 分区方案。代码保留但 dormant。 */
-                Vector<GraphIndexSearchRes> res = algo.search(ctx, query, ef);
+                Vector<GraphIndexSearchRes> res;
+                PgGraphSignature signature;
+                size_t graph_count=0;
+                bool exact_fallback=false;
+                const bool rescue_enabled=vexdb_lite_get_signature_rescue();
+                const bool ready=rescue_enabled && signature.load(index,metap);
+                so->info.signature_state=rescue_enabled?signature.state:"disabled";
+                ++so->info.rounds;
+                if (ready) {
+                    ++so->info.counted_rounds;
+                    size_t calls=0;
+                    auto seen=(unsigned char*)palloc0((signature.header.count+7)/8);
+                    signature_rescue::Observer observer{seen,size_t(signature.header.count),&calls};
+                    using Store=std::remove_reference_t<decltype(store)>;
+                    using Dister=std::remove_reference_t<decltype(distancer)>;
+                    GraphIndexAlgorithm<Store,Dister,PgAlloc,signature_rescue::Observer> algo(metap,store,distancer,observer);
+                    res=algo.search(ctx,query,ef,[](auto){return true;},[&](auto &points,auto &dister) {
+                        graph_count=points.size();
+                        so->info.rescue_refinements+=signature.complete(index,store,dister,query,observer,points);
+                    });
+                    so->info.distance_calls+=calls;
+                    so->info.route=so->info.rescue_refinements?"graph_rescue":"graph";
+                    algo.destroy();pfree(seen);signature.destroy();
+                } else if (rescue_enabled && graph_signature_supported(metap)) {
+                    // A write can invalidate an auxiliary even after rollback.
+                    // Returning to a narrow graph silently would lose quality.
+                    // Enumerate all raw nodes; the executor still checks heap
+                    // visibility and SQL predicates under its own snapshot.
+                    exact_fallback=true;
+                    ++so->info.counted_rounds;
+                    using Store=std::remove_reference_t<decltype(store)>;
+                    for (typename Store::T id=0;id<metap->num_vectors;++id) {
+                        CHECK_FOR_INTERRUPTS();
+                        const float distance=store.get_distance(distancer,query,id);
+                        ++so->info.distance_calls;
+                        store.get_itempointer(id,[&](const typename Store::point_type *elem) {
+                            elem->apply_on_tids(ctx,[&](const ItemPointerData &tid) {
+                                res.push_back({tid,distance});return false;
+                            });
+                        });
+                    }
+                    std::sort(res.begin(),res.end(),[](const auto&a,const auto&b){return a.dist<b.dist;});
+                    so->info.route="exact_signature_fallback";
+                } else {
+                    // Keep the original unobserved graph/PQ implementation on
+                    // the default route. Zero here means unmeasured, not free.
+                    GraphIndexAlgorithm algo{metap,store,distancer};
+                    res=algo.search(ctx,query,ef);
+                    graph_count=std::min<size_t>(res.size(),metap->num_vectors);
+                    so->info.route="graph";algo.destroy();
+                }
                 ctx.destroy();
-                algo.destroy();
 
                 so->tid_count = res.size();
                 so->res = res.data();
                 so->first = false;
-                so->has_more_data = res.size() >= ef;
+                so->graph_ef=ef;so->info.graph_ef=exact_fallback?0:ef;
+                so->has_more_data = !exact_fallback && graph_count >= ef;
+                last_search_info=so->info;
             });
         };
 
@@ -227,7 +312,10 @@ retry2:
         if (!so->has_more_data) {
             return false;
         }
-        ef = std::max((size_t)(so->tid_count * 2), (size_t)25);
+        // TIDs can grow through dedup groups or rescue, independently of the
+        // graph search width. Neither is a reason to inflate the next search.
+        ef = std::min<size_t>(UINT32_MAX,std::max<size_t>(so->graph_ef*2,25));
+        if (ef<=so->graph_ef) return false;
         so->tid_offset = 0;
         goto retry;
     }

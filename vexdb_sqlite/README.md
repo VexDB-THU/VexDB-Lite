@@ -1,11 +1,34 @@
 # vexdb_sqlite — VexDB-Lite 的 SQLite 适配层
 
-把 VexDB 自研图索引（GRAPH_INDEX / HNSW）以 **SQLite 虚拟表 + Shadow Table** 形态外放，补齐三态同源的 **Edge** 一极。对标 sqlite-vec（有过滤、无 ANN），目标是 SQLite 生态第一个「持久化 ANN 索引 + 过滤查询 + 端侧 + 宽松许可」的向量扩展。
+SQLite 版在同一个扩展中提供 VexDB 自研图索引和 VexFS 文件能力。普通表、向量索引和文件可以保存在同一个数据库中，并由 SQLite 事务和 Backup API 统一管理。
 
 > 完整计划：`docs/plans/2026-06-10_sqlite-adapter-v1-plan.md`
 > 范围调研：`docs/research/2026-06-10_sqlite-v1-scope-reinvestigation.md`
 
 ## 当前进度：M0～M5 ✅，PQ / RaBitQ 已接入共享图算法
+## 统一命令
+
+macOS 构建会生成自带 SQLite 的 `vexdb`，无需手动加载扩展：
+
+```bash
+vexdb agent.db
+vexdb agent.db "SELECT vexdb_version();"
+vexdb fs --db agent.db ls /
+vexdb fs --db agent.db grep -n error /
+vexdb fs --db agent.db index enable
+vexdb fs --db agent.db check
+```
+
+`vexfs` 是同一个可执行文件的兼容入口，等价于 `vexdb fs`。
+
+`grep` 默认通过单个数据库连接批量搜索，不需要逐个打开挂载文件。大工作区可显式开启
+FTS5 trigram 索引；索引默认关闭，关闭时不增加文件写入开销。宿主 SQLite 没有 FTS5 时
+仍可使用批量扫描，不会让文件不可读。
+
+每个文件版本保存 SHA-256。`vexdb fs check` 默认只读检查目录、提交、历史、快照、暂存区
+和全部内容；`vexdb fs check --quick` 跳过 BLOB 哈希，只检查结构和引用。
+
+现有 SQLite 程序仍然可以加载 `vexdb_lite.dylib`：
 
 ```sql
 .load ./vexdb_lite              -- 桌面；移动端走静态注册
@@ -17,8 +40,10 @@ CREATE VIRTUAL TABLE idx USING GRAPH_INDEX(
     quantizer=pq, pq_m=32, memory_mode=compact, m=16
 );
 INSERT INTO idx(rowid, embedding) VALUES (1, :blob_or_json);
-SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;
+SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;  -- 持久化 ANN
 ```
+
+## 当前进度
 
 | 里程碑 | 验证 | 状态 |
 |---|---|---|
@@ -31,6 +56,8 @@ SELECT rowid, distance FROM idx WHERE embedding MATCH :query AND k = 10;
 | PQ（共享训练、编码、ADC、SIMD） | full/compact、L2/cosine/IP、精确重排、增量和重启 | ✅ macOS arm64 |
 | RaBitQ（共享量化器、图遍历、持久化） | L2/cosine/IP recall@10 均为 1.000 | ✅ macOS arm64 |
 | M5 跨平台发版 | Linux、macOS、iOS XCFramework、Android、WASM | ✅ v0.0.17 |
+| M4 spec 落地 | 多引擎 YAML spec | ✅ |
+| M5 macOS 统一包 | `vexdb` + `vexfs` + dylib + App + FSKit | ✅ 技术预览 |
 
 距离语义三 metric 统一 **lower = closer**（L2=sqrt、cosine=1-sim、ip=负内积），`ORDER BY distance ASC` 即最近优先。跨 ISA（NEON/SSE）允许 ~1e-6 级 float32 重排序分歧。
 
@@ -107,3 +134,43 @@ clang++ build/smoke.o build/init_core.o build/vtab_core.o build/sqlite3.o -lpthr
 - **Stage A 核心**（M0✅ → M1 距离层 → M2 暴力搜索 → M3 HNSW + M3+ 并行 → M4 spec → M5 桌面发版）
 - **Stage B** HybridIndex（过滤查询）
 - **Stage C** 移动端（iOS/Android，WASM 可选）
+
+## 有界查询缓存与批量建图
+
+服务端应复用已打开的连接和预备语句，并将连接数、索引缓存和原向量一起计入内存预算。每次请求重新打开大库、或交替切换大索引，与持久连接的延迟不同，应分别测量。[实际SQL稳定性对照](../docs/reports/2026-11-03_recall-and-pg-io-validation.md)保留了两种条件的结果；热连接稳定不能替代冷启动验收。
+
+`graph_memory_limit`控制每个连接的图段缓存。大量连接可以使用较小的查询缓存，批量建图则可单独设置`graph_build_memory_limit`，单位均为字节。例如：
+
+```sql
+CREATE VIRTUAL TABLE vectors USING GRAPH_INDEX(
+    embedding FLOAT[768], metric=l2,
+    graph_memory_limit=41943040,
+    graph_build_memory_limit=2147483648
+);
+```
+
+这表示查询缓存40MiB，构建工作集预算2GiB。构建预算为0或省略时沿用旧规则：查询缓存的4倍。较大的构建预算会占用更多维护内存，可以减少分段反复读取，并让更多向量参与并行内存建图；这项成本需要计入建索引资源。段缓存以外的元数据、临时对象和SQLite缓存仍需额外内存，这些参数不是进程RSS硬上限。
+
+也可以用`INSERT INTO vectors(vectors) VALUES('graph_build_memory_limit=2147483648')`调整后续构建预算。它随事务提交/回滚，不删除现有图，不改变查询缓存，也不自动重建已有索引。原有文件缺少这个配置键时继续使用旧默认。
+
+## 可选过滤分流与辅助码补漏（开发分支）
+
+SQLite目前没有PQ查询入口。原向量L2图可以显式试用辅助码补漏；过滤分流是另一个独立开关，默认均关闭：
+
+```sql
+BEGIN;
+INSERT INTO vectors(vectors) VALUES('signature_build=42');
+INSERT INTO vectors(vectors) VALUES('signature_rescue=on');
+INSERT INTO vectors(vectors) VALUES('filtered_search_mode=auto');
+COMMIT;
+
+SELECT rowid, distance FROM vectors
+WHERE embedding MATCH :query AND k=10 AND tenant_id=:tenant;
+SELECT vexdb_search_info(vectors) FROM vectors LIMIT 1;
+```
+
+表须声明示例中的`tenant_id`元数据列。分流只按当前候选数、实际图节点数、维度和搜索预算估算工作量；候选较小时直接精算，其他情况继续图搜索。类型、NULL、排序规则与事务快照仍由SQLite约束，分页应用于最终结果。`filtered_search_mode=off`恢复旧分流策略；配置随事务提交和回滚。
+
+启用补漏后，原向量L2图的辅助码缺失或失效时使用当前事务下的原向量精确搜索。这能避免静默退回较窄的图搜索，但可能明显变慢；重建后仍须显式生成辅助码。辅助码的逻辑大小及每连接实际分配容量都计入资源，原向量继续保留。
+
+诊断函数参数是虚拟表的表名列，不是字符串；空表没有可供读取的行。输出包括实际路径、估距数、宽度和辅助码容量。它用于解释执行路径，不能自动证明某个近似搜索宽度在任意业务达到99.9%。已验证场景、超时与缺项见[公平对照与质量保护](../docs/reports/2026-11-02_search-fairness-and-quality-protection.md)。

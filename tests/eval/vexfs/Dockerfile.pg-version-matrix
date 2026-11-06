@@ -1,0 +1,25 @@
+ARG PG_MAJOR=16
+FROM postgres:${PG_MAJOR}-bookworm AS build
+
+ARG PG_MAJOR
+ARG JOBS=1
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake g++ make \
+        libboost-system-dev libboost-thread-dev \
+        postgresql-server-dev-${PG_MAJOR} \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY vexdb_lite_src /src/vexdb_lite
+WORKDIR /src/vexdb_lite
+RUN PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config \
+    cmake -S vexdb_pg -B build/pg \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DBOOST_FALLBACK_INC=/src/vexdb_lite/thirdparties/boost \
+    && cmake --build build/pg -j${JOBS} \
+    && DESTDIR=/stage cmake --install build/pg
+
+FROM postgres:${PG_MAJOR}-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libboost-system1.74.0 libboost-thread1.74.0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /stage/ /

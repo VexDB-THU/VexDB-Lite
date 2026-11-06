@@ -1,4 +1,7 @@
 #include "vex_graph_index.hpp"
+#include "vex_pq_training_executor.hpp"
+#include "vex_pq_graph_search.hpp"
+#include "vex_graph_connectivity.hpp"
 
 #include <cmath>
 #include <set>
@@ -40,9 +43,27 @@ namespace duckdb {
 
 namespace {
 
+// The shared containers rely on explicit destruction in PG memory contexts.
+// DuckDB has no per-query PG context to reclaim their backing allocations.
+template <typename T>
+struct ExplicitContainerGuard {
+    T &value;
+    ~ExplicitContainerGuard() { ann_helper::optional_destroy(value); }
+};
+
 using DuckMetricList = MetricList<Metric::L2, Metric::INNER_PRODUCT, Metric::COSINE>;
 using DuckDTypeList = DistPrecisionTypeList<DistPrecisionType::FLOAT>;
 constexpr uint32_t PQ_INVALID_CODE_POSITION = std::numeric_limits<uint32_t>::max();
+
+// ReserveCapacity may leave an unassigned tail after duplicate vectors merge.
+// Quantizer codes and persistent node IDs cover only the assigned prefix.
+static size_t AssignedNodeCount(const DuckStore &store) {
+    const auto count = static_cast<size_t>(store.next_base_id_.load(std::memory_order_acquire));
+    if (count > store.elems.size()) {
+        throw InternalException("GRAPH_INDEX assigned node count exceeds reserved slots");
+    }
+    return count;
+}
 
 static bool ReadUInt64LE(const char *&ptr, const char *end, uint64_t &value) {
     if (end - ptr < static_cast<ptrdiff_t>(sizeof(value))) {
@@ -109,9 +130,9 @@ public:
 
     void SetPendingCodePosition(uint32_t position) { pending_code_position_ = position; }
 
-    template <bool exclusive = false, bool bottom_only = false>
+    template <bool with_lock = false, bool force_share_flag = false>
     auto get_entry(int_fast8_t insert_level = 0) {
-        return store_.template get_entry<exclusive, bottom_only>(insert_level);
+        return store_.template get_entry<with_lock, force_share_flag>(insert_level);
     }
 
     void release_entry_lock(bool shared) {
@@ -333,6 +354,18 @@ private:
     std::vector<float> dist_table_;
 };
 
+static ann_helper::distance_func GetPQRefineDistance(idx_t dim) {
+    // PQ refinement ranks squared L2, including normalized cosine vectors.
+    // Select the same runtime SIMD kernel used by the raw graph, once per
+    // query rather than keeping a scalar dependency chain per candidate.
+    return DispatchRunner<false, MetricList<Metric::L2>,
+        DistPrecisionTypeList<DistPrecisionType::FLOAT>, DispatcherMode::NO_QUANT>::call(
+            Metric::L2, DistPrecisionType::FLOAT, static_cast<uint16>(dim), QuantizerType::NONE,
+            [](auto &d) -> ann_helper::distance_func {
+                return std::decay_t<decltype(d)>::get_distance_single;
+            });
+}
+
 template <typename Fn>
 static auto RunWithDuckAlgo(VexMetric metric, idx_t dim, int ef_construction, int m, DuckStore &store, Fn &&fn) {
     return DispatchRunner<false, DuckMetricList, DuckDTypeList, DispatcherMode::NO_QUANT>::call(
@@ -351,6 +384,19 @@ static auto RunWithDuckDistancer(VexMetric metric, idx_t dim, Fn &&fn) {
         ToDuckMetric(metric), DistPrecisionType::FLOAT, static_cast<uint16>(dim), QuantizerType::NONE,
         [&](auto &distancer) -> decltype(auto) {
             return fn(distancer);
+        });
+}
+
+template <typename Fn>
+static auto RunWithReverseDuckAlgo(VexMetric metric, idx_t dim, int ef_construction, int m,
+                                  DuckStore &store, const vex_duck::ReverseGraph<uint32_t>::Data &reverse, Fn &&fn) {
+    return DispatchRunner<false, DuckMetricList, DuckDTypeList, DispatcherMode::NO_QUANT>::call(
+        ToDuckMetric(metric), DistPrecisionType::FLOAT, static_cast<uint16>(dim), QuantizerType::NONE,
+        [&](auto &distancer) -> decltype(auto) {
+            using DistT = std::decay_t<decltype(distancer)>;
+            vex_duck::ReverseGraphSearchStore<DuckStore> view(store, reverse);
+            GraphIndexAlgorithm<decltype(view), DistT> algo(uint_fast16_t(ef_construction), uint_fast16_t(m), view, distancer);
+            return fn(algo);
         });
 }
 
@@ -666,6 +712,23 @@ unique_ptr<BoundIndex> GraphIndex::Create(CreateIndexInput &input) {
         }
     }
 
+    // DuckDB's bind callback can supply empty CREATE options when reopening.
+    // Allocator layouts and distance semantics must use the saved parameters.
+    if (input.storage_info.allocator_infos.size() >= 3) {
+        const auto &saved = input.storage_info.options;
+        auto read_int = [&](const char *key, int &out) {
+            auto it = saved.find(key);
+            if (it != saved.end()) out = it->second.GetValue<int>();
+        };
+        read_int("m", m);
+        read_int("ef_construction", ef_construction);
+        auto saved_metric = saved.find("metric");
+        if (saved_metric != saved.end()) metric = ParseMetric(saved_metric->second.GetValue<string>());
+        if (m < 2 || m > 128 || ef_construction < 1 || ef_construction > 10000) {
+            throw InvalidInputException("GRAPH_INDEX saved graph parameters are out of range");
+        }
+    }
+
     auto graph_index = make_uniq<GraphIndex>(input.name, input.constraint_type, input.column_ids, input.table_io_manager,
                                              input.unbound_expressions, input.db, dimension, m, ef_construction,
                                              metric, 0, pq_m, compact_mode, build_threads, rabitq_requested);
@@ -767,6 +830,9 @@ void GraphIndex::BuildBulk(const float *vectors, idx_t vector_count, const std::
     if (vector_count > 0 && !vectors) {
         throw InvalidInputException("GRAPH_INDEX bulk vector source is null");
     }
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
     runtime_ = make_uniq<GraphIndexRuntimeState>(dimension_, m_, Allocator::Get(db));
     runtime_->store.InitAllocators(table_io_manager.GetIndexBlockManager());
     // Fresh store for the bulk build — re-apply the budget captured in Create().
@@ -905,6 +971,34 @@ void GraphIndex::BuildBulk(const float *vectors, idx_t vector_count, const std::
     runtime_->store.normalize_vectors_ = (metric_ == VexMetric::COSINE);
     RebuildRowIdNodeMap();
 
+    // Concurrent pruning can remove the last path into an early outlier or
+    // component. Repair it after the workers join, while raw vectors are still
+    // available and before this graph or its quantized form is published.
+    auto &store = runtime_->store;
+    const auto raw_distance = RunWithDuckDistancer(metric_, dimension_, [](auto &d) -> ann_helper::distance_func {
+        return std::decay_t<decltype(d)>::get_distance_single;
+    });
+    auto distance = [&](uint32_t a, uint32_t b) {
+        return raw_distance(store.get_data(a), store.get_data(b), static_cast<uint16>(dimension_));
+    };
+    auto find_neighbors = [&](uint32_t target) {
+        std::vector<uint32_t> nodes;
+        RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
+            PointExtensionContext point_ctx;
+            auto found = algo.search(point_ctx, store.get_data(target),
+                                     std::min<size_t>(std::max<size_t>(size_t(m_) * 2, ef_construction_),
+                                                      store.next_base_id_.load(std::memory_order_acquire)));
+            ExplicitContainerGuard<std::decay_t<decltype(found)>> result_guard {found};
+            for (const auto &candidate : found) {
+                auto it = rowid_node_map_.find(candidate.tid.row_id);
+                if (it != rowid_node_map_.end()) nodes.push_back(it->second);
+            }
+        });
+        return nodes;
+    };
+    vex_duck::RepairBaseConnectivity(store, static_cast<uint32_t>(store.entry_info.id),
+                                    find_neighbors, distance);
+
     // When samples ≤ ksub (256 for nbits=8) the shared AnnKmeans takes the
     // QuickCenters fast-path (every sample becomes a centroid), so PQ works
     // at any non-empty row count. Compact mode in particular needs PQ to
@@ -952,7 +1046,10 @@ void GraphIndex::TrainAndEncodeRaBitQ() {
     }
 
     auto &store = runtime_->store;
-    const idx_t node_count = store.elems.size();
+    const idx_t node_count = store.next_base_id_.load(std::memory_order_acquire);
+    if (node_count == 0 || node_count > store.elems.size()) {
+        throw InternalException("RaBitQ training found an invalid assigned node count");
+    }
     const int padded_dim = RABITQ_PADDED_DIM(static_cast<int>(dimension_));
     auto quantizer = std::make_unique<::rabitq::RaBitQuantizer>(
         static_cast<int>(dimension_), padded_dim, ToRaBitQMetric(metric_));
@@ -1080,9 +1177,16 @@ void GraphIndex::RebuildBulk(const float *vectors, idx_t vector_count, const std
 }
 
 void GraphIndex::SwapRebuildState(GraphIndex &staged) noexcept {
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
     runtime_.swap(staged.runtime_);
     deleted_rids_.swap(staged.deleted_rids_);
     std::swap(pq_use_, staged.pq_use_);
+    const bool old_pq_stale = quantizer_search_stale_.load(std::memory_order_relaxed);
+    quantizer_search_stale_.store(staged.quantizer_search_stale_.load(std::memory_order_relaxed),
+                           std::memory_order_release);
+    staged.quantizer_search_stale_.store(old_pq_stale, std::memory_order_relaxed);
     std::swap(pq_quantizer_, staged.pq_quantizer_);
     pq_codes_.swap(staged.pq_codes_);
     pq_row_id_order_.swap(staged.pq_row_id_order_);
@@ -1120,15 +1224,10 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
     // std::malloc/free allocator, serial parallel executor. The shared PQ never sees any
     // duck-specific types — backend swap is purely at this construction site.
     ::vex::quantizer::PQContext ctx;
-    struct ParallelTrainConfig {
-        size_t max_workers = 1;
-    } parallel_config;
-    // Inject a thread-pool driver so each of the M sub-quantizer K-means runs
-    // on its own std::thread. The shared algorithm writes only into its own
-    // [m*ksub*dsub : (m+1)*ksub*dsub] slice of the centroids buffer and uses
-    // std::malloc plus a per-task deterministic random state, so no further
-    // synchronization is needed. Exceptions from any worker are captured and the first is
-    // rethrown after all threads join.
+    // Each subquantizer retains a fresh thread and pinned RNG, but at most
+    // build_threads_ may train concurrently. Each K-means worker owns a
+    // samples*256 lower-bound matrix, so M-thread fanout can use gigabytes
+    // even when WITH (threads=1) was requested.
     //
     // Disable knob: set environment variable VEX_PQ_TRAIN_SERIAL=1 to force
     // the serial fallback (debug aid).
@@ -1136,54 +1235,6 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
         const char *env = std::getenv("VEX_PQ_TRAIN_SERIAL");
         return !(env && env[0] == '1');
     }();
-    if (pq_parallel_train) {
-        ctx.parallel.run_fn = [](size_t n,
-                                  const ::vex::quantizer::PQParallelExecutor::TaskFn &body,
-                                  void *user) {
-            // K-means inside each subquantizer also calls ctx.parallel.Run with
-            // num_samples (~50K) and num_centers (256). Spawning a thread per
-            // such task is catastrophic. Only parallelise the small outer loop
-            // (M subquantizers, typically ≤ 64). Anything larger runs serial.
-            constexpr size_t kMaxParallel = 64;
-            if (n == 0) return;
-            auto *config = static_cast<ParallelTrainConfig *>(user);
-            const size_t max_workers = config ? std::max<size_t>(config->max_workers, 1) : 1;
-            if (n == 1 || n > kMaxParallel || max_workers == 1) {
-                for (size_t i = 0; i < n; i++) body(i);
-                return;
-            }
-            const size_t worker_count = std::min(n, max_workers);
-            std::atomic<size_t> next_task{0};
-            std::vector<std::thread> workers;
-            workers.reserve(worker_count);
-            std::vector<std::exception_ptr> errors(n);
-            try {
-                for (size_t worker = 0; worker < worker_count; worker++) {
-                    workers.emplace_back([&body, &errors, &next_task, n]() {
-                        while (true) {
-                            const size_t i = next_task.fetch_add(1, std::memory_order_relaxed);
-                            if (i >= n) break;
-                            try {
-                                body(i);
-                            } catch (...) {
-                                errors[i] = std::current_exception();
-                            }
-                        }
-                    });
-                }
-            } catch (...) {
-                for (auto &t : workers) {
-                    if (t.joinable()) t.join();
-                }
-                throw;
-            }
-            for (auto &t : workers) t.join();
-            for (auto &ep : errors) {
-                if (ep) std::rethrow_exception(ep);
-            }
-        };
-        ctx.parallel.user = &parallel_config;
-    }
     ::vex::quantizer::KMeansState kmeans_state;
     // Elkan K-means stores metric bounds and relies on the triangle
     // inequality, so it must receive Euclidean distance rather than squared
@@ -1191,9 +1242,10 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
     kmeans_state.distance_fn = ann_helper::get_general_distance_func(
         Metric::L2_SQRT, static_cast<uint32>(dimension_ / pq_m_));
     kmeans_state.norm_fn     = nullptr;
-    // Skip duplicate-center error for tiny test datasets — pq_m=4 + 8-dim
-    // synthetic data trips it spuriously and adds no recall protection.
-    kmeans_state.skip_check_duplicate = true;
+    // Sparse/repeated business vectors may have fewer distinct subvectors
+    // than the codebook size. Only that data-dependent case permits duplicate
+    // centers; unexpected collapse with diverse input remains an error.
+    kmeans_state.allow_low_diversity_centers = true;
 
     pq_quantizer_.free_resources(ctx);
     pq_quantizer_.set_basic_values(static_cast<size_t>(dimension_), pq_m_, /*nbits*/8);
@@ -1227,11 +1279,17 @@ void GraphIndex::TrainAndEncodePQ(const float *vec_data, const std::vector<row_t
                     vec_data + source_id * dimension_,
                     dimension_ * sizeof(float));
     }
-    const size_t per_worker_scratch =
-        std::max<size_t>(sample_count * pq_quantizer_.ksub * sizeof(float), 1);
-    parallel_config.max_workers = std::max<size_t>(
-        1, std::min<size_t>(pq_quantizer_.M,
-                            kParallelScratchBudget / per_worker_scratch));
+    const size_t per_worker_scratch = std::max<size_t>(1,
+        ::vex::quantizer::EstimateKMeansScratchBytes(sample_count, pq_quantizer_.ksub,
+                                                    pq_quantizer_.dsub));
+    const size_t train_workers = std::max<size_t>(1,
+        std::min({size_t(build_threads_), size_t(pq_quantizer_.M),
+                  kParallelScratchBudget / per_worker_scratch}));
+    vex_duck::PQTrainingExecutor pq_executor(train_workers);
+    if (pq_parallel_train) {
+        ctx.parallel.run_fn = vex_duck::PQTrainingExecutor::Run;
+        ctx.parallel.user = &pq_executor;
+    }
 
     // Wrap the sampled raw-float buffer as PQFloatArray (non-owning).
     ::vex::quantizer::PQFloatArray samples;
@@ -1442,7 +1500,20 @@ void GraphIndex::RebuildPQNodeCodePositions() {
                 break;
             }
         }
+        if (pq_node_code_positions_[node_id] == PQ_INVALID_CODE_POSITION &&
+            elems[node_id].tids.empty() && runtime_->store.node_alloc_) {
+            auto *header = runtime_->store.GetNodeHeader(static_cast<uint32_t>(node_id));
+            if (header) {
+                auto it = pq_latest_code_positions_.find(header->row_id);
+                if (it != pq_latest_code_positions_.end()) pq_node_code_positions_[node_id] = it->second;
+            }
+        }
         if (pq_node_code_positions_[node_id] == PQ_INVALID_CODE_POSITION) {
+            // Bulk-build capacity can exceed the assigned nodes after vector
+            // deduplication. A slot with no row need not have a PQ code. Keep
+            // it unmapped: CodeFor still rejects any unmapped node actually
+            // traversed, while nodes with live rows must be fully covered.
+            if (elems[node_id].tids.empty()) continue;
             throw InvalidInputException(
                 "PQ row/code metadata does not cover graph node %llu",
                 static_cast<unsigned long long>(node_id));
@@ -1450,27 +1521,57 @@ void GraphIndex::RebuildPQNodeCodePositions() {
     }
 }
 
-void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
+const vex_duck::PQRefineLookup<row_t, uint32_t>::Map &GraphIndex::GetPQRefineLookup() const {
+    return pq_refine_lookup_.GetOrBuild([&](auto &lookup) {
+        const auto &elems = runtime_->store.elems;
+        lookup.reserve(elems.size());
+        const auto used = std::min<size_t>(elems.size(), runtime_->store.next_base_id_.load());
+        for (uint32_t sid = 0; sid < used; sid++) {
+            for (auto &tid : elems[sid].tids) lookup[tid.row_id] = sid;
+            // Normal reload omits deleted nodes' tids, but their graph edges
+            // still participate in navigation. Their saved primary row id
+            // locates the original PQ code without restoring any deleted row.
+            if (elems[sid].tids.empty() && runtime_->store.node_alloc_) {
+                auto ptr = runtime_->store.GetNodePtr(sid);
+                if (ptr.Get()) {
+                    auto *header = reinterpret_cast<vex::HNSWNodeHeader<uint32_t> *>(runtime_->store.node_alloc_->Get(ptr));
+                    if (header && header->row_id >= 0 && header->row_id < MAX_ROW_ID) lookup[header->row_id] = sid;
+                }
+            }
+        }
+    });
+}
+
+void GraphIndex::SearchPQ(const float *query_vec, idx_t k,
                           std::vector<row_t> &row_ids, std::vector<float> &distances,
-                          double refine_factor) const {
+                          double refine_factor, int graph_ef, PQSearchMetrics *metrics, bool include_deleted,
+                          const vex_duck::RowIdFilter<row_t> *allowed, bool bidirectional,
+                          VexSearchProfileData *profile) const {
     row_ids.clear();
     distances.clear();
-    if (storage_pointer_corruption_ || !pq_use_ || pq_codes_.empty() || !runtime_ || k == 0) {
+    if (metrics) *metrics = {};
+    // Protect the availability check and all code/store reads from Append/Delete.
+    VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
+    vex_duck::SharedLockGuard _rg(graph_rwlock_);
+    lock_timer.Stop();
+    if (storage_pointer_corruption_ || !runtime_ || !k || !pq_use_ || pq_codes_.empty()) {
         return;
     }
-    vex_duck::SharedLockGuard _rg(graph_rwlock_);
-    auto &store = runtime_->store;
-    if (pq_node_code_positions_.size() != store.elems.size()) {
-        throw InternalException("PQ node/code mapping is unavailable; rebuild the index");
+    if (graph_ef > 0 && (compact_mode_ || metric_ == VexMetric::INNER_PRODUCT)) {
+        throw InvalidInputException("pq_graph requires a non-compact L2 or cosine PQ index");
     }
-
+    // Refine only meaningful in non-compact (raw vec available) and factor>1.
+    const bool refine = refine_factor > 1.0 && !compact_mode_ && runtime_;
+    const auto exact_distance = refine ? GetPQRefineDistance(dimension_) : nullptr;
+    const idx_t pq_k = refine
+        ? std::min<idx_t>(static_cast<idx_t>(k * refine_factor), pq_row_id_order_.size())
+        : std::min<idx_t>(k, pq_row_id_order_.size());
     const idx_t target_k = k;
-    const bool refine = refine_factor > 1.0 && !compact_mode_;
-    const idx_t candidate_k = refine
-        ? std::min<idx_t>(static_cast<idx_t>(std::ceil(static_cast<double>(k) * refine_factor)),
-                          pq_row_id_order_.size())
-        : k;
-
+    k = pq_k;  // expand heap capacity for the PQ pass
+    VexProfileTimer prepare_timer(profile ? &profile->pq_prepare_ns : nullptr);
+    // For cosine indexes the stored codebook was trained on already-normalized
+    // vectors (BuildBulk pre-normalizes). To keep the query in the same space
+    // we normalize the incoming query too. L2 path uses the query as-is.
     std::vector<float> query_buf;
     const float *query = query_vec;
     if (metric_ == VexMetric::COSINE) {
@@ -1480,105 +1581,183 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
     }
 
     auto *self = const_cast<::vex::quantizer::ProductQuantizer *>(&pq_quantizer_);
-    DuckPQDistancer distancer(*self);
-    distancer.process(query);
-    const bool has_deleted = !deleted_rids_.empty();
-    std::vector<std::pair<float, row_t>> candidates;
-    idx_t estimated_live_codes = pq_latest_code_positions_.size();
-    if (has_deleted) {
-        for (auto rid : deleted_rids_) {
-            if (pq_latest_code_positions_.find(rid) != pq_latest_code_positions_.end() &&
-                estimated_live_codes > 0) {
-                estimated_live_codes--;
+    const size_t code_size = self->code_size;
+    std::vector<float> dist_table(self->M * self->ksub);
+    self->compute_distance_table(query, dist_table.data());
+    prepare_timer.Stop();
+    auto score_one = [&](const uint8_t *code) {
+        VexProfileTimer timer(profile ? &profile->pq_distance_ns : nullptr);
+        if (profile) ++profile->pq_codes_scored;
+        return self->distance_to_code(code, dist_table.data());
+    };
+
+    // Walk all codes, keeping a max-heap of size k by approximate distance.
+    // (deleted_rids_ filtered out before insertion so the heap never wastes
+    // capacity on rows the table no longer has.)
+    using Entry = std::pair<float, row_t>;
+    auto cmp = [](const Entry &a, const Entry &b) { return a.first < b.first; };  // max-heap
+    std::vector<Entry> heap;
+    heap.reserve(k + 1);
+
+    auto push_one = [&](float d, row_t rid) {
+        if (heap.size() < k) {
+            heap.emplace_back(d, rid);
+            std::push_heap(heap.begin(), heap.end(), cmp);
+        } else if (d < heap.front().first) {
+            std::pop_heap(heap.begin(), heap.end(), cmp);
+            heap.back() = {d, rid};
+            std::push_heap(heap.begin(), heap.end(), cmp);
+        }
+    };
+
+    const bool has_deleted = !include_deleted && !deleted_rids_.empty();
+    auto permitted = [&](row_t rid) {
+        return (!allowed || allowed->Contains(rid)) &&
+               (!has_deleted || deleted_rids_.find(rid) == deleted_rids_.end());
+    };
+    const idx_t n = pq_row_id_order_.size();
+    const auto *codes_base = pq_codes_.data();
+
+    if (graph_ef > 0) {
+        auto &store = runtime_->store;
+        if (store.entry_info.level < 0) return;
+        const auto &slots = pq_node_code_positions_;
+        if (slots.size() != store.elems.size()) {
+            throw InvalidInputException("pq_graph: incomplete node/code mapping; rebuild the index");
+        }
+        const auto *reverse = bidirectional ? &reverse_graph_.GetOrBuild(store) : nullptr;
+        const auto width = static_cast<uint32_t>(std::min<idx_t>(
+            store.elems.size(), std::max<idx_t>(static_cast<idx_t>(graph_ef), k)));
+        // Select once per search. The default specialization has no profiling
+        // branch or clock call inside the distance loop.
+        auto navigate = [&](auto measure) {
+            using SearchStore = vex_duck::PQGraphSearchStore<DuckStore, ::vex::quantizer::ProductQuantizer,
+                                                           std::vector<uint32_t>, decltype(measure)::value>;
+            SearchStore pq_store(store, *self, slots, codes_base, dist_table.data(), reverse, profile);
+            vex_duck::PQGraphDistance distance;
+            GraphIndexAlgorithm<SearchStore, vex_duck::PQGraphDistance> algo(
+                uint_fast16_t(ef_construction_), uint_fast16_t(m_), pq_store, distance);
+            auto found = algo.search_internal(store.entry_info, nullptr, width, [&](uint32_t sid) {
+                if (!has_deleted && !allowed) return true;
+                for (const auto &tid : store.elems[sid].tids) {
+                    if (permitted(tid.row_id)) return true;
+                }
+                return false;
+            });
+            if (metrics) metrics->codes_scored = pq_store.codes_scored;
+            return found;
+        };
+        VexProfileTimer navigation_timer(profile ? &profile->pq_navigation_ns : nullptr);
+        auto candidates = profile ? navigate(std::true_type()) : navigate(std::false_type());
+        navigation_timer.Stop();
+        if (profile) profile->graph_candidates += candidates.size();
+        // Shared-core Vector uses explicit destruction (PG memory contexts
+        // normally reclaim it). DuckDB queries must release it on every exit.
+        ExplicitContainerGuard<decltype(candidates)> candidates_guard {candidates};
+        // A second PQ top-k cutoff can discard true neighbours that the graph
+        // already found. When raw refinement is enabled, rank the whole graph
+        // result by exact distance instead. ef controls the navigation/result
+        // budget; the factor remains a minimum width, not another lossy cutoff.
+        // Compute once per physical node, then expand its live duplicate rows.
+        if (refine) k = target_k;
+        VexProfileTimer refine_timer(profile && refine ? &profile->pq_refine_ns : nullptr);
+        for (const auto &candidate : candidates) {
+            float d = candidate.dist;
+            if (refine) {
+                const auto *raw = reinterpret_cast<const float *>(store.get_data(candidate.id));
+                if (!raw) continue;
+                d = exact_distance(query, raw, static_cast<uint16>(dimension_));
+                if (metrics) ++metrics->raw_vectors_refined;
+                if (profile) ++profile->raw_vectors_refined;
+            }
+            for (const auto &tid : store.elems[candidate.id].tids) {
+                if (permitted(tid.row_id)) {
+                    push_one(d, tid.row_id);
+                }
             }
         }
-    }
-    if (k >= estimated_live_codes) {
-        // Returning the whole relation is necessarily O(N). Scan the persisted
-        // row-oriented codes here so a large LIMIT cannot lose graph nodes that
-        // are not reached by the ANN walk. Normal top-k queries stay on the
-        // bounded graph path below.
-        candidates.reserve(pq_row_id_order_.size());
-        for (idx_t code_position = 0; code_position < pq_row_id_order_.size(); code_position++) {
-            if (!IsLatestPQCodePosition(code_position)) {
-                continue;
+        if (refine) {
+            std::sort_heap(heap.begin(), heap.end(), cmp);
+            for (const auto &entry : heap) {
+                row_ids.push_back(entry.second);
+                distances.push_back(entry.first);
             }
-            const row_t rid = pq_row_id_order_[code_position];
-            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                continue;
-            }
-            const auto *code = pq_codes_.data() + code_position * pq_quantizer_.code_size;
-            candidates.emplace_back(
-                distancer.get_distance_single(nullptr, code, 0), rid);
+            return;
         }
     } else {
-        DuckQuantizedSearchStore quantized_store(
-            store, pq_codes_, pq_quantizer_.code_size, &pq_node_code_positions_);
-        GraphIndexAlgorithm<DuckQuantizedSearchStore, DuckPQDistancer> algo(
-            static_cast<uint_fast16_t>(ef_construction_), static_cast<uint_fast16_t>(m_),
-            quantized_store, distancer);
-
-        store.search_lock_free_.store(true, std::memory_order_release);
-        const idx_t base_search_width =
-            std::max<idx_t>(candidate_k, std::max<idx_t>(k, static_cast<idx_t>(ef)));
-        // This topology was built with raw-vector distances while traversal uses
-        // noisier ADC distances. Keep a bounded 2x candidate window so the two
-        // orderings can diverge without dropping close neighbours at the boundary.
-        // The work remains O(ef), independent of the total number of PQ codes.
-        idx_t needed = base_search_width * 2;
-        if (has_deleted) {
-            needed += deleted_rids_.size();
-        }
-        const auto search_k = static_cast<uint_fast16_t>(
-            std::min<idx_t>(needed, std::numeric_limits<uint_fast16_t>::max()));
-        PointExtensionContext point_ctx;
-        auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
-        VtlDestroyGuard results_guard(results);
-
-        candidates.reserve(results.size());
-        for (idx_t i = 0; i < results.size(); i++) {
-            const row_t rid = results[i].tid.row_id;
-            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                continue;
+        // ADC fast path: process 4 codes per iteration via the SIMD
+        // distance_to_four_code dispatcher (Stage 5 wired up sse/avx/avx512
+        // variants of distance_four_codes_8/16/g). Walk in groups of 4 row
+        // positions; if any of the 4 hits a deleted row_id fall back to per-row
+        // for that group so deleted_rids_ filtering stays correct.
+        idx_t i = 0;
+        for (; i + 4 <= n; i += 4) {
+            if (has_deleted || allowed || pq_latest_code_positions_.size() != n) {
+                bool any_deleted = false;
+                for (idx_t k4 = 0; k4 < 4; k4++) {
+                    if (!IsLatestPQCodePosition(i + k4) || !permitted(pq_row_id_order_[i + k4])) {
+                        any_deleted = true;
+                        break;
+                    }
+                }
+                if (any_deleted) {
+                    for (idx_t k4 = 0; k4 < 4; k4++) {
+                        row_t rid = pq_row_id_order_[i + k4];
+                        if (!IsLatestPQCodePosition(i + k4) || !permitted(rid)) continue;
+                        float d = score_one(codes_base + (i + k4) * code_size);
+                        if (metrics) ++metrics->codes_scored;
+                        push_one(d, rid);
+                    }
+                    continue;
+                }
             }
-            candidates.emplace_back(results[i].dist, rid);
+            float d0, d1, d2, d3;
+            {
+                VexProfileTimer timer(profile ? &profile->pq_distance_ns : nullptr);
+                if (profile) profile->pq_codes_scored += 4;
+                self->distance_to_four_code(dist_table.data(),
+                                        codes_base + (i + 0) * code_size,
+                                        codes_base + (i + 1) * code_size,
+                                        codes_base + (i + 2) * code_size,
+                                        codes_base + (i + 3) * code_size,
+                                        d0, d1, d2, d3);
+            }
+            if (metrics) metrics->codes_scored += 4;
+            push_one(d0, pq_row_id_order_[i + 0]);
+            push_one(d1, pq_row_id_order_[i + 1]);
+            push_one(d2, pq_row_id_order_[i + 2]);
+            push_one(d3, pq_row_id_order_[i + 3]);
         }
-    }
-    // PQ commonly gives adjacent vectors the same code distance. Graph walk
-    // order is not a stable tie-breaker, so make equal-distance results
-    // deterministic and consistent with the former row-oriented ADC scan.
-    std::sort(candidates.begin(), candidates.end(), [](const auto &a, const auto &b) {
-        return a.first < b.first || (a.first == b.first && a.second < b.second);
-    });
-    if (candidates.size() > candidate_k) {
-        candidates.resize(candidate_k);
+        // Remainder (0-3 rows).
+        for (; i < n; i++) {
+            row_t rid = pq_row_id_order_[i];
+            if (!IsLatestPQCodePosition(i) || !permitted(rid)) continue;
+            float d = score_one(codes_base + i * code_size);
+            if (metrics) ++metrics->codes_scored;
+            push_one(d, rid);
+        }
     }
 
-    if (refine && !candidates.empty()) {
+    std::sort_heap(heap.begin(), heap.end(), cmp);
+
+    if (refine && !heap.empty()) {
+        VexProfileTimer timer(profile ? &profile->pq_refine_ns : nullptr);
         // Re-rank top k*factor candidates using exact raw-vector distance.
-        // The same eager row_id → node map used by UPDATE supplies the raw
-        // vector location, so refine never pays a first-query O(N) scan.
-        std::vector<float> refine_query;
-        const float *rq = query_vec;
-        if (metric_ == VexMetric::COSINE) {
-            refine_query.assign(query_vec, query_vec + dimension_);
-            NormalizeInPlace(refine_query.data(), dimension_);
-            rq = refine_query.data();
-        }
+        // Build a lazy row_id → store_id map by scanning store.elems on first
+        // refine call, cached and invalidated on writes or store replacement.
+        const auto &refine_lookup = GetPQRefineLookup();
         std::vector<std::pair<float, row_t>> exact;
-        exact.reserve(candidates.size());
-        for (auto &e : candidates) {
-            auto it = rowid_node_map_.find(e.second);
-            if (it == rowid_node_map_.end()) continue;
+        exact.reserve(heap.size());
+        for (auto &e : heap) {
+            auto it = refine_lookup.find(e.second);
+            if (it == refine_lookup.end()) continue;
             const auto *raw = reinterpret_cast<const float *>(runtime_->store.get_data(it->second));
             if (!raw) continue;
-            float d = 0.0f;
-            for (idx_t j = 0; j < dimension_; j++) {
-                float diff = rq[j] - raw[j];
-                d += diff * diff;
-            }
+            float d = exact_distance(query, raw, static_cast<uint16>(dimension_));
             exact.emplace_back(d, e.second);
         }
+        if (metrics) metrics->raw_vectors_refined = exact.size();
+        if (profile) profile->raw_vectors_refined += exact.size();
         std::partial_sort(exact.begin(),
                           exact.begin() + std::min<size_t>(target_k, exact.size()),
                           exact.end(),
@@ -1593,11 +1772,11 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
         return;
     }
 
-    const size_t out = std::min<size_t>(target_k, candidates.size());
+    const size_t out = std::min<size_t>(target_k, heap.size());
     row_ids.reserve(out);
     distances.reserve(out);
     for (size_t i = 0; i < out; i++) {
-        auto &e = candidates[i];
+        auto &e = heap[i];
         row_ids.push_back(e.second);
         distances.push_back(e.first);
     }
@@ -1605,10 +1784,12 @@ void GraphIndex::SearchPQ(const float *query_vec, idx_t k, int ef,
 
 void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
                               std::vector<row_t> &row_ids,
-                              std::vector<float> &distances) const {
+                              std::vector<float> &distances, bool include_deleted,
+                              const vex_duck::RowIdFilter<row_t> *allowed,
+                              VexSearchProfileData *profile) const {
     row_ids.clear();
     distances.clear();
-    if (storage_pointer_corruption_) {
+    if (!k || storage_pointer_corruption_) {
         return;
     }
     const size_t code_size = ::rabitq::CodeSize(static_cast<int>(dimension_));
@@ -1638,14 +1819,19 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
                                           rabitq_query_rescaling_factor_);
         distancer.process(query);
         std::vector<std::pair<float, row_t>> candidates;
-        candidates.reserve(store.elems.size());
-        for (idx_t node_id = 0; node_id < store.elems.size(); node_id++) {
+        const auto node_count = AssignedNodeCount(store);
+        if (rabitq_codes_.size() != node_count * code_size) {
+            throw InternalException("RaBitQ code coverage does not match graph nodes");
+        }
+        candidates.reserve(node_count);
+        for (idx_t node_id = 0; node_id < node_count; node_id++) {
             const auto *code = rabitq_codes_.data() + node_id * code_size;
             const float distance = distancer.get_distance_single(nullptr, code, 0);
             for (const auto &tid : store.elems[node_id].tids) {
                 if (has_deleted && deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
                     continue;
                 }
+                if (allowed && !allowed->Contains(tid.row_id)) continue;
                 candidates.emplace_back(distance, tid.row_id);
             }
         }
@@ -1662,7 +1848,7 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
     };
 
     auto do_search = [&](auto &store, uint_fast16_t search_k, bool has_deleted) {
-        if (rabitq_codes_.size() != store.elems.size() * code_size) {
+        if (rabitq_codes_.size() != AssignedNodeCount(store) * code_size) {
             throw InternalException("RaBitQ code coverage does not match graph nodes");
         }
         ::rabitq::CodeDistancer distancer(*rabitq_quantizer_,
@@ -1675,35 +1861,49 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
             static_cast<uint_fast16_t>(ef_construction_),
             static_cast<uint_fast16_t>(m_), quantized_store, distancer);
 
-        store.search_lock_free_.store(true, std::memory_order_release);
+        if (!store.search_lock_free_.load(std::memory_order_acquire)) {
+            store.search_lock_free_.store(true, std::memory_order_release);
+        }
+        VexProfileTimer navigation_timer(profile ? &profile->raw_navigation_ns : nullptr);
         PointExtensionContext point_ctx;
-        auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
-        VtlDestroyGuard results_guard(results);
-        for (idx_t i = 0; i < results.size() && row_ids.size() < k; i++) {
-            const row_t rid = results[i].tid.row_id;
-            if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                continue;
+        auto emit = [&](auto &results) {
+            VtlDestroyGuard results_guard(results);
+            for (idx_t i = 0; i < results.size() && row_ids.size() < k; i++) {
+                const row_t rid = results[i].tid.row_id;
+                if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) continue;
+                if (allowed && !allowed->Contains(rid)) continue;
+                row_ids.push_back(rid);
+                distances.push_back(convert_distance(results[i].dist));
             }
-            float distance = convert_distance(results[i].dist);
-            // Cosine inputs are normalized before encoding/search, so 1-dot is
-            // already DuckDB's public cosine distance.
-            row_ids.push_back(rid);
-            distances.push_back(distance);
+        };
+        if (allowed) {
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k,
+                [&](uint32_t id) {
+                    for (const auto &tid : store.elems[id].tids)
+                        if (allowed->Contains(tid.row_id)) return true;
+                    return false;
+                });
+            emit(results);
+        } else {
+            auto results = algo.search(point_ctx, reinterpret_cast<const char *>(query), search_k);
+            emit(results);
         }
     };
 
     UnorderedSet<size_t> deleted_internal;
+    ExplicitContainerGuard<decltype(deleted_internal)> deleted_guard {deleted_internal};
     {
+        VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
         vex_duck::SharedLockGuard _rg(graph_rwlock_);
+        lock_timer.Stop();
         if (!runtime_ || !rabitq_use_ || !rabitq_quantizer_ || rabitq_codes_.empty()) {
             return;
         }
         auto &store = runtime_->store;
-        const bool has_deleted = !deleted_rids_.empty();
+        const bool has_deleted = !include_deleted && !deleted_rids_.empty();
+        const auto node_count = AssignedNodeCount(store);
         const idx_t live_upper_bound =
-            store.elems.size() > deleted_rids_.size()
-                ? store.elems.size() - deleted_rids_.size()
-                : 0;
+            node_count > deleted_rids_.size() ? node_count - deleted_rids_.size() : 0;
         if (k >= live_upper_bound) {
             do_full_scan(store, has_deleted);
             return;
@@ -1728,7 +1928,7 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
             do_search(store, search_k, has_deleted);
             return;
         }
-        for (size_t id = 0; id < store.elems.size(); id++) {
+        for (size_t id = 0; id < node_count; id++) {
             for (auto &tid : store.elems[id].tids) {
                 if (deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
                     deleted_internal.insert(id);
@@ -1749,16 +1949,17 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
         });
     }
     {
+        VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
         vex_duck::SharedLockGuard _rg(graph_rwlock_);
+        lock_timer.Stop();
         if (!runtime_ || !rabitq_use_ || !rabitq_quantizer_ || rabitq_codes_.empty()) {
             return;
         }
         auto &store = runtime_->store;
-        const bool has_deleted = !deleted_rids_.empty();
+        const bool has_deleted = !include_deleted && !deleted_rids_.empty();
+        const auto node_count = AssignedNodeCount(store);
         const idx_t live_upper_bound =
-            store.elems.size() > deleted_rids_.size()
-                ? store.elems.size() - deleted_rids_.size()
-                : 0;
+            node_count > deleted_rids_.size() ? node_count - deleted_rids_.size() : 0;
         if (k >= live_upper_bound) {
             do_full_scan(store, has_deleted);
             return;
@@ -1774,7 +1975,9 @@ void GraphIndex::SearchRaBitQ(const float *query_vec, idx_t k, int ef,
 }
 
 void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<row_t> &row_ids,
-                           std::vector<float> &distances) const {
+                           std::vector<float> &distances, bool include_deleted,
+                           const vex_duck::RowIdFilter<row_t> *allowed, bool bidirectional,
+                           VexSearchProfileData *profile) const {
     row_ids.clear();
     distances.clear();
     if (storage_pointer_corruption_) {
@@ -1797,6 +2000,7 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
                     if (has_deleted && deleted_rids_.find(tid.row_id) != deleted_rids_.end()) {
                         continue;
                     }
+                    if (allowed && !allowed->Contains(tid.row_id)) continue;
                     candidates.emplace_back(distance, tid.row_id);
                 }
             }
@@ -1819,31 +2023,58 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
     // it under the SAME shared lock as the deleted-entry detection — keeping the
     // hot search path at a single index-lock acquire (QPS-neutral vs the original).
     auto do_search = [&](auto &store, uint_fast16_t search_k, bool has_deleted) {
+        VexProfileTimer timer(profile ? &profile->raw_navigation_ns : nullptr);
         // searches hold graph_rwlock_ shared, writers take it exclusive, so the
         // per-node reader lock inside the HNSW walk is redundant. Skip it to avoid
         // hub-node reader-byte cacheline contention under high read concurrency.
         // Safe only while the shared lock is held; the flag is set under it too.
-        store.search_lock_free_.store(true, std::memory_order_release);
-        RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, [&](auto &algo) {
-            auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
-            VtlDestroyGuard results_guard(res);
-            for (idx_t i = 0; i < res.size() && row_ids.size() < k; i++) {
-                row_t rid = res[i].tid.row_id;
-                if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) {
-                    continue;
+        // Most queries find it already enabled. Repeated stores would invalidate
+        // the same reader-shared cache line on every concurrent search.
+        if (!store.search_lock_free_.load(std::memory_order_relaxed)) {
+            store.search_lock_free_.store(true, std::memory_order_relaxed);
+        }
+        auto search = [&](auto &algo) {
+            auto emit = [&](auto &res) {
+                ExplicitContainerGuard<std::decay_t<decltype(res)>> result_guard {res};
+                for (idx_t i = 0; i < res.size() && row_ids.size() < k; i++) {
+                    row_t rid = res[i].tid.row_id;
+                    if (has_deleted && deleted_rids_.find(rid) != deleted_rids_.end()) continue;
+                    if (allowed && !allowed->Contains(rid)) continue;
+                    row_ids.push_back(rid);
+                    distances.push_back(res[i].dist);
                 }
-                row_ids.push_back(rid);
-                distances.push_back(res[i].dist);
+            };
+            if (!allowed) {
+                // Retain the original DummyFilter search specialization when
+                // no scalar selector is requested.
+                auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k);
+                emit(res);
+                return;
             }
-        });
+            auto res = algo.search(point_ctx, reinterpret_cast<const char *>(query_vec), search_k, [&](uint32_t sid) {
+                for (const auto &tid : store.elems[sid].tids)
+                    if (allowed->Contains(tid.row_id)) return true;
+                return false;
+            });
+            emit(res);
+        };
+        if (bidirectional) {
+            const auto &reverse = reverse_graph_.GetOrBuild(store);
+            RunWithReverseDuckAlgo(metric_, dimension_, ef_construction_, m_, store, reverse, search);
+        } else {
+            RunWithDuckAlgo(metric_, dimension_, ef_construction_, m_, store, search);
+        }
     };
 
     // deleted_rids_ + store.elems are mutated by writers (Append/Delete) under
     // graph_rwlock_ exclusive, so every read of them must hold the lock shared.
     // Common path: ONE shared lock spans deleted detection AND the search.
     UnorderedSet<size_t> deleted_internal;  // only filled on the rare repair path
+    ExplicitContainerGuard<decltype(deleted_internal)> deleted_guard {deleted_internal};
     {
+        VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
         vex_duck::SharedLockGuard _rg(graph_rwlock_);
+        lock_timer.Stop();
         if (!runtime_) {
             return;
         }
@@ -1853,7 +2084,7 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
                 "use the active quantizer search path");
         }
         auto &store = runtime_->store;
-        const bool has_deleted = !deleted_rids_.empty();
+        const bool has_deleted = !include_deleted && !deleted_rids_.empty();
         idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
         if (has_deleted) {
             needed += deleted_rids_.size();
@@ -1897,7 +2128,9 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
 
     // Rare path only: repair the entry under the exclusive lock, then search.
     {
+        VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
         vex_duck::ExclusiveLockGuard _wg(graph_rwlock_);
+        lock_timer.Stop();
         if (!runtime_) {
             return;
         }
@@ -1907,7 +2140,9 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
         });
     }
     {
+        VexProfileTimer lock_timer(profile ? &profile->graph_lock_ns : nullptr);
         vex_duck::SharedLockGuard _rg(graph_rwlock_);
+        lock_timer.Stop();
         if (!runtime_) {
             return;
         }
@@ -1917,7 +2152,7 @@ void GraphIndex::SearchANN(const float *query_vec, idx_t k, int ef, std::vector<
                 "use the active quantizer search path");
         }
         auto &store = runtime_->store;
-        const bool has_deleted = !deleted_rids_.empty();
+        const bool has_deleted = !include_deleted && !deleted_rids_.empty();
         idx_t needed = std::max<idx_t>(k, static_cast<idx_t>(ef));
         if (has_deleted) {
             needed += deleted_rids_.size();
@@ -1941,6 +2176,10 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     // Mutates the graph: exclude all concurrent (shared) searches so the
     // lock-free search read path stays safe.
     vex_duck::ExclusiveLockGuard _wg(graph_rwlock_);
+    const bool had_pq_model = pq_use_ && pq_quantizer_.trained;
+    const bool had_rabitq_model = rabitq_use_ && rabitq_quantizer_;
+    const size_t old_pq_code_count = pq_row_id_order_.size();
+    const size_t old_rabitq_code_bytes = rabitq_codes_.size();
 
     if (storage_pointer_corruption_) {
         return ErrorData(ExceptionType::INVALID_INPUT,
@@ -2139,12 +2378,12 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
                 ::rabitq::EncodeCode(*rabitq_quantizer_, static_cast<int>(dim),
                                      encode_src, pending_rabitq_code.data());
             }
-            const size_t old_node_count = runtime_->store.elems.size();
+            const size_t old_node_count = runtime_->store.next_base_id_.load(std::memory_order_acquire);
             const char *query = reinterpret_cast<const char *>(vec_ptr);
             typename AlgoT::InsertContextBase insert_ctx(point_ctx, query, &tid);
             algo.insert(insert_ctx);
             RecordRowIdNode(tid.row_id, static_cast<uint32_t>(insert_ctx.result_id));
-            if (rabitq_active && runtime_->store.elems.size() > old_node_count) {
+            if (rabitq_active && runtime_->store.next_base_id_.load(std::memory_order_acquire) > old_node_count) {
                 rabitq_codes_.insert(rabitq_codes_.end(),
                                     pending_rabitq_code.begin(), pending_rabitq_code.end());
             }
@@ -2171,7 +2410,7 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
                 if (track_pq_vector_hashes) {
                     pq_vector_coverage_hashes_.push_back(HashCoverageRowVector(tid.row_id, encode_src, dim));
                 }
-                if (runtime_->store.elems.size() > old_node_count) {
+                if (runtime_->store.next_base_id_.load(std::memory_order_acquire) > old_node_count) {
                     pq_node_code_positions_.resize(runtime_->store.elems.size(),
                                                    PQ_INVALID_CODE_POSITION);
                     pq_node_code_positions_[old_node_count] = code_position;
@@ -2189,8 +2428,15 @@ ErrorData GraphIndex::Append(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
     if (compact_mode_ && (pq_use_ || rabitq_use_)) {
         ReleaseRawVectors();
     }
+    if ((had_pq_model && pq_row_id_order_.size() > old_pq_code_count) ||
+        (had_rabitq_model && rabitq_codes_.size() > old_rabitq_code_bytes)) {
+        quantizer_search_stale_.store(true, std::memory_order_release);
+    }
     rowid_coverage_checked_.store(false, std::memory_order_release);
     rowid_coverage_stale_.store(false, std::memory_order_relaxed);
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
     return ErrorData();
 }
 
@@ -2231,11 +2477,17 @@ void GraphIndex::Delete(IndexLock &state, DataChunk &entries, Vector &row_identi
     }
     rowid_coverage_checked_.store(false, std::memory_order_release);
     rowid_coverage_stale_.store(false, std::memory_order_relaxed);
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
 }
 
 void GraphIndex::CommitDrop(IndexLock &index_lock) {
     (void)index_lock;
     vex_duck::ExclusiveLockGuard _wg(graph_rwlock_);
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
     if (runtime_) {
         ReleaseRawVectors();
         if (runtime_->store.node_alloc_) {
@@ -2250,6 +2502,10 @@ void GraphIndex::CommitDrop(IndexLock &index_lock) {
     duplicate_rowid_nodes_.clear();
     rowid_coverage_checked_.store(false, std::memory_order_release);
     rowid_coverage_stale_.store(false, std::memory_order_relaxed);
+}
+
+void GraphIndex::ResetStorage(IndexLock &index_lock) {
+    CommitDrop(index_lock);
 }
 
 ErrorData GraphIndex::Insert(IndexLock &l, DataChunk &chunk, Vector &row_ids) {
@@ -2336,7 +2592,7 @@ void GraphIndex::Vacuum(IndexLock &l) {
         throw InvalidInputException("PQ code bytes do not match row order before VACUUM");
     }
     if (rabitq_active &&
-        rabitq_codes_.size() != old_store.elems.size() * rabitq_code_size) {
+        rabitq_codes_.size() != AssignedNodeCount(old_store) * rabitq_code_size) {
         throw InvalidInputException("RaBitQ code bytes do not match graph nodes before VACUUM");
     }
 
@@ -2367,7 +2623,7 @@ void GraphIndex::Vacuum(IndexLock &l) {
         new_pq_codes.reserve(pq_latest_code_positions_.size() * pq_code_size);
         new_pq_row_id_order.reserve(pq_latest_code_positions_.size());
         new_pq_latest_positions.reserve(pq_latest_code_positions_.size());
-        if (HasVectorCoverageChecksum()) {
+        if (HasVectorCoverageChecksumUnlocked()) {
             new_pq_vector_hashes.reserve(pq_latest_code_positions_.size());
         }
     }
@@ -2465,7 +2721,7 @@ void GraphIndex::Vacuum(IndexLock &l) {
                                         old_pq_code + pq_code_size);
                     new_pq_row_id_order.push_back(row_id);
                     new_pq_latest_positions[row_id] = new_position;
-                    if (HasVectorCoverageChecksum()) {
+                    if (HasVectorCoverageChecksumUnlocked()) {
                         new_pq_vector_hashes.push_back(
                             pq_vector_coverage_hashes_[old_pq_position]);
                     }
@@ -2605,7 +2861,7 @@ idx_t GraphIndex::GetNodeCount() const {
     return result;
 }
 
-idx_t GraphIndex::GetRowIdCount() const {
+idx_t GraphIndex::GetRowIdCount(bool include_deleted) const {
     if (!runtime_) {
         return 0;
     }
@@ -2616,27 +2872,30 @@ idx_t GraphIndex::GetRowIdCount() const {
     idx_t total = 0;
     for (auto &elem : runtime_->store.elems) {
         for (auto &tid : elem.tids) {
-            if (deleted_rids_.find(tid.row_id) == deleted_rids_.end()) {
+            if (include_deleted || deleted_rids_.find(tid.row_id) == deleted_rids_.end()) {
                 total++;
             }
         }
     }
+    // Full PQ scans can still see saved codes for deleted rows after reload,
+    // when the corresponding in-memory node tids have already been omitted.
+    if (include_deleted && pq_use_) total = std::max<idx_t>(total, pq_row_id_order_.size());
     return total;
 }
 
 GraphIndexRowIdCoverage GraphIndex::GetRowIdCoverage() const {
     GraphIndexRowIdCoverage coverage;
+    vex_duck::SharedLockGuard _rg(graph_rwlock_);
     if (!runtime_) {
         return coverage;
     }
 
-    vex_duck::SharedLockGuard _rg(graph_rwlock_);
     const bool pq_coverage_layout = compact_mode_ && pq_use_ && pq_quantizer_.trained &&
                                     pq_quantizer_.code_size > 0 && !pq_codes_.empty() &&
                                     pq_codes_.size() == pq_row_id_order_.size() * pq_quantizer_.code_size;
     if (pq_coverage_layout) {
         const auto code_size = static_cast<idx_t>(pq_quantizer_.code_size);
-        const bool has_vector_hashes = HasVectorCoverageChecksum();
+        const bool has_vector_hashes = HasVectorCoverageChecksumUnlocked();
         for (idx_t i = 0; i < pq_row_id_order_.size(); i++) {
             if (!IsLatestPQCodePosition(i)) {
                 continue;
@@ -2661,14 +2920,15 @@ GraphIndexRowIdCoverage GraphIndex::GetRowIdCoverage() const {
         return coverage;
     }
 
-    const bool rabitq_coverage_layout = UsesRaBitQCoverageChecksum();
+    const bool rabitq_coverage_layout = UsesRaBitQCoverageChecksumUnlocked();
     if (rabitq_coverage_layout) {
         auto &store = runtime_->store;
         const auto code_size = ::rabitq::CodeSize(static_cast<int>(dimension_));
+        const auto node_count = AssignedNodeCount(store);
         LWLockAcquire(&store.elems_veclock, LW_SHARED);
         {
             std::shared_lock<std::shared_mutex> _tl(GraphIndexPoint::tid_lock());
-            for (idx_t id = 0; id < store.elems.size(); id++) {
+            for (idx_t id = 0; id < node_count; id++) {
                 const auto *code = rabitq_codes_.data() + id * code_size;
                 for (auto &tid : store.elems[id].tids) {
                     auto rid = tid.row_id;
@@ -2716,18 +2976,33 @@ GraphIndexRowIdCoverage GraphIndex::GetRowIdCoverage() const {
 }
 
 bool GraphIndex::HasVectorCoverageChecksum() const {
+    vex_duck::SharedLockGuard guard(graph_rwlock_);
+    return HasVectorCoverageChecksumUnlocked();
+}
+
+bool GraphIndex::HasVectorCoverageChecksumUnlocked() const {
     return !pq_vector_coverage_hashes_.empty() &&
            pq_vector_coverage_hashes_.size() == pq_row_id_order_.size();
 }
 
 bool GraphIndex::UsesPQCoverageChecksum() const {
+    // memory_mode is fixed for this index's lifetime. Full mode needs no model
+    // checksum, so it also avoids another shared-lock operation while planning.
+    if (!compact_mode_) return false;
+    vex_duck::SharedLockGuard guard(graph_rwlock_);
+    return UsesPQCoverageChecksumUnlocked();
+}
+
+bool GraphIndex::UsesPQCoverageChecksumUnlocked() const {
     return compact_mode_ && pq_use_ && pq_quantizer_.trained && pq_quantizer_.code_size > 0 &&
            !pq_codes_.empty() && pq_codes_.size() == pq_row_id_order_.size() * pq_quantizer_.code_size &&
-           !HasVectorCoverageChecksum();
+           !HasVectorCoverageChecksumUnlocked();
 }
 
 uint64_t GraphIndex::HashPQVectorForCoverage(row_t row_id, const float *vec) const {
-    if (!UsesPQCoverageChecksum()) {
+    if (!compact_mode_) return 0;
+    vex_duck::SharedLockGuard guard(graph_rwlock_);
+    if (!UsesPQCoverageChecksumUnlocked()) {
         return 0;
     }
     std::vector<uint8_t> code(pq_quantizer_.code_size);
@@ -2737,16 +3012,24 @@ uint64_t GraphIndex::HashPQVectorForCoverage(row_t row_id, const float *vec) con
 }
 
 bool GraphIndex::UsesRaBitQCoverageChecksum() const {
+    if (!compact_mode_) return false;
+    vex_duck::SharedLockGuard guard(graph_rwlock_);
+    return UsesRaBitQCoverageChecksumUnlocked();
+}
+
+bool GraphIndex::UsesRaBitQCoverageChecksumUnlocked() const {
     if (!compact_mode_ || !rabitq_use_ || !rabitq_quantizer_ || !runtime_) {
         return false;
     }
     const auto code_size = ::rabitq::CodeSize(static_cast<int>(dimension_));
     return code_size > 0 &&
-           rabitq_codes_.size() == runtime_->store.elems.size() * code_size;
+           rabitq_codes_.size() == AssignedNodeCount(runtime_->store) * code_size;
 }
 
 uint64_t GraphIndex::HashRaBitQVectorForCoverage(row_t row_id, const float *vec) const {
-    if (!UsesRaBitQCoverageChecksum()) {
+    if (!compact_mode_) return 0;
+    vex_duck::SharedLockGuard guard(graph_rwlock_);
+    if (!UsesRaBitQCoverageChecksumUnlocked()) {
         return 0;
     }
     std::vector<uint8_t> code(::rabitq::CodeSize(static_cast<int>(dimension_)));
@@ -2761,6 +3044,8 @@ idx_t GraphIndex::GetInMemorySize(IndexLock &state) {
     }
     vex_duck::SharedLockGuard _rg(graph_rwlock_);
     idx_t size = 0;
+    size += pq_node_codes_.AllocatedBytes();
+    size += reverse_graph_.AllocatedBytes();
     if (runtime_->store.node_alloc_) {
         size += runtime_->store.node_alloc_->GetInMemorySize();
     }
@@ -3136,6 +3421,11 @@ void GraphIndex::DeserializePQAndModeFromStorage(const IndexStorageInfo &info) {
         compact_mode_flag = compact_it->second.GetValue<bool>();
     }
     compact_mode_ = compact_mode_flag;
+    auto stale_pq_it = info.options.find("quantizer_search_stale");
+    const bool legacy_quantizer_history = (pq_use_ || rabitq_use_) && !deleted_rids_.empty();
+    quantizer_search_stale_.store(stale_pq_it == info.options.end()
+                              ? legacy_quantizer_history : stale_pq_it->second.GetValue<bool>(),
+                          std::memory_order_release);
     if (compact_mode_) {
         ReleaseRawVectors();
     }
@@ -3146,6 +3436,10 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
     if (!runtime_) {
         return;
     }
+
+    pq_refine_lookup_.Invalidate();
+    pq_node_codes_.Invalidate();
+    reverse_graph_.Invalidate();
 
     auto &store = runtime_->store;
     storage_pointer_corruption_ = false;
@@ -3554,6 +3848,7 @@ void GraphIndex::DeserializeFromStorage(const IndexStorageInfo &info) {
         }
     }
 
+    RestoreDuplicateRowIds(info);
     DeserializePQAndModeFromStorage(info);
 }
 

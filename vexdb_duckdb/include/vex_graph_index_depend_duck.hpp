@@ -441,7 +441,7 @@ public:
     /* When true, lock_point/unlock_point skip the per-node SHARED (reader)
      * stripe lock. GraphIndex::SearchANN/SearchPQ hold an index-level shared
      * rwlock (graph_rwlock_) for the whole query while writers (Append/Insert/
-     * Delete/CommitDrop) take it exclusive, so the striped reader-vs-writer
+     * Delete/index reset) take it exclusive, so the striped reader-vs-writer
      * per-node lock is redundant during search and only causes contention on
      * the few stripe atomics that hub nodes hash to (cacheline ping-pong that
      * collapsed throughput at high read concurrency). Set true on first search;
@@ -731,17 +731,21 @@ public:
     //     或图为空 (entry.level < 0)，需要升级为 EXCLUSIVE。先抢 entry_waitlock
     //     阻拦后续 reader（防饥饿），再 release shared、acquire exclusive。
     //
-    // exclusive=true 表示 caller 跳过升级判断，强制 SHARED 模式（部分 query 路径）
-    template <bool exclusive = false, bool bottom_only = false>
+    // Shared-core contract: false returns a snapshot without a retained lock;
+    // true keeps the lock for insert(), which calls release_entry_lock().
+    template <bool with_lock = false, bool force_share_flag = false>
     std::pair<GraphIndexEntryInfo, bool> get_entry(int_fast8_t insert_level = 0) {
-        (void)bottom_only;
         LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
         LWLockRelease(&entry_waitlock);
 
         LWLockAcquire(&entry_lock, LW_SHARED);
         GraphIndexEntryInfo entry = entry_info;
+        if constexpr (!with_lock) {
+            LWLockRelease(&entry_lock);
+            return {entry, true};
+        }
         bool shared = true;
-        if ((!exclusive && insert_level > entry.level) || entry.level < 0) {
+        if ((!force_share_flag && insert_level > entry.level) || entry.level < 0) {
             LWLockRelease(&entry_lock);
             LWLockAcquire(&entry_waitlock, LW_EXCLUSIVE);
             LWLockAcquire(&entry_lock, LW_EXCLUSIVE);

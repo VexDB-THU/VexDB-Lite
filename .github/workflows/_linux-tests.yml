@@ -1,0 +1,156 @@
+name: Linux engine tests
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        default: ubuntu-24.04
+      arch:
+        type: string
+        default: x86_64
+      test_pg:
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  duckdb:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    env:
+      DUCKDB_VERSION: v1.5.2
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libboost-dev
+          python -m pip install 'cmake>=3.28,<4' -r tests/spec/requirements.txt
+      - uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: duckdb-${{ env.DUCKDB_VERSION }}-${{ inputs.arch }}
+      - name: Build extension
+        run: bash build_duck.sh build
+      - name: Run DuckDB spec
+        run: bash tests/spec/_lib/docker/run_duckdb.sh test
+      - name: Check prepared vector requests and snapshots
+        run: |
+          duck_root="build/duck/${DUCKDB_VERSION}"
+          cmake --build "$duck_root/build" --target duckdb -j2
+          bash vexdb_duckdb/test/run_prepared_vector_test.sh \
+            "$duck_root/duckdb_src/src/include" "$duck_root/build/src/libduckdb.so" \
+            "$duck_root/build/extension/vexdb_lite/vexdb_lite.duckdb_extension" \
+            build/spec/duckdb/prepared-requests
+          bash vexdb_duckdb/test/run_prepared_filter_pruning_test.sh \
+            "$duck_root/duckdb_src/src/include" "$duck_root/build/src/libduckdb.so" \
+            "$duck_root/build/extension/vexdb_lite/vexdb_lite.duckdb_extension" \
+            build/spec/duckdb/prepared-requests/filter-pruning
+          bash vexdb_duckdb/test/run_fetch_rows_capacity_test.sh \
+            "$duck_root/duckdb_src/src/include" "$duck_root/build/src/libduckdb.so" \
+            build/spec/duckdb/prepared-requests/fetch-capacity
+          bash vexdb_duckdb/test/run_bounded_array_order_test.sh \
+            "$duck_root/duckdb_src/src/include" "$duck_root/build/src/libduckdb.so" \
+            "$duck_root/build/extension/vexdb_lite/vexdb_lite.duckdb_extension" \
+            build/spec/duckdb/prepared-requests/bounded-array-order
+          bash vexdb_duckdb/test/run_scan_output_projection_test.sh \
+            "$duck_root/duckdb_src/src/include" "$duck_root/build/src/libduckdb.so" \
+            "$duck_root/build/extension/vexdb_lite/vexdb_lite.duckdb_extension" \
+            build/spec/duckdb/prepared-requests/scan-output
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: duckdb-prepared-requests-${{ inputs.arch }}
+          path: |
+            build/spec/duckdb/prepared-requests/**/compile.log
+            build/spec/duckdb/prepared-requests/**/result.log
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: duckdb-${{ env.DUCKDB_VERSION }}-${{ inputs.arch }}
+          path: build/duck/${{ env.DUCKDB_VERSION }}/build/extension/vexdb_lite/vexdb_lite.duckdb_extension
+          if-no-files-found: error
+
+  sqlite:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libboost-dev libpq-dev libfuse3-dev pkg-config
+          python -m pip install 'cmake>=3.28,<4' -r tests/spec/requirements.txt
+      - uses: hendrikmuhs/ccache-action@v1
+        with:
+          key: sqlite-${{ inputs.arch }}
+      - name: Build and run SQLite tests
+        env:
+          BUILD_TYPE: Release
+        run: bash build_sqlite.sh test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-${{ inputs.arch }}
+          path: |
+            vexdb_sqlite/build/vexdb
+            vexdb_sqlite/build/vexfs
+            vexdb_sqlite/build/vexdb_lite.so
+            vexdb_sqlite/build/libvexdb_lite_static.a
+          if-no-files-found: error
+
+  pg:
+    if: inputs.test_pg
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    env:
+      BUILDX_EXTRA_ARGS: --build-arg PG_GIT_TAG=REL_19_STABLE
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: docker/setup-buildx-action@v3
+      - name: Render PG spec
+        run: |
+          python -m pip install -r tests/spec/requirements.txt
+          python tests/spec/_lib/render.py --engine pg --out build/spec
+      - name: Build PG test image
+        run: bash tests/spec/_lib/docker/run_pg.sh build
+      - name: Run PG spec
+        run: bash tests/spec/_lib/docker/run_pg.sh test
+      - name: Check PQ transaction snapshots
+        run: |
+          mkdir -p build/spec/pg/results
+          printf '%s\n' '#!/bin/sh' 'exec docker exec -i vexdb_pg19-test psql "$@"' > build/ci-pg-psql
+          chmod +x build/ci-pg-psql
+          python vexdb_pg/test/pq_snapshot_regression.py \
+            --psql "$PWD/build/ci-pg-psql" --host 127.0.0.1 --port 5432 \
+            --user postgres --database test --out build/spec/pg/results/pq-snapshot
+      - name: Collect PG logs
+        if: always()
+        run: |
+          if docker inspect vexdb_pg19-test >/dev/null 2>&1; then
+            mkdir -p build/spec/pg/results
+            docker logs vexdb_pg19-test > build/spec/pg/results/container.log 2>&1
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pg-spec-${{ inputs.arch }}
+          path: build/spec/pg/results/
+          if-no-files-found: warn
+      - name: Stop PG test container
+        if: always()
+        run: bash tests/spec/_lib/docker/run_pg.sh down

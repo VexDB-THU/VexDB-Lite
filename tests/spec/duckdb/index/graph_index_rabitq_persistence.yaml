@@ -5,6 +5,8 @@ description: RaBitQ top-k and incremental codes survive checkpoint and restart.
 steps:
   - raw_directive: load __TEST_DIR__/rabitq_persistence.db
   - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 40;
+  - statement: SET vexdb_search_profile = true;
   - statement: CREATE TABLE rq_p (id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
   - statement: "INSERT INTO rq_p SELECT i, ${VEC_LITERAL([
       sin(i*0.07)::FLOAT, cos(i*0.09)::FLOAT,
@@ -13,12 +15,20 @@ steps:
       sin(i*0.23)::FLOAT, cos(i*0.29)::FLOAT], 8)}
       FROM ${RANGE2(1, 1501)} t(i);"
   - statement: CREATE INDEX idx_rq_p ON rq_p USING ${VEX_INDEX} (vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', m=16, ef_construction=160)};
-  - statement: "CREATE TABLE rq_before AS SELECT id, row_number() OVER () rn FROM (
+  # CTAS already changes the transaction and therefore invokes exact-snapshot
+  # protection. COPY captures the read-only ANN result before creating a table.
+  - statement: "COPY (SELECT id, row_number() OVER () rn FROM (
       SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 20
-      );"
+      )) TO '__TEST_DIR__/rabitq-before.csv' (HEADER);"
+  - query: SELECT (vexdb_last_search_profile()).search_calls > 0, (vexdb_last_search_profile()).exact_fallback_calls = 0;
+    _field_types: II
+    expect:
+      - [true, true]
+  - statement: CREATE TABLE rq_before AS SELECT * FROM read_csv('__TEST_DIR__/rabitq-before.csv');
   - statement: CHECKPOINT;
   - raw_directive: restart
   - statement: SET ${GUC_BF_THRESHOLD} = 0;
+  - statement: SET ${GUC_EF_SEARCH} = 40;
   - query: EXPLAIN SELECT id FROM rq_p ORDER BY ${L2(vec, ${VEC_LITERAL([0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8], 8)})} LIMIT 20;
     _field_types: II
     expect:

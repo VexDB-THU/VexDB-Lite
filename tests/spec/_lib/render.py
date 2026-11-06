@@ -314,7 +314,7 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
             sql = step.get("query") or step.get("statement", "")
             lines += [
                 "statement error" + _connection_suffix(step),
-                render_template(sql, dialect),
+                render_template(sql, dialect).strip(),
                 "----",
                 step["expect_error"],
                 "",
@@ -324,7 +324,7 @@ def emit_duckdb(spec: dict, dialect: dict) -> str:
             field_types = step.get("_field_types") or ("I" * (len(rows[0]) if rows else 1))
             lines += [
                 _query_header(field_types, step.get("_sort", "")) + _connection_suffix(step),
-                render_template(step["query"], dialect),
+                render_template(step["query"], dialect).strip(),
                 "----",
             ]
             for row in rows:
@@ -353,6 +353,7 @@ def emit_pg(spec: dict, dialect: dict) -> tuple[str, str]:
     sql_lines = [
         f"-- spec: {spec['name']}",
         "-- 抑制 NOTICE/WARNING (扩展输出噪声), 让 expected 纯净",
+        r"\set VERBOSITY terse",
         "SET client_min_messages = ERROR;",
         "",
     ]

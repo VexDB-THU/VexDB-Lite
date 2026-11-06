@@ -1,6 +1,6 @@
 # 编译构建指南
 
-本文档说明如何从源码编译 VexDB 的 PostgreSQL 插件（`vexdb_lite.so`）和 DuckDB 扩展（`vexdb_lite.duckdb_extension`）。
+本文档说明 PostgreSQL、DuckDB、SQLite 三个适配层的实际构建和测试入口。当前 CI 范围见 [当前状态](current-status.md)。根目录没有 CMakeLists.txt，不能在根目录执行 `cmake -S .`。
 
 ---
 
@@ -12,7 +12,7 @@
 |------|------|------|
 | CMake | ≥ 3.14 | 构建系统 |
 | GCC / G++ | x86: 10.3，ARM: 9.3+ | 仅 Linux；macOS 用 Clang 13+ |
-| PostgreSQL | 19（devel） | 需要 server 头文件（`pg_config` 可调用） |
+| PostgreSQL | 16 / 17 / 18 / 19 | 需要对应版本的 server 头文件（`pg_config` 可调用） |
 | Boost | vendored 1.91（`thirdparties/boost/`） | 已内置，无需单独安装；Kylin V10 等缺系统 Boost 的机器需额外传 `-DBOOST_FALLBACK_INC` |
 
 ### DuckDB 扩展
@@ -20,7 +20,7 @@
 | 工具 | 版本 | 说明 |
 |------|------|------|
 | CMake | ≥ 3.28（**< 4.x**） | CMake 4.x 与 DuckDB v1.5.2 `link_threads` 检查不兼容 |
-| GCC / G++ | manylinux_2_28 容器内 GCC（自动） | 构建脚本在容器内运行，无需本地安装 |
+| C++17 编译器 | GCC / Clang | `build_duck.sh` 在本机运行，需要本机编译器与 Boost 头文件 |
 | DuckDB 源码 | v1.5.2 | 首次构建自动从 GitHub 拉取（~1.5 GB，需数分钟） |
 
 ---
@@ -28,8 +28,8 @@
 ## 拉取代码
 
 ```bash
-git clone https://github.com/VexDB-THU/vexdb_lite.git
-cd vexdb_lite
+git clone https://github.com/VexDB-THU/VexDB-Lite.git
+cd VexDB-Lite
 ```
 
 ---
@@ -49,7 +49,7 @@ ls build/pg/vexdb_lite.so
 CMake 自动调用 `pg_config` 查找 PostgreSQL 头文件。PG 在非标准路径时手动指定：
 
 ```bash
-# 方式：cmake -D 参数，或通过环境变量
+# 通过环境变量指定实际 pg_config
 PG_CONFIG=/opt/pg19/bin/pg_config cmake -B build/pg vexdb_pg/
 ```
 
@@ -59,15 +59,6 @@ PG_CONFIG=/opt/pg19/bin/pg_config cmake -B build/pg vexdb_pg/
 cmake -B build/pg vexdb_pg/ \
     -DBOOST_FALLBACK_INC=/opt/boost_1_90_0
 ```
-
-### 方式二：顶层 cmake（根目录，仅构建 PG 插件）
-
-```bash
-cmake -B build/pg .
-cmake --build build/pg -j$(nproc)
-```
-
-> 顶层 CMakeLists.txt 是只调 `add_subdirectory(vexdb_pg)` 的薄层分发，**不构建 DuckDB 扩展**。DuckDB 扩展通过 `build_duck.sh` 或 `build.sh` 单独构建。
 
 ### 安装到 PG 扩展目录
 
@@ -81,13 +72,12 @@ PG_SHARE=$(pg_config --sharedir)/extension
 sudo cp build/pg/vexdb_lite.so ${PG_PKGLIB}/
 sudo cp vexdb_pg/vexdb_lite.control ${PG_SHARE}/
 sudo cp vexdb_pg/sql/vexdb_lite--1.0.sql ${PG_SHARE}/
-sudo cp vexdb_pg/sql/vexdb_lite--1.0.sql ${PG_SHARE}/vexdb_lite--1.1.sql
-sudo cp vexdb_pg/sql/vexdb_lite--1.0--1.1.sql ${PG_SHARE}/
 ```
 
 ### 在 PostgreSQL 中启用
 
 ```sql
+-- 先在 postgresql.conf 中配置 shared_preload_libraries = 'vexdb_lite' 并重启
 CREATE EXTENSION vexdb_lite;
 SELECT extversion FROM pg_extension WHERE extname = 'vexdb_lite';
 ```
@@ -100,14 +90,14 @@ DuckDB 扩展有两套构建路径，用途不同：
 
 ### 路径一：build_duck.sh（可加载扩展，生产用）
 
-产出 `vexdb_lite.duckdb_extension`，作为独立文件通过 `LOAD` 加载到任意 DuckDB 实例。
+产出 `vexdb_lite.duckdb_extension`，作为独立文件通过 `LOAD` 加载到相同版本的 DuckDB 实例。
 
 ```bash
 # Release 构建（首次会自动拉取 DuckDB v1.5.2 源码 ~1.5 GB）
 bash build_duck.sh build
 
 # 产物
-ls build/duck/build/extension/vexdb_lite/vexdb_lite.duckdb_extension
+ls build/duck/v1.5.2/build/extension/vexdb_lite/vexdb_lite.duckdb_extension
 ```
 
 **子命令列表**（不含 `debug`）：
@@ -118,8 +108,8 @@ ls build/duck/build/extension/vexdb_lite/vexdb_lite.duckdb_extension
 | `build-unittest` | 编译扩展 + DuckDB unittest runner |
 | `unittest [pattern]` | 构建并运行 SQL 测试（自动调 build-unittest） |
 | `strip` | 手动执行 strip + footer 重写 |
-| `clean` | 清除 `build/duck/build/` |
-| `purge` | 清除整个 `build/duck/`（含 DuckDB 源码） |
+| `clean` | 清除 `build/duck/v1.5.2/build/` |
+| `purge` | 清除当前版本的 `build/` 和 `duckdb_src/`，保留共享数据 |
 
 > **注意**：`build_duck.sh` 没有 debug 子命令，只产出 Release 构建。如需 debug 构建请使用下方 `build.sh`。
 
@@ -131,56 +121,76 @@ bash build_duck.sh clean && bash build_duck.sh build
 
 > `CLEAN_DUCK_BUILD=1` 环境变量只在 `scripts/release.sh` 中有效，`build_duck.sh` 本身不识别该变量。
 
-### 路径二：build.sh（DuckDB 整体编译，调试 / 测试用）
+### Debug 构建与测试
 
-将 vexdb_lite 扩展静态链接进 DuckDB 二进制，产出带 vexdb_lite 的 `duckdb` CLI 和 `unittest` runner。适合本地功能调试和运行测试套件。
+`build.sh` 使用 `build_duck.sh setup` 准备的源码树，Debug 构建入口是：
 
 ```bash
-# Debug 构建
-bash build.sh dev
-
-# Release 构建
-bash build.sh release
-
-# 构建并运行所有 vexdb_lite 测试
-bash build.sh test
-
-# 只运行匹配 pattern 的测试
-bash build.sh test --filter 'graph'
-
-# AddressSanitizer 构建
-bash build.sh dev --asan
-
-# 限制并行 job 数
+bash build_duck.sh setup
 bash build.sh dev -j4
+# Debug runner：build/duck/v1.5.2/duckdb_src/build/debug/test/unittest
 ```
 
-产物路径：
-- Debug：`build/debug/duckdb`、`build/debug/test/unittest`
-- Release：`build/release/duckdb`、`build/release/test/unittest`
-
-运行测试：
+功能回归统一使用 spec runner，避免直接运行未部署用例的 unittest：
 
 ```bash
-# build.sh test 等价于：
-bash build_duck.sh build-unittest
-./build/duck/build/test/unittest "test/sql/vex/*"
-
-# 运行特定测试
-./build/debug/test/unittest "test/sql/vex/index/graph*"
-
-# 通过 build_duck.sh 快捷方式
-bash build_duck.sh unittest 'test/sql/vex/index/graph*'
+python3 -m pip install -r tests/spec/requirements.txt
+bash tests/spec/_lib/docker/run_duckdb.sh test
+bash tests/spec/_lib/docker/run_duckdb.sh test '*graph_index_ann*'
 ```
+
+DuckDB runner 在本地运行，不需要 Docker。它会渲染、部署用例并构建
+`build/duck/v1.5.2/build/test/unittest`，默认执行 `[spec_run]`。
+设置 `DUCKDB_VERSION` 后，源码和产物路径中的版本也相应变化。
 
 ### 加载扩展（路径一产物）
 
 ```sql
--- 允许加载未签名扩展（vexdb_lite 扩展当前未签名）
-SET allow_unsigned_extensions = true;
+-- 使用 duckdb -unsigned 启动，或在客户端连接配置中允许未签名扩展
 LOAD '/path/to/vexdb_lite.duckdb_extension';
 SELECT vexdb_version();
 ```
+
+---
+
+## 编译 SQLite 与 VexFS
+
+需要 CMake ≥ 3.14、C++17 编译器和 Boost 头文件。脚本会下载并校验固定版本的 SQLite
+amalgamation。Linux 安装 `libfuse3-dev` 可额外构建 FUSE helper；桌面连接 PostgreSQL
+后端还需要 libpq 开发文件。
+
+```bash
+bash build_sqlite.sh build
+bash build_sqlite.sh test
+# 产物目录：vexdb_sqlite/build/
+# 动态扩展：vexdb_lite.so（Linux）或 vexdb_lite.dylib（macOS）
+# 静态库：libvexdb_lite_static.a
+# 统一命令：vexdb，兼容文件入口：vexfs
+```
+
+`test` 包括向量、VexFS、CLI 冒烟和 SQLite spec。已有构建可单独运行 spec：
+
+```bash
+bash tests/spec/_lib/docker/run_sqlite.sh
+```
+
+SQLite runner 同样不需要 Docker。macOS 预览包、Android 和 iOS 的入口分别为
+`agent_files/macos/package_preview.sh`、`bash build_sqlite.sh android` 和
+`bash build_sqlite.sh ios`；交叉编译结果需要独立进行设备测试。
+
+## PostgreSQL spec
+
+```bash
+python3 -m pip install -r tests/spec/requirements.txt
+python3 tests/spec/_lib/render.py --engine pg --out build/spec
+# 使用 PG 19 稳定分支，避免 master 后续切换到下一个大版本
+BUILDX_EXTRA_ARGS='--build-arg PG_GIT_TAG=REL_19_STABLE' \
+  bash tests/spec/_lib/docker/run_pg.sh build
+bash tests/spec/_lib/docker/run_pg.sh test
+bash tests/spec/_lib/docker/run_pg.sh down
+```
+
+只有 PG runner 使用 Docker。完整命令和过滤方式见 [测试框架](../tests/spec/README.md)。
 
 ---
 
@@ -215,9 +225,7 @@ bash scripts/release.sh package
 | `vexdb_lite.so` | PG 插件（stripped，含 `.gnu_debuglink`） |
 | `vexdb_lite.so.debug` | PG 插件的独立 debug symbols（split-debug） |
 | `vexdb_lite.control` | PG 控制文件 |
-| `vexdb_lite--1.0.sql` | PG 1.0 安装 SQL |
-| `vexdb_lite--1.1.sql` | PG 1.1 安装 SQL（默认版本） |
-| `vexdb_lite--1.0--1.1.sql` | PG 1.0 到 1.1 升级 SQL |
+| `vexdb_lite--1.0.sql` | PG 安装 SQL |
 
 打包后的 Release tarballs（`dist/release/`）：
 
@@ -255,13 +263,15 @@ apt install postgresql-server-dev-19
 
 ### DuckDB 扩展加载报 `IO Error: The file is not a DuckDB extension`
 
-扩展与 DuckDB 版本严格绑定，当前只支持 v1.5.2：
+扩展与 DuckDB 版本严格绑定，默认构建目标是 v1.5.2。切换版本必须重新构建对应产物：
 
 ```sql
 SELECT version();  -- 确认为 v1.5.2
 ```
 
 ### GLIBCXX 版本不满足
+
+以下是历史发布产物的记录，当前 CI artifact 不承诺同等兼容性，实际以发布校验为准。
 
 `vexdb_lite.duckdb_extension`（manylinux_2_28 编译）要求 `GLIBCXX_3.4.22`；`vexdb_lite.so`（host GCC 编译）要求 `GLIBCXX_3.4.26`（x86）。CentOS 7 需升级：
 

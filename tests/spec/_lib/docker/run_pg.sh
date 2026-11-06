@@ -19,7 +19,6 @@ ROOT_DIR="$(cd "$(dirname "$0")/../../../.." && pwd)"
 # PG source lives inside this repo (vexdb_lite/duckdb). The legacy
 # separate ~/PersonalProjects/PG_VEXDB checkout was retired 2026-05-13.
 PG_VEXDB_SRC="${PG_VEXDB_SRC:-$ROOT_DIR}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
 SPEC_DIR="${ROOT_DIR}/build/spec/pg"
 RESULTS_DIR="${SPEC_DIR}/results"
 PG_MAJOR="${PG_MAJOR:-19}"
@@ -28,12 +27,40 @@ case "$PG_MAJOR" in
     *) echo "PG_MAJOR must be one of: 16, 17, 18, 19" >&2; exit 2 ;;
 esac
 PG_GIT_TAG="${PG_GIT_TAG:-REL_${PG_MAJOR}_STABLE}"
-IMAGE="vexdb_pg${PG_MAJOR}:latest"
-CONTAINER="vexdb_pg${PG_MAJOR}-test"
+IMAGE="${VEXDB_PG_IMAGE:-vexdb_pg${PG_MAJOR}:latest}"
+CONTAINER="${VEXDB_PG_CONTAINER:-vexdb_pg${PG_MAJOR}-test}"
 if [[ "$PG_MAJOR" == "19" ]]; then
     PG_HOST_PORT="${PG_HOST_PORT:-5433}"
 else
     PG_HOST_PORT="${PG_HOST_PORT:-$((5400 + PG_MAJOR))}"
+fi
+DATABASE="${VEXDB_PG_DATABASE:-test}"
+PG_DATA="${VEXDB_PG_DATA:-/var/lib/postgresql/data}"
+PG_LOG="${VEXDB_PG_LOG:-/tmp/pg.log}"
+PG_OS_USER="${VEXDB_PG_OS_USER:-postgres}"
+PYTHON_BIN="${VEXDB_LITE_PYTHON:-${PYTHON_BIN:-}}"
+
+if [[ -n "$PYTHON_BIN" ]]; then
+    [[ -x "$PYTHON_BIN" ]] || { echo "VEXDB_LITE_PYTHON 不可执行：$PYTHON_BIN" >&2; exit 2; }
+    "$PYTHON_BIN" -c 'import sys; raise SystemExit(sys.version_info < (3, 8))' || {
+        echo "VEXDB_LITE_PYTHON 需要 Python 3.8 或更高版本：$PYTHON_BIN" >&2
+        exit 2
+    }
+else
+    for candidate in \
+        "$(command -v python3 2>/dev/null || true)" \
+        /opt/homebrew/bin/python3 \
+        /opt/anaconda3/bin/python3 \
+        /usr/bin/python3; do
+        [[ -n "$candidate" && -x "$candidate" ]] || continue
+        if "$candidate" -c \
+                'import sys; raise SystemExit(sys.version_info < (3, 8))' \
+                >/dev/null 2>&1; then
+            PYTHON_BIN="$candidate"
+            break
+        fi
+    done
+    [[ -n "$PYTHON_BIN" ]] || { echo "PG spec 需要 Python 3.8 或更高版本" >&2; exit 2; }
 fi
 
 YEL=$'\033[1;33m'; GRN=$'\033[0;32m'; RED=$'\033[0;31m'; NC=$'\033[0m'
@@ -103,8 +130,8 @@ cmd_up() {
 wait_pg_ready() {
     info "等待 PG ready..."
     for _ in $(seq 1 30); do
-        if docker exec "$CONTAINER" psql -d test -c 'SELECT 1' >/dev/null 2>&1; then
-            ok "PG ready on localhost:${PG_HOST_PORT} db=test (容器内 5432)"
+        if docker exec "$CONTAINER" psql -U postgres -d "$DATABASE" -c 'SELECT 1' >/dev/null 2>&1; then
+            ok "PG ready on localhost:${PG_HOST_PORT} db=$DATABASE (容器内 5432)"
             return 0
         fi
         sleep 1
@@ -114,8 +141,8 @@ wait_pg_ready() {
 
 restart_pg_immediate() {
     info "按 spec 指令立即重启 PostgreSQL（验证 WAL 恢复）"
-    docker exec "$CONTAINER" pg_ctl -D /var/lib/postgresql/data \
-        -l /tmp/pg.log -m immediate -w restart >/dev/null
+    docker exec -u "$PG_OS_USER" "$CONTAINER" pg_ctl -D "$PG_DATA" \
+        -l "$PG_LOG" -m immediate -w restart >/dev/null
     wait_pg_ready
 }
 
@@ -148,7 +175,8 @@ run_spec_sql() {
             restart_pg_immediate
         fi
         first=0
-        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off \
+        docker exec -i "$CONTAINER" sh -c 'exec "$@" 2>&1' sh \
+            psql -U postgres -d "$DATABASE" -X -q -t -A -F '|' -P pager=off \
             >> "$actual" 2>&1 < "$segment" || true
     done
     rm -rf "$segment_dir"
@@ -161,11 +189,11 @@ cmd_down() {
 }
 
 cmd_shell() {
-    docker exec -it "$CONTAINER" psql -d test
+    docker exec -it "$CONTAINER" psql -U postgres -d "$DATABASE"
 }
 
 cmd_logs() {
-    docker exec "$CONTAINER" tail -100 /tmp/pg.log
+    docker exec "$CONTAINER" tail -100 "$PG_LOG"
 }
 
 cmd_status() {
@@ -203,7 +231,8 @@ cmd_test() {
         # -X: 不读 .psqlrc; -q: quiet (不输出 CREATE TABLE 等); -t: 不带 header/footer
         # -A: unaligned; -F '|': 字段分隔符; --no-psqlrc; ON_ERROR_STOP 失败立即停
         # 每个 spec 跑前: 删除 public schema 下所有用户表 (保留 extension)
-        docker exec -i "$CONTAINER" psql -d test -X -q -t -A -F '|' -P pager=off > /dev/null 2>&1 <<'EOF'
+        docker exec -i "$CONTAINER" sh -c 'exec "$@" 2>&1' sh \
+            psql -U postgres -d "$DATABASE" -X -q -t -A -F '|' -P pager=off > /dev/null 2>&1 <<'EOF'
 DO $$
 DECLARE r record;
 BEGIN

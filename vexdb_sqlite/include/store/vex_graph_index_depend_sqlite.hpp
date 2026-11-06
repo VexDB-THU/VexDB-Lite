@@ -435,18 +435,34 @@ public:
         }
     }
 
+    // Workers have joined. Capacity was published up front for safe concurrent
+    // writes; only assigned IDs are real nodes. Do not persist unused slots as
+    // zero vectors or let a later append address a trimmed slot as preallocated.
+    void FinishBulkBuild() {
+        std::unique_lock<std::shared_mutex> lock(elems_mutex_);
+        const size_t base=next_base_id_.load(std::memory_order_acquire);
+        const size_t upper=next_upper_id_.load(std::memory_order_acquire);
+        elems.resize(base);vectors.resize(base);base_points.resize(base);
+        upper_points.resize(upper);
+        base_size_.store(base,std::memory_order_release);
+        upper_size_.store(upper,std::memory_order_release);
+    }
+
     // 双锁升级协议（照 duck/主库）：SHARED 读 entry；需要更高 level 或图空时
     // 先抢 wait gate 再升 EXCLUSIVE，防写者饥饿。
-    template <bool exclusive = false, bool bottom_only = false>
+    template <bool with_lock = false, bool force_share_flag = false>
     std::pair<GraphIndexEntryInfo, bool> get_entry(int_fast8_t insert_level = 0) {
-        (void)bottom_only;
         entry_wait_mutex_.lock();
         entry_wait_mutex_.unlock();
 
         entry_mutex_.lock_shared();
         GraphIndexEntryInfo entry = entry_info;
+        if constexpr (!with_lock) {
+            entry_mutex_.unlock_shared();
+            return {entry, true};
+        }
         bool shared = true;
-        if ((!exclusive && insert_level > entry.level) || entry.level < 0) {
+        if ((!force_share_flag && insert_level > entry.level) || entry.level < 0) {
             entry_mutex_.unlock_shared();
             entry_wait_mutex_.lock();
             entry_mutex_.lock();

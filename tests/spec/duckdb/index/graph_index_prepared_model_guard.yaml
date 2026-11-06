@@ -1,0 +1,181 @@
+name: duckdb_graph_index_prepared_model_guard
+engines:
+- duckdb
+tags:
+- regression
+- quantizer
+- prepared
+- transaction
+description: Prepared ANN plans must recheck model freshness and see this transaction, including local inserts and rollback.
+steps:
+- statement: SET ${GUC_BF_THRESHOLD}=0;
+- statement: SET ${GUC_EF_SEARCH}=1024;
+- statement: CREATE TABLE prepared_pq_full(id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+- statement: INSERT INTO prepared_pq_full SELECT i, ${VEC_LITERAL([(i*.01)::FLOAT,0,0,0,0,0,0,0], 8)} FROM ${RANGE(512)}t(i);
+- statement: CREATE INDEX prepared_pq_full_ann ON prepared_pq_full USING ${VEX_INDEX}(vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', memory_mode='full', pq_m=4, m=16,
+    ef_construction=160)};
+- statement: SET ${GUC_PQ_SEARCH_MODE}='pq_only';
+- statement: PREPARE prepared_pq_full_query AS SELECT id FROM prepared_pq_full ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;
+- statement: EXECUTE prepared_pq_full_query;
+- query: EXPLAIN EXECUTE prepared_pq_full_query;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: UPDATE prepared_pq_full SET vec=${VEC_LITERAL([100,0,0,0,0,0,0,0], 8)} WHERE id=0;
+- statement: UPDATE prepared_pq_full SET vec=${VEC_LITERAL([-100,0,0,0,0,0,0,0], 8)} WHERE id=1;
+- query: EXECUTE prepared_pq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: UPDATE prepared_pq_full SET vec=${VEC_LITERAL([500,0,0,0,0,0,0,0], 8)} WHERE id=2;
+- query: EXECUTE prepared_pq_full_query;
+  _field_types: I
+  expect:
+  - - 3
+- statement: ROLLBACK;
+- query: EXECUTE prepared_pq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: INSERT INTO prepared_pq_full VALUES(999,${VEC_LITERAL([.0001,0,0,0,0,0,0,0], 8)});
+- query: EXECUTE prepared_pq_full_query;
+  _field_types: I
+  expect:
+  - - 999
+- statement: ROLLBACK;
+- query: EXECUTE prepared_pq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DEALLOCATE prepared_pq_full_query;
+- statement: DROP TABLE prepared_pq_full;
+- statement: CREATE TABLE prepared_pq_compact(id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+- statement: INSERT INTO prepared_pq_compact SELECT i, ${VEC_LITERAL([(i*.01)::FLOAT,0,0,0,0,0,0,0], 8)} FROM ${RANGE(512)}t(i);
+- statement: CREATE INDEX prepared_pq_compact_ann ON prepared_pq_compact USING ${VEX_INDEX}(vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='pq', memory_mode='compact',
+    pq_m=4, m=16, ef_construction=160)};
+- statement: SET ${GUC_PQ_SEARCH_MODE}='pq_only';
+- statement: PREPARE prepared_pq_compact_query AS SELECT id FROM prepared_pq_compact ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;
+- statement: EXECUTE prepared_pq_compact_query;
+- query: EXPLAIN EXECUTE prepared_pq_compact_query;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: UPDATE prepared_pq_compact SET vec=${VEC_LITERAL([100,0,0,0,0,0,0,0], 8)} WHERE id=0;
+- statement: UPDATE prepared_pq_compact SET vec=${VEC_LITERAL([-100,0,0,0,0,0,0,0], 8)} WHERE id=1;
+- query: EXECUTE prepared_pq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: UPDATE prepared_pq_compact SET vec=${VEC_LITERAL([500,0,0,0,0,0,0,0], 8)} WHERE id=2;
+- query: EXECUTE prepared_pq_compact_query;
+  _field_types: I
+  expect:
+  - - 3
+- statement: ROLLBACK;
+- query: EXECUTE prepared_pq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: INSERT INTO prepared_pq_compact VALUES(999,${VEC_LITERAL([.0001,0,0,0,0,0,0,0], 8)});
+- query: EXECUTE prepared_pq_compact_query;
+  _field_types: I
+  expect:
+  - - 999
+- statement: ROLLBACK;
+- query: EXECUTE prepared_pq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DEALLOCATE prepared_pq_compact_query;
+- statement: DROP TABLE prepared_pq_compact;
+- statement: CREATE TABLE prepared_rabitq_full(id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+- statement: INSERT INTO prepared_rabitq_full SELECT i, ${VEC_LITERAL([(i*.01)::FLOAT,0,0,0,0,0,0,0], 8)} FROM ${RANGE(512)}t(i);
+- statement: CREATE INDEX prepared_rabitq_full_ann ON prepared_rabitq_full USING ${VEX_INDEX}(vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='full',
+    m=16, ef_construction=160)};
+- statement: SET ${GUC_PQ_SEARCH_MODE}='pq_only';
+- statement: PREPARE prepared_rabitq_full_query AS SELECT id FROM prepared_rabitq_full ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;
+- statement: EXECUTE prepared_rabitq_full_query;
+- query: EXPLAIN EXECUTE prepared_rabitq_full_query;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: UPDATE prepared_rabitq_full SET vec=${VEC_LITERAL([100,0,0,0,0,0,0,0], 8)} WHERE id=0;
+- statement: UPDATE prepared_rabitq_full SET vec=${VEC_LITERAL([-100,0,0,0,0,0,0,0], 8)} WHERE id=1;
+- query: EXECUTE prepared_rabitq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: UPDATE prepared_rabitq_full SET vec=${VEC_LITERAL([500,0,0,0,0,0,0,0], 8)} WHERE id=2;
+- query: EXECUTE prepared_rabitq_full_query;
+  _field_types: I
+  expect:
+  - - 3
+- statement: ROLLBACK;
+- query: EXECUTE prepared_rabitq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: INSERT INTO prepared_rabitq_full VALUES(999,${VEC_LITERAL([.0001,0,0,0,0,0,0,0], 8)});
+- query: EXECUTE prepared_rabitq_full_query;
+  _field_types: I
+  expect:
+  - - 999
+- statement: ROLLBACK;
+- query: EXECUTE prepared_rabitq_full_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DEALLOCATE prepared_rabitq_full_query;
+- statement: DROP TABLE prepared_rabitq_full;
+- statement: CREATE TABLE prepared_rabitq_compact(id INTEGER PRIMARY KEY, vec ${VECTOR(8)});
+- statement: INSERT INTO prepared_rabitq_compact SELECT i, ${VEC_LITERAL([(i*.01)::FLOAT,0,0,0,0,0,0,0], 8)} FROM ${RANGE(512)}t(i);
+- statement: CREATE INDEX prepared_rabitq_compact_ann ON prepared_rabitq_compact USING ${VEX_INDEX}(vec${OPS_L2_COL})${IDX_WITH_L2(quantizer='rabitq', memory_mode='compact',
+    m=16, ef_construction=160)};
+- statement: SET ${GUC_PQ_SEARCH_MODE}='pq_only';
+- statement: PREPARE prepared_rabitq_compact_query AS SELECT id FROM prepared_rabitq_compact ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;
+- statement: EXECUTE prepared_rabitq_compact_query;
+- query: EXPLAIN EXECUTE prepared_rabitq_compact_query;
+  _field_types: II
+  expect:
+  - - physical_plan
+    - <REGEX>:.*VEXDB_INDEX_SCAN.*
+- statement: UPDATE prepared_rabitq_compact SET vec=${VEC_LITERAL([100,0,0,0,0,0,0,0], 8)} WHERE id=0;
+- statement: UPDATE prepared_rabitq_compact SET vec=${VEC_LITERAL([-100,0,0,0,0,0,0,0], 8)} WHERE id=1;
+- query: EXECUTE prepared_rabitq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: UPDATE prepared_rabitq_compact SET vec=${VEC_LITERAL([500,0,0,0,0,0,0,0], 8)} WHERE id=2;
+- query: EXECUTE prepared_rabitq_compact_query;
+  _field_types: I
+  expect:
+  - - 3
+- statement: ROLLBACK;
+- query: EXECUTE prepared_rabitq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: BEGIN;
+- statement: INSERT INTO prepared_rabitq_compact VALUES(999,${VEC_LITERAL([.0001,0,0,0,0,0,0,0], 8)});
+- query: EXECUTE prepared_rabitq_compact_query;
+  _field_types: I
+  expect:
+  - - 999
+- statement: ROLLBACK;
+- query: EXECUTE prepared_rabitq_compact_query;
+  _field_types: I
+  expect:
+  - - 2
+- statement: DEALLOCATE prepared_rabitq_compact_query;
+- statement: DROP TABLE prepared_rabitq_compact;
+- statement: RESET ${GUC_PQ_SEARCH_MODE};

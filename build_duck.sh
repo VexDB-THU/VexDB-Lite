@@ -56,7 +56,7 @@ LIBVEX="$DUCK_BUILD/extension/vexdb_lite/libvexdb_lite_extension.a"
 
 ANN_HDF5_SRC="${ANN_HDF5_SRC:-}"  # path to sift-128-euclidean.hdf5 from ann-benchmarks
 
-NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)"
+NCPU="${BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)}"
 CXX_BIN="${CXX:-c++}"
 
 YEL='\033[1;33m'; GRN='\033[0;32m'; RED='\033[0;31m'; NC='\033[0m'
@@ -99,6 +99,7 @@ EOF
     info "cmake configure → $DUCK_BUILD"
     cmake -S "$DUCK_SRC" -B "$DUCK_BUILD" \
         -DCMAKE_BUILD_TYPE=Release \
+        ${BOOST_ROOT:+-DBOOST_ROOT="$BOOST_ROOT"} -DBoost_NO_BOOST_CMAKE=ON \
         -DBUILD_SHELL=OFF \
         -DBUILD_UNITTESTS=ON \
         -DENABLE_EXTENSION_AUTOLOADING=OFF \

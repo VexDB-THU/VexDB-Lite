@@ -24,7 +24,7 @@ void PQDistancer::train(Relation index, FloatVectorArray samples, size_t dimensi
                          ? Metric::INNER_PRODUCT : Metric::L2,
                      index, kstate, (int)pq.dsub, /*ispq*/ true, /*pqtrain*/ true);
     ::vex::quantizer::KMeansState shared_state;
-    shared_state.skip_check_duplicate = kstate->skipCheckDuplicate;
+    shared_state.allow_low_diversity_centers = true;
     shared_state.distance_fn = kstate->kmeansprocinfo;
     shared_state.norm_fn = kstate->kmeansnormprocinfo;
 

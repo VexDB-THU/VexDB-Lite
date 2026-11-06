@@ -53,6 +53,15 @@ steps:
     _field_types: I
     expect:
       - [2]
+  - query: "EXPLAIN SELECT id FROM pq_reload_compact ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: II
+    expect:
+      - [physical_plan, "<!REGEX>:.*VEXDB_INDEX_SCAN.*"]
+  - statement: PRAGMA vexdb_rebuild_index('idx_pq_reload_compact');
+  - query: "EXPLAIN SELECT id FROM pq_reload_compact ORDER BY ${L2(vec, ${VEC_LITERAL([0,0,0,0,0,0,0,0], 8)})} LIMIT 1;"
+    _field_types: II
+    expect:
+      - [physical_plan, "<REGEX>:.*VEXDB_INDEX_SCAN.*"]
   - statement: RESET ${GUC_PQ_SEARCH_MODE};
   - query: "SELECT count(*), count(DISTINCT id) FROM (
       SELECT id FROM rq_reload_compact

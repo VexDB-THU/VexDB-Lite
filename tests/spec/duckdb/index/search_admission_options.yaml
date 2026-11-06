@@ -1,0 +1,44 @@
+name: index__search_admission_options
+tags: [vex, regression]
+engines: [duckdb]
+description: Database-wide admission scope, configurable limits and wait-timeout validation.
+steps:
+- statement: RESET GLOBAL vexdb_search_concurrency;
+- statement: RESET vexdb_search_queue_timeout_ms;
+- query: >
+    SELECT current_setting('vexdb_search_concurrency'),
+           struct_extract(vexdb_search_queue_state(), 'limit'),
+           struct_extract(vexdb_search_queue_state(), 'active'),
+           struct_extract(vexdb_search_queue_state(), 'waiting');
+  _field_types: IIII
+  expect: [[0,0,0,0]]
+- statement: SET GLOBAL vexdb_search_concurrency=3;
+- statement: SET SESSION vexdb_search_concurrency=8;
+  expect_error: database-wide
+- statement: SET vexdb_search_concurrency=8;
+  expect_error: SET GLOBAL
+- statement: RESET vexdb_search_concurrency;
+  expect_error: RESET GLOBAL
+- statement: SET GLOBAL vexdb_search_concurrency=-2;
+  expect_error: must be -1
+- statement: SET GLOBAL vexdb_search_concurrency=NULL;
+  expect_error: must be -1
+- query: >
+    SELECT current_setting('vexdb_search_concurrency'),
+           struct_extract(vexdb_search_queue_state(), 'limit');
+  _field_types: II
+  expect: [[3,3]]
+- statement: SET GLOBAL vexdb_search_concurrency=-1;
+- query: SELECT (struct_extract(vexdb_search_queue_state(), 'limit') > 0)::INTEGER;
+  _field_types: I
+  expect: [[1]]
+- statement: SET vexdb_search_queue_timeout_ms=25;
+- statement: SET vexdb_search_queue_timeout_ms=NULL;
+  expect_error: cannot be NULL
+- statement: SET vexdb_search_queue_timeout_ms=-1;
+  expect_error: out of range
+- query: SELECT current_setting('vexdb_search_queue_timeout_ms');
+  _field_types: I
+  expect: [[25]]
+- statement: RESET GLOBAL vexdb_search_concurrency;
+- statement: RESET vexdb_search_queue_timeout_ms;

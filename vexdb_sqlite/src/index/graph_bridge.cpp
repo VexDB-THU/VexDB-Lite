@@ -3,6 +3,8 @@
 // include 顺序约定（duck 同款）：宿主依赖头必须先于 algorithm.h。
 #include "vex_graph_index_depend_sqlite.hpp"
 #include "graph_index/graph_index_algorithm.h"
+#include "graph_index/signature_search.h"
+#include <set>
 
 #include "distance/core/distance.h"
 #include "distance/core/distance_dispatcher.h"
@@ -41,6 +43,10 @@ private:
     T &value_;
 };
 using SqDTypeList = DistPrecisionTypeList<DistPrecisionType::FLOAT>;
+struct DistanceCounter {
+    size_t *calls;
+    template<typename ID> void record(ID) const { ++*calls; }
+};
 
 Metric ToCoreMetric(VexMetric m) {
     switch (m) {
@@ -286,15 +292,15 @@ private:
 
 // 照抄 duck RunWithDuckAlgo（graph_index.cpp:53）：dispatcher 选出 distancer，
 // 就地实例化算法对象执行 fn。Store 参数化：MemStore（全内存）/ DiskStore（段式）。
-template <typename Store, typename Fn>
+template <typename Store, typename Fn, typename Observer = GraphSearchUnobserved>
 auto RunWithAlgo(Metric metric, uint16_t dim, int ef_construction, int m, Store &store,
-                 Fn &&fn) {
+                 Fn &&fn, Observer observer = {}) {
     return DispatchRunner<false, SqMetricList, SqDTypeList, DispatcherMode::NO_QUANT>::call(
         metric, DistPrecisionType::FLOAT, dim, QuantizerType::NONE,
         [&](auto &distancer) -> decltype(auto) {
             using DistT = std::decay_t<decltype(distancer)>;
-            using AlgoT = GraphIndexAlgorithm<Store, DistT>;
-            AlgoT algo(uint_fast16_t(ef_construction), uint_fast16_t(m), store, distancer);
+            using AlgoT = GraphIndexAlgorithm<Store, DistT, PgAlloc, Observer>;
+            AlgoT algo(uint_fast16_t(ef_construction), uint_fast16_t(m), store, distancer, observer);
             return fn(algo);
         });
 }
@@ -340,6 +346,7 @@ bool ReadPod(const char *&p, const char *end, T &v) {
 }  // namespace
 
 struct GraphBridge::Impl {
+    GraphBridge::SearchStats search_stats;
     uint16_t dim;
     int m;
     int ef_construction;
@@ -517,7 +524,7 @@ struct GraphBridge::Impl {
         kmeans_state.distance_fn = ann_helper::get_general_distance_func(
             metric == VexMetric::INNER_PRODUCT ? Metric::INNER_PRODUCT : Metric::L2_SQRT,
             uint32_t(pq.dsub));
-        kmeans_state.skip_check_duplicate = true;
+        kmeans_state.allow_low_diversity_centers = true;
         ::vex::quantizer::PQFloatArray sample_view;
         sample_view.data = samples.data();
         sample_view.length = sample_count;
@@ -621,6 +628,79 @@ struct GraphBridge::Impl {
         }
     }
 
+    bool signature_enabled = false, signature_meta_dirty = false;
+    signature_rescue::Header signature;
+    std::vector<float> signature_center, signature_lut;
+    std::vector<int8_t> signature_signs;
+    std::vector<uint32_t> signature_order;
+    std::vector<char> signature_codes;
+    std::set<size_t> signature_dirty;
+
+    void init_signature() {
+        signature_signs.resize(3*signature.padded);
+        signature_order.resize(signature.padded);
+        signature_lut.resize(signature.bits+1);
+        signature_rescue::Initialize(signature.seed,signature.padded,signature_signs.data(),signature_order.data());
+        signature_rescue::Cosines(signature.bits,signature_lut.data());
+    }
+    void encode_signature(const float *vec,size_t id) {
+        std::vector<float> scratch(signature.padded); uint64_t code[4]; float norm;
+        if (!signature_rescue::Encode(vec,signature_center.data(),dim,signature.padded,256,
+                signature_signs.data(),signature_order.data(),scratch.data(),code,norm))
+            throw std::runtime_error("signature needs finite L2 vectors");
+        char *record=signature_codes.data()+id*signature_rescue::record_bytes;
+        std::memcpy(record,&norm,4); std::memcpy(record+4,code,32);
+        signature_dirty.insert(id/SqliteDiskStore::SEG_RECORDS);
+    }
+    bool write_signature(const GraphBridge::SegWriteFn &write,bool full) {
+        if (!signature.valid) return true;
+        if (full || signature_meta_dirty) {
+            std::vector<char> meta(sizeof(signature)+dim*4);
+            std::memcpy(meta.data(),&signature,sizeof(signature));
+            std::memcpy(meta.data()+sizeof(signature),signature_center.data(),dim*4);
+            if (!write(7,0,meta)) return false;
+        }
+        const size_t span=SqliteDiskStore::SEG_RECORDS*signature_rescue::record_bytes;
+        auto segment=[&](size_t seg) {
+            size_t lo=seg*span, hi=std::min(signature_codes.size(),lo+span);
+            return write(8,uint32_t(seg),std::vector<char>(signature_codes.begin()+lo,signature_codes.begin()+hi));
+        };
+        if (full) for (size_t seg=0;seg*span<signature_codes.size();++seg) {
+            if (!segment(seg)) return false;
+        }
+        else for (auto seg:signature_dirty) if (!segment(seg)) return false;
+        signature_dirty.clear();signature_meta_dirty=false;return true;
+    }
+    bool read_signature(const GraphBridge::SegReadFn &read,size_t count,std::string &err) {
+        std::vector<char> meta;
+        int code_kind = 8;
+        if (!read(7,0,meta)) {
+            if (quantizer_type != QuantizerType::NONE || !read(5,0,meta)) return true;
+            code_kind = 6; // legacy raw signature layout; never a quantizer
+        }
+        if (meta.size()!=sizeof(signature)+dim*4) {err="invalid signature metadata";return false;}
+        std::memcpy(&signature,meta.data(),sizeof(signature));
+        if (quantizer_type!=QuantizerType::NONE || metric!=VexMetric::L2 || !signature_rescue::ValidHeader(signature,dim,count) ||
+                count>signature_codes.max_size()/signature_rescue::record_bytes) {
+            err="signature metadata does not match graph";return false;
+        }
+        signature_center.resize(dim);std::memcpy(signature_center.data(),meta.data()+sizeof(signature),dim*4);
+        signature_codes.resize(count*signature_rescue::record_bytes);
+        const size_t span=SqliteDiskStore::SEG_RECORDS*signature_rescue::record_bytes;
+        for (size_t seg=0;seg*span<signature_codes.size();++seg) {
+            std::vector<char> buf;size_t bytes=std::min(span,signature_codes.size()-seg*span);
+            if (!read(code_kind,uint32_t(seg),buf) || buf.size()!=bytes) {err="signature code segment missing/short";return false;}
+            std::memcpy(signature_codes.data()+seg*span,buf.data(),bytes);
+        }
+        if (code_kind == 6) {
+            // Migrate the old raw-only layout on the next write transaction.
+            // Reads stay read-only; all existing model bytes are preserved.
+            signature_meta_dirty = true;
+            for (size_t seg=0; seg*span<signature_codes.size(); ++seg) signature_dirty.insert(seg);
+        }
+        init_signature();return true;
+    }
+
     template <typename ElemsVec>
     void build_rowid_map(const ElemsVec &elems) {
         rowid_to_node.clear();
@@ -718,6 +798,12 @@ void GraphBridge::Insert(const float *vec, int64_t rowid) {
     } else {
         run(im.store);
     }
+    const size_t after_signature = im.disk ? im.disk->elems.size() : im.store.elems.size();
+    if (im.signature.valid && after_signature == before+1) {
+        im.signature_codes.resize(after_signature*signature_rescue::record_bytes);
+        im.encode_signature(vec,before);
+        im.signature.count=after_signature;im.signature_meta_dirty=true;
+    }
     // rowid→node 懒 map 增量维护：节点数 +1 = 新节点（assign_vector_id 顺序
     // 分配，必在尾部）→ 追加一条；节点数不变 = dedup 把 tid 挂到既有节点
     //（节点 id 不可知）→ 才保守作废。原先无条件作废让交替 INSERT/DELETE
@@ -776,8 +862,12 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         if (n == 1) return 0;
 
         size_t rest = n - 1;
-        int workers = n_threads;
-        if (workers > int(rest)) workers = int(rest);
+        constexpr size_t kBatch = 64;
+        // n_threads is a ceiling. Do not launch workers which cannot receive
+        // a full scheduling batch; tiny recovery builds otherwise start far
+        // apart before their nearest preceding rows have been inserted.
+        const size_t full_batches = std::max<size_t>(1, rest / kBatch);
+        const int workers = int(std::min<size_t>(std::max(1, n_threads), full_batches));
         // Phase B：单线程回退。浏览器默认没有 SharedArrayBuffer/跨域隔离，
         // 非 pthread WASM 构建固定走这里，避免产物要求额外响应头。
 #if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
@@ -799,7 +889,6 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         std::exception_ptr first_error = nullptr;
         std::mutex err_mu;
         auto worker = [&]() {
-            constexpr size_t kBatch = 64;
             while (!failed.load(std::memory_order_relaxed)) {
                 size_t begin = next.fetch_add(kBatch, std::memory_order_relaxed);
                 if (begin >= n) break;
@@ -823,6 +912,7 @@ void GraphBridge::BuildBulk(const float *vecs, const int64_t *rowids, size_t n, 
         return 0;
 #endif
     });
+    im.store.FinishBulkBuild();
     im.train_quantizer(im.store);
     im.release_raw_vectors(im.store);
 }
@@ -837,6 +927,7 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
                          std::vector<std::pair<double, int64_t>> &out) {
     auto &im = *impl_;
     out.clear();
+    im.search_stats = {};
     if (Count() == 0 || k == 0) return;
 
     // cosine：归一化 query 副本，使 raw=-cos_sim、1+raw 与 M2 暴力路径数值一致
@@ -857,7 +948,7 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
         size_t live = n > im.dead_nodes ? n - im.dead_nodes : 1;
         ef = uint32_t(std::min<double>(double(ef) * double(n) / double(live), double(ef) * 2.0));
     }
-    auto run = [&](auto &store) {
+    auto run = [&](auto &store, auto observer, auto completion) {
         PointExtensionContext pctx;
         auto node_filter = [&](uint32 id) -> bool {
             for (const auto &t : store.elems[id].tids) {
@@ -883,11 +974,11 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
         };
         auto search = [&](auto &algo) {
             if (filter) {
-                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef, node_filter);
+                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef, node_filter, completion);
                 VtlDestroyGuard results_guard(results);
                 emit(results);
             } else {
-                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef);
+                auto results = algo.search(pctx, reinterpret_cast<const char *>(q), ef, [](uint32_t) { return true; }, completion);
                 VtlDestroyGuard results_guard(results);
                 emit(results);
             }
@@ -907,9 +998,9 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
             auto search_codes = [&](auto &distancer) {
                 SqliteQuantizedSearchStore<std::decay_t<decltype(store)>> quantized_store(
                     store, im.quantizer_codes, code_size);
-                GraphIndexAlgorithm<decltype(quantized_store), std::decay_t<decltype(distancer)>> algo(
+                GraphIndexAlgorithm<decltype(quantized_store), std::decay_t<decltype(distancer)>, PgAlloc, decltype(observer)> algo(
                     uint_fast16_t(im.ef_construction), uint_fast16_t(im.m),
-                    quantized_store, distancer);
+                    quantized_store, distancer, observer);
                 search(algo);
             };
             if (im.uses_pq() && im.pq_state) {
@@ -929,14 +1020,41 @@ void GraphBridge::Search(const float *query, size_t k, uint32_t ef_search,
             RunWithAlgo(im.core_metric, im.dim, im.ef_construction, im.m, store, [&](auto &algo) {
                 search(algo);
                 return 0;
-            });
+            }, observer);
         }
     };
-    if (im.disk) {
-        run(*im.disk);
-    } else {
-        run(im.store);
-    }
+    auto select_store = [&](auto &store) {
+        if (im.quantizer_type != QuantizerType::NONE || !im.signature_enabled || !signature_rescue::ValidHeader(im.signature,im.dim,Count())) {
+            run(store,DistanceCounter{&im.search_stats.distance_calls},GraphSearchUncompleted{});return;
+        }
+        std::vector<unsigned char> seen((Count()+7)/8,0);size_t calls=0;
+        signature_rescue::Observer observer{seen.data(),Count(),&calls};
+        auto completion=[&](auto &points,auto &distancer) {
+            if (!signature_rescue::WorthScanning(Count(),im.dim,im.signature.padded,calls)) return;
+            const size_t limit=calls*25/1000;if (!limit) return;
+            std::vector<float> scratch(im.signature.padded);uint64_t code[4];float norm;
+            if (!signature_rescue::Encode(q,im.signature_center.data(),im.dim,im.signature.padded,256,
+                    im.signature_signs.data(),im.signature_order.data(),scratch.data(),code,norm)) return;
+            std::vector<signature_rescue::Nominee> heap(limit);
+            signature_rescue::Selector selector{heap.data(),0,limit,observer,code,norm,im.signature_lut.data()};
+            for (size_t id=0;id<Count();++id)
+                selector.offer(uint32_t(id),im.signature_codes.data()+id*signature_rescue::record_bytes);
+            for (size_t i=0;i<selector.count;++i) {
+                auto id=heap[i].id;
+                // A disallowed node can navigate the graph, but cannot enter the output pool.
+                bool allowed=!filter;
+                if (filter) for (const auto &tid:store.elems[id].tids) if (filter(tid.row_id)) {allowed=true;break;}
+                if (!allowed) continue;
+                float distance=store.get_distance(distancer,reinterpret_cast<const char*>(q),id);
+                ++im.search_stats.rescue_refinements;
+                points.emplace_back(id,id,uint32_t(INVALID_VECTOR_ID),distance,nullptr);
+            }
+            std::sort(points.begin(),points.end(),[](const auto&a,const auto&b){return a.dist<b.dist;});
+        };
+        run(store,observer,completion);
+        im.search_stats.distance_calls=calls;
+    };
+    if (im.disk) select_store(*im.disk); else select_store(im.store);
 }
 
 bool GraphBridge::RemoveTid(int64_t rowid) {
@@ -954,6 +1072,8 @@ bool GraphBridge::RemoveTid(int64_t rowid) {
                 break;
             }
         }
+        // Keep an empty node's code: a later duplicate may attach a new TID to
+        // the same node. Empty nodes still emit no rows through get_tids().
         if (tids.empty()) im.dead_nodes++;
         store.mark_elem_dirty(node_id);
         im.rowid_to_node.erase(it);
@@ -965,6 +1085,41 @@ bool GraphBridge::RemoveTid(int64_t rowid) {
 
 size_t GraphBridge::DeadNodeCount() const {
     return impl_->dead_nodes;
+}
+
+void GraphBridge::SetSignatureRescue(bool enabled) { impl_->signature_enabled=enabled; }
+bool GraphBridge::HasSignature() const {
+    return signature_rescue::ValidHeader(impl_->signature,impl_->dim,Count());
+}
+GraphBridge::SearchStats GraphBridge::LastSearchStats() const { return impl_->search_stats; }
+size_t GraphBridge::SignatureMemoryBytes() const {
+    const auto &im=*impl_;
+    return im.signature_codes.capacity()+im.signature_center.capacity()*sizeof(float)+
+        im.signature_signs.capacity()+im.signature_order.capacity()*sizeof(uint32_t)+
+        im.signature_lut.capacity()*sizeof(float);
+}
+void GraphBridge::BuildSignature(uint64_t seed) {
+    auto &im=*impl_;size_t n=Count();
+    if (im.quantizer_type!=QuantizerType::NONE || im.compact_mode || im.metric!=VexMetric::L2 || !n || n>=uint32_t(INVALID_VECTOR_ID))
+        throw std::runtime_error("signature needs a nonempty FLOAT L2 graph with 32-bit IDs");
+    // Build into a separate owner. Failure leaves the previous graph/model intact.
+    Impl model(im.dim,im.m,im.ef_construction,im.metric,QuantizerType::NONE,0,false);
+    model.signature.dim=im.dim;model.signature.padded=signature_rescue::Padded(im.dim,512);
+    model.signature.seed=seed;model.signature.count=n;model.signature_center.resize(im.dim);
+    model.signature_codes.resize(n*signature_rescue::record_bytes);model.init_signature();
+    std::vector<double> sum(im.dim,0);std::vector<float> vector(im.dim);
+    auto copy_vector=[&](size_t id) {
+        if (im.disk) {auto b=im.disk->read_data(uint32_t(id));std::memcpy(vector.data(),b.get_vecbuf(),im.dim*4);b.release();}
+        else std::memcpy(vector.data(),im.store.vectors[id].data(),im.dim*4);
+    };
+    for (size_t id=0;id<n;++id) {copy_vector(id);for(size_t d=0;d<im.dim;++d)sum[d]+=vector[d];}
+    for (size_t d=0;d<im.dim;++d)model.signature_center[d]=float(sum[d]/n);
+    for (size_t id=0;id<n;++id) {copy_vector(id);model.encode_signature(vector.data(),id);}
+    model.signature.valid=1;
+    im.signature=model.signature;im.signature_center.swap(model.signature_center);
+    im.signature_codes.swap(model.signature_codes);im.signature_signs.swap(model.signature_signs);
+    im.signature_order.swap(model.signature_order);im.signature_lut.swap(model.signature_lut);
+    im.signature_dirty.swap(model.signature_dirty);im.signature_meta_dirty=true;
 }
 
 size_t GraphBridge::Count() const {
@@ -1002,6 +1157,7 @@ size_t GraphBridge::CacheBudgetBytes() const {
 bool GraphBridge::HasDirty() const {
     return impl_->full_dirty || impl_->elems_dirty || impl_->quantizer_fixed_dirty ||
            !impl_->quantizer_dirty_code_segs.empty() ||
+           impl_->signature_meta_dirty || !impl_->signature_dirty.empty() ||
            (impl_->disk && impl_->disk->has_dirty());
 }
 
@@ -1444,6 +1600,7 @@ bool ReadMetaV2(const GraphBridge::SegReadFn &read, uint16_t dim, int m, VexMetr
 bool GraphBridge::SerializeV2(const SegWriteFn &write) {
     auto &im = *impl_;
     std::vector<char> buf;
+    if (!im.write_signature(write,im.full_dirty)) return false;
 
     auto write_quantizer = [&]() -> bool {
         if (im.quantizer_type == QuantizerType::NONE) return true;
@@ -1764,6 +1921,7 @@ std::unique_ptr<GraphBridge> GraphBridge::OpenV2(const SegReadFn &read, uint16_t
     st.entry_info.set(size_t(h.entry_id), size_t(h.entry_cur_layer_idx),
                       int_fast8_t(h.entry_level));
     if (!ReadQuantizer(read, *bridge->impl_, base_n, err)) return nullptr;
+    if (!bridge->impl_->read_signature(read,base_n,err)) return nullptr;
     return bridge;
 }
 
@@ -1827,6 +1985,7 @@ std::unique_ptr<GraphBridge> GraphBridge::OpenV2Disk(const SegReadFn &read,
     ds.dirty_elem_segs_.clear();
     ds.dirty_upper_segs_.clear();
     if (!ReadQuantizer(read, im, base_n, err)) return nullptr;
+    if (!bridge->impl_->read_signature(read,base_n,err)) return nullptr;
     return bridge;
 }
 

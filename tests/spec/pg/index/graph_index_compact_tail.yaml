@@ -1,0 +1,33 @@
+name: graph_index_compact_tail
+tags: [pg-only, regression, rabitq, compact, storage]
+description: |
+  Compact code payloads may grow at small dimensions and shrink at larger
+  dimensions. Preserve every payload byte, pad the final PG page, and reclaim
+  the raw tail on every supported smgrtruncate API.
+engines: [pg]
+steps:
+- statement: SET maintenance_work_mem='512MB';
+- statement: |
+    DO $case$
+    DECLARE dim int; tab text; idx text; codes bigint; actual bigint; block_bytes bigint;
+    BEGIN
+      block_bytes := current_setting('block_size')::bigint;
+      FOREACH dim IN ARRAY ARRAY[16,64] LOOP
+        tab := 'compact_tail_'||dim;
+        idx := tab||'_ann';
+        EXECUTE format('CREATE TABLE %I(id int,vec floatvector(%s))',tab,dim);
+        EXECUTE format('INSERT INTO %I SELECT i,array_agg(sin(i::float8*d*.017)::float4 ORDER BY d)::floatvector FROM generate_series(1,12001)i CROSS JOIN generate_series(1,%s)d GROUP BY i',tab,dim);
+        EXECUTE format('CREATE INDEX %I ON %I USING vexdb_graph(vec floatvector_l2_ops) WITH(quantizer=rabitq,memory_mode=compact,m=8,ef_construction=64,parallel_workers=0)',idx,tab);
+        SELECT rabitq_codes_bytes INTO codes FROM vexdb_index_info() WHERE indexname=idx;
+        SELECT (pg_stat_file(pg_relation_filepath(idx::regclass)||'_vm')).size INTO actual;
+        IF codes IS NULL OR codes<=0 OR actual<>((codes+block_bytes-1)/block_bytes)*block_bytes
+           OR actual<>pg_relation_size(idx::regclass,'vm') THEN
+          RAISE EXCEPTION 'compact file size mismatch: dimension %, logical codes %, actual %',dim,codes,actual;
+        END IF;
+        EXECUTE format('DROP TABLE %I',tab);
+      END LOOP;
+    END
+    $case$;
+- query: SELECT count(*) FROM pg_class WHERE relname IN ('compact_tail_16','compact_tail_64');
+  expect: [[0]]
+- statement: RESET maintenance_work_mem;

@@ -91,7 +91,7 @@ static int brute(sqlite3 *db, const char *table, const char *fn, const char *que
     return n;
 }
 
-// recall@k（按 id 集合交集），同时校验 KNN 的 dist 与 ground truth 首位一致。
+// ANN 可以遗漏精确 top1；召回率与每条结果的距离正确性分别检查。
 static double recall_check(sqlite3 *db, const char *table, const char *fn,
                            const float *query, const char *what) {
     char qjson[2048];
@@ -111,12 +111,40 @@ static double recall_check(sqlite3 *db, const char *table, const char *fn,
             if (aids[i] == gids[j]) { hit++; break; }
         }
     }
-    // distance 数值与标量函数一致（top1 必须同 id 同值）
-    if (aids[0] != gids[0] || fabs(ad[0] - gd[0]) > 1e-5) {
-        fprintf(stderr, "M3 FAIL: %s: top1 id/dist mismatch a=(%lld,%.8f) g=(%lld,%.8f)\n",
-                what, (long long)aids[0], ad[0], (long long)gids[0], gd[0]);
+    // 对返回的同一 rowid 计算标量距离，不能把近似结果的距离与另一行的
+    // 精确 top1 距离比较。保留调用者的 recall >= 0.9 门槛。
+    char sql[1024];
+    snprintf(sql, sizeof(sql), "SELECT %s(embedding, ?1) FROM %s WHERE rowid = ?2", fn, table);
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &st, NULL) != SQLITE_OK) {
+        fprintf(stderr, "M3 FAIL: %s: prepare scalar distance check: %s\n", what, sqlite3_errmsg(db));
         g_fail = 1;
+        return (double)hit / K;
     }
+    sqlite3_bind_text(st, 1, qjson, -1, SQLITE_TRANSIENT);
+    for (int i = 0; i < an; i++) {
+        sqlite3_bind_int64(st, 2, aids[i]);
+        int rc = sqlite3_step(st);
+        double scalar = rc == SQLITE_ROW ? sqlite3_column_double(st, 0) : NAN;
+        if (rc != SQLITE_ROW || sqlite3_column_type(st, 0) == SQLITE_NULL ||
+            !isfinite(ad[i]) || !isfinite(scalar) || fabs(ad[i] - scalar) > 1e-5) {
+            fprintf(stderr, "M3 FAIL: %s: row %lld distance mismatch ann=%.8f scalar=%.8f rc=%d\n",
+                    what, (long long)aids[i], ad[i], scalar, rc);
+            g_fail = 1;
+        }
+        if (i > 0 && ad[i] + 1e-5 < ad[i - 1]) {
+            fprintf(stderr, "M3 FAIL: %s: distances are not ordered\n", what);
+            g_fail = 1;
+        }
+        for (int j = 0; j < i; j++) {
+            if (aids[i] == aids[j]) {
+                fprintf(stderr, "M3 FAIL: %s: duplicate row %lld\n", what, (long long)aids[i]);
+                g_fail = 1;
+            }
+        }
+        sqlite3_reset(st);
+    }
+    sqlite3_finalize(st);
     return (double)hit / K;
 }
 

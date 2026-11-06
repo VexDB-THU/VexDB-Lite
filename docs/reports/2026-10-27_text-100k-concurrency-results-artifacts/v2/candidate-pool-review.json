@@ -1,0 +1,88 @@
+{
+  "reviewed_epoch": 1793084903.532268,
+  "rows_checked": 600,
+  "scope": "Untimed fixed-parameter diagnostic; no parameter selection or throughput claim",
+  "protocol_sha256": "b6b8128b1ac83251e203b635598a3b326cd0ff83907effc3a7186a47a30f2ef9",
+  "source_sha256": "ecd37d288b85387e4816af23a786fc3ab5c6ccff0eca9068941b575e40274413",
+  "reviewer_sha256": "dc5c684cf0df457023526c810b8c4a89abb39cbcef2db0f991b979689869e19b",
+  "pools_sha256": "3bf14df9d72494ff582c2aa6ab463533cd9b73e7866db605f8670e4c4b54ab44",
+  "truth_sha256": "9fcb3c125c8a9595d96b51c5dd1b2a9a76eb5c781085a29adb063d1922956860",
+  "formal_review_sha256": "b84087f701eac172cc61035b5ee3a86bf450b9430a0ea8d2b18cba13d14dcad4",
+  "methods": {
+    "full-r16": {
+      "hits": 2000,
+      "pool_hits": 2000,
+      "missing_from_pool": 0,
+      "in_pool_not_returned": 0,
+      "imperfect_queries": [],
+      "min_query_hits": 10,
+      "code_sum": 20000000,
+      "recall": 1.0,
+      "mean_codes": 100000.0
+    },
+    "pq-ef256-r16": {
+      "hits": 1989,
+      "pool_hits": 1989,
+      "missing_from_pool": 11,
+      "in_pool_not_returned": 0,
+      "imperfect_queries": [
+        {
+          "query": 26,
+          "hits": 9
+        },
+        {
+          "query": 54,
+          "hits": 9
+        },
+        {
+          "query": 64,
+          "hits": 9
+        },
+        {
+          "query": 76,
+          "hits": 6
+        },
+        {
+          "query": 119,
+          "hits": 8
+        },
+        {
+          "query": 192,
+          "hits": 9
+        },
+        {
+          "query": 195,
+          "hits": 9
+        }
+      ],
+      "min_query_hits": 6,
+      "code_sum": 829332,
+      "recall": 0.9945,
+      "mean_codes": 4146.66
+    },
+    "pq-ef512-r16": {
+      "hits": 1996,
+      "pool_hits": 1996,
+      "missing_from_pool": 4,
+      "in_pool_not_returned": 0,
+      "imperfect_queries": [
+        {
+          "query": 26,
+          "hits": 9
+        },
+        {
+          "query": 119,
+          "hits": 8
+        },
+        {
+          "query": 195,
+          "hits": 9
+        }
+      ],
+      "min_query_hits": 8,
+      "code_sum": 1454523,
+      "recall": 0.998,
+      "mean_codes": 7272.615
+    }
+  }
+}

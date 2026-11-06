@@ -5,6 +5,7 @@
 #   bash build_sqlite.sh build    # 配置 + 编译双形态 + smoke test 二进制
 #   bash build_sqlite.sh test     # build + 跑完整功能/并行/spec 测试
 #   bash build_sqlite.sh benchmark # Release 量化器功能 + 性能门槛
+#   bash build_sqlite.sh eval     # build + 跑 VexFS full eval（可传 quick/full/stress）
 #   bash build_sqlite.sh package  # Release 编 macOS arm64+x86_64 → dist/ tarball + SHA256
 #   bash build_sqlite.sh ios      # Stage C：device+sim 静态库 → XCFramework（+sim smoke）
 #   bash build_sqlite.sh android  # Stage C：NDK arm64-v8a/x86_64 静态库 + loadable .so
@@ -16,7 +17,7 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)/vexdb_sqlite"
 BUILD_DIR="$DIR/build"
 CMD="${1:-build}"
-NCPU=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)
+NCPU="${BUILD_JOBS:-$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 8)}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 # 解析 cmake：优先 PATH，其次 conan/brew 常见位置（非交互 shell 常无 cmake on PATH）。
@@ -57,7 +58,7 @@ case "$CMD" in
     vendor)
         bash "$DIR/vendor_sqlite.sh"
         ;;
-    build|test)
+    build|test|eval)
         [ -f "$DIR/third_party/sqlite/sqlite3ext.h" ] || bash "$DIR/vendor_sqlite.sh"
         "$CMAKE" -S "$DIR" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE="${BUILD_TYPE:-Debug}" \
             "${BOOST_CMAKE_ARGS[@]}"
@@ -67,11 +68,16 @@ case "$CMD" in
         ls -la "$BUILD_DIR"/*.dylib "$BUILD_DIR"/*.so "$BUILD_DIR"/*.a 2>/dev/null || true
         if [ "$CMD" = "test" ]; then
             echo ""
+            echo "=== 构建内存预算回归 ==="
+            "$BUILD_DIR/build_memory_budget_test"
+            echo "=== 图记录读取与事务回归 ==="
+            "$BUILD_DIR/sqlite_record_reader_test"
             echo "=== M0 静态注册冒烟 ==="
             "$BUILD_DIR/m0_static_smoke"
             echo "=== M1 距离层冒烟 ==="
             "$BUILD_DIR/m1_distance_smoke"
             echo "=== RaBitQ SIMD 分发冒烟 ==="
+            "$BUILD_DIR/entry_lock_contract"
             "$BUILD_DIR/simd_dispatch_smoke"
             echo "=== M2 虚拟表冒烟 ==="
             "$BUILD_DIR/m2_vtab_smoke"
@@ -84,8 +90,38 @@ case "$CMD" in
             [ -f "$EXTENSION" ] || EXTENSION="$BUILD_DIR/vexdb_lite.so"
             "$PYTHON_BIN" "$DIR/test/legacy_fixture_test.py" "$EXTENSION" \
                 "$DIR/test/fixtures/sqlite_quantizer_legacy_v3.db.gz"
+            echo "=== VexFS SQLite 合同冒烟 ==="
+            "$BUILD_DIR/vexfs_static_smoke"
+            echo "=== VexFS runtime C ABI 冒烟 ==="
+            "$BUILD_DIR/vexfs_runtime_smoke"
+            echo "=== VexFS Linux/Windows 平台边界冒烟 ==="
+            "$BUILD_DIR/vexfs_platform_linux_smoke"
+            "$BUILD_DIR/vexfs_platform_windows_smoke"
+            "$BUILD_DIR/vexfs_platform_registry_smoke"
+            if [ -x "$BUILD_DIR/vexfs-fuse" ]; then
+                echo "=== VexFS Linux FUSE helper 冒烟 ==="
+                FUSE_SMOKE_DB="${TMPDIR:-/tmp}/vexfs-fuse-helper-smoke-$$.sqlite3"
+                trap 'rm -f "$FUSE_SMOKE_DB" "$FUSE_SMOKE_DB-wal" "$FUSE_SMOKE_DB-shm"' EXIT
+                "$BUILD_DIR/vexfs-fuse" --db "$FUSE_SMOKE_DB" --workspace smoke --self-test
+                rm -f "$FUSE_SMOKE_DB" "$FUSE_SMOKE_DB-wal" "$FUSE_SMOKE_DB-shm"
+                trap - EXIT
+            fi
+            echo "=== VexFS CLI 冒烟 ==="
+            bash "$DIR/../agent_files/cli/test/vexfs_cli_smoke.sh" "$BUILD_DIR/vexfs"
+            echo "=== VexDB-Lite 统一 CLI 冒烟 ==="
+            bash "$DIR/../agent_files/cli/test/vexdb_unified_smoke.sh" "$BUILD_DIR/vexdb"
             echo "=== M4 spec（L2 DSL 渲染 + runner） ==="
             bash "$DIR/../tests/spec/_lib/docker/run_sqlite.sh"
+        elif [ "$CMD" = "eval" ]; then
+            EVAL_MODE="${2:-full}"
+            case "$EVAL_MODE" in
+                quick|full|stress) ;;
+                *) echo "eval mode 只能是 quick、full 或 stress" >&2; exit 2 ;;
+            esac
+            echo ""
+            echo "=== VexFS $EVAL_MODE eval ==="
+            python3 "$DIR/../tests/eval/vexfs/run.py" \
+                --mode "$EVAL_MODE" --build-dir "$BUILD_DIR"
         fi
         ;;
     benchmark)
@@ -227,7 +263,7 @@ case "$CMD" in
         echo "已清理 build 目录"
         ;;
     *)
-        echo "Usage: $0 [build|test|benchmark|package|ios|android|wasm|vendor|clean]"
+        echo "Usage: $0 [build|test|benchmark|eval [quick|full|stress]|package|ios|android|wasm|vendor|clean]"
         exit 1
         ;;
 esac

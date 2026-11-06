@@ -43,6 +43,7 @@ extern "C" {
 #include "quantizer/annkmeans.h"
 #include "floatvector.h"
 #include "pq.h"
+#include "pq_training_sample.h"
 #include "rabitq/rabitq_distancer.h"
 #include "rel_utils.h"
 #include "vector_buffer/vector_smgr.h"
@@ -675,7 +676,7 @@ private:
             quantizer.emplace();
             quantizer->template emplace<PQDistancer>();
             PQDistancer &tmp = quantizer->template get<PQDistancer>();
-            tmp.train(index, samples, dimension, metric, false,
+            tmp.train(index, samples, dimension, metric, need_norm,
                       parallel_workers, maintenance_work_mem_kb,
                       (uint32)graph_index_get_pq_m(index));
             tmp.flush(index, qtcode_block, false);

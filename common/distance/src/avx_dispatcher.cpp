@@ -149,10 +149,7 @@ private:
         }
 
         static INLINE_PROP AccT madd_square(VecT a, AccT s) {
-            __m256i a16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(a, 0));
-            __m256i sq = _mm256_mullo_epi16(a16, a16);
-            // TD: fix bug
-            return _mm256_add_epi32(sq, s);
+            return madd_vectors(a, a, s);
         }
 
         static INLINE_PROP AccT madd_vectors(VecT a, VecT b, AccT s) {
@@ -326,12 +323,11 @@ public:
 
 private:
     static FORCE_INLINE float hsum_epi32_256(__m256i v) {
-        __m128i lo = _mm256_castsi256_si128(v);
-        __m128i hi = _mm256_extracti128_si256(v, 1);
-        __m128i sum = _mm_add_epi32(lo, hi);
-        sum = _mm_hadd_epi32(sum, sum);
-        sum = _mm_hadd_epi32(sum, sum);
-        return (float)_mm_cvtsi128_si32(sum);
+        alignas(32) int32 lanes[8];
+        _mm256_store_si256(reinterpret_cast<__m256i *>(lanes), v);
+        int64 sum = 0;
+        for (auto lane : lanes) sum += lane;
+        return static_cast<float>(sum);
     }
 };
 

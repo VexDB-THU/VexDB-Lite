@@ -2,6 +2,9 @@
 
 #include "vex_fetch_utils.hpp"
 #include "vex_graph_index.hpp"
+#include "vex_search_admission.hpp"
+#include "vex_search_profile.hpp"
+#include <cmath>
 
 #include "duckdb/common/types/column/column_data_collection.hpp"
 #include "duckdb/execution/column_binding_resolver.hpp"
@@ -13,6 +16,33 @@ namespace duckdb {
 
 static constexpr const char *kAlgorithmBruteForce = "brute-force";
 static constexpr const char *kAlgorithmHnsw = "hnsw";
+
+static string GetPQSearchMode(ClientContext &context, const GraphIndex &index, bool filtered = false) {
+    string mode = "off";
+    Value value;
+    if (context.TryGetCurrentSetting("vexdb_pq_search_mode", value)) {
+        mode = StringUtil::Lower(value.ToString());
+    }
+    if (mode.empty()) mode = "off";
+    if (mode != "off" && mode != "pq_only" && mode != "pq_graph") {
+        throw InvalidInputException("vexdb_pq_search_mode must be 'off', 'pq_only' or 'pq_graph', got '%s'", mode);
+    }
+    // The existing PQ tables/refinement implement L2 (normalized for cosine),
+    // not negative inner product. Filtered IP must use its raw metric or SQL
+    // fallback, including when the session requested pq_only.
+    if (filtered && index.GetMetric() == VexMetric::INNER_PRODUCT && mode != "off") return "off";
+    if (mode == "pq_graph" && (index.IsCompactMode() || index.GetMetric() == VexMetric::INNER_PRODUCT)) {
+        if (filtered) return "off";
+        throw InvalidInputException("pq_graph requires a non-compact L2 or cosine PQ index");
+    }
+    if (index.UsesRaBitQ()) return "off";
+    if (index.IsCompactMode() && !filtered) mode = "pq_only";
+    if (mode != "off" && !index.UsesPQ()) {
+        if (filtered) return "off";
+        throw InvalidInputException("PQ search requires the index to be built with WITH (quantizer='pq', pq_m=N)");
+    }
+    return mode;
+}
 
 class VexIndexScanOperatorState : public OperatorState {
 public:
@@ -39,9 +69,19 @@ PhysicalOperator &LogicalVexIndexScan::CreatePlan(ClientContext &context, Physic
     {
         auto bft = GetBruteForceThreshold(context);
         auto &phys_scan = scan.Cast<PhysicalVexIndexScan>();
-        phys_scan.algorithm_used = (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
+        if (filter_plan) phys_scan.filter_plan = filter_plan->Copy();
+        if (quality_fallback_plan) phys_scan.quality_fallback_plan = quality_fallback_plan->Copy();
+        if (!output_steps.empty()) {
+            phys_scan.output_buffer_types = output_types;
+            for (auto &step : output_steps) phys_scan.output_steps.push_back(step.Copy());
+        }
+        phys_scan.search_admission = VexSearchAdmission::Get(*context.db);
+        const auto mode = GetPQSearchMode(context, graph_index, bool(filter_plan));
+        phys_scan.algorithm_used = mode == "pq_graph" ? "pq-graph" : mode == "pq_only" ? "pq-full-scan" :
+                                  (static_cast<int64_t>(graph_index.GetNodeCount()) <= bft)
                                        ? kAlgorithmBruteForce
                                        : kAlgorithmHnsw;
+        if (filter_plan) phys_scan.algorithm_used = "filtered-auto (" + phys_scan.algorithm_used + " / exact)";
     }
     if (children.empty()) {
         auto &dummy_scan = planner.Make<PhysicalDummyScan>(vector<LogicalType> {LogicalType::INTEGER}, 1);
@@ -67,6 +107,7 @@ string LogicalVexIndexScan::GetExtensionName() const {
 }
 
 vector<ColumnBinding> LogicalVexIndexScan::GetColumnBindings() {
+    if (!output_steps.empty()) return output_steps.back().bindings;
     vector<ColumnBinding> result;
     for (idx_t i = 0; i < output_types.size(); i++) {
         result.emplace_back(table_index, idx_t(i));
@@ -86,6 +127,10 @@ void LogicalVexIndexScan::Serialize(Serializer &serializer) const {
 }
 
 void LogicalVexIndexScan::ResolveTypes() {
+    if (!output_steps.empty()) {
+        types = output_steps.back().types;
+        return;
+    }
     types = output_types;
     for (auto &child : children) {
         for (auto &type : child->types) {
@@ -105,6 +150,7 @@ PhysicalVexIndexScan::PhysicalVexIndexScan(PhysicalPlan &physical_plan, vector<L
 	  column_ids(std::move(column_ids_p)), fetch_output_positions(std::move(fetch_output_positions_p)),
 	  distance_output_index(distance_output_index_p), returned_types(std::move(returned_types_p)),
 	  base_output_count(base_output_count_p) {
+    output_buffer_types = types;
 }
 
 string PhysicalVexIndexScan::GetName() const {
@@ -118,6 +164,8 @@ InsertionOrderPreservingMap<string> PhysicalVexIndexScan::ParamsToString() const
     if (!algorithm_used.empty()) {
         result["Algorithm"] = algorithm_used;
     }
+    if (filter_plan) result["Filter"] = "snapshot-visible scalar prefilter";
+    if (!output_steps.empty()) result["Output"] = "projected inside scan";
     return result;
 }
 
@@ -161,6 +209,9 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
     (void)gstate;
 
 	if (!scan_state.searched) {
+        VexSearchProfileRun profile_run(context.client);
+        auto *profile = profile_run.Get();
+        VexProfileTimer prepare_timer(profile ? &profile->prepare_ns : nullptr);
 		DataChunk query_input;
 		if (!input.data.empty() && input.size() > 0) {
 			vector<LogicalType> base_types;
@@ -168,7 +219,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
 			for (idx_t i = 0; i < input.ColumnCount(); i++) {
 				base_types.push_back(input.data[i].GetType());
 			}
-			query_input.Initialize(context.client, base_types);
+			query_input.Initialize(context.client, base_types, 1);
 			query_input.SetCardinality(1);
 			for (idx_t i = 0; i < input.ColumnCount(); i++) {
 				query_input.data[i].Reference(input.data[i]);
@@ -178,7 +229,7 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
 		if (query_input.ColumnCount() > 0) {
 			query_executor.SetChunk(query_input);
 		}
-		Vector query_result(query_vec_expr->return_type);
+		Vector query_result(query_vec_expr->return_type, idx_t(1));
 		query_executor.ExecuteExpression(query_result);
 		query_result.Flatten(1);
 		auto query_val = query_result.GetValue(0);
@@ -203,57 +254,174 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
             ef = static_cast<int>(k) * 2;
         }
 
-        bool pq_only = false;
-        Value pq_mode_val;
-        if (context.client.TryGetCurrentSetting("vexdb_pq_search_mode", pq_mode_val)) {
-            auto mode = StringUtil::Lower(pq_mode_val.ToString());
-            if (mode == "pq_only") {
-                pq_only = true;
-            } else if (mode != "off" && !mode.empty()) {
-                throw InvalidInputException(
-                    "vexdb_pq_search_mode must be 'off' or 'pq_only', got '%s'", pq_mode_val.ToString());
-            }
-        }
-        // compact mode 不保留索引侧原始向量。RaBitQ 在下方优先走
-        // code-aware 图搜索；PQ 则强制走 code 搜索，不允许落到原始向量路径。
-        if (graph_index.IsCompactMode()) {
-            pq_only = true;
-        }
-
-        vector<row_t> result_row_ids;
-        vector<float> result_distances;
-        if (graph_index.UsesRaBitQ()) {
-            graph_index.SearchRaBitQ(query_vec.data(), k, ef, result_row_ids, result_distances);
-        } else if (pq_only) {
-            if (!graph_index.UsesPQ()) {
-                throw InvalidInputException(
-                    "vexdb_pq_search_mode='pq_only' requires the index to be built with WITH (quantizer='pq', pq_m=N)");
-            }
-            double refine_factor = 1.0;
+        auto pq_mode = GetPQSearchMode(context.client, graph_index, bool(filter_plan));
+        const bool stale_quantizer = graph_index.NeedsQuantizerRebuild();
+        if (stale_quantizer) pq_mode = "off";
+        Value bidirectional_value;
+        const bool bidirectional = context.client.TryGetCurrentSetting("vexdb_graph_bidirectional_search", bidirectional_value) &&
+                                   bidirectional_value.GetValue<bool>();
+        double refine_factor = 1.0;
+        if (pq_mode != "off") {
             Value refine_val;
             if (context.client.TryGetCurrentSetting("vexdb_pq_refine_k_factor", refine_val)) {
                 refine_factor = refine_val.GetValue<double>();
-                if (refine_factor < 1.0 || refine_factor > 1000.0) {
+                if (!std::isfinite(refine_factor) || refine_factor < 1.0 || refine_factor > 1000.0) {
                     throw InvalidInputException(
                         "vexdb_pq_refine_k_factor must be in [1.0, 1000.0], got %.3f", refine_factor);
                 }
             }
-            graph_index.SearchPQ(query_vec.data(), k, ef, result_row_ids, result_distances,
-                                 refine_factor);
-        } else {
-            graph_index.SearchANN(query_vec.data(), k, ef, result_row_ids, result_distances);
         }
 
+        vector<row_t> result_row_ids;
+        vector<float> result_distances;
+        const auto &admission = search_admission;
+        if (!admission) throw InternalException("VexDB index scan has no search admission state");
+        auto &storage = table.GetStorage();
+        auto &transaction = DuckTransaction::Get(context.client, table.ParentCatalog().GetAttached());
+        idx_t requested = k, row_limit = 0;
+        prepare_timer.Stop();
+        auto acquire = [&] {
+            VexProfileTimer timer(profile ? &profile->queue_wait_ns : nullptr);
+            return admission->Acquire(context.client);
+        };
+        auto search_once = [&](idx_t count, const vex_duck::RowIdFilter<row_t> *mask) {
+            if (profile) {
+                ++profile->search_calls;
+                if (profile->search_calls > 1) ++profile->retry_calls;
+                profile->routes |= pq_mode == "pq_graph" ? 2 : pq_mode != "off" ? 4 : 1;
+            }
+            VexProfileTimer timer(profile ? &profile->search_ns : nullptr);
+            VexProfileTimer retry_timer(profile && profile->search_calls > 1 ? &profile->retry_search_ns : nullptr);
+            if (graph_index.UsesRaBitQ() && !stale_quantizer) {
+                graph_index.SearchRaBitQ(query_vec.data(), count, ef, result_row_ids, result_distances,
+                                        true, mask, profile);
+            } else if (pq_mode != "off") {
+                graph_index.SearchPQ(query_vec.data(), count, result_row_ids, result_distances, refine_factor,
+                                     pq_mode == "pq_graph" ? ef : 0, nullptr, true, mask, bidirectional, profile);
+            } else {
+                graph_index.SearchANN(query_vec.data(), count, ef, result_row_ids, result_distances,
+                                      true, mask, bidirectional, profile);
+            }
+        };
+        // A prepared plan can outlive both model freshness and the transaction
+        // in which it was bound. Recheck here, before acquiring graph locks.
+        const bool exact_snapshot = transaction.ChangesMade() || stale_quantizer;
+        if (exact_snapshot) {
+            const auto *plan = filter_plan ? filter_plan.get() : quality_fallback_plan.get();
+            if (!plan) throw InternalException("VexDB scan is missing its snapshot fallback plan");
+            VexProfileTimer prefilter_timer(profile ? &profile->prefilter_ns : nullptr);
+            auto allowed = VexScanAllowedRows(context.client, storage, transaction, *plan, profile);
+            prefilter_timer.Stop();
+            if (profile) {
+                profile->allowed_rows += allowed.size();
+                profile->routes |= 8;
+                ++profile->exact_fallback_calls;
+            }
+            // An out-of-date model also leaves its graph topology unqualified
+            // for raw navigation. Protect all storage modes until rebuild.
+            if (!allowed.empty() && k) {
+                auto permit = acquire();
+                VexProfileTimer timer(profile ? &profile->exact_ns : nullptr);
+                VexFilteredExact(context.client, storage, transaction, *plan, query_val,
+                                 allowed, k, result_row_ids, result_distances, profile);
+            } else if (profile) {
+                profile->routes |= 16;
+            }
+        } else if (filter_plan) {
+            Value mode_value;
+            string filtered_mode = "exact";
+            if (context.client.TryGetCurrentSetting("vexdb_filtered_search_mode", mode_value))
+                filtered_mode = StringUtil::Lower(mode_value.ToString());
+            if (filtered_mode != "auto" && filtered_mode != "exact")
+                throw InvalidInputException("vexdb_filtered_search_mode must be 'auto' or 'exact'");
+            // Metadata is evaluated by DuckDB expressions against this SQL
+            // transaction. No storage/expression callback runs under graph locks.
+            VexProfileTimer prefilter_timer(profile ? &profile->prefilter_ns : nullptr);
+            auto allowed = VexScanAllowedRows(context.client, storage, transaction, *filter_plan, profile);
+            prefilter_timer.Stop();
+            if (profile) {
+                profile->allowed_rows += allowed.size();
+                if (allowed.empty()) profile->routes |= 16;
+            }
+            if (!allowed.empty() && k) {
+                auto permit = acquire();
+                const auto target = MinValue<idx_t>(k, allowed.size());
+                const auto refine_budget = idx_t(std::min<double>(double(allowed.size()), double(target) * refine_factor));
+                const auto budget = std::max<idx_t>(idx_t(std::max(1, ef)), refine_budget);
+                const bool exact = filtered_mode == "exact" ||
+                                   allowed.size() <= std::max<idx_t>(idx_t(GetBruteForceThreshold(context.client)), budget) ||
+                                   (pq_mode == "off" && graph_index.IsCompactMode());
+                if (!exact) {
+                    VexProfileTimer mask_timer(profile ? &profile->mask_ns : nullptr);
+                    const vex_duck::RowIdFilter<row_t> mask(allowed);
+                    mask_timer.Stop();
+                    search_once(target, &mask);
+                    for (auto id : result_row_ids) if (!mask.Contains(id))
+                        throw InternalException("Filtered vector search returned a row outside its snapshot predicate");
+                }
+                if (exact || result_row_ids.size() < target) {
+                    VexProfileTimer timer(profile ? &profile->exact_ns : nullptr);
+                    if (profile) {
+                        profile->routes |= 8;
+                        if (exact) ++profile->exact_selected_calls;
+                        else ++profile->exact_fallback_calls;
+                    }
+                    VexFilteredExact(context.client, storage, transaction, *filter_plan, query_val,
+                                     allowed, target, result_row_ids, result_distances, profile);
+                }
+                if (context.client.IsInterrupted()) throw InterruptException();
+            }
+        } else {
+            // One FIFO admission/deadline per query, including visibility retries.
+            // The permit is released before row fetching starts below.
+            auto permit = acquire();
+            while (true) {
+                // Wait before SearchPQ/SearchANN acquire any graph or allocator
+                // lock. A permit covers only search, never row fetch/transactions.
+                {
+                    search_once(requested, nullptr);
+                }
+                if (context.client.IsInterrupted()) throw InterruptException();
+                const auto returned = result_row_ids.size();
+                VexProfileTimer visibility_timer(profile ? &profile->visibility_ns : nullptr);
+                idx_t visible = 0, invisible = 0;
+                for (idx_t i = 0; i < returned && visible < k; ++i) {
+                    if (storage.CanFetch(transaction, result_row_ids[i])) {
+                        result_row_ids[visible] = result_row_ids[i];
+                        result_distances[visible++] = result_distances[i];
+                    } else {
+                        ++invisible;
+                    }
+                }
+                result_row_ids.resize(visible);
+                result_distances.resize(visible);
+                if (profile) profile->snapshot_rejected += invisible;
+                visibility_timer.Stop();
+                if (visible >= k || !invisible || returned < requested) break;
+                // Concurrent commits can add closer rows outside this transaction's
+                // snapshot. Grow only after observing visibility loss; no fixed
+                // oversampling multiplier or work on the ordinary read-only path.
+                if (!row_limit) row_limit = graph_index.GetRowIdCount(true);
+                if (requested >= row_limit) break;
+                requested += std::min(requested, row_limit - requested);
+            }
+        }
+
+        VexProfileTimer fetch_timer(profile ? &profile->fetch_ns : nullptr);
         auto fetch_types = BuildOutputTypes(column_ids, returned_types);
-        auto fetched = FetchRowsByRowIds(context.client, table, column_ids, fetch_types, result_row_ids, k, 0);
+        auto fetched = FetchRowsByRowIds(context.client, table, column_ids, fetch_types, result_row_ids, k, 0, true);
+        fetch_timer.Stop();
+        if (profile) profile->output_rows += result_row_ids.size();
+        VexProfileTimer output_timer(profile ? &profile->output_ns : nullptr);
 
         scan_state.collection = make_uniq<ColumnDataCollection>(context.client, types);
         ColumnDataScanState fetch_scan;
         fetched->InitializeScan(fetch_scan);
+        const auto output_capacity = MaxValue<idx_t>(1, MinValue<idx_t>(STANDARD_VECTOR_SIZE, fetched->Count()));
         DataChunk fetch_chunk;
-        fetch_chunk.Initialize(context.client, fetch_types);
+        fetch_chunk.Initialize(context.client, fetch_types, output_capacity);
         DataChunk output_chunk;
-        output_chunk.Initialize(context.client, types);
+        output_chunk.Initialize(context.client, output_buffer_types, output_capacity);
         idx_t dist_offset = 0;
 
         while (true) {
@@ -284,7 +452,28 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
                 }
             }
             output_chunk.SetCardinality(fetch_chunk.size());
-            scan_state.collection->Append(output_chunk);
+            DataChunk result_chunk;
+            result_chunk.InitializeEmpty(output_buffer_types);
+            result_chunk.Reference(output_chunk);
+            for (auto &step : output_steps) {
+                if (step.predicate) {
+                    ExpressionExecutor predicate(context.client, *step.predicate);
+                    SelectionVector selected(result_chunk.size());
+                    const auto count = predicate.SelectExpression(result_chunk, selected);
+                    result_chunk.Slice(selected, count);
+                }
+                if (!result_chunk.size()) break;
+                DataChunk projected;
+                projected.Initialize(context.client, step.types, output_capacity);
+                ExpressionExecutor projection(context.client, step.expressions);
+                projection.Execute(&result_chunk, projected);
+                result_chunk.Move(projected);
+            }
+            if (!result_chunk.size()) {
+                dist_offset += fetch_chunk.size();
+                continue;
+            }
+            scan_state.collection->Append(result_chunk);
             dist_offset += fetch_chunk.size();
         }
         scan_state.collection->InitializeScan(scan_state.scan_state);
@@ -296,7 +485,10 @@ OperatorResultType PhysicalVexIndexScan::Execute(ExecutionContext &context, Data
     if (chunk.size() == 0) {
         return OperatorResultType::FINISHED;
     }
-    return OperatorResultType::NEED_MORE_INPUT;
+    // Keep the same input until the collection is drained. Asking for another
+    // input after its first batch truncates large LIMIT results at 2048 rows;
+    // the dummy source has no second input to trigger the next collection scan.
+    return OperatorResultType::HAVE_MORE_OUTPUT;
 }
 
 OperatorFinalizeResultType PhysicalVexIndexScan::FinalExecute(ExecutionContext &context, DataChunk &chunk,

@@ -4,6 +4,11 @@
 #include "module/timer.h"
 #include "rabitq/estimator.h"
 #include "pq.h"
+#include "pq_training_sample.h"
+
+extern "C" {
+#include "common/pg_prng.h"
+}
 
 #include <algorithm>
 #include <cstdint>
@@ -78,7 +83,7 @@ void setupKmeansState(Metric metric, Relation index, AnnKmeansState *kmeanstate,
                  (int)metric);
         }
     }
-    kmeanstate->skipCheckDuplicate = pqtrain;
+    kmeanstate->skipCheckDuplicate = false;
     kmeanstate->metric             = metric;
     kmeanstate->indexName[0]       = '\0';
 }
@@ -98,6 +103,11 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     // row the same chance even when the heap is ordered by time, tenant or
     // cluster. A fixed seed keeps CREATE INDEX output reproducible.
     samples->length = 0;
+    const int capacity = std::min(sample_nums, samples->maxlen);
+    if (capacity <= 0) return;
+    if (samples->dim != dimensions) {
+        elog(ERROR, "PQ sampling dimensions do not match the sample buffer");
+    }
     Snapshot snap = GetActiveSnapshot();
 #if PG_VERSION_NUM >= 190000
     TableScanDesc scan = table_beginscan(heap, snap, 0, NULL, 0);
@@ -122,21 +132,22 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
     // train the same codebook after dump/restore or in a freshly created test
     // database, where OIDs are expected to differ.
     uint64_t random_state = UINT64_C(0x6A09E667F3BCC909) ^
-                            (uint64_t)sample_nums ^ (uint64_t)dimensions;
+                            (uint64_t)capacity ^ (uint64_t)dimensions;
     while (table_scan_getnextslot(scan, ForwardScanDirection, slot)) {
         scanned++;
+        MemoryContext old_context = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
         econtext->ecxt_scantuple = slot;
         FormIndexDatum(indexInfo, slot, estate, values, isnull);
         if (!isnull[0]) {
             FloatVector *fv = DatumGetFloatVector(values[0]);
             if (fv->dim == dimensions) {
                 uint64_t sample_index;
-                if (seen < (uint64_t)sample_nums) {
+                if (seen < (uint64_t)capacity) {
                     sample_index = seen;
                 } else {
                     sample_index = ReservoirIndex(random_state, seen + 1);
                 }
-                if (sample_index < (uint64_t)sample_nums) {
+                if (sample_index < (uint64_t)capacity) {
                     float *sample = FloatVectorArrayGet(samples, (int)sample_index);
                     std::memcpy(sample, fv->x, sizeof(float) * dimensions);
                     if (norm_func != nullptr) {
@@ -146,15 +157,18 @@ void ann_sample_rows(FloatVectorArray samples, Relation heap, Relation index,
                 seen++;
             }
         }
+        MemoryContextSwitchTo(old_context);
         ResetExprContext(econtext);
         if ((scanned & UINT64_C(0xFFF)) == 0) {
             CHECK_FOR_INTERRUPTS();
         }
     }
-    samples->length = (int)std::min<uint64_t>(seen, (uint64_t)sample_nums);
+    samples->length = (int)std::min<uint64_t>(seen, (uint64_t)capacity);
     FreeExecutorState(estate);
     ExecDropSingleTupleTableSlot(slot);
     table_endscan(scan);
+    ereport(NOTICE, (errmsg("vex PQ: sampled %d of " UINT64_FORMAT
+                            " eligible vectors", samples->length, seen)));
 }
 
 void RaBitQMeta::init(uint32 dim)

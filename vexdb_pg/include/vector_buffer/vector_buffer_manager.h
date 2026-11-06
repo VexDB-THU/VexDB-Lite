@@ -125,7 +125,7 @@ struct VecBufferLoc {
     static constexpr uint32 invalid_mask = 0x80000000u;
     static constexpr uint32 empty_mask = 0x40000000u;
 
-    VecBufferLoc() : buf_offset(0), offset(0) {}
+    VecBufferLoc() : buf_offset(invalid_mask | empty_mask), offset(0) {}
     VecBufferLoc(uint32 bo, uint32 off) : buf_offset(bo), offset(off) {}
     VecBufferLoc(struct BufferParams &params);
     bool operator==(const VecBufferLoc &rhs) const
@@ -137,11 +137,13 @@ struct VecBufferLoc {
         if (buf_offset != rhs.buf_offset) return buf_offset < rhs.buf_offset;
         return offset < rhs.offset;
     }
-    bool valid() const { return !(buf_offset & invalid_mask); }
+    bool valid() const { return !(buf_offset & (invalid_mask | empty_mask)); }
     void set_invalid() { buf_offset |= invalid_mask; }
     void set_valid() { buf_offset &= ~invalid_mask; }
-    bool empty() const { return buf_offset == 0 && offset == 0; }
-    void set_empty() { buf_offset = 0; offset = 0; }
+    // An absent slot must remain empty after set_invalid(), and physical
+    // slot 0:0 must never be mistaken for the absence of an allocation.
+    bool empty() const { return (buf_offset & empty_mask) != 0; }
+    void set_empty() { buf_offset = invalid_mask | empty_mask; offset = 0; }
     uint32 valid_buf_offset() const { return buf_offset & ~invalid_mask; }
 };
 

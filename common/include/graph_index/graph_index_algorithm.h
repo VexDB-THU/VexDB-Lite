@@ -34,7 +34,15 @@ inline int_fast8_t get_insert_level(uint_fast16_t m)
 PERF_DECLARE_CATS(AlgPerfCats, false, insert_tid, split_phase1, split_phase2, split_phase3,
     reallocate, get_eviction, get_data, get_center, update_stat);
 
-template <typename Store, typename Dister, template<typename> class Alloc = PgAlloc>
+struct GraphSearchUnobserved {
+    template<typename T> void record(T) const {}
+};
+struct GraphSearchUncompleted {
+    template<typename C,typename D> void operator()(C &,D &) const {}
+};
+
+template <typename Store, typename Dister, template<typename> class Alloc = PgAlloc,
+          typename Observer = GraphSearchUnobserved>
 class GraphIndexAlgorithm : public PERFER(AlgPerfCats) {
     using PerfCats = AlgPerfCats;
     using T = typename Store::T;
@@ -56,6 +64,50 @@ class GraphIndexAlgorithm : public PERFER(AlgPerfCats) {
     using Map = UnorderedMap<K, V, H, E, Alloc<Pair<K, V>>>;
     template<typename U, typename H = impl::DefaultHasher<U>, typename E = impl::DefaultEqual<U>>
     using USet = UnorderedSet<U, H, E, Alloc<U>>;
+
+    // Read-only stores may supply a query-local membership implementation.
+    // Other stores retain the same allocator and hash set as before.
+    template <bool base_layer, typename SearchStore>
+    static auto MakeSearchVisited(SearchStore &s, size_t hint, int)
+        -> decltype(s.template make_search_visited<base_layer>(hint)) {
+        return s.template make_search_visited<base_layer>(hint);
+    }
+    template <bool base_layer, typename SearchStore>
+    static USet<T> MakeSearchVisited(SearchStore &, size_t hint, long) {
+        return USet<T>(hint);
+    }
+
+    template <bool base_layer, typename SearchStore>
+    static auto SearchNeighborCount(SearchStore &s, T id, size_t, int)
+        -> decltype(s.template search_neighbor_count<base_layer>(id)) {
+        return s.template search_neighbor_count<base_layer>(id);
+    }
+    template <bool base_layer, typename SearchStore>
+    static size_t SearchNeighborCount(SearchStore &, T, size_t fallback, long) { return fallback; }
+
+    // Disk-backed adapters may visit the same refinement candidates in physical
+    // row order. Keep the candidate array intact so final ranking and ties do
+    // not depend on the order in which vectors were fetched.
+    template <typename RefineStore, typename Candidates>
+    static auto MakeRefinementOrder(RefineStore &s, PointExtensionContext &ctx,
+                                    const Candidates &candidates, int)
+        -> decltype(s.make_refinement_order(ctx, candidates)) {
+        return s.make_refinement_order(ctx, candidates);
+    }
+    template <typename RefineStore, typename Candidates>
+    static Vec<size_t> MakeRefinementOrder(RefineStore &, PointExtensionContext &,
+                                           const Candidates &, long) { return {}; }
+
+    template <typename SearchStore>
+    static auto SearchNodeCount(SearchStore &s, int) -> decltype(s.search_node_count())
+        { return s.search_node_count(); }
+    template <typename SearchStore>
+    static size_t SearchNodeCount(SearchStore &, long) { return 0; }
+    template <typename SearchStore>
+    static auto SearchInterrupt(SearchStore &s, int) -> decltype(s.search_interrupt(), void())
+        { s.search_interrupt(); }
+    template <typename SearchStore>
+    static void SearchInterrupt(SearchStore &, long) {}
 
     struct ClosestCompare {
         bool operator()(const Cand &a, const Cand &b) const {
@@ -90,6 +142,7 @@ class GraphIndexAlgorithm : public PERFER(AlgPerfCats) {
     uint_fast16_t m;
     Store &store;
     Dister &distancer;
+    Observer observer;
     Holder<Map<Pair<T, T>, float, PairHasher, PairCmp>> dist_cache;
 public:
     struct InsertContextBase {
@@ -108,14 +161,15 @@ public:
     };
     using InsertContext = InsertContextBase;
 
-    GraphIndexAlgorithm(uint_fast16_t ef_construction, uint_fast16_t m, Store &store, Dister &distancer)
+    GraphIndexAlgorithm(uint_fast16_t ef_construction, uint_fast16_t m, Store &store, Dister &distancer, Observer observer = {})
         : ef_construction(ef_construction),
           m(m),
           store(store),
           distancer(distancer),
+          observer(observer),
           dist_cache() {}
-    GraphIndexAlgorithm(const GraphIndexMetaPage metap, Store &store, Dister &distancer)
-        : GraphIndexAlgorithm(metap->ef_construction, metap->m, store, distancer) {}
+    GraphIndexAlgorithm(const GraphIndexMetaPage metap, Store &store, Dister &distancer, Observer observer = {})
+        : GraphIndexAlgorithm(metap->ef_construction, metap->m, store, distancer, observer) {}
 
     void destroy()
     {
@@ -128,6 +182,18 @@ public:
     Vec<Cand> search_internal(const GraphIndexEntryInfo &entry_info, const char *query, uint32 ef_search,
                               filter_func &&filter)
     {
+        const size_t node_count = SearchNodeCount(store, 0);
+        if (node_count != 0 && ef_search >= node_count) {
+            // A budget covering the whole graph must also cover components
+            // disconnected by pruning or vacuum. Work stays within that budget.
+            Vec<Cand> all(node_count);
+            for (size_t i = 0; i < node_count; ++i) {
+                if ((i & 255) == 0) SearchInterrupt(store, 0);
+                if (filter(T(i))) all.emplace_back(T(i), T(i), get_distance(query, T(i)));
+            }
+            std::sort(all.begin(), all.end(), ClosestCompare{});
+            return all;
+        }
         CONSTEXPR_IF (need_refine) {
             constexpr float refine_factor = 1.25;
             ef_search *= refine_factor;
@@ -145,9 +211,9 @@ public:
     {
         return search_internal(entry_info, query, ef_search, dummy_filter);
     }
-    template <typename filter_func>
+    template <typename filter_func, typename Completion>
     Vector<GraphIndexSearchRes> search(PointExtensionContext &ctx, const char *query, uint32 ef_search,
-                                       filter_func &&filter)
+                                       filter_func &&filter, Completion &&completion)
     {
         Vector<GraphIndexSearchRes> res;
         const GraphIndexEntryInfo entry_info = store.template get_entry<false>().first;
@@ -156,6 +222,7 @@ public:
         }
 
         Vec<Cand> ep = search_internal(entry_info, query, ef_search, filter);
+        completion(ep, distancer);
         refine(ctx, ep, query);
 
         res.reserve(ep.size());
@@ -172,6 +239,11 @@ public:
         ann_helper::optional_destroy(temp);
         ann_helper::optional_destroy(ep);
         return res;
+    }
+    template<typename F>
+    Vector<GraphIndexSearchRes> search(PointExtensionContext &ctx, const char *query, uint32 ef_search, F &&filter)
+    {
+        return search(ctx, query, ef_search, std::forward<F>(filter), GraphSearchUncompleted{});
     }
     Vector<GraphIndexSearchRes> search(PointExtensionContext &ctx, const char *query, uint32 ef_search)
     {
@@ -349,7 +421,10 @@ retry:
 
     void repair_upperpoint(T cur_layer_idx, const UnorderedSet<size_t> &deleted)
     {
-        auto [neighbors_info, unused, id] = store.template get_point_info<false>(cur_layer_idx);
+        auto point_info = store.template get_point_info<false>(cur_layer_idx);
+        auto neighbors_info = std::get<0>(point_info);
+        auto unused = std::get<1>(point_info);
+        auto id = std::get<2>(point_info);
         (void)unused;
         if (deleted.contains((size_t)id)) {
             return;
@@ -392,6 +467,7 @@ private:
     template <bool estimate = false>
     float get_distance(const char *query, T id)
     {
+        observer.record(id);
         CONSTEXPR_IF (estimate) {
             return store.get_distance_est(distancer, query, id);
         } else {
@@ -562,6 +638,7 @@ private:
                 nbr_id.push_back(id);
                 nbr_cur_layer_idx.push_back(cur_layer_idx);
             }
+            for (auto scored_id : nbr_id) observer.record(scored_id);
             store.get_distance_batch(distancer, query, nbr_id, dists);
             for (size_t i = 0; i < nbr_id.size(); ++i) {
                 float dist = dists[i];
@@ -587,7 +664,7 @@ private:
     {
         uint_fast16_t nbr_num = get_nbr_num<is_base_layer>();
         fpq furthest(ef + 1);
-        USet<T> visited(m * ef * 2);
+        auto visited = MakeSearchVisited<is_base_layer>(store, m * ef * 2, 0);
         for (const Cand &cand : entrypoint) {
             visited.insert(cand.id);
         }
@@ -595,6 +672,7 @@ private:
         Vec<T> nbr_id(nbr_num);
         Vec<T> nbr_cur_layer_idx(nbr_num);
         float *dists = (float *)Alloc<char>().allocate(sizeof(float) * nbr_num);
+        size_t dists_capacity = nbr_num;
         while (!closest.empty()) {
             Cand cur_point = closest.top();
             closest.pop();
@@ -607,11 +685,18 @@ private:
             auto [neighbors_id, lower_layer_idx, unused] =
                 store.template get_point_info<is_base_layer>(cur_point.cur_layer_idx);
             (void)unused;
+            const size_t search_nbr_num = SearchNeighborCount<is_base_layer>(
+                store, cur_point.cur_layer_idx, nbr_num, 0);
+            if (search_nbr_num > dists_capacity) {
+                Alloc<char>().deallocate((char *)dists, sizeof(float) * dists_capacity);
+                dists = (float *)Alloc<char>().allocate(sizeof(float) * search_nbr_num);
+                dists_capacity = search_nbr_num;
+            }
             T *neighbors_cur_layer_idx = is_base_layer ? neighbors_id : neighbors_id + nbr_num;
 
             nbr_id.clear();
             nbr_cur_layer_idx.clear();
-            for (uint_fast16_t i = 0; i < nbr_num; ++i) {
+            for (size_t i = 0; i < search_nbr_num; ++i) {
                 T id = neighbors_id[i];
                 if (!is_valid(id)) {
                     break;
@@ -623,6 +708,7 @@ private:
                 nbr_cur_layer_idx.push_back(neighbors_cur_layer_idx[i]);
             }
 
+            for (auto scored_id : nbr_id) observer.record(scored_id);
             store.get_distance_batch(distancer, query, nbr_id, dists);
             const float threshold = furthest.size() < ef ? FLT_MAX : furthest.top().dist;
             for (size_t i = 0; i < nbr_id.size(); ++i) {
@@ -644,7 +730,7 @@ private:
         }
         furthest.sort();
 
-        Alloc<char>().deallocate((char*)dists, sizeof(float) * nbr_num);
+        Alloc<char>().deallocate((char*)dists, sizeof(float) * dists_capacity);
         ann_helper::optional_destroy(nbr_cur_layer_idx);
         ann_helper::optional_destroy(nbr_id);
         ann_helper::optional_destroy(closest);
@@ -663,7 +749,9 @@ private:
         CONSTEXPR_IF (need_refine) {
             const auto norm_func = get_norm_func();
             char *vec = alloc_vector(store.get_vecsize());
-            for (Cand &point : candidates) {
+            auto order = MakeRefinementOrder(store, ctx, candidates, 0);
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                Cand &point = candidates[order.empty() ? i : order[i]];
                 if (store.fetch_vec_from_heap(ctx, point.id, vec)) {
                     if (norm_func) {
                         norm_func(vec, store.get_dim(), vec);
@@ -673,6 +761,7 @@ private:
                     point.dist = INVALID_DIST;
                 }
             }
+            ann_helper::optional_destroy(order);
             free_vector(vec);
             std::sort(candidates.begin(), candidates.end(), [](const Cand &a, const Cand &b) -> bool {
                 return a.dist < b.dist;

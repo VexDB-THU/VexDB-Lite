@@ -1,0 +1,52 @@
+name: duckdb_graph_index_rabitq_duplicates_persistence
+engines: [duckdb]
+tags: [vex, regression]
+description: RaBitQ full and compact codes cover assigned nodes after duplicate bulk builds, appends and repeated restarts.
+steps:
+  - raw_directive: load __TEST_DIR__/rabitq_duplicates.db
+  - statement: SET vexdb_brute_force_threshold=0;
+  - statement: CREATE TABLE rq_full AS SELECT i::INTEGER id, [(i%256)::FLOAT,(i%256+1)::FLOAT,(i%256+2)::FLOAT,(i%256+3)::FLOAT]::FLOAT[4] vec FROM range(1024)t(i);
+  - statement: CREATE TABLE rq_compact AS SELECT * FROM rq_full;
+  - statement: CREATE INDEX rq_full_idx ON rq_full USING GRAPH_INDEX(vec) WITH(metric='l2',quantizer='rabitq',m=8,threads=1);
+  - statement: CREATE INDEX rq_compact_idx ON rq_compact USING GRAPH_INDEX(vec) WITH(metric='l2',quantizer='rabitq',memory_mode='compact',m=8,threads=1);
+  - statement: SET vexdb_ef_search=2048;
+  - query: SELECT count(*) FROM (SELECT id FROM rq_full ORDER BY l2_distance(vec,[1,2,3,4]::FLOAT[4]) LIMIT 10);
+    _field_types: I
+    expect: [[10]]
+  - query: SELECT count(*) FROM (SELECT id FROM rq_compact ORDER BY l2_distance(vec,[1,2,3,4]::FLOAT[4]) LIMIT 10);
+    _field_types: I
+    expect: [[10]]
+  - query: SELECT count(*) FROM (SELECT id FROM rq_full ORDER BY l2_distance(vec,[1,2,3,4]::FLOAT[4]) LIMIT 1024);
+    _field_types: I
+    expect: [[1024]]
+  - query: SELECT count(*) FROM (SELECT id FROM rq_compact ORDER BY l2_distance(vec,[1,2,3,4]::FLOAT[4]) LIMIT 1024);
+    _field_types: I
+    expect: [[1024]]
+  - statement: INSERT INTO rq_full VALUES(2000,[999,1000,1001,1002]::FLOAT[4]);
+  - statement: INSERT INTO rq_compact VALUES(2000,[999,1000,1001,1002]::FLOAT[4]);
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - query: SELECT row_id_map_size FROM vexdb_index_info() WHERE index_name='rq_full_idx';
+    _field_types: I
+    expect: [[1025]]
+  - query: SELECT row_id_map_size FROM vexdb_index_info() WHERE index_name='rq_compact_idx';
+    _field_types: I
+    expect: [[1025]]
+  - query: SELECT id FROM rq_full ORDER BY l2_distance(vec,[999,1000,1001,1002]::FLOAT[4]) LIMIT 1;
+    _field_types: I
+    expect: [[2000]]
+  - query: SELECT id FROM rq_compact ORDER BY l2_distance(vec,[999,1000,1001,1002]::FLOAT[4]) LIMIT 1;
+    _field_types: I
+    expect: [[2000]]
+  - statement: DELETE FROM rq_full WHERE id%13=0;
+  - statement: DELETE FROM rq_compact WHERE id%13=0;
+  - statement: PRAGMA vexdb_rebuild_index('rq_full_idx');
+  - statement: PRAGMA vexdb_rebuild_index('rq_compact_idx');
+  - statement: CHECKPOINT;
+  - raw_directive: restart
+  - query: SELECT row_id_map_size=(SELECT count(*) FROM rq_full) FROM vexdb_index_info() WHERE index_name='rq_full_idx';
+    _field_types: I
+    expect: [[true]]
+  - query: SELECT row_id_map_size=(SELECT count(*) FROM rq_compact) FROM vexdb_index_info() WHERE index_name='rq_compact_idx';
+    _field_types: I
+    expect: [[true]]

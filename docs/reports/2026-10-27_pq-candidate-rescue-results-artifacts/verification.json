@@ -1,0 +1,32 @@
+{
+  "verified_epoch": 1793098090.617955,
+  "baseline_source_files_matched": 145,
+  "frozen_inputs_matched": 156,
+  "primary_completed_result_hashes_matched": true,
+  "extra_audit_inputs_matched": true,
+  "completed64_sql_view_byte_exact": true,
+  "main_sql_lists_recomputed": 1638400,
+  "extra_saved_sql_lists_recomputed": 296960,
+  "total_saved_sql_lists_recomputed": 1935360,
+  "unique_new_queries": 2048,
+  "primary_goal_passed": true,
+  "overall_goal_passed": false,
+  "missing": [
+    {
+      "cohort": "b",
+      "round": 2,
+      "connections": 16,
+      "methods": [
+        "raw-ef768",
+        "pq-ef1536-r16"
+      ],
+      "reason": "native process stopped at4GiB disk guard before either16-client point completed"
+    }
+  ],
+  "source_scripts_py_compile": "passed",
+  "git_diff_check": "passed",
+  "failed_product_prototypes_present": false,
+  "native_queue_status": "stopped; no new worker or timer created",
+  "current_free_disk_bytes": 3180613632,
+  "scope": "local SDK, corpus-vector proxies, one graph seed and shared host; interrupted unsaved calls excluded; no commit/push/release or production acceptance"
+}

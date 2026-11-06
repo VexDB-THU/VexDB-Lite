@@ -667,15 +667,18 @@ VecBuffer VecBufferManager::get_buffer(Relation rel, size_t loc, uint32 elem_siz
     BufferParams params = {rel, loc, elem_size, pool_offset, st};
     uint32 retry_count = 0;
     constexpr uint32 max_retry = 16u;
+    bool pending_invalidation = false;
 retry:
+    pending_invalidation = false;
     if (cur_pool.locmap_for(sig)->try_emplace_or_cvisit(sig, params,
         [&](const auto &x) {
             Assert(loc == x.first.offset);
             params.buf_offset = x.second.buf_offset;
             params.offset = x.second.offset;
             if (unlikely(!x.second.valid())) {
-                // cur_pool.miss.inc();
-                // cur_pool.hit.inc(-1);
+                // A pinned invalid slot cannot be repaired by growing a pool.
+                // Read directly until its previous owner releases the pin.
+                pending_invalidation = !x.second.empty();
                 return;
             }
 #if VERIFY_BUFFER
@@ -709,11 +712,18 @@ retry:
             ProcessInterrupts();
             goto failed;
         }
+        if (pending_invalidation) goto failed;
         ++retry_count;
         if (retry_count > max_retry || !pool[pool_offset]) {
             goto failed;
         }
-        if (nalloced >= NVecBuf) {
+        if (nalloced < NVecBuf) {
+            // Grow outside the locmap insertion callback. The callback holds
+            // a map lock, so it must neither wait for a worker nor evict a
+            // vector from a potentially identical map shard.
+            bool evicted = false;
+            expand_or_recollect_space(params.pool_offset, evicted);
+        } else {
             if (do_evict(params.pool_offset)) {
                 cur_pool.stats.nevict.fetch_add(1ul, RELAXED_ORDER);
             } else if (cur_pool.nfreed.load(RELAXED_ORDER) <= 1ul) {
@@ -741,73 +751,18 @@ failed:
 /* VecBufferLoc constructor from BufferParams */
 VecBufferLoc::VecBufferLoc(BufferParams &params)
 {
-    constexpr uint32 spins_per_delay = 40u;
-    constexpr uint32 max_spins = 3u * spins_per_delay;
-    constexpr long min_delay_usec = 512l;
-    constexpr long max_delay_usec = 65536l;
     auto &mgr = *VecBufMgr;
-    uint32 spins = 0;
-    long delay = min_delay_usec;
     Assert(mgr.pool[params.pool_offset]);
     auto &pool = *mgr.pool[params.pool_offset];
     VecBufferLoc loc;
-    /* Original max_spins=120 timed out and set_invalid+break, relying on the
-     * async worker to add a block. Under high cold-miss rates the worker could
-     * not keep up, leaving the pool stalled at ~40 MB of a 2 GB quota.
-     *
-     * Fix: on timeout the backend synchronously calls expand_or_recollect_space
-     * and resets the spin counter before retrying. LWLockConditionalAcquire
-     * inside expand may fail under contention — use nalloced delta to detect
-     * a genuine expansion; failed attempts do not count against the quota.
-     * The cap of 3 self-expands bounds the worst case; one sync expand is
-     * typically enough to unblock the pool. */
-    constexpr uint32 max_self_expand = 3u;
-    uint32 self_expand_count = 0;
-    while (!pool.pop_freelist(loc)) {
-        /* Once the global quota is exhausted there is nothing left for the
-         * expansion worker to add.  The old path still slept with exponential
-         * backoff before returning an invalid location; get_buffer() could
-         * only evict a slot after that return.  A full cache therefore paid
-         * several pointless sleeps on every cold miss and collapsed under
-         * concurrent random scans.  Fail this allocation immediately so the
-         * outer, map-unlocked path can evict and retry (or fall back to direct
-         * disk I/O after its bounded retries). */
-        if (mgr.nalloced >= NVecBuf) {
-            loc.set_empty();
-            loc.set_invalid();
-            break;
-        }
-        if (spins % spins_per_delay == 0) {
-            if (InterruptPending) {
-                loc.set_empty();
-                loc.set_invalid();
-                break;
-            }
-            if (spins > max_spins) {
-                if (self_expand_count < max_self_expand && mgr.nalloced < NVecBuf) {
-                    uint32 before = mgr.nalloced;
-                    bool dummy;
-                    mgr.expand_or_recollect_space(params.pool_offset, dummy);
-                    if (mgr.nalloced > before) {
-                        ++self_expand_count;
-                    }
-                    spins = 0;
-                    delay = min_delay_usec;
-                    continue;
-                }
-                loc.set_empty();
-                loc.set_invalid();
-                break;
-            }
-            mgr.async_expand_or_recollect_space(params.pool_offset);
-            pg_usleep(delay);
-            delay += (delay * ((double) random() / (double) MAX_RANDOM_VALUE) + 0.5);
-            if (delay > max_delay_usec) {
-                delay = max_delay_usec;
-            }
-        }
-        SPIN_DELAY();
-        ++spins;
+    // This constructor runs while locmap holds its insertion lock. Waiting
+    // here can block the worker needed to return space; unsuccessful grows
+    // also used to reset the retry counter indefinitely. Let get_buffer do
+    // bounded growth/eviction outside the map lock, then use direct reads if
+    // the optional cache is still unavailable.
+    if (!pool.pop_freelist(loc)) {
+        loc.set_empty();
+        loc.set_invalid();
     }
     buf_offset = params.buf_offset = loc.buf_offset;
     offset = params.offset = loc.offset;
@@ -1418,34 +1373,63 @@ void create_vec_data(Relation rel, bool need_wal)
 
 void truncate_vector_file(Relation rel)
 {
-    RelationGetSmgr(rel);
-    
-    if (!smgrexists(rel->rd_smgr, VECTOR_FORKNUM)) {
-        return;
-    }
-    
-    /* Truncate visibility map fork */
-    ForkNumber fork = VECTOR_FORKNUM;
-    BlockNumber nblocks = 0;
-#if PG_VERSION_NUM >= 180000
-    smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks, &nblocks);
-#else
-    smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks);
-#endif
+    truncate_vector_file_to(rel, 0);
 }
 
 void truncate_vector_file_to(Relation rel, size_t nbytes)
 {
     RelationGetSmgr(rel);
-
     if (!smgrexists(rel->rd_smgr, VECTOR_FORKNUM)) {
         return;
     }
 
+    const size_t target_blocks = nbytes / BLCKSZ + (nbytes % BLCKSZ != 0);
+    if (target_blocks >= InvalidBlockNumber) {
+        ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                        errmsg("vector file exceeds the supported block count")));
+    }
     ForkNumber fork = VECTOR_FORKNUM;
-    BlockNumber nblocks = (BlockNumber)((nbytes + BLCKSZ - 1) / BLCKSZ);
+    BlockNumber nblocks = static_cast<BlockNumber>(target_blocks);
+    BlockNumber old_nblocks = smgrnblocks(rel->rd_smgr, fork);
+
+    // Byte writes round to the I/O alignment, which can be smaller than a PG
+    // page. smgr counts only full pages. Preserve the payload, and finish the
+    // existing final page before asking smgr to truncate whole blocks.
+    // This also handles a shrinking file whose old partial tail follows the
+    // requested last full page: mdtruncate would otherwise see equal counts
+    // and leave that tail untouched.
+    MdfdVec *tail = vec_getseg(rel->rd_smgr, old_nblocks, VEC_EXTENSION_RETURN_NULL);
+    size_t written_bytes = static_cast<size_t>(old_nblocks) * BLCKSZ;
+    if (tail != NULL) {
+        off_t file_bytes = FileSize(tail->mdfd_vfd);
+        if (file_bytes < 0) {
+            ereport(ERROR, (errcode_for_file_access(),
+                            errmsg("could not read vector file size: %m")));
+        }
+        written_bytes = static_cast<size_t>(tail->mdfd_segno) *
+                        static_cast<size_t>(RELSEG_SIZE) * BLCKSZ + static_cast<size_t>(file_bytes);
+    }
+    if (nbytes > written_bytes) {
+        ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+                        errmsg("vector file is shorter than its encoded payload"),
+                        errdetail("Expected %zu bytes, found %zu.", nbytes, written_bytes)));
+    }
+    if (written_bytes % BLCKSZ != 0) {
+        const size_t rounded_blocks = written_bytes / BLCKSZ + 1;
+        if (rounded_blocks >= InvalidBlockNumber) {
+            ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                            errmsg("vector file exceeds the supported block count")));
+        }
+        const char zero = 0;
+        vec_write(rel->rd_smgr, static_cast<off_t>(rounded_blocks * BLCKSZ - 1),
+                  1, &zero, false, VecStorageType::PureCode);
+        old_nblocks = smgrnblocks(rel->rd_smgr, fork);
+    }
+
 #if PG_VERSION_NUM >= 180000
-    smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks, &nblocks);
+    // PG18+ needs the actual old size. Passing the new count as both arguments
+    // makes mdtruncate return early and leaves the original vector tail.
+    smgrtruncate(rel->rd_smgr, &fork, 1, &old_nblocks, &nblocks);
 #else
     smgrtruncate(rel->rd_smgr, &fork, 1, &nblocks);
 #endif

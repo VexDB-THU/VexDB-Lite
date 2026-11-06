@@ -20,6 +20,8 @@
 #include "index/graph_bridge.h"
 #include "quantizer/product_quantizer.h"
 #include "rabitq/code_distancer.h"
+#include "store/sqlite_record_reader.h"
+#include "store/build_memory_budget.h"
 #include "vex_distance_entry.h"
 
 #include <algorithm>
@@ -92,15 +94,19 @@ struct GraphIndexVtab {
     // >0 且全图估算超限 → DiskStore 段式懒加载（meta/elems/upper 常驻，
     // base/vec 段 LRU，预算管段缓存）。
     sqlite3_int64 graph_memory_limit = 0;
+    // 构建工作集预算；0沿用查询缓存的4倍，不增加每个查询连接的缓存。
+    sqlite3_int64 graph_build_memory_limit = 0;
 
     // M3：内存 HNSW 图（懒加载：首次 KNN 时从 %_graph blob 还原或 %_vectors 重建）。
     // 一致性协议：任何写路径先清 %_graph（宿主事务内）；xSync 把 dirty 内存图
     // 序列化写回——磁盘上存在 blob 即保证与 %_vectors 一致；崩溃中途=无 blob=重建。
     std::unique_ptr<GraphBridge> graph;
+    std::weak_ptr<vexdb_sqlite::SqliteRecordReader> graph_record_reader;
     bool graph_dirty = false;
     // 行数缓存：-1=未知（首查时 count 一次），之后随 INSERT/DELETE 增减维护。
     // 1M 行表上每次 KNN 都 count(*) 全表扫（~80ms）会淹没 HNSW 本身（μs 级）。
     sqlite3_int64 row_count = -1;
+    std::string search_info = "{\"route\":\"none\"}";
     // 跨连接失效 cookie（FTS5 iCookie 同理）：%_config 'cookie' 整数，任何
     // 连接的图/段变更事务在 xSync bump；本连接在查询/写入口比对，变了就作废
     // 缓存的图与行数——否则他端提交的写永远不可见，且本端的 stale 图写回
@@ -242,6 +248,13 @@ bool ParseCreateArgs(int argc, const char *const *argv, GraphIndexVtab &vt,
             } else if (key == "graph_memory_limit") {
                 vt.graph_memory_limit = atoll(val.c_str());
                 if (vt.graph_memory_limit < 0) { err = "graph_memory_limit must be >= 0"; return false; }
+            } else if (key == "graph_build_memory_limit") {
+                std::int64_t limit;
+                if (!vexdb_sqlite::ParseBuildMemoryLimit(val, limit)) {
+                    err = "graph_build_memory_limit must be an integer in [0,9223372036854775807]";
+                    return false;
+                }
+                vt.graph_build_memory_limit = limit;
             } else {
                 err = "unknown parameter: " + key;
                 return false;
@@ -447,6 +460,7 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
         ConfigSet(*vt, "quantizer", QuantizerName(vt->quantizer));
         ConfigSet(*vt, "pq_m", std::to_string(vt->pq_m));
         ConfigSet(*vt, "memory_mode", vt->compact_mode ? "compact" : "full");
+        ConfigSet(*vt, "graph_build_memory_limit", std::to_string(vt->graph_build_memory_limit));
         ConfigSet(*vt, "column", col_name);
         ConfigSet(*vt, "cookie", "0");
         if (!vt->meta_cols.empty())
@@ -521,6 +535,15 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
             delete vt;
             return SQLITE_CORRUPT;
         }
+        if (ConfigGet(*vt, "graph_build_memory_limit", v)) {
+            std::int64_t limit;
+            if (!vexdb_sqlite::ParseBuildMemoryLimit(v, limit)) {
+                *pzErr = sqlite3_mprintf("GRAPH_INDEX: invalid graph_build_memory_limit");
+                delete vt;
+                return SQLITE_ERROR;
+            }
+            vt->graph_build_memory_limit = limit;
+        }
     }
 
     if (col_name.empty()) col_name = "embedding";
@@ -529,6 +552,8 @@ int ConnectImpl(sqlite3 *db, int argc, const char *const *argv,
         delete vt;
         return rc;
     }
+    rc=sqlite3_overload_function(db,"vexdb_search_info",1);
+    if (rc!=SQLITE_OK) { delete vt;return rc; }
     *ppVtab = &vt->base;
     return SQLITE_OK;
 }
@@ -653,70 +678,28 @@ GraphBridge::SegWriteFn MakeSegWriter(GraphIndexVtab &vt) {
     };
 }
 
-// 记录粒度读（M9'b）：sqlite3_blob 增量 I/O 只触达 offset 所在页，免整段拷贝。
-// (kind,seg)→rowid 持久 stmt 点查 + 缓存；blob handle reopen 复用，语句事务
-// 过期（SQLITE_ABORT）或 rowid 失效时 close 重开/重查兜底。
-GraphBridge::SegRecReadFn MakeRecReader(GraphIndexVtab &vt) {
+// 普通读取用后关闭 BLOB；构建可取得 reader，在有界操作作用域内复用。
+GraphBridge::SegRecReadFn MakeRecReader(
+    GraphIndexVtab &vt,
+    std::shared_ptr<vexdb_sqlite::SqliteRecordReader> *operation_reader = nullptr) {
     char *sql = sqlite3_mprintf("SELECT rowid FROM %s WHERE kind = ?1 AND seg = ?2",
                                 vt.ShadowName("graph").c_str());
     sqlite3_stmt *raw = nullptr;
     int rc = sqlite3_prepare_v2(vt.db, sql, -1, &raw, nullptr);
     sqlite3_free(sql);
-    if (rc != SQLITE_OK) return nullptr;
-    std::shared_ptr<sqlite3_stmt> st(raw, sqlite3_finalize);
-
-    struct RecState {
-        std::unordered_map<uint64_t, sqlite3_int64> rowids;
-        sqlite3_blob *blob = nullptr;
-        ~RecState() {
-            if (blob) sqlite3_blob_close(blob);
-        }
-    };
-    auto state = std::make_shared<RecState>();
-    sqlite3 *db = vt.db;
-    std::string zdb = vt.schema;
-    std::string ztable = vt.name + "_graph";
-
-    return [st, state, db, zdb, ztable](int kind, uint32_t seg, size_t offset, size_t len,
-                                        char *dst) -> bool {
-        const uint64_t key = (uint64_t(uint32_t(kind)) << 32) | seg;
-        bool ok = false;
-        for (int pass = 0; pass < 2 && !ok; pass++) {
-            sqlite3_int64 rowid;
-            auto it = state->rowids.find(key);
-            if (it != state->rowids.end() && pass == 0) {
-                rowid = it->second;
-            } else {
-                sqlite3_bind_int(st.get(), 1, kind);
-                sqlite3_bind_int64(st.get(), 2, sqlite3_int64(seg));
-                int src = sqlite3_step(st.get());
-                if (src != SQLITE_ROW) {
-                    sqlite3_reset(st.get());
-                    return false;
-                }
-                rowid = sqlite3_column_int64(st.get(), 0);
-                sqlite3_reset(st.get());  // 用后即 reset：活跃语句钉读事务
-                state->rowids[key] = rowid;
-            }
-            for (int attempt = 0; attempt < 2; attempt++) {
-                if (sqlite3_blob_open(db, zdb.c_str(), ztable.c_str(), "data", rowid, 0,
-                                      &state->blob) != SQLITE_OK) {
-                    state->blob = nullptr;
-                    break;  // rowid 可能失效 → 外层重查
-                }
-                int rc2 = sqlite3_blob_read(state->blob, dst, int(len), int(offset));
-                // blob handle 用后立即关闭：打开的 handle 内部是停在 ROW 的
-                // 语句，同样钉住读事务（reopen 复用的微优化让位正确性）。
-                sqlite3_blob_close(state->blob);
-                state->blob = nullptr;
-                if (rc2 == SQLITE_OK) {
-                    ok = true;
-                    break;
-                }
-                if (rc2 != SQLITE_ABORT) break;  // ABORT=事务过期重试一次，其余失败
-            }
-        }
-        return ok;
+    if (rc != SQLITE_OK) {
+        sqlite3_finalize(raw);
+        return nullptr;
+    }
+    // sqlite3_finalize is a function-pointer macro in loadable builds.
+    std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt *)> stmt(raw, sqlite3_finalize);
+    auto reader = std::make_shared<vexdb_sqlite::SqliteRecordReader>(
+        vt.db, stmt.get(), vt.schema, vt.name + "_graph");
+    stmt.release();
+    vt.graph_record_reader = reader;
+    if (operation_reader) *operation_reader = reader;
+    return [reader](int kind, uint32_t seg, size_t offset, size_t len, char *dst) {
+        return reader->Read(kind, seg, offset, len, dst);
     };
 }
 
@@ -841,10 +824,15 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
     // work_mem 的惯例：构建是一次性 maintenance 操作，临时放大仍有界；
     // phase 2 的写工作集是反向边触碰的 base 段，预算太紧会驱逐 dirty 段
     // 反复写回——写放大不可用）。
-    sqlite3_int64 build_budget = vt.graph_memory_limit >
-            std::numeric_limits<sqlite3_int64>::max() / 4
-        ? std::numeric_limits<sqlite3_int64>::max()
-        : vt.graph_memory_limit * 4;
+    // Read the current transaction's config, rather than a cached setting:
+    // ROLLBACK / ROLLBACK TO must also undo maintenance-budget changes.
+    std::int64_t configured_budget = 0;
+    std::string configured;
+    if (ConfigGet(vt, "graph_build_memory_limit", configured) &&
+        !vexdb_sqlite::ParseBuildMemoryLimit(configured, configured_budget))
+        return vt.SetError("invalid graph_build_memory_limit");
+    sqlite3_int64 build_budget = vexdb_sqlite::BuildMemoryBudget(
+        vt.graph_memory_limit, configured_budget);
     // 每行内存：图（vec+base+upper 摊销，对齐 EstimateGraphBytes）+ 预读数组
     sqlite3_int64 per_graph = EstimateGraphBytes(vt, 1024) / 1024 + 1;
     sqlite3_int64 per_row = per_graph + sqlite3_int64(vt.dim) * 4 + 16;
@@ -882,7 +870,10 @@ int BuildTwoPhase(GraphIndexVtab &vt, sqlite3_int64 n) {
     // phase 2：DiskStore 打开（构建期预算）+ 剩余行流式逐条插入。构建完成后
     // 图保留使用（预算大于查询期 limit 是软超额；图作废/重开即回到查询预算）。
     std::string err;
-    vt.graph = GraphBridge::OpenV2Disk(MakeSegReader(vt), MakeSegWriter(vt), MakeRecReader(vt),
+    std::shared_ptr<vexdb_sqlite::SqliteRecordReader> record_reader;
+    auto read_rec = MakeRecReader(vt, &record_reader);
+    vexdb_sqlite::ScopedRecordReadReuse read_scope(record_reader);
+    vt.graph = GraphBridge::OpenV2Disk(MakeSegReader(vt), MakeSegWriter(vt), read_rec,
                                        uint16_t(vt.dim), vt.m, vt.ef_construction, vt.metric,
                                        vt.quantizer, vt.pq_m, vt.compact_mode,
                                        size_t(build_budget), err);
@@ -988,7 +979,7 @@ int vtabBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
     // (constraint 下标, meta 列下标, op 码)。EQ/GT/GE/LT/LE 都下推——白名单
     // 预查机制与谓词形态无关（SQL WHERE 拼接），同列多约束（范围双边）自然
     // AND 叠加。
-    std::vector<std::tuple<int, int, char>> meta_preds;
+    std::vector<std::tuple<int, int, char, std::string>> meta_preds;
     // 存在我们无法消费的 usable 约束（不可下推 op 的 meta 谓词、distance 列
     // 谓词、rowid 谓词等）时，引擎会对 vtab 输出再过滤——此时 LIMIT 不能当
     // k（vtab 只回 LIMIT 行，过滤后必少于 LIMIT，错误的 SQL 语义）。
@@ -1020,7 +1011,9 @@ int vtabBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
         if (c.iColumn >= 1 && c.iColumn <= n_meta) {
             char op = MetaOpCode(c.op);
             if (op) {
-                meta_preds.emplace_back(i, c.iColumn - 1, op);
+                const char *collation=sqlite3_vtab_collation(info,i);
+                if (!collation) return SQLITE_NOMEM;
+                meta_preds.emplace_back(i, c.iColumn - 1, op,collation);
                 continue;
             }
         }
@@ -1062,6 +1055,11 @@ int vtabBestIndex(sqlite3_vtab *pVtab, sqlite3_index_info *info) {
                 if (!enc.empty()) enc += ',';
                 enc += std::to_string(std::get<1>(mp));
                 enc += std::get<2>(mp);
+                // Hex keeps arbitrary registered collation names out of the
+                // idxStr separators. The SQL whitelist uses the same collation.
+                enc += '@';
+                constexpr char hex[]="0123456789abcdef";
+                for (unsigned char c:std::get<3>(mp)) { enc+=hex[c>>4];enc+=hex[c&15]; }
             }
             info->idxStr = static_cast<char *>(sqlite3_malloc(int(enc.size()) + 1));
             if (!info->idxStr) return SQLITE_NOMEM;
@@ -1233,12 +1231,23 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
     struct MetaPred {
         int col;
         char op;
+        std::string collation="BINARY";
     };
     std::vector<MetaPred> meta_preds;
     for (const char *p = idxStr; p && *p;) {
         MetaPred mp{atoi(p), '='};
         while (*p >= '0' && *p <= '9') p++;
         if (*p && *p != ',') mp.op = *p++;
+        if (*p=='@') {
+            ++p;mp.collation.clear();
+            auto digit=[](char c)->int { return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1; };
+            while (*p && *p!=',') {
+                int hi=digit(p[0]),lo=p[1]?digit(p[1]):-1;
+                if(hi<0||lo<0||(hi==0&&lo==0))return vt.SetError("internal: bad collation encoding");
+                mp.collation+=char(hi*16+lo);p+=2;
+            }
+            if(mp.collation.empty())return vt.SetError("internal: empty collation");
+        }
         if (mp.col < 0 || mp.col >= int(vt.meta_cols.size()) || !MetaOpSql(mp.op))
             return vt.SetError("internal: bad idxStr meta predicate");
         meta_preds.push_back(mp);
@@ -1248,6 +1257,21 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
     if (argc < meta_argv_base + int(meta_preds.size()))
         return vt.SetError("internal: KNN argv/idxStr mismatch");
 
+    // All exact exits must apply OFFSET, including an empty/small whitelist.
+    auto finish = [&](int code) {
+        if (code==SQLITE_OK && offset>0)
+            cur.pos=std::min<size_t>(size_t(offset),cur.hits.size());
+        return code;
+    };
+    auto info = [&](const char *route,const char *state,size_t eligible,size_t ef,
+                    size_t calls=0,size_t refinements=0) {
+        vt.search_info="{\"route\":\""+std::string(route)+"\",\"signature_state\":\""+state+
+            "\",\"eligible\":"+std::to_string(eligible)+",\"graph_ef\":"+std::to_string(ef)+
+            ",\"distance_calls\":"+std::to_string(calls)+",\"rescue_refinements\":"+
+            std::to_string(refinements)+",\"signature_capacity_bytes\":"+
+            std::to_string(vt.graph?vt.graph->SignatureMemoryBytes():0)+"}";
+    };
+
     // 谓词预查：rowid 白名单（hash set 给图内过滤，list 给集合暴力保序遍历）。
     std::vector<sqlite3_int64> allowed_list;
     std::unordered_set<sqlite3_int64> allowed;
@@ -1255,7 +1279,8 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
         std::string where;
         for (size_t i = 0; i < meta_preds.size(); i++) {
             if (i) where += " AND ";
-            where += QuotedCol(vt.meta_cols[size_t(meta_preds[i].col)].name) + " " +
+            where += QuotedCol(vt.meta_cols[size_t(meta_preds[i].col)].name) + " COLLATE "+
+                     QuotedCol(meta_preds[i].collation)+" " +
                      MetaOpSql(meta_preds[i].op) + " ?" + std::to_string(i + 1);
         }
         char *sql = sqlite3_mprintf("SELECT rowid FROM %s WHERE %s",
@@ -1274,12 +1299,37 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
         if (allowed_list.empty()) {
             cur.hits.clear();
             cur.pos = 0;
+            info("empty","not_checked",0,0);
             return SQLITE_OK;
         }
         // 白名单足够小（≤ max(k*4, 暴力阈值)）：集合暴力，免图遍历+谓词补偿
         if (sqlite3_int64(allowed_list.size()) <=
             std::max<sqlite3_int64>(k * 4, vt.brute_force_threshold)) {
-            return KnnBruteOverSet(vt, cur, q, k, allowed_list);
+            info("exact_filtered","not_checked",allowed_list.size(),0,allowed_list.size());
+            return finish(KnnBruteOverSet(vt, cur, q, k, allowed_list));
+        }
+        // Compare a complete filtered scan with a conservative lower bound on
+        // graph work: at least ef accepted points must be scored. Count vector,
+        // row-ID and adjacency bytes; no field name or dataset threshold.
+        std::string filter_mode;
+        if (ConfigGet(vt,"filtered_search_mode",filter_mode) && filter_mode=="auto") {
+        const double n=double(CountVectors(vt));
+        const double ef=std::max<double>(double(k),vt.ef_search)*
+            std::min(10.0,std::max(1.0,n/double(allowed_list.size())));
+        const double vector_bytes=double(vt.dim)*sizeof(float);
+        const double exact_bytes=double(allowed_list.size())*(vector_bytes+2*sizeof(sqlite3_int64));
+        // Duplicate rows may share one graph node. Row count would overstate
+        // the graph's distance work and send duplicate-heavy data to a costly
+        // full row scan. If there is no usable graph count, exact over the
+        // whitelist also avoids building the entire graph during a query.
+        const sqlite3_int64 nodes=vt.graph?sqlite3_int64(vt.graph->Count()):
+            GraphBridge::PeekPersistedNodeCount(MakeSegReader(vt));
+        const double graph_bytes=std::min(double(std::max<sqlite3_int64>(0,nodes)),ef)*
+            (vector_bytes+2*vt.m*sizeof(uint32_t));
+        if (vt.metric==VexMetric::L2 && (nodes<=0 || exact_bytes<=graph_bytes)) {
+            info("exact_filtered","not_checked",allowed_list.size(),0,allowed_list.size());
+            return finish(KnnBruteOverSet(vt,cur,q,k,allowed_list));
+        }
         }
         allowed.reserve(allowed_list.size() * 2);
         allowed.insert(allowed_list.begin(), allowed_list.end());
@@ -1287,11 +1337,6 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
 
     // 出口统一收口：OFFSET 下推时输出从第 offset 个命中起（hits 已物化
     // k+offset 个）。
-    auto finish = [&](int rc2) {
-        if (rc2 == SQLITE_OK && offset > 0)
-            cur.pos = std::min<size_t>(size_t(offset), cur.hits.size());
-        return rc2;
-    };
 
     // M3：行数超过阈值走 HNSW 图（懒加载）；小表保持暴力（精度优先）。
     // 注：带谓词且到达此处时 |白名单| > 暴力阈值，全表行数必然也超阈值。
@@ -1302,30 +1347,42 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
             // M9' DiskStore 模式且无 v2 段（写作废后未恢复）：查询路径不重建
             // （重建峰值违背 graph_memory_limit），退化暴力——带谓词时白名单
             // 点查，否则全表扫。恢复=下一次写事务 xSync 重建落盘。
+            info(allowed_list.empty()?"exact_no_graph":"exact_filtered_no_graph","missing",
+                 allowed_list.empty()?size_t(CountVectors(vt)):allowed_list.size(),0,
+                 allowed_list.empty()?size_t(CountVectors(vt)):allowed_list.size());
             if (!allowed_list.empty())
                 return finish(KnnBruteOverSet(vt, cur, q, k, allowed_list));
             return finish(KnnBruteScan(vt, cur, q, k));
         }
         std::vector<std::pair<double, int64_t>> hits;
         const size_t requested_k = size_t(k);
-        auto pq_candidate_k = [&]() -> size_t {
+        auto pq_candidate_k = [&](uint32_t width) -> size_t {
             if (!vt.graph->UsesPQ()) return requested_k;
-            // 图遍历宽度仍由 ef_search 控制，精排预算按 PQ 压缩强度调整：
-            // 子段维度越大，单个 code 越粗，需要保留更多 ADC 候选。32 维下
-            // pq_m=16(dsub=2) 取 4*k，pq_m=8(dsub=4) 取 8*k。旧逻辑固定
-            // 1.25*ef_search，默认 top-10 总是做 200 次 B-tree 点查。
-            const size_t dsub = vt.pq_m > 0 ? size_t(vt.dim) / vt.pq_m : 1;
-            const size_t refine_factor = std::max<size_t>(4, dsub * 2);
-            const size_t max_size = std::numeric_limits<size_t>::max();
-            size_t candidates = requested_k > max_size / refine_factor
-                ? max_size
-                : requested_k * refine_factor;
-            size_t available = allowed.empty() ? size_t(CountVectors(vt)) : allowed.size();
-            return std::min(std::max(requested_k, candidates), available);
+            // Refine the whole returned graph pool. The configured traversal
+            // width is the quality budget; a second fixed multiple of k must
+            // not discard candidates that navigation already found.
+            const size_t available = allowed.empty() ? size_t(CountVectors(vt)) : allowed.size();
+            return std::min(std::max(requested_k, size_t(width)), available);
         };
         // DiskStore 段 I/O 可 throw（如写事务内 evict 脏段写回失败）——必须在
         // C 边界内 catch 转 SQL 错误，否则异常穿 SQLite C 帧 = UB/terminate。
         try {
+            // Search already owns the SQL read operation. Release the BLOB
+            // before xFilter returns so an idle cursor cannot pin a snapshot.
+            vexdb_sqlite::ScopedRecordReadReuse read_scope(vt.graph_record_reader.lock());
+            // Read from the transaction snapshot, including rollback/savepoints.
+            std::string signature_mode;
+            const bool rescue=vt.quantizer==QuantizerType::NONE &&
+                ConfigGet(vt,"signature_rescue",signature_mode) && signature_mode=="on";
+            vt.graph->SetSignatureRescue(rescue);
+            if (rescue && vt.metric==VexMetric::L2 && !vt.graph->HasSignature()) {
+                info("exact_signature_fallback","missing_or_invalid",
+                    allowed.empty()?size_t(CountVectors(vt)):allowed.size(),0,
+                    allowed.empty()?size_t(CountVectors(vt)):allowed.size());
+                return finish(allowed.empty()?KnnBruteScan(vt,cur,q,k):
+                    KnnBruteOverSet(vt,cur,q,k,allowed_list));
+            }
+            uint32_t actual_ef=uint32_t(vt.ef_search);
             if (!allowed.empty()) {
                 // ef 选择性补偿：通过率越低，图遍历途经的"废点"越多，按
                 // N/|set| 放大 ef（上限 10×，防极端谓词把成本推到全图）。
@@ -1333,13 +1390,19 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
                 // 若只放大 ef_search，k 较大时补偿会被 max 整个吞掉。
                 double sel = double(CountVectors(vt)) / double(allowed.size());
                 double base_ef = std::max<double>(double(k), double(vt.ef_search));
-                uint32_t ef_eff = uint32_t(base_ef * std::min(10.0, std::max(1.0, sel)));
-                vt.graph->Search(q.data, pq_candidate_k(), ef_eff,
+                uint32_t ef_eff = uint32_t(std::min<double>(UINT32_MAX,base_ef * std::min(10.0, std::max(1.0, sel))));
+                actual_ef=ef_eff;
+                vt.graph->Search(q.data, pq_candidate_k(ef_eff), ef_eff,
                                  [&](int64_t rid) { return allowed.count(rid) > 0; }, hits);
             } else {
                 uint32_t ef = uint32_t(vt.ef_search);
-                vt.graph->Search(q.data, pq_candidate_k(), ef, hits);
+                vt.graph->Search(q.data, pq_candidate_k(ef), ef, hits);
             }
+            const auto stats=vt.graph->LastSearchStats();
+            info(rescue&&stats.rescue_refinements?"graph_rescue":"graph",
+                 rescue?(vt.graph->HasSignature()?"ready":"unsupported"):"disabled",
+                 allowed.empty()?size_t(CountVectors(vt)):allowed.size(),actual_ef,
+                 stats.distance_calls,stats.rescue_refinements);
         } catch (const std::exception &e) {
             return vt.SetError(e.what());
         }
@@ -1378,7 +1441,18 @@ int FilterKnn(GraphIndexVtab &vt, GraphIndexCursor &cur, int idx_num, const char
         return finish(SQLITE_OK);
     }
 
+    info("exact_small","not_checked",size_t(CountVectors(vt)),0,size_t(CountVectors(vt)));
     return finish(KnnBruteScan(vt, cur, q, k));
+}
+
+void SearchInfo(sqlite3_context *context,int,sqlite3_value **) {
+    auto *vt=static_cast<GraphIndexVtab*>(sqlite3_user_data(context));
+    sqlite3_result_text(context,vt->search_info.c_str(),-1,SQLITE_TRANSIENT);
+}
+int vtabFindFunction(sqlite3_vtab *table,int n,const char *name,
+                     void (**function)(sqlite3_context*,int,sqlite3_value**),void **data) {
+    if(n!=1 || sqlite3_stricmp(name,"vexdb_search_info"))return 0;
+    *function=SearchInfo;*data=asVtab(table);return 1;
 }
 
 int vtabFilter(sqlite3_vtab_cursor *pCur, int idxNum, const char *idxStr, int argc,
@@ -1554,11 +1628,45 @@ int vtabUpdate(sqlite3_vtab *pVtab, int argc, sqlite3_value **argv,
         size_t eq = cmd.find('=');
         std::string key = cmd.substr(0, eq == std::string::npos ? cmd.size() : eq);
         TrimSpaces(key);
+        if (key == "signature_build" && eq != std::string::npos) {
+            // Explicit seed: repeatable model, no query-time training.
+            std::string value=cmd.substr(eq+1);
+            if (value.empty() || value.find_first_not_of("0123456789")!=std::string::npos)
+                return vt->SetError("signature_build requires an unsigned seed");
+            try {
+                size_t consumed=0;uint64_t seed=std::stoull(value,&consumed);
+                if (consumed!=value.size()) return vt->SetError("invalid signature seed");
+                int rc=EnsureGraph(*vt);if(rc!=SQLITE_OK)return rc;
+                if (!vt->graph) return vt->SetError("build the graph in a write transaction first");
+                vt->graph->BuildSignature(seed);vt->graph_dirty=true;return SQLITE_OK;
+            } catch (const std::exception &e) {return vt->SetError(e.what());}
+        }
+        if (key == "signature_rescue" && eq != std::string::npos) {
+            std::string value=cmd.substr(eq+1);
+            if (value!="on" && value!="off") return vt->SetError("signature_rescue must be on or off");
+            if (value=="on" && (vt->quantizer!=QuantizerType::NONE || vt->metric!=VexMetric::L2))
+                return vt->SetError("signature_rescue requires a raw L2 graph");
+            return ConfigSet(*vt,"signature_rescue",value);
+        }
+        if (key == "filtered_search_mode" && eq != std::string::npos) {
+            std::string value=cmd.substr(eq+1);
+            if(value!="off" && value!="auto")
+                return vt->SetError("filtered_search_mode must be off or auto");
+            return ConfigSet(*vt,"filtered_search_mode",value);
+        }
         if (key == "ef_search" && eq != std::string::npos) {
             int v = atoi(cmd.c_str() + eq + 1);
             if (v < 1) return vt->SetError("ef_search must be positive");
             vt->ef_search = v;
             ConfigSet(*vt, "ef_search", std::to_string(v));
+            return SQLITE_OK;
+        }
+        if (key == "graph_build_memory_limit" && eq != std::string::npos) {
+            std::int64_t limit;
+            if (!vexdb_sqlite::ParseBuildMemoryLimit(cmd.substr(eq + 1), limit))
+                return vt->SetError("graph_build_memory_limit must be an integer in [0,9223372036854775807]");
+            ConfigSet(*vt, "graph_build_memory_limit", std::to_string(limit));
+            // 只影响后续构建，不作废已持久化的图或放大查询缓存。
             return SQLITE_OK;
         }
         if (key == "brute_force_threshold" && eq != std::string::npos) {
@@ -1865,7 +1973,7 @@ const sqlite3_module vexdb_graph_index_module = {
     /* xSync         */ vtabSync,
     /* xCommit       */ vtabCommit,
     /* xRollback     */ vtabRollback,
-    /* xFindFunction */ nullptr,
+    /* xFindFunction */ vtabFindFunction,
     /* xRename       */ nullptr,
     /* xSavepoint    */ vtabSavepoint,
     /* xRelease      */ vtabRelease,
