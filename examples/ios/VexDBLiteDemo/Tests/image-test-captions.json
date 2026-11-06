@@ -1,0 +1,22 @@
+[
+  {"file":"img01.jpg","path":"images/general/img01.jpg","caption":"仰视视角的现代高层建筑，立面有密集的水平线条","tags":["建筑","高楼","现代","仰视"],"subset":"general"},
+  {"file":"img02.jpg","path":"images/general/img02.jpg","caption":"夕阳下横跨海湾的红色悬索桥","tags":["桥梁","红色","悬索桥","海湾"],"subset":"general"},
+  {"file":"img03.jpg","path":"images/general/img03.jpg","caption":"一个孩子捧着《HOLY BIBLE》专心阅读","tags":["人物","孩子","书","阅读"],"subset":"general"},
+  {"file":"img04.jpg","path":"images/general/img04.jpg","caption":"木地板上摆放着斧头、锤子和手套等旧工具","tags":["工具","木地板","斧头","锤子"],"subset":"general"},
+  {"file":"img05.jpg","path":"images/general/img05.jpg","caption":"金色田野里的传统农耕场景，有马匹、农机和干草垛","tags":["田野","农业","马","农机","干草"],"subset":"general"},
+  {"file":"img06.jpg","path":"images/general/img06.jpg","caption":"夕阳照亮海面，一只海鸥在码头附近低飞","tags":["海面","夕阳","海鸥","码头"],"subset":"general"},
+  {"file":"img07.jpg","path":"images/general/img07.jpg","caption":"逆光下一个背对镜头站在草地上的人","tags":["人物","背影","草地","逆光"],"subset":"general"},
+  {"file":"img08.jpg","path":"images/general/img08.jpg","caption":"高举火炬的自由女神像黑白照片","tags":["自由女神像","黑白","火炬","雕像"],"subset":"general"},
+  {"file":"img09.jpg","path":"images/general/img09.jpg","caption":"叶片饱满、呈莲座状排列的绿色多肉植物","tags":["多肉","植物","绿色","莲座"],"subset":"general"},
+  {"file":"img10.jpg","path":"images/general/img10.jpg","caption":"带有纹理、结疤和鞋印的棕色木地板","tags":["木板","木地板","纹理","棕色"],"subset":"general"},
+  {"file":"img11.jpg","path":"images/general/img11.jpg","caption":"雪山和海浪前的一艘红白色小渔船","tags":["渔船","海浪","雪山","红白"],"subset":"general"},
+  {"file":"img12.jpg","path":"images/general/img12.jpg","caption":"蓝天中一片纤细弯曲的白云","tags":["蓝天","白云","天空","云朵"],"subset":"general"},
+  {"file":"img13.jpg","path":"images/general/img13.jpg","caption":"棕色卷发、红唇女性的面部肖像特写","tags":["女性","肖像","卷发","红唇"],"subset":"general"},
+  {"file":"img14.jpg","path":"images/general/img14.jpg","caption":"云雾笼罩的山谷和远处的针叶林","tags":["山谷","云雾","森林","风景"],"subset":"general"},
+  {"file":"img15.jpg","path":"images/general/img15.jpg","caption":"岩石山地上方的蓝色星轨夜空","tags":["星空","星轨","夜空","岩石"],"subset":"general"},
+  {"file":"img16.jpg","path":"images/general/img16.jpg","caption":"停在水面上的橙色起重工程船","tags":["工程船","起重机","水面","港口"],"subset":"general"},
+  {"file":"img17.jpg","path":"images/general/img17.jpg","caption":"桌面上打开的一台银灰色笔记本电脑","tags":["笔记本电脑","桌面","银灰色","办公"],"subset":"general"},
+  {"file":"img18.jpg","path":"images/general/img18.jpg","caption":"夕阳照亮云海和远处的群山","tags":["夕阳","云海","群山","风景"],"subset":"general"},
+  {"file":"img19.jpg","path":"images/general/img19.jpg","caption":"穿过绿色山谷的铁路轨道","tags":["铁路","铁轨","山谷","绿色"],"subset":"general"},
+  {"file":"img20.jpg","path":"images/general/img20.jpg","caption":"雾气中的金色山坡和几棵树","tags":["山坡","雾气","树木","风景"],"subset":"general"}
+]
